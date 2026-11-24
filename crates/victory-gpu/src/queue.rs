@@ -664,6 +664,10 @@ extern "system" fn present(
     let shown = shown_plane(&found);
     #[cfg(windows)]
     log_planes(frame, planes, &found, shown);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if present_target(frame) {
+        return S_OK;
+    }
     #[cfg(windows)]
     if let Some(&resource) = found.get(shown).and_then(|p| p.first())
         && let Some(texture) = crate::resource::host_resource(resource)
@@ -697,6 +701,27 @@ extern "system" fn present(
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Diagnostics, `VICTORY_PRESENT_TARGET`: shows the render target it names
+/// in place of the shown plane, if frame `frame` used one and the window
+/// takes it. False (always, unless the variable is set): the plane is shown
+/// as usual. No overlay is blended over a target.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn present_target(frame: u64) -> bool {
+    let Some(target) = crate::capture::present_override(frame) else {
+        return false;
+    };
+    let Some(host) = crate::host::host() else {
+        return false;
+    };
+    let state = crate::host::legal_state(&target.texture, target.state.load(Ordering::Relaxed));
+    if host.present(&target.texture, state, None, frame).is_none() {
+        return false;
+    }
+    // The draws traced for `blinks`, which is not asked about this frame.
+    crate::draw::take_frame();
+    true
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]

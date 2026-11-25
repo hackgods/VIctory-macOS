@@ -66,6 +66,12 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Barriers added for narrow host waves ([`split_wave_barriers`]).
+    #[cfg(test)]
+    pub split_barriers: usize,
+    /// The `WaveSize` the program declares.
+    #[cfg(test)]
+    pub wave_size: Option<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -87,6 +93,8 @@ pub(crate) struct Parts<'a> {
     /// Compute-stage biased samples run as gradient samples scaled by
     /// `2^bias` ([`Options::bias_as_gradients`](super::Options)).
     pub bias_as_gradients: bool,
+    /// See [`Options::narrow_waves`](super::Options).
+    pub narrow_waves: bool,
 }
 
 enum Stop {
@@ -258,6 +266,10 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: Set<usize>,
+    /// Group barriers before these instructions (index = length: at the
+    /// block's end), for a one-wave group split across host waves
+    /// ([`split_wave_barriers`]).
+    split_barriers: Set<(usize, usize)>,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
     /// dword ([`packed_half`]).
     half_outputs: HashMap<u8, bool>,
@@ -552,6 +564,7 @@ impl<'a> Lower<'a> {
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
             || insts().any(|i| i.name().starts_with("image_bvh"));
         let mut console_lanes = false;
+        let mut split_barriers = Set::default();
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -591,8 +604,25 @@ impl<'a> Lower<'a> {
                 })
             };
             let wave = if x.native.wave64 { 64 } else { 32 };
-            let one_wave = cs.threads.iter().product::<u32>() <= wave;
-            if console_lanes || one_wave && s.lds_dwords > 0 {
+            let lanes = cs.threads.iter().product::<u32>();
+            let one_wave = lanes <= wave;
+            // The console's one wave is several host waves: LDS no longer
+            // passes between its lanes without a barrier.
+            let mut synced = false;
+            if x.narrow_waves && one_wave && lanes > 32 && s.lds_dwords > 0 {
+                // shortcut: a read in divergent code of what divergent code
+                // wrote gets no barrier (none could be placed there); the
+                // program then runs as before.
+                if let Some(b) = split_wave_barriers(p) {
+                    split_barriers = b;
+                    synced = true;
+                }
+            }
+            // A host whose waves are narrower than WaveSize(64) does not run
+            // the dispatch (D3DMetal: nothing written): ask for the console's
+            // width only where wave operations need it, or LDS is not synced.
+            let fits = x.narrow_waves && (synced || lanes <= 32);
+            if console_lanes || one_wave && s.lds_dwords > 0 && !fits {
                 s.wave_size = Some(wave);
             }
         }
@@ -691,6 +721,7 @@ impl<'a> Lower<'a> {
             root_memory,
             flat: None,
             no_barrier,
+            split_barriers,
             half_outputs: half_outputs(&x.native.io),
             mask_data: match x.native.stage {
                 HwStage::Cs => MaskData::Console,
@@ -1359,6 +1390,9 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
+                if self.split_barriers.contains(&(b, i)) {
+                    self.group_barrier();
+                }
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
@@ -1369,6 +1403,9 @@ impl<'a> Lower<'a> {
                     continue;
                 }
                 i += 1;
+            }
+            if self.split_barriers.contains(&(b, p.blocks[b].insts.len())) {
+                self.group_barrier();
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             self.tail[b] = Some(self.cur);
@@ -1403,6 +1440,10 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
+            split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            wave_size: self.s.wave_size,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3330,6 +3371,17 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Thread-group sync with a shared-memory fence, and a UAV fence when
+    /// the program writes UAVs (the waits before an s_barrier make those
+    /// writes visible on the console).
+    fn group_barrier(&mut self) {
+        let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
+        let mode = self.s.m.i32(mode);
+        let void = self.s.t.void;
+        self.s
+            .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     // ---- instructions ----
 
     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
@@ -3362,14 +3414,7 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                // Thread-group sync with a shared-memory fence, and a UAV
-                // fence when the program writes UAVs (the waits before an
-                // s_barrier make those writes visible on the console).
-                let mode = if self.writes_uavs { 1 | 2 | 8 } else { 1 | 8 };
-                let mode = self.s.m.i32(mode);
-                let void = self.s.t.void;
-                self.s
-                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+                self.group_barrier();
                 Ok(())
             }
             Fields::Sopp { .. } => Ok(()),
@@ -10789,6 +10834,83 @@ impl<'a> Lower<'a> {
     }
 }
 
+/// Where a compute group that is one console wave needs group barriers
+/// when the host splits it into narrower waves: (block, instruction) to
+/// sync before, instruction index = the block's length for its end.
+///
+/// The console runs such a group in lockstep, so its compiler leaves out
+/// the barrier between one lane's LDS write and another's read. Here a
+/// read (or atomic) of LDS that a write may have changed since the last
+/// barrier gets one before it. Barriers need every lane of the group, so
+/// they go only in blocks each lane runs exactly once (no cycle through
+/// them, on every path from the entry to an end); such a block still dirty
+/// at its end syncs there when a successor is not one, so divergent code
+/// after it reads clean LDS. `None`: a read in divergent code may see a
+/// write made in divergent code since the last such block.
+pub(crate) fn split_wave_barriers(p: &Program) -> Option<Set<(usize, usize)>> {
+    let n = p.blocks.len();
+    let succ = |b: usize| p.blocks[b].exit.successors();
+    // Blocks reachable from `from`'s successors (or from `from` itself when
+    // `start`), never entering `avoid`.
+    let reach = |from: usize, start: bool, avoid: Option<usize>| {
+        let mut seen = vec![false; n];
+        let mut stack = if start { vec![from] } else { succ(from) };
+        while let Some(b) = stack.pop() {
+            if Some(b) == avoid || std::mem::replace(&mut seen[b], true) {
+                continue;
+            }
+            stack.extend(succ(b));
+        }
+        seen
+    };
+    let uniform: Vec<bool> = (0..n)
+        .map(|b| {
+            let ends_around = b != 0
+                && reach(0, true, Some(b))
+                    .iter()
+                    .enumerate()
+                    .any(|(q, &r)| r && succ(q).is_empty());
+            !reach(b, false, None)[b] && !ends_around
+        })
+        .collect();
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut dirty_out = vec![false; n];
+    loop {
+        let mut at = Set::default();
+        let mut changed = false;
+        for &b in &order {
+            let mut dirty = p.blocks[b].preds.iter().any(|&q| dirty_out[q]);
+            for (i, inst) in p.blocks[b].insts.iter().enumerate() {
+                let name = inst.name();
+                if name == "s_barrier" {
+                    dirty = false;
+                }
+                if !matches!(inst.fields, Fields::Ds { .. })
+                    || name.starts_with("ds_swizzle")
+                    || name.contains("permute")
+                {
+                    continue;
+                }
+                if dirty && !name.starts_with("ds_write") {
+                    if !uniform[b] {
+                        return None;
+                    }
+                    at.insert((b, i));
+                }
+                dirty = !name.starts_with("ds_read");
+            }
+            if dirty && uniform[b] && succ(b).iter().any(|&s| !uniform[s]) {
+                at.insert((b, p.blocks[b].insts.len()));
+                dirty = false;
+            }
+            changed |= std::mem::replace(&mut dirty_out[b], dirty) != dirty;
+        }
+        if !changed {
+            return Some(at);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
@@ -10830,6 +10952,7 @@ mod tests {
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,
+            narrow_waves: false,
             view_marks: false,
         })
         .map(|_| ())
@@ -10883,6 +11006,7 @@ mod tests {
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,
+            narrow_waves: false,
             view_marks: false,
         })
     }
@@ -11075,6 +11199,7 @@ mod tests {
             mesh_stride: 0,
             atomic_locks: false,
             bias_as_gradients: false,
+            narrow_waves: false,
             view_marks: false,
         })
         .unwrap();
@@ -11849,5 +11974,129 @@ mod tests {
         for a in [1, 3, 4] {
             assert_eq!(param(a), "- - - - - - - -");
         }
+    }
+
+    // ---- one console wave split across host waves ----
+
+    const V_LSHLREV_V1_2_V0: u32 = 0x3402_0082; // v_lshlrev_b32 v1, 2, v0
+    const DS_WRITE_V1_V0: [u32; 2] = [0xD834_0000, 0x0000_0001]; // ds_write_b32 v1, v0
+    const DS_READ_V2_V1_4: [u32; 2] = [0xD8D8_0004, 0x0200_0001]; // ds_read_b32 v2, v1 offset:4
+    const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
+    const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
+    const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
+
+    /// `s_cbranch_execz` over the next `words` words.
+    const fn skip(words: u32) -> u32 {
+        0xBF88_0000 | words
+    }
+
+    fn wave64(words: &[u32]) -> ir::Program {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        ir::build(&code, true, 256).unwrap()
+    }
+
+    /// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
+    /// LDS: the barriers it got for narrow host waves.
+    fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
+        lowered(words, lanes, narrow_waves).split_barriers
+    }
+
+    /// The same program, lowered.
+    fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads: [lanes, 1, 1],
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves,
+            view_marks: false,
+        })
+        .expect("lower")
+    }
+
+    #[test]
+    fn a_read_after_another_lanes_write_syncs_in_a_split_wave() {
+        let mut w = vec![V_LSHLREV_V1_2_V0];
+        w.extend(DS_WRITE_V1_V0);
+        w.extend(DS_READ_V2_V1_4);
+        w.push(S_ENDPGM);
+        let at = super::split_wave_barriers(&wave64(&w)).unwrap();
+        assert_eq!(at.into_iter().collect::<Vec<_>>(), [(0, 2)]);
+        assert_eq!(split_barriers(&w, 64, true), 1);
+        // Option off, or a group one host wave holds: as before.
+        assert_eq!(split_barriers(&w, 64, false), 0);
+        assert_eq!(split_barriers(&w, 32, true), 0);
+        // Synced, it no longer asks for 64-lane waves a 32-lane host lacks
+        // (D3DMetal runs nothing then); without the option it still does.
+        assert_eq!(lowered(&w, 64, true).wave_size, None);
+        assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
+        assert_eq!(lowered(&w, 32, true).wave_size, None);
+    }
+
+    #[test]
+    fn a_divergent_write_syncs_at_the_join_before_the_read() {
+        // 34d88edf583f3778's shape: lanes with v0 = 0 write, all read.
+        let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(2)];
+        w.extend(DS_WRITE_V1_V0);
+        w.push(RESTORE_EXEC);
+        w.extend(DS_READ_V2_V1_4);
+        w.push(S_ENDPGM);
+        let p = wave64(&w);
+        let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+        assert_eq!(at.len(), 1);
+        let (b, i) = at[0];
+        assert!(p.blocks[b].insts[i].name().starts_with("ds_read"));
+        assert_eq!(p.blocks[b].preds.len(), 2, "the join");
+        assert_eq!(split_barriers(&w, 64, true), 1);
+    }
+
+    #[test]
+    fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
+        let mut w = vec![V_LSHLREV_V1_2_V0];
+        w.extend(DS_WRITE_V1_V0);
+        w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
+        w.extend(DS_READ_V2_V1_4);
+        w.push(RESTORE_EXEC);
+        w.push(S_ENDPGM);
+        let p = wave64(&w);
+        let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
+        assert_eq!(at, [(0, p.blocks[0].insts.len())], "the end of the entry");
+        assert_eq!(split_barriers(&w, 64, true), 1);
+    }
+
+    #[test]
+    fn no_barrier_in_divergent_code() {
+        // Write and read both under the branch: no barrier can go there.
+        let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+        w.extend(DS_WRITE_V1_V0);
+        w.extend(DS_READ_V2_V1_4);
+        w.push(RESTORE_EXEC);
+        w.push(S_ENDPGM);
+        assert!(super::split_wave_barriers(&wave64(&w)).is_none());
+        assert_eq!(split_barriers(&w, 64, true), 0);
     }
 }

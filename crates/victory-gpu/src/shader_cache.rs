@@ -103,6 +103,18 @@ fn bias_as_gradients() -> bool {
     })
 }
 
+/// Whether translations take wave64 programs to run in 32-lane host waves:
+/// under Wine, whose D3DMetal reports 32 lanes and ignores `WaveSize(64)`.
+/// `VICTORY_NARROW_WAVES=0` or `1` overrides.
+fn narrow_waves() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_NARROW_WAVES").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => under_wine(),
+    })
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -123,10 +135,12 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 4] = [const { OnceLock::new() }; 4];
-    BUILDS[usize::from(locks) | usize::from(bias) << 1].get_or_init(|| {
+/// as gradients, narrow waves): their own cache entries, one per
+/// combination.
+fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
+    let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
+    BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
@@ -134,6 +148,9 @@ fn options_build(locks: bool, bias: bool) -> &'static [u8; 32] {
         }
         if bias {
             h.update(b"bias as gradients");
+        }
+        if narrow {
+            h.update(b"narrow waves");
         }
         *h.finalize().as_bytes()
     })
@@ -150,11 +167,16 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         view_marks: true,
         atomic_locks: atomic_locks(),
         bias_as_gradients: bias_as_gradients(),
+        narrow_waves: narrow_waves(),
     };
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients {
-        options_build(options.atomic_locks, options.bias_as_gradients)
+    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
+        options_build(
+            options.atomic_locks,
+            options.bias_as_gradients,
+            options.narrow_waves,
+        )
     } else {
         build()
     };

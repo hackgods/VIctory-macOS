@@ -750,6 +750,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        narrow_waves: false,
         view_marks: false,
     })?;
     Ok(HostShader {

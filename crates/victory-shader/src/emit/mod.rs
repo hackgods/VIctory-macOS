@@ -390,6 +390,11 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
+    /// says (D3DMetal): a compute group that is one console wave of more
+    /// than 32 lanes gets group barriers where its lanes read LDS other
+    /// lanes may have written, which the console's lockstep made safe.
+    pub narrow_waves: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -516,6 +521,7 @@ pub fn emit_with(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
+        narrow_waves: options.narrow_waves,
     };
     let l = match lower::lower(&parts(st, res)) {
         // Discarded lanes kept on as helpers can read what no surviving

@@ -200,6 +200,7 @@ fn build(
         mesh_stride: 0,
         atomic_locks: false,
         bias_as_gradients: false,
+        narrow_waves: false,
         view_marks: false,
     })
     .expect("lower");

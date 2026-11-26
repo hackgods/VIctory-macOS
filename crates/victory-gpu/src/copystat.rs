@@ -442,6 +442,7 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::BigResizedBytes as usize]),
         c[C::BigResizedNs as usize] / 1e6,
     );
+    log_sites();
     tracing::info!(
         "  host submissions per frame: {:.1} executes ({:.1} from the queue pump), {:.1} lists, {:.1} lists/execute",
         c[C::Submissions as usize],
@@ -547,6 +548,8 @@ fn note_large(size: usize) {
     if INSIDE.with(|i| i.replace(true)) {
         return;
     }
+    // Its own stack's blocks are not sampled either.
+    let naming = NAMING.with(|n| n.replace(true));
     let first = {
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let first = *seen & class == 0;
@@ -558,7 +561,94 @@ fn note_large(size: usize) {
         let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
         tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
     }
+    NAMING.with(|n| n.set(naming));
     INSIDE.with(|i| i.set(false));
+}
+
+/// With `VICTORY_RESIZE_SITES=1`: the stacks of the first [`SITES`] big
+/// blocks made or resized in each dump period (whether resized, bytes,
+/// thread, stack), named with the dump by where they come from: who makes
+/// and grows the blocks of 1-8 MB the world frames resize ~60 times each.
+static SITES_TAKEN: Mutex<Vec<(bool, usize, String, std::backtrace::Backtrace)>> =
+    Mutex::new(Vec::new());
+static SITES_NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const SITES: usize = 48;
+
+std::thread_local! {
+    /// The thread is taking or naming a stack: its own blocks go unnamed
+    /// (the stack lock is not reentrant).
+    static NAMING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether [`note_site`] takes stacks: 0 not asked yet, 1 no, 2 yes.
+static SITES_ON: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn sites_enabled() -> bool {
+    match SITES_ON.load(Relaxed) {
+        0 => {
+            let on = std::env::var_os("VICTORY_RESIZE_SITES").is_some_and(|v| v == "1");
+            SITES_ON.store(if on { 2 } else { 1 }, Relaxed);
+            on
+        }
+        on => on == 2,
+    }
+}
+
+/// A big block of `size` bytes was made (`resized` false) or resized.
+fn note_site(resized: bool, size: usize) {
+    if !sites_enabled() || NAMING.with(|n| n.replace(true)) {
+        return;
+    }
+    if SITES_NOTED.fetch_add(1, Relaxed) < SITES {
+        let thread = std::thread::current().name().unwrap_or("?").to_owned();
+        let trace = std::backtrace::Backtrace::force_capture();
+        SITES_TAKEN
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((resized, size, thread, trace));
+    }
+    NAMING.with(|n| n.set(false));
+}
+
+/// The period's big blocks by where they come from, most bytes first:
+/// "made"/"resized", blocks, MB, the threads, the first frames of ours.
+fn log_sites() {
+    let taken = std::mem::take(&mut *SITES_TAKEN.lock().unwrap_or_else(|e| e.into_inner()));
+    SITES_NOTED.store(0, Relaxed);
+    if taken.is_empty() {
+        return;
+    }
+    NAMING.with(|n| n.set(true));
+    let mut by: HashMap<(bool, String), (u64, u64, String)> = HashMap::new();
+    for (resized, size, thread, trace) in taken {
+        let text = trace.to_string();
+        let site: Vec<&str> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.contains("victory") && !l.contains("copystat"))
+            .take(10)
+            .collect();
+        let e = by.entry((resized, site.join(" | "))).or_default();
+        e.0 += 1;
+        e.1 += size as u64;
+        if !e.2.contains(&thread) && e.2.len() < 200 {
+            e.2 = if e.2.is_empty() {
+                thread
+            } else {
+                format!("{}, {thread}", e.2)
+            };
+        }
+    }
+    NAMING.with(|n| n.set(false));
+    let mut by: Vec<_> = by.into_iter().collect();
+    by.sort_by_key(|(_, (_, bytes, _))| std::cmp::Reverse(*bytes));
+    for ((resized, site), (n, bytes, threads)) in by.into_iter().take(12) {
+        tracing::info!(
+            "  big heap blocks {} (first {SITES} of the period): {n} ({:.1} MB) on {threads}: {site}",
+            if resized { "resized" } else { "made" },
+            bytes as f64 / 1e6
+        );
+    }
 }
 
 /// The tests and the bench share the note lists: one at a time.
@@ -761,6 +851,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
                     layout.size(),
                     started,
                 );
+                note_site(false, layout.size());
             }
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
             if layout.size() >= LARGE {
@@ -781,6 +872,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
                     layout.size(),
                     started,
                 );
+                note_site(false, layout.size());
             }
             HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
             if layout.size() >= LARGE {
@@ -815,6 +907,7 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
                     size,
                     started,
                 );
+                note_site(true, size);
             }
             HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
             HEAP_BYTES.fetch_add(size as u64, Relaxed);
@@ -865,5 +958,44 @@ mod alloc_tests {
         let grew: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
         let big = BIG as u64;
         assert_eq!(grew, [1, big, 1, 2 * big, 1, 2 * big]);
+    }
+
+    /// With the sites switch on, a big block made and then grown is named
+    /// with its stack, as made and as resized, and the dump empties the list.
+    #[test]
+    fn big_blocks_name_where_they_are_made_and_grown() {
+        use super::{SITES_ON, SITES_TAKEN};
+        let _one = super::SEQUENTIAL.lock().unwrap_or_else(|e| e.into_inner());
+        SITES_ON.store(2, Relaxed);
+        SITES_TAKEN.lock().unwrap().clear();
+        super::SITES_NOTED.store(0, Relaxed);
+        // Sizes no other test makes, which may sample its blocks meanwhile.
+        let (made, grown) = (BIG + 3 * 4096, 2 * BIG + 5 * 4096);
+        let layout = Layout::from_size_align(made, 16).unwrap();
+        // SAFETY: freed with the layout it was grown to.
+        unsafe {
+            let p = CountingAlloc.alloc(layout);
+            assert!(!p.is_null());
+            let q = CountingAlloc.realloc(p, layout, grown);
+            assert!(!q.is_null());
+            CountingAlloc.dealloc(q, Layout::from_size_align(grown, 16).unwrap());
+        }
+        SITES_ON.store(1, Relaxed);
+        let taken: Vec<(bool, usize, bool)> = SITES_TAKEN
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, size, _, _)| *size == made || *size == grown)
+            .map(|(resized, size, _, trace)| {
+                (
+                    *resized,
+                    *size,
+                    trace.to_string().contains("big_blocks_name"),
+                )
+            })
+            .collect();
+        assert_eq!(taken, [(false, made, true), (true, grown, true)]);
+        super::log_sites();
+        assert!(SITES_TAKEN.lock().unwrap().is_empty());
     }
 }

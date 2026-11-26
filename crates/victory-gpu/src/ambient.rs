@@ -44,7 +44,7 @@ use crate::host::{Host, HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
 
-pub(crate) use set::{DEPTH, LIGHT, RESOLVES};
+pub(crate) use set::{DEPTH, ENDS_REFLECTIONS, LIGHT, REFLECTIONS, RESOLVES};
 
 /// Whether the stand-in is on: `VICTORY_AMBIENT=1` (off when unset, empty,
 /// `0` or `off`). Read once.
@@ -60,7 +60,7 @@ fn var(name: &str) -> Option<String> {
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if on() {
-        tracing::info!("{}", set::start_line(level(), shade()));
+        tracing::info!("{}", set::start_line(level(), shade(), keep()));
     }
 }
 
@@ -109,6 +109,23 @@ fn level() -> f32 {
 fn tint() -> [f32; 3] {
     static SET: OnceLock<[f32; 3]> = OnceLock::new();
     *SET.get_or_init(|| set::tint(var("VICTORY_AMBIENT_TINT").as_deref()))
+}
+
+/// The most a reflection may hold, as a part of the ambient light's level:
+/// `VICTORY_AMBIENT_REFLECT=<part>` (0.5 by default; 0 leaves the title's
+/// reflections alone).
+///
+/// Without rays the reflections are the sky's, unoccluded, wherever a
+/// surface is glossy: indoors a wooden floor, a counter and glass tops wore
+/// a white glaze five to ten times brighter than anything in the room (the
+/// fork's run ciel1, 2026-11-25; it did not move with the ambient level).
+/// They are held to a part of the light around, after the program that
+/// writes them for the last time in a frame (`set::REFLECTED`); the
+/// lighting programs read that image next.
+/// shortcut: stands in for what the title's traced reflections would see.
+fn keep() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
 }
 
 /// How much less of the light reaches creases and corners, worked out from
@@ -206,6 +223,20 @@ fn viewed_as(copy: &HostTexture, own: DXGI_FORMAT, wanted: DXGI_FORMAT) -> bool 
 /// list's heaps, compute root signature and pipeline are then ours).
 pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     record(list, light, depth, 0.0)
+}
+
+/// Holds the reflections in `image` to a part of the ambient light, in
+/// `list`, after the program that wrote them last. Whether it recorded
+/// anything (the list's heaps, compute root signature and pipeline are then
+/// ours).
+pub(crate) fn hold(list: &HostList, image: This) -> bool {
+    let held = keep();
+    if held <= 0.0 || !record(list, image, None, held) {
+        return false;
+    }
+    static HELD: std::sync::Once = std::sync::Once::new();
+    HELD.call_once(|| tracing::info!(held, "reflections held to the ambient light"));
+    true
 }
 
 fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool {

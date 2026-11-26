@@ -53,6 +53,16 @@ pub(crate) fn shade(value: Option<&str>) -> [f32; 4] {
     shade
 }
 
+/// `VICTORY_AMBIENT_REFLECT=<part>`: the most a reflection may hold, as a
+/// part of the ambient light's level (0.5 by default; 0 leaves the title's
+/// reflections alone).
+pub(crate) fn keep(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|k: &f32| k.is_finite() && *k >= 0.0)
+        .unwrap_or(0.5)
+}
+
 /// Replaces the first values of `to` by those of the comma list `value`
 /// that read as numbers, each in its place.
 fn overlay(to: &mut [f32], value: Option<&str>) {
@@ -74,18 +84,33 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 
+/// The program that writes the title's reflections for the last time in a
+/// frame, by the start of its name, and where it writes them (R9G9B9E5 as
+/// 32-bit integers).
+pub(crate) const REFLECTED: &[u8] = b"CS_UpdateHistory";
+pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
+
 /// What a program is to the stand-in (bits; 0: nothing).
 pub(crate) const RESOLVES: u8 = 1;
+pub(crate) const ENDS_REFLECTIONS: u8 = 2;
 
 /// What the program of shader container `container` is to the stand-in.
 pub(crate) fn role_of(container: &[u8]) -> u8 {
-    if holds(container, PROGRAM) { RESOLVES } else { 0 }
+    let mut role = 0;
+    if holds(container, PROGRAM) {
+        role |= RESOLVES;
+    }
+    if holds(container, REFLECTED) {
+        role |= ENDS_REFLECTIONS;
+    }
+    role
 }
 
 /// What the stand-in calls a role in the log.
 pub(crate) fn role_name(role: u8) -> &'static str {
     match role {
         RESOLVES => "resolves the indirect diffuse light",
+        ENDS_REFLECTIONS => "writes the reflections last",
         _ => "several",
     }
 }
@@ -265,12 +290,18 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
 pub(crate) fn start_line(
     level: f32,
     shade: [f32; 4],
+    keep: f32,
 ) -> String {
     let light = format!("a constant ambient light of level {level}");
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
+    let reflections = if keep > 0.0 {
+        format!("reflections held to {keep} of it")
+    } else {
+        "reflections left alone".to_owned()
+    };
     format!(
         "VICTORY_AMBIENT: the screen probes' indirect diffuse light is replaced by {light}, \
-         {shaded}"
+         {shaded}; {reflections}"
     )
 }
 
@@ -303,6 +334,9 @@ mod tests {
         assert_eq!(shade(None), [1.0, 0.6, 0.1, 0.45]);
         assert_eq!(shade(Some("0")), [0.0, 0.6, 0.1, 0.45]);
         assert_eq!(shade(Some("0.5,x,0.2")), [0.5, 0.6, 0.2, 0.45]);
+        assert_eq!(keep(None), 0.5);
+        assert_eq!(keep(Some("-2")), 0.5);
+        assert_eq!(keep(Some("0")), 0.0);
     }
 
     /// Programs are known by the start of their name, anywhere in the
@@ -320,6 +354,7 @@ mod tests {
             RESOLVES
         );
         assert_eq!(role_of(&container("CS_ScreenProbes_TemporalResolve_CB_a1c765aa")), RESOLVES);
+        assert_eq!(role_of(&container("CS_UpdateHistory_e877ef6e")), ENDS_REFLECTIONS);
         assert_eq!(role_of(&container("CS_ScreenProbes_ActivateRays_d60186e6")), 0);
         assert_eq!(role_of(&container("CS_ScreenProbes_TemporalResolv")), 0);
         assert_eq!(role_of(b""), 0);
@@ -386,10 +421,11 @@ mod tests {
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(0.6, [1.0, 0.6, 0.1, 0.45]);
+        let line = start_line(0.6, [1.0, 0.6, 0.1, 0.45], 0.5);
         assert!(line.starts_with("VICTORY_AMBIENT: "), "{line}");
         assert!(line.contains("constant ambient light of level 0.6, shaded from depth"), "{line}");
-        let plain = start_line(1.4, [0.0, 0.6, 0.1, 0.45]);
-        assert!(plain.contains("level 1.4, not shaded"), "{plain}");
+        assert!(line.ends_with("reflections held to 0.5 of it"), "{line}");
+        let plain = start_line(1.4, [0.0, 0.6, 0.1, 0.45], 0.0);
+        assert!(plain.contains("level 1.4, not shaded; reflections left alone"), "{plain}");
     }
 }

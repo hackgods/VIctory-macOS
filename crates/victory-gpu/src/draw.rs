@@ -1165,7 +1165,7 @@ impl State {
             return;
         }
         let role = crate::pipeline::ambient_role(self.pipeline as This);
-        if role & crate::ambient::RESOLVES == 0 {
+        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS) == 0 {
             return;
         }
         let Some(stage) =
@@ -1196,13 +1196,23 @@ impl State {
             };
             (texture != 0).then_some((pin, texture as This))
         };
-        let light = image(ResourceType::Uav, crate::ambient::LIGHT);
-        let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
-        let recorded = match &light {
-            Some((_, light)) => crate::ambient::raise(list, *light, depth.as_ref().map(|d| d.1)),
-            None => {
-                once!("no ambient light: the resolve's light image is not at its place in the table");
-                false
+        let recorded = if role & crate::ambient::RESOLVES != 0 {
+            let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+            let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+            match &light {
+                Some((_, light)) => {
+                    crate::ambient::raise(list, *light, depth.as_ref().map(|d| d.1))
+                }
+                None => {
+                    once!("no ambient light: the resolve's light image is not at its place in the table");
+                    false
+                }
+            }
+        } else {
+            // The reflections, held to the light around.
+            match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                Some((_, reflections)) => crate::ambient::hold(list, *reflections),
+                None => false,
             }
         };
         if recorded {

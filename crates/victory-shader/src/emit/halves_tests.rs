@@ -151,11 +151,23 @@ fn lower_halves(
     narrow_waves: bool,
     literal: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
+    lower_halves_limited(native, host_wave32, narrow_waves, literal, false)
+}
+
+/// [`lower_halves`]; `limits`: lanes past a dispatch's count of threads
+/// leave where the program can (`emit::Options::thread_limits`).
+fn lower_halves_limited(
+    native: &NativeProgram,
+    host_wave32: bool,
+    narrow_waves: bool,
+    literal: bool,
+    limits: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
     let io = io::raise(&p, native).expect("io::raise");
-    lower::lower_pruned(
+    lower::lower_limited(
         &lower::Parts {
             native,
             p: &p,
@@ -176,6 +188,7 @@ fn lower_halves(
         },
         None,
         literal,
+        limits,
     )
 }
 
@@ -1994,5 +2007,181 @@ fn literal_wave64_programs_match_the_console_on_every_gpu() {
     for (words, lds, want) in cases {
         let failed = differences_in(true, &words, 64, 1, &want, lds, true, true);
         assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+}
+
+/// Each lane that runs adds 1 to `counter[local x]` (the raw UAV).
+fn counted_lanes(extra: &[u32]) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend(extra);
+    w.extend([
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE0C8_1000,
+        0x800A_0201, // buffer_atomic_add v2, v1, s[40:43], 0 offen
+        S_ENDPGM,
+    ]);
+    w
+}
+
+/// The user-data word a translation reads for a dispatch counted in
+/// threads, if any.
+fn thread_limit(l: &lower::Lowered) -> Option<super::UserData> {
+    let code = RootType::Other(super::USER_DISPATCH_THREADS_X);
+    l.user_data.iter().copied().find(|u| u.root == code)
+}
+
+/// Which programs leave the lanes past a dispatch's count of threads:
+/// those of one dimension whose lanes never wait for each other, not in
+/// 32-lane halves that pass values nor in literal halves, and only when the
+/// translation asks for it; the word is past the console's user data and
+/// names the group's width.
+#[test]
+fn only_programs_whose_lanes_never_wait_leave_past_a_count_of_threads() {
+    let limited = |words: &[u32], wave64, threads, host_wave32| {
+        let n = native(words, wave64, threads, 0);
+        let l = lower_halves_limited(&n, host_wave32, true, true, true).expect("translates");
+        thread_limit(&l)
+    };
+    let plain = counted_lanes(&[]);
+    let word = limited(&plain, false, 64, true).expect("a word for the count");
+    assert_eq!(
+        (word.index, word.dword),
+        (1, 64),
+        "past the one user-data SGPR"
+    );
+    assert_eq!(
+        limited(&plain, true, 64, true).map(|u| u.dword),
+        Some(64),
+        "wave64 in 32-lane waves"
+    );
+    let n = native(&plain, false, 64, 0);
+    assert_eq!(
+        thread_limit(&lower_halves(&n, true, true, true).unwrap()),
+        None,
+        "not asked for"
+    );
+    assert_eq!(
+        limited(&plain, false, 1, true),
+        None,
+        "a group of one thread"
+    );
+    let mut flat = native(&plain, false, 64, 0);
+    flat.io = StageIo::Cs(ComputeIo {
+        rsrc2: 1 << 1,
+        threads: [8, 8, 1],
+    });
+    let l = lower_halves_limited(&flat, true, true, true, true).unwrap();
+    assert_eq!(thread_limit(&l), None, "two dimensions");
+    // s_barrier: lanes that left would never reach it.
+    assert_eq!(
+        limited(&counted_lanes(&[0xBF8A_0000]), false, 64, true),
+        None,
+        "a group barrier"
+    );
+    // v_mbcnt reads console lanes: a wave64 group of 64 runs in halves,
+    // which pass values between them at barriers; one of 32 does not.
+    let lanes = counted_lanes(&[0xD765_0003, 0x0001_00C1]);
+    assert_eq!(limited(&lanes, true, 64, true), None, "in halves");
+    assert!(limited(&lanes, true, 32, true).is_some(), "one host wave");
+    assert!(
+        limited(&lanes, true, 64, false).is_some(),
+        "one host wave64"
+    );
+    // A lane read across the halves translates only as literal halves,
+    // whose group must take one path: no word there.
+    let n = native(&literal_lane_reads(false), true, 64, 0);
+    let l = lower_halves_limited(&n, true, true, true, true).expect("literal halves");
+    assert_eq!(thread_limit(&l), None, "literal halves");
+    let code: Vec<u8> = lanes.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    for want in [
+        "v_mbcnt_lo_u32_b32 v3, -1, 0",
+        "v_lshlrev_b32 v1, 2, v0",
+        "v_mov_b32 v2, 1",
+        "buffer_atomic_add v2, v1, s[40:43], 0 offen",
+    ] {
+        assert!(
+            text.iter().any(|t| t.contains(want)),
+            "{want:?} not in {text:?}"
+        );
+    }
+    let code: Vec<u8> = [0xBF8A_0000u32, S_ENDPGM]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    assert_eq!(gfx10::decode(&code).unwrap()[0].text(true), "s_barrier");
+}
+
+/// A dispatch counted in threads (`DispatchX`, after DexNom/VIctory
+/// bc3cd4b0): of two groups of 64 only the lanes below the count run, in
+/// wave32 and wave64 programs, and a count of 0 runs them all. Each lane
+/// that runs adds 1 to the counter of its local x.
+#[cfg(windows)]
+#[test]
+fn the_lanes_past_a_count_of_threads_do_not_run() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut hosts = Host::each_hardware();
+    if let Ok(warp) = Host::new(true) {
+        hosts.push(("WARP".into(), warp));
+    }
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(64),
+    ];
+    for (adapter, host) in &hosts {
+        let wave32 = host.wave32().unwrap_or(false);
+        for wave64 in [false, true] {
+            let n = native(&counted_lanes(&[]), wave64, 64, 0);
+            let l = lower_halves_limited(&n, wave32, wave32, true, true).expect("translates");
+            let limit = thread_limit(&l).expect("a word for the count");
+            let shader = shader(l);
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .expect("DXIL validation failed");
+            }
+            let label = format!("{adapter} (wave64 {wave64})");
+            let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+                panic!("{label}: no pipeline");
+            };
+            for count in [0u32, 1, 7, 31, 32, 33, 63, 64, 65, 74, 127, 128] {
+                let mut ud = vec![0; shader.user_data_dwords() as usize];
+                ud[limit.index as usize] = count;
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [2, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                let runs = if count == 0 { 128 } else { count };
+                let want: Vec<u32> = (0..64)
+                    .map(|i| u32::from(i < runs) + u32::from(i + 64 < runs))
+                    .collect();
+                assert_eq!(out[0], want, "{label}: count {count}");
+            }
+            eprintln!("{label}: the lanes past every count stayed out");
+        }
     }
 }

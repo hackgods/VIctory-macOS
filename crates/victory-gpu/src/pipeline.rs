@@ -89,7 +89,13 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::with_hash(stage, bytes, full)))
+        .or_insert_with(|| {
+            // The programs the ambient stand-in follows are known by name
+            // (`crate::ambient`; nothing while it is off).
+            #[cfg(windows)]
+            crate::ambient::note_program(&full.to_hex()[..16], bytes);
+            Arc::new(Shader::with_hash(stage, bytes, full))
+        })
         .clone()
 }
 
@@ -384,6 +390,10 @@ struct Pipeline {
     /// ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// What its programs are to the ambient stand-in ([`crate::ambient`]):
+    /// bits, 0 for nothing (always while the stand-in is off).
+    #[cfg(windows)]
+    ambient: u8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -428,6 +438,13 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn held_back(this: This) -> bool {
     !this.is_null() && pipeline(this).builder && !builder::runs()
+}
+
+/// What the title pipeline's programs are to the ambient stand-in
+/// ([`crate::ambient`]): bits, 0 for nothing.
+#[cfg(windows)]
+pub(crate) fn ambient_role(this: This) -> u8 {
+    if this.is_null() { 0 } else { pipeline(this).ambient }
 }
 
 /// A title DLL was mapped at `base`, `size` bytes (the acceleration-
@@ -611,6 +628,8 @@ fn hand_out(
     if builder {
         builder::note(&host);
     }
+    #[cfg(windows)]
+    let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
         packet: [0; 8],
@@ -618,6 +637,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        ambient,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

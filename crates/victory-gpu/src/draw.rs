@@ -1152,6 +1152,64 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list);
+    }
+
+    /// After a dispatch: the stand-in for ray-traced indirect light
+    /// (`crate::ambient`, `VICTORY_AMBIENT=1`; from Belobug 0603123), if the
+    /// program is one it follows. Its pass sets a view heap, a compute root
+    /// signature and a pipeline of its own: the title's are set again by the
+    /// next draw or dispatch.
+    fn ambient(&mut self, list: &HostList) {
+        if !crate::ambient::on() {
+            return;
+        }
+        let role = crate::pipeline::ambient_role(self.pipeline as This);
+        if role & crate::ambient::RESOLVES == 0 {
+            return;
+        }
+        let Some(stage) =
+            crate::pipeline::host_pipeline(self.pipeline as This).and_then(|p| p.stages.first())
+        else {
+            return;
+        };
+        // The texture viewed at a place of one of the program's tables, if
+        // its code uses that place as `kind`; the view stays pinned while
+        // the pass is recorded.
+        let image = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage.translated().used.iter().find(|u| {
+                u.kind == kind
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })?;
+            let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+                return None;
+            };
+            let pin = crate::descriptor::view(table + u64::from(offset) * 4)?;
+            // A texture the title placed in memory itself: the resource made
+            // for that memory.
+            let placed = crate::descriptor::host::placed_texture(&pin);
+            let texture = match (placed.as_ref().unwrap_or(&pin), kind) {
+                (&View::Unordered(r, ..), ResourceType::Uav) => r,
+                (&View::Shader(r, _), ResourceType::Srv) => r,
+                _ => 0,
+            };
+            (texture != 0).then_some((pin, texture as This))
+        };
+        let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+        let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+        let recorded = match &light {
+            Some((_, light)) => crate::ambient::raise(list, *light, depth.as_ref().map(|d| d.1)),
+            None => {
+                once!("no ambient light: the resolve's light image is not at its place in the table");
+                false
+            }
+        };
+        if recorded {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| "the ambient light's pass (VICTORY_AMBIENT)".into());
+            self.host_state_lost();
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1872,6 +1930,7 @@ impl State {
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            self.ambient(list);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }

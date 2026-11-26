@@ -549,15 +549,13 @@ struct Object {
     mapped: usize,
 }
 
-/// A buffer the CPU maps that the frame changes.
+/// A buffer the CPU maps, as at the frame's start.
 struct Mapped {
     at: usize,
     size: usize,
-    /// Its pages the frame changes, in order: those the recorded run's CPU
-    /// or GPU had changed by a later submission (the recorder looked at
-    /// every page views name before each), and those the frame's copies
-    /// write.
-    touched: Vec<u32>,
+    /// The number of each of its pages (`plain::page_hash`; of a page of
+    /// zeros it is zero).
+    pages: Vec<u64>,
     /// Where the capture has its bytes at the frame's start: runs of whole
     /// pages (offset in the buffer, bytes, offset in `deltas.bin`), in
     /// order; what is in none is zero.
@@ -633,9 +631,10 @@ pub struct Player {
     /// Copies of what the frame changes of the GPU's own memory, as at its
     /// start.
     masters: Vec<(u32, ID3D12Resource)>,
-    /// The buffers the CPU maps that the frame changes, with where the
-    /// capture has what they held at the frame's start: put back from the
-    /// capture itself, so no second copy of them is held.
+    /// The buffers the CPU maps, with the number of each of their pages at
+    /// the frame's start and where the capture has their bytes: what a run
+    /// changed is found by the numbers and put back from the capture
+    /// itself, so no second copy of them is held.
     mapped: Vec<Mapped>,
     /// What the CPU wrote between submissions: the bytes, for each
     /// submission where in them, and a buffer of the GPU's with the same
@@ -2192,39 +2191,9 @@ impl Player {
             let to = &mut self.delta_bytes[*at as usize..(*at + d.len) as usize];
             read_at(&file, to, d.file).context("what the CPU wrote between submissions")?;
         }
-        // The pages of mapped buffers the frame changes: to be put back
-        // between loops from the capture's bytes of the frame's start.
-        let mut touched: HashMap<u32, Vec<(u64, u64)>> = HashMap::new();
-        for (d, _) in self.delta_parts.iter().flatten() {
-            touched.entry(d.res).or_default().push((d.at, d.at + d.len));
-        }
-        for c in self.commands.iter().flatten() {
-            let (res, from, to) = match c {
-                Cmd::CopyBuffer {
-                    dst, dst_at, len, ..
-                } => (*dst, *dst_at, dst_at + len),
-                Cmd::CopyTexture {
-                    dst:
-                        Loc::Placed {
-                            res,
-                            offset,
-                            size,
-                            pitch,
-                            ..
-                        },
-                    ..
-                } => {
-                    let len = u64::from(*pitch) * u64::from(size[1]) * u64::from(size[2].max(1));
-                    (*res, *offset, offset + len)
-                }
-                Cmd::CopyResource { dst, .. } => (*dst, 0, u64::MAX),
-                Cmd::ResolveQuery {
-                    dst, at, count, ..
-                } => (*dst, *at, at + u64::from(*count) * 8),
-                _ => continue,
-            };
-            touched.entry(res).or_default().push((from, to));
-        }
+        // What the mapped buffers hold now, page by page: the frame's start,
+        // to find what a run changed. Only pages the capture has bytes of
+        // are not zero.
         let mut by_buffer: HashMap<u32, Vec<(u64, u64, u64)>> = HashMap::new();
         for d in &first {
             by_buffer
@@ -2232,29 +2201,47 @@ impl Player {
                 .or_default()
                 .push((d.at, d.len, d.file));
         }
-        for (id, ranges) in touched {
-            let Some(o) = self.objects.get(&id).filter(|o| o.mapped != 0) else {
-                continue;
-            };
-            let size = self.frame.resources[o.index].desc.width as usize;
-            let mut pages: Vec<u32> = ranges
-                .iter()
-                .flat_map(|&(from, to)| {
-                    let to = to.min(size as u64) as usize;
-                    (from as usize / PAGE..to.div_ceil(PAGE)).map(|p| p as u32)
-                })
-                .collect();
-            pages.sort_unstable();
-            pages.dedup();
-            let mut runs = by_buffer.remove(&id).unwrap_or_default();
-            runs.sort_unstable();
-            self.mapped.push(Mapped {
-                at: o.mapped,
-                size,
-                touched: pages,
-                runs,
-            });
-        }
+        let mut mapped: Vec<Mapped> = self
+            .objects
+            .iter()
+            .filter(|(_, o)| o.mapped != 0)
+            .map(|(id, o)| {
+                let size = self.frame.resources[o.index].desc.width as usize;
+                let mut runs = by_buffer.remove(id).unwrap_or_default();
+                runs.sort_unstable();
+                Mapped {
+                    at: o.mapped,
+                    size,
+                    pages: vec![0; size.div_ceil(PAGE)],
+                    runs,
+                }
+            })
+            .collect();
+        let all = std::sync::Mutex::new(mapped.iter_mut());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    loop {
+                        let Some(m) = all.lock().unwrap_or_else(|e| e.into_inner()).next() else {
+                            break;
+                        };
+                        for &(at, len, _) in &m.runs {
+                            let (from, to) = (at as usize, ((at + len) as usize).min(m.size));
+                            for page in (from..to).step_by(PAGE) {
+                                let n = PAGE.min(m.size - page);
+                                // SAFETY: a page of the buffer's mapping.
+                                let bytes = unsafe {
+                                    std::slice::from_raw_parts((m.at + page) as *const u8, n)
+                                };
+                                m.pages[page / PAGE] = plain::page_hash(bytes);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        drop(all);
+        self.mapped = mapped;
         Ok(())
     }
 
@@ -2633,31 +2620,44 @@ impl Player {
         Ok(())
     }
 
-    /// Puts back what a run changed of the buffers the CPU maps: every
-    /// page the frame changes ([`Mapped::touched`]) is read from the capture
-    /// again, or zeroed. The GPU is idle (the caller waited).
+    /// Puts back what a run changed of the buffers the CPU maps (what the
+    /// CPU wrote between submissions, what shaders and copies wrote,
+    /// whatever an experiment made them write): every page whose number is
+    /// not the one of the frame's start is read from the capture again, or
+    /// zeroed. The GPU is idle (the caller waited).
     fn restore_mapped(&mut self) -> Result<()> {
         let file = File::open(self.folder.join("deltas.bin"))?;
-        let next = AtomicUsize::new(0);
         let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
         let bytes = AtomicUsize::new(0);
         let began = Instant::now();
+        // Pieces of 4 MB of the buffers, taken by the threads in turn.
+        const PIECE: usize = 1024;
+        let pieces: Vec<(usize, usize)> = self
+            .mapped
+            .iter()
+            .enumerate()
+            .flat_map(|(i, m)| (0..m.pages.len()).step_by(PIECE).map(move |p| (i, p)))
+            .collect();
+        let next = AtomicUsize::new(0);
         std::thread::scope(|scope| {
-            let (next, all, file, failed, bytes) = (&next, &self.mapped, &file, &failed, &bytes);
+            let (next, all, pieces, file, failed, bytes) =
+                (&next, &self.mapped, &pieces, &file, &failed, &bytes);
             for _ in 0..8 {
                 scope.spawn(move || {
-                    while let Some(m) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        for &i in &m.touched {
-                            let page = i as usize * PAGE;
-                            if page >= m.size {
-                                continue;
-                            }
+                    while let Some(&(i, first)) = pieces.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let m = &all[i];
+                        let last = (first + PIECE).min(m.pages.len());
+                        for (p, &was) in m.pages[first..last].iter().enumerate() {
+                            let page = (first + p) * PAGE;
                             let n = PAGE.min(m.size - page);
                             // SAFETY: a page of the buffer's mapping, which
                             // this thread alone has; the GPU is idle.
                             let now = unsafe {
                                 std::slice::from_raw_parts_mut((m.at + page) as *mut u8, n)
                             };
+                            if plain::page_hash(now) == was {
+                                continue;
+                            }
                             bytes.fetch_add(n, Ordering::Relaxed);
                             // The run of the capture that holds it, if any.
                             let k = m.runs.partition_point(|r| r.0 <= page as u64);

@@ -182,8 +182,14 @@ and a loop takes about 0.3 s more than the frame itself. Everything the
 frame's views name is made again at its full size, as in the title's run:
 D3DMetal counted 24 GB of video memory for it, of which the process itself
 has 6 GB resident. Between loops the textures and GPU buffers the frame
-changes are put back from copies (2 GB here); of the buffers the CPU maps,
-only the pages the frame changes are put back, read from the capture again.
+changes are put back from copies (2 GB here); the buffers the CPU maps are
+looked through page by page, and the pages that are not as at the frame's
+start are read from the capture again, so that a loop starts the same
+whatever the one before did, experiments included.
+
+All of it is memory the machine cannot page out (27 GB wired while that
+capture replays, by 64bitMango's later notes). Do not start one next to a
+title or a large build on a 48 GB machine.
 
 ## Limits
 

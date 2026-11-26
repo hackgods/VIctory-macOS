@@ -33,7 +33,8 @@
 //!    `crate::shadow::Shadow::copy_back`): `crate::watch::writing` around a
 //!    kernel copy (`crate::host::write_mapped`), so nothing faults on a
 //!    guarded page, an unmapped page is left alone, and every copy holding
-//!    the memory takes it again ([`land_all`]).
+//!    the memory takes it again ([`land_all`]). Of a texture several lists
+//!    of one submission wrote, the last list's copy alone lands.
 //!
 //! Only textures whose host texture the GPU writes are taken: such a host
 //! texture is never brought up to date from title memory
@@ -547,16 +548,38 @@ pub(crate) fn record(list: &crate::host::HostList, target: Target) -> Option<Bac
     Some(Back { buffer, data: data as usize, bytes: total, subs, mips, layout: target.layout, ticket: target.ticket })
 }
 
+/// Which of copies `keys` (texture, title address; in the order their lists
+/// ran) land: the last of each texture's. The lists have all run, so the
+/// last one holds what they left, and landing the others first would only
+/// be written over.
+fn last_of_each(keys: &[(usize, usize)]) -> Vec<bool> {
+    let mut lands = vec![false; keys.len()];
+    let mut seen = Vec::new();
+    for (i, key) in keys.iter().enumerate().rev() {
+        if !seen.contains(key) {
+            seen.push(*key);
+            lands[i] = true;
+        }
+    }
+    lands
+}
+
 /// Once a submission's lists have run (`Host::finish`): the copies `backs`
-/// of their textures (in list order) land in title memory.
+/// of their textures (in list order) land in title memory, of a texture
+/// several lists wrote the last list's alone.
 #[cfg(windows)]
 pub(crate) fn land_all(backs: &[Arc<Back>]) {
     if backs.is_empty() {
         return;
     }
     let started = std::time::Instant::now();
-    for back in backs {
-        land(back);
+    let keys: Vec<(usize, usize)> = backs.iter().map(|b| (b.ticket.owner, b.ticket.at)).collect();
+    for (back, lands) in backs.iter().zip(last_of_each(&keys)) {
+        if lands {
+            land(back);
+        } else {
+            count(LATER, 1);
+        }
     }
     count(MICROS, started.elapsed().as_micros() as u64);
 }
@@ -770,6 +793,16 @@ mod tests {
         let mut tiled = vec![0xcdu8; layout.size as usize];
         assert!(matches!(tile_all(&layout, 3, &subs, &vec![0; total], &mut tiled), Err((Error::Unsupported, 0, 0))));
         assert!(tiled.iter().all(|&b| b == 0xcd));
+    }
+
+    /// Of a texture copied by several lists of a submission, the last
+    /// list's copy lands (a list named twice too); others land in order.
+    #[test]
+    fn the_last_copy_of_each_texture_lands() {
+        let (a, b, c) = ((1, 0x1000), (2, 0x2000), (3, 0x1000));
+        assert_eq!(last_of_each(&[]), Vec::<bool>::new());
+        assert_eq!(last_of_each(&[a, b, a, c, b]), [false, false, true, true, true]);
+        assert_eq!(last_of_each(&[a, a]), [false, true]);
     }
 
     #[test]

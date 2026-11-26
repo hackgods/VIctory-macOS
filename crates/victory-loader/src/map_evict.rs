@@ -29,6 +29,16 @@
 //! still refuses a piece with references or dependents, and it removes
 //! through the streaming engine as the title's own removals do.
 //!
+//! Two more conditions since the first run with the switch (13:15), which
+//! stopped on a read of a removed piece's contents (+0x2294954): the
+//! streaming engine still had a request for that piece in one of its stage
+//! lists, and the map store's "may this request wait" callback reads the
+//! contents without a check. A piece is now left alone
+//! - if the title's own check before a removal (+0x51c6150, the first thing
+//!   its removal of a piece and its parents does) says "not now", or
+//! - if a request with its object number waits in one of the engine's 17
+//!   stage lists at that moment.
+//!
 //! What this changes in the title's behaviour: pieces the title would have
 //! kept loaded (for a return to the place, or until its own clean-up) are
 //! gone ten seconds after they are let go of and 1.5 km away, whenever the
@@ -68,6 +78,13 @@ const REMOVE_BYTES: [u8; 13] = [0x56, 0x57, 0x53, 0x48, 0x83, 0xec, 0x30, 0x48, 
 /// `sub rsp, 0x28; and edx, 0xf1`.
 const UNREQUIRE: u32 = 0x04f6_6640;
 const UNREQUIRE_BYTES: [u8; 10] = [0x48, 0x83, 0xec, 0x28, 0x81, 0xe2, 0xf1, 0x00, 0x00, 0x00];
+/// The title's check before it removes a piece and its parents (store,
+/// slot): not zero means "not now" (a load of one of them is under way).
+/// `push r15; push r14; push r13; push r12; push rsi; push rdi; push rbp;
+/// push rbx; sub rsp, 0x28`.
+const BUSY: u32 = 0x051c_6150;
+const BUSY_BYTES: [u8; 16] =
+    [0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53, 0x48, 0x83, 0xec, 0x28];
 
 /// The low 9 bits of a box word that mean "forced on once, let go of since,
 /// no search asking, not switched by script".
@@ -164,7 +181,9 @@ fn trampoline(base: u64, at: u64, tick: u64) -> Option<Vec<u8>> {
 #[cfg(windows)]
 mod live {
     use super::*;
-    use crate::pool_watch::{BUILDINGS, FOCUS, POSITION, Reader, STORE, place_of};
+    use crate::pool_watch::{
+        BUILDINGS, ENGINE, FOCUS, POSITION, REQUEST_NEXT, Reader, STAGE_COUNT, STAGES, STORE, place_of,
+    };
     use std::sync::Mutex;
 
     struct Evict {
@@ -173,10 +192,14 @@ mod live {
         waits: Waits,
         last_pass: Option<Instant>,
         last_log: Instant,
-        /// Pieces asked for and gone since the last log line, and in all.
+        /// Pieces asked for and gone since the last log line, and in all;
+        /// pieces left alone because the title's check said "not now" or a
+        /// request for them waited.
         asked: u32,
         gone: u32,
         all_gone: u64,
+        busy: u32,
+        requested: u32,
     }
 
     static STATE: Mutex<Option<Evict>> = Mutex::new(None);
@@ -258,17 +281,46 @@ mod live {
             // routines (their first bytes were checked in `patch`), with the
             // arguments the title's callers give them, on the title's thread
             // at the point of the frame where its box streamer is updated.
-            let (unrequire, remove) = unsafe {
+            let (unrequire, remove, busy) = unsafe {
                 (
                     std::mem::transmute::<usize, unsafe extern "win64" fn(u32, u32)>(base + UNREQUIRE as usize),
                     std::mem::transmute::<usize, unsafe extern "win64" fn(usize, u32) -> u32>(base + REMOVE as usize),
+                    std::mem::transmute::<usize, unsafe extern "win64" fn(usize, u32) -> u32>(base + BUSY as usize),
                 )
             };
-            for slot in self.waits.pass(&pieces, now, AGE, MOST) {
+            let due = self.waits.pass(&pieces, now, AGE, MOST);
+            // The objects the engine has a request for in a stage list now.
+            let mut waiting = std::collections::HashSet::new();
+            if !due.is_empty()
+                && let Some(engine) = self.reader.pointer(base + ENGINE as usize).filter(|&e| e != 0)
+            {
+                for stage in 0..STAGE_COUNT {
+                    let mut request = self.reader.pointer(engine + STAGES + 8 * stage).unwrap_or(0);
+                    for _ in 0..1 << 14 {
+                        let Some(object) = self.reader.dword(request) else { break };
+                        waiting.insert(object & 0x0fff_ffff);
+                        request = self.reader.pointer(request + REQUEST_NEXT).unwrap_or(0);
+                    }
+                }
+            }
+            for slot in due {
+                let object = first_object.wrapping_add(slot);
+                if waiting.contains(&(object & 0x0fff_ffff)) {
+                    self.requested += 1;
+                    self.waits.refused(slot, now);
+                    continue;
+                }
+                // SAFETY: as above; it only reads the streaming records of
+                // the piece and its parents.
+                if unsafe { busy(store, slot) } & 0xff != 0 {
+                    self.busy += 1;
+                    self.waits.refused(slot, now);
+                    continue;
+                }
                 // SAFETY: as above; flag 1 is the "do not delete" the
                 // title's callers clear before this removal.
                 unsafe {
-                    unrequire(first_object.wrapping_add(slot), 1);
+                    unrequire(object, 1);
                     remove(store, slot);
                 }
                 self.asked += 1;
@@ -279,16 +331,20 @@ mod live {
                     self.waits.refused(slot, now);
                 }
             }
-            if self.asked != 0 && now.saturating_duration_since(self.last_log) >= Duration::from_secs(5) {
+            if self.asked + self.busy + self.requested != 0
+                && now.saturating_duration_since(self.last_log) >= Duration::from_secs(5)
+            {
                 self.all_gone += u64::from(self.gone);
                 tracing::info!(
-                    "map pieces put out: {} of {} asked for in the last seconds, {} in all; {} let go of and away now",
+                    "map pieces put out: {} of {} asked for in the last seconds, {} in all; left alone {} not now by the title's check, {} with a request waiting; {} let go of and away now",
                     self.gone,
                     self.asked,
                     self.all_gone,
+                    self.busy,
+                    self.requested,
                     pieces.len()
                 );
-                (self.asked, self.gone, self.last_log) = (0, 0, now);
+                (self.asked, self.gone, self.busy, self.requested, self.last_log) = (0, 0, 0, 0, now);
             }
         }
     }
@@ -309,6 +365,7 @@ mod live {
             std::slice::from_raw_parts(at(THUNK), THUNK_BYTES.len()) == THUNK_BYTES
                 && std::slice::from_raw_parts(at(REMOVE), REMOVE_BYTES.len()) == REMOVE_BYTES
                 && std::slice::from_raw_parts(at(UNREQUIRE), UNREQUIRE_BYTES.len()) == UNREQUIRE_BYTES
+                && std::slice::from_raw_parts(at(BUSY), BUSY_BYTES.len()) == BUSY_BYTES
         };
         if !known {
             return Err("not the build it was written for (bytes differ)");
@@ -342,6 +399,8 @@ mod live {
             asked: 0,
             gone: 0,
             all_gone: 0,
+            busy: 0,
+            requested: 0,
         });
         let mut old = 0;
         // SAFETY: our page holds the code; the site is the rel32 of the

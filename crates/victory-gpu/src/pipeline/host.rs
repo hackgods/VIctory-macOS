@@ -398,6 +398,18 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
+/// the DXIL each stage of a pipeline of the title's containers `stages`
+/// (stage and container) gets from this build with this run's switches,
+/// and whether it is one made for the pipeline alone. Not adapted to this
+/// line's pipelines yet: every stage is refused.
+pub(crate) fn retranslated(stages: &[(&'static str, &[u8])]) -> Vec<(Result<Vec<u8>, String>, bool)> {
+    stages
+        .iter()
+        .map(|_| (Err("--retranslate is not adapted to this line's pipelines yet".to_owned()), false))
+        .collect()
+}
+
 /// Logs a pipeline that gets no host pipeline, once per reason.
 fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());

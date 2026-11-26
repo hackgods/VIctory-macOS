@@ -711,6 +711,11 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    // The draws run so far, for the frame recorder's world frame
+    // (`VICTORY_RECORD_AT=w<n>`): read where `capture::presented` reads
+    // them, so that both tell the same frame as the world's first.
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -726,6 +731,8 @@ extern "system" fn present(
     log_planes(frame, planes, &found, shown);
     #[cfg(all(windows, feature = "diagnostics"))]
     if present_target(frame) {
+        // A frame's end for the frame recorder too, without its picture.
+        crate::replay::record::present(frame, None, drawn);
         return S_OK;
     }
     #[cfg(windows)]
@@ -752,10 +759,15 @@ extern "system" fn present(
             crate::resource::host_transition(*o, s);
         }
         crate::resource::host_transition(resource, state);
+        // The frame recorder's end of a frame (`VICTORY_RECORD`): the
+        // picture is in `state` again.
+        crate::replay::record::present(frame, Some((&texture, state)), drawn);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]
         let _ = shown;
+    } else {
+        crate::replay::record::present(frame, None, drawn);
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);

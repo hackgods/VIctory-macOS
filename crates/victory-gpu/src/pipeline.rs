@@ -113,6 +113,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     // Written outside the lock every pipeline creation takes.
     #[cfg(windows)]
     if created {
+        // With the frame recorder asked for (`VICTORY_RECORD`), the
+        // container is kept beside its captures, so that a replay can
+        // translate it again (one look at a flag without it).
+        crate::replay::record::container(&full.to_hex()[..16], bytes);
         spill(&shader, full.as_bytes());
     }
     #[cfg(not(windows))]

@@ -81,6 +81,8 @@ mod ranges;
 mod ray_skip;
 #[cfg(any(windows, test))]
 mod recent;
+// The capture format is plain std: read, and tested, everywhere.
+pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

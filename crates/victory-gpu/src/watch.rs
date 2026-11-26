@@ -1064,22 +1064,35 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
-/// Reports GPU shader writes into aliased title memory `[at, at + len)` so
-/// any other trackers over those pages (such as textures' staging) know they
-/// changed and re-upload on next use. Fast-paths out when no tracker or alias
-/// covers the range.
-pub(crate) fn notify_written(at: usize, len: usize) {
+/// Shaders wrote aliased title memory `[at, at + len)` (`crate::alias`):
+/// every tracker holding its pages (textures' staging, heaps, other host
+/// copies), and the pages showing the same memory elsewhere, sees them
+/// changed. Nothing is saved (the write happened; there is no "before" to
+/// keep) and no guard is opened: a GPU write does not go through the CPU's
+/// page protection, so the title's own writes stay seen. Opened, as through
+/// [`changed`] in VIctory-macOS #207, each run of pages cost two protection
+/// calls a submission and the title's next write there a fault. The idea is
+/// Marvisak/VIctory 29decb3's `watch::gpu_wrote` (derz92's good pair on
+/// VIctory-macOS #322 ran with a marking patch of their own). Returns the
+/// tracked pages marked.
+pub(crate) fn notify_written(at: usize, len: usize) -> usize {
     if len == 0 {
-        return;
+        return 0;
     }
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     if g.holders.range(first..last).next().is_none()
         && g.alias_of.range(first..last).next().is_none()
     {
-        return;
+        return 0;
     }
-    changed(&mut g, first, last, false);
+    let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    let marked = g.holders.range(first..last).count() + others.iter().filter(|p| g.holders.contains_key(p)).count();
+    mark_changed(&mut g, first, last, false);
+    for page in others {
+        mark_changed(&mut g, page, page + 1, false);
+    }
+    marked
 }
 
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:

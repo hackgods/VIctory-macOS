@@ -356,7 +356,7 @@ impl Uploads {
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !shadow.clean() && !crate::watch::clean_bit(*bit) {
+        if !crate::watch::clean_bit(*bit) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -401,7 +401,7 @@ pub(crate) fn refresh_slot(
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if !crate::watch::clean_bit(shadow.dirty_bit()) {
         add(shadow, *address as usize, *len as usize);
     }
 }

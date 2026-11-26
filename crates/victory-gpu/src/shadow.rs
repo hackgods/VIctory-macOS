@@ -438,7 +438,8 @@ impl Shadow {
                 let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
                 self.refresh_widened(from, to);
             }
-            crate::watch::notify_written(from, to - from);
+            let marked = crate::watch::notify_written(from, to - from);
+            crate::alias::noted(to - from, marked, false);
             return 0;
         }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
@@ -553,9 +554,16 @@ impl Shadow {
         shadow
     }
 
-    #[cfg(test)]
+    /// Whether the title's memory is this copy's own (`crate::alias`): it is
+    /// never copied, nor copied back.
     pub(crate) fn is_aliased(&self) -> bool {
         self.aliased
+    }
+
+    /// Where title address `address` is in the copy's mapping.
+    pub(crate) fn host_ptr(&self, address: u64) -> *mut u8 {
+        // SAFETY: the caller asks about an address inside the copy.
+        unsafe { self.data.add(self.offset(address) as usize) }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -613,6 +621,16 @@ impl Shadow {
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
         if self.aliased {
+            // Nothing to keep: shaders write title memory itself. A range
+            // whose writes are not marked (root views) is noted, so that its
+            // copy-back tells the other trackers over it; marked writes are
+            // told page by page from the marks ([`Shadow::copy_back_marked`]).
+            if !marked {
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert((address, address + len));
+            }
             return;
         }
         self.pending
@@ -699,14 +717,27 @@ impl Shadow {
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
         if self.aliased {
+            // Shaders wrote title memory itself. The other trackers over a
+            // range are told here only where its writes were not marked (the
+            // marks told them page by page): every declared range told whole
+            // marked all of the title's big heaps changed at each submission.
+            // Writes meant to stay out of title memory (`crate::memory::
+            // withholding`, `back` false) are in it already; their marks were
+            // dropped, so the range is told whole, and counted.
+            let declared = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(address, address + len));
             let (from, to) = self.inside(address, len);
-            if from < to {
+            if from < to && (declared || !back) {
                 let start = self.start as usize;
                 if self.has_widened.load(Ordering::Acquire) {
                     let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
                     self.refresh_widened(start + from, start + to);
                 }
-                crate::watch::notify_written(start + from, to - from);
+                let marked = crate::watch::notify_written(start + from, to - from);
+                crate::alias::noted(to - from, marked, !back);
             }
             return 0;
         }
@@ -810,7 +841,8 @@ impl Shadow {
                     let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
                     self.refresh_widened(from, to);
                 }
-                crate::watch::notify_written(from, to - from);
+                let marked = crate::watch::notify_written(from, to - from);
+                crate::alias::noted(to - from, marked, false);
             };
             for &page in pages {
                 let (from, to) = (page.max(start), (page + PAGE).min(end));
@@ -1762,7 +1794,30 @@ pub(crate) fn unregister_aliased(start: u64) -> bool {
     removed
 }
 
-fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
+/// The aliased regions `(start, end)` overlapping `[start, end)`, in order.
+pub(crate) fn aliased_between(start: u64, end: u64) -> Vec<(u64, u64)> {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    let lowest = start.saturating_sub(ALIASED_SPAN.load(Ordering::Relaxed));
+    map.range(lowest..end)
+        .map(|(&s, sh)| (s, s + sh.len))
+        .filter(|&(_, e)| e > start)
+        .collect()
+}
+
+/// The aliased regions now: how many, and their bytes.
+pub(crate) fn aliased_totals() -> (usize, u64) {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return (0, 0);
+    }
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    (map.len(), map.values().map(|s| s.len).sum())
+}
+
+/// The aliased region holding all of `[address, end)`.
+pub(crate) fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
         return None;
     }

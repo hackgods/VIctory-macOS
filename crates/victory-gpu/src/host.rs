@@ -57,6 +57,20 @@ impl Drop for Holding {
     }
 }
 
+/// mac: whether this thread holds the submission lock.
+pub(crate) fn holds_submissions() -> bool {
+    HOLDS_SUBMISSIONS.with(std::cell::Cell::get)
+}
+
+/// mac: runs `f` on this thread as a holder of the submission lock if
+/// `holds`: for a thread that works for one that holds it and waits for
+/// that work (`crate::descriptor::pool`), so that [`Host::quiet`] does not
+/// wait there for the lock its own caller holds.
+pub(crate) fn as_holder<R>(holds: bool, f: impl FnOnce() -> R) -> R {
+    let _holding = holds.then(Holding::enter);
+    f()
+}
+
 pub(crate) mod unwaited;
 
 /// What the end of a submission ([`Host::finish`]) needs from its start:
@@ -3800,6 +3814,7 @@ impl Meter {
             crate::texback::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
+            crate::descriptor::pool::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

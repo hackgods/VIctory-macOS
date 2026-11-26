@@ -273,6 +273,16 @@ pub(crate) fn heap_locks(value: Option<&str>) -> [bool; 2] {
     }
 }
 
+/// `VICTORY_HEAP_SYNC_THREADS`'s rule (`crate::descriptor::pool`): the
+/// threads a heap sync makes a pass's changed slots on, its own among them;
+/// 1 is the syncing thread alone, as before. Unset, no number, 0 or 1: 1;
+/// a larger number: itself, `most` at most. Always 1 unless the heap's
+/// slots have locks of their own (`split`, `VICTORY_HEAP_LOCKS=1`).
+pub(crate) fn heap_sync_threads(value: Option<&str>, split: bool, most: usize) -> usize {
+    let asked = value.and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(1);
+    if split { asked.clamp(1, most.max(1)) } else { 1 }
+}
+
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -331,7 +341,7 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, heap_locks, heap_sync_pause, key, quick, setting, uav_size, writers};
+    use super::{copy_order, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
 
     /// How many tests have the copy-order split forced on right now.
     pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -399,6 +409,19 @@ pub(crate) mod tests {
         assert_eq!(heap_locks(Some("count")), [false, true]);
         assert_eq!(heap_locks(Some("1")), [true, true]);
         assert_eq!(heap_locks(Some("yes")), [true, true]);
+    }
+
+    #[test]
+    fn a_heap_sync_has_one_thread_unless_asked_and_the_locks_are_split() {
+        for value in [None, Some(""), Some("0"), Some("1"), Some("yes"), Some("-3")] {
+            assert_eq!(heap_sync_threads(value, true, 8), 1, "{value:?}");
+        }
+        assert_eq!(heap_sync_threads(Some("2"), true, 8), 2);
+        assert_eq!(heap_sync_threads(Some(" 4 "), true, 8), 4);
+        assert_eq!(heap_sync_threads(Some("64"), true, 8), 8);
+        for value in [None, Some("1"), Some("4"), Some("64")] {
+            assert_eq!(heap_sync_threads(value, false, 8), 1, "{value:?} without the split locks");
+        }
     }
 
     #[test]

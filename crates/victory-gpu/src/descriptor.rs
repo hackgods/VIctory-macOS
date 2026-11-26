@@ -19,6 +19,8 @@ pub(crate) mod host;
 mod paged;
 // mac: plain std too.
 #[cfg(any(windows, test))]
+pub(crate) mod pool;
+#[cfg(any(windows, test))]
 pub(crate) mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [

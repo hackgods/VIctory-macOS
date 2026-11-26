@@ -181,3 +181,69 @@ fn slots_made_by_several_threads_show_what_one_thread_makes() {
     assert_eq!(host.log_messages(), None);
     drop((split, one));
 }
+
+/// A pass made on several threads (`VICTORY_HEAP_SYNC_THREADS`,
+/// `HostHeap::sync_wide`) leaves every slot as the pass alone leaves it,
+/// pass after pass as the title rewrites its records; and the host is
+/// content. Says how long the passes took each way (`--nocapture`).
+#[test]
+fn a_pass_made_on_several_threads_shows_what_the_pass_alone_makes() {
+    let Some(host) = host() else {
+        return; // no host GPU here
+    };
+    const SLOTS: u32 = 8192;
+    // As the split form runs: a held lock is tried again before a sleep.
+    crate::descriptor::slots::spin_in_tests();
+    let title = Title::new(SLOTS, 160);
+    let pools: Vec<crate::descriptor::pool::Pool> = [2, 3, 4].map(crate::descriptor::pool::Pool::new).into();
+    let wide: Vec<HostHeap> = pools.iter().filter_map(|_| HostHeap::new_as(false, SLOTS, true)).collect();
+    let (Some(alone), Some(one)) = (HostHeap::new_as(false, SLOTS, true), HostHeap::new_as(false, SLOTS, false)) else {
+        return;
+    };
+    if wide.len() != pools.len() {
+        return;
+    }
+    let all: Vec<u32> = (0..SLOTS).collect();
+    let at = |i: u32| title.at(i);
+    let mut next = random(9);
+    // Milliseconds: the pass alone on a split heap, on a one-lock heap,
+    // and on each pool.
+    let mut ms = vec![0f64; 2 + pools.len()];
+    let mut timed = |k: usize, f: &mut dyn FnMut()| {
+        let began = std::time::Instant::now();
+        f();
+        ms[k] += began.elapsed().as_secs_f64() * 1e3;
+    };
+    const PASSES: u32 = 6;
+    for pass in 0..PASSES {
+        // Every slot gets another record than it has (now and then none).
+        for i in 0..SLOTS {
+            let view = (pass + i) as usize * 7 + (next() % 3) as usize;
+            title.write(i, (next() % 23 != 0).then(|| &title.views[view % title.views.len()]));
+        }
+        timed(0, &mut || alone.sync_slots(0, SLOTS, title.start(), 32));
+        timed(1, &mut || one.sync_slots(0, SLOTS, title.start(), 32));
+        for (k, (heap, pool)) in wide.iter().zip(&pools).enumerate() {
+            timed(2 + k, &mut || heap.sync_wide(pool, &all, &at));
+        }
+        for i in 0..SLOTS {
+            let expected = shown(&one, i);
+            assert_eq!(shown(&alone, i), expected, "slot {i}, pass {pass}, split locks");
+            for (heap, pool) in wide.iter().zip(&pools) {
+                assert_eq!(shown(heap, i), expected, "slot {i}, pass {pass}, {} threads", pool.threads());
+            }
+        }
+    }
+    let slots = f64::from(PASSES * SLOTS);
+    eprintln!(
+        "heap sync of {SLOTS} changed slots, {PASSES} passes, microseconds a slot: alone with split locks {:.2}, \
+         alone with the one lock {:.2}, on 2, 3 and 4 threads {:.2?}",
+        ms[0] * 1e3 / slots,
+        ms[1] * 1e3 / slots,
+        ms[2..].iter().map(|m| m * 1e3 / slots).collect::<Vec<_>>(),
+    );
+    // SAFETY: a plain device query.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    assert_eq!(host.log_messages(), None);
+    drop((wide, alone, one));
+}

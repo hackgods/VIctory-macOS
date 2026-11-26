@@ -103,6 +103,17 @@ pub(super) fn running() -> bool {
     RUNNING.with(std::cell::Cell::get)
 }
 
+/// Runs `f` on this thread as part of a round ahead if `round` (the answer
+/// of [`running`] on the thread whose round it is), else as part of none:
+/// a thread that makes slots for a syncing thread (`super::pool`) leaves
+/// the slots that thread would leave, and counts as it would.
+pub(super) fn as_round<R>(round: bool, f: impl FnOnce() -> R) -> R {
+    let before = RUNNING.with(|r| r.replace(round));
+    let out = f();
+    RUNNING.with(|r| r.set(before));
+    out
+}
+
 /// Since the last frame line: rounds; slots they found changed; of those,
 /// slots left for the sync before the next submission; rounds cut short
 /// (the GPU finished, or a round of the unwaited thread's reached its

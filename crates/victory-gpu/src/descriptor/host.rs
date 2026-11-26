@@ -801,6 +801,17 @@ impl HostHeap {
         if super::ahead::on() {
             super::ahead::changed(stale.len());
         }
+        // mac: the changed slots of a pass made on several threads, where
+        // slots have locks of their own (`super::pool`).
+        if self.made.split()
+            && let Some(pool) = super::pool::get()
+        {
+            let wide = stale.len() >= super::pool::WORTH;
+            super::pool::note(stale.len(), wide);
+            if wide {
+                return self.sync_wide(pool, &stale, &at);
+            }
+        }
         // mac: a view heap's buffer shader views from one lookup per record.
         if !self.sampler && quick::on() {
             return self.sync_quick(&stale, at);
@@ -808,6 +819,40 @@ impl HostHeap {
         for i in stale {
             self.mirror(i, at(i), false);
         }
+    }
+
+    /// mac: what [`HostHeap::sync_slots`] does with the slots of `stale`,
+    /// on the threads of `pool` and this one: the slots in parts, each part
+    /// made in order by one thread the way the pass alone makes them (the
+    /// quick way or `mirror`), the parts side by side. A slot is made under
+    /// its own lock whichever thread makes it, so every slot ends as the
+    /// pass alone leaves it; only the order between parts is free, as it is
+    /// between this pass and the title's threads making slots meanwhile.
+    ///
+    /// A thread of the pool works in this thread's name: in a round ahead
+    /// of a submission if this is one (it leaves the slots a round leaves),
+    /// as a holder of the submission lock if this thread holds it, and
+    /// counted as a heap sync.
+    fn sync_wide(&self, pool: &super::pool::Pool, stale: &[u32], at: &(impl Fn(u32) -> u64 + Sync)) {
+        // A few parts a thread: slots differ in what they cost to make.
+        let part = stale.len().div_ceil(pool.threads() * 4).max(16);
+        let parts: Vec<&[u32]> = stale.chunks(part).collect();
+        let (round, holds) = (super::ahead::running(), crate::host::holds_submissions());
+        let quick = !self.sampler && quick::on();
+        pool.run(parts.len(), &|k| {
+            let _syncing = super::slots::Syncing::enter();
+            super::ahead::as_round(round, || {
+                crate::host::as_holder(holds, || {
+                    if quick {
+                        self.sync_quick(parts[k], at);
+                    } else {
+                        for &i in parts[k] {
+                            self.mirror(i, at(i), false);
+                        }
+                    }
+                })
+            });
+        });
     }
 
     /// mac: `runs` (title heap memory a sync took as written), after the

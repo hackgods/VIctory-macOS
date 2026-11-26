@@ -74,6 +74,8 @@ pub mod pipeline;
 mod placement;
 #[cfg(windows)]
 mod primitive;
+// mac: a sampling profile of the process's threads (`VICTORY_PROFILE`).
+pub mod profile;
 pub mod query;
 pub mod queue;
 // Plain std, so its tests run everywhere.

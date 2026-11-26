@@ -1156,6 +1156,9 @@ fn install() {
         EXCEPTION_POINTERS,
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
+        // mac: the sampler leaves a thread alone while it takes exceptions
+        // (`crate::profile::excepted`; one load without `VICTORY_PROFILE`).
+        crate::profile::excepted();
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const WRITE: usize = 1;

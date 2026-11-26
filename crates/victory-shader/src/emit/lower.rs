@@ -21,12 +21,15 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
+mod f64_sum;
 mod halves;
 mod mac;
 mod mesh;
 pub(crate) use mesh::{KeptOutputs, plan_merge};
 pub(crate) use halves::Local as HalvesLocal;
 pub(crate) use mac::Mac;
+#[cfg(test)]
+pub(crate) use f64_sum::count_f64_high;
 #[cfg(test)]
 pub(crate) use mac::early_depth as early_depth_rule;
 use mesh::prune_signature;
@@ -1311,10 +1314,10 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
-            // The fork lowers this sum with DXIL doubles
-            // (avatarmanz b17b69fd, 61e5f79a), which the Mac line's host
-            // does not have; left out.
-            Shape::ActiveF64(..) => return Err("a whole-wave sum of 64-bit floats"),
+            // Not as the fork lowers it (DXIL doubles): `lower::f64_sum`.
+            Shape::ActiveF64(lo, hi, mask, high) => {
+                return self.active_f64_sum(lo, hi, mask, high);
+            }
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self

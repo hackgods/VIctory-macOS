@@ -621,10 +621,10 @@ impl Module {
 
     /// Argument `arg` (the opcode is argument 0) of each written call of
     /// functions named `name`, as the 32 bits it holds where it is an
-    /// expression over constants: i32 and i1 `bin`, `cmp` and `select`, and
-    /// bit casts between i32 and f32. `None` for anything else, and for a
-    /// shift by 32 or more anywhere in the expression, taken or not (LLVM
-    /// leaves its result undefined).
+    /// expression over constants: i32 and i1 `bin`, `cmp` and `select`, bit
+    /// casts between i32 and f32, and conversions of an i32 to f32. `None`
+    /// for anything else, and for a shift by 32 or more anywhere in the
+    /// expression, taken or not (LLVM leaves its result undefined).
     #[cfg(test)]
     pub fn constant_call_args(&self, name: &str, arg: usize) -> Vec<Option<u32>> {
         let plan = self.plan();
@@ -641,6 +641,12 @@ impl Module {
             }
         }
         out
+    }
+
+    /// `v` as [`Module::constant_call_args`] works an argument out.
+    #[cfg(test)]
+    pub fn constant_value(&self, v: V) -> Option<u32> {
+        self.constant_bits(v, &mut HashMap::new())
     }
 
     #[cfg(test)]
@@ -713,6 +719,17 @@ impl Module {
                             None
                         }
                     }
+                    // An i32 as the nearest f32, as the CPU converts it.
+                    Op::Cast(op @ (Cast::UiToFp | Cast::SiToFp), a) => (|| {
+                        let int = self.types[self.type_of(a).0 as usize] == TypeDef::Int(32);
+                        let float = self.types[inst.ty.0 as usize] == TypeDef::Float;
+                        let a = self.constant_bits(a, known).filter(|_| int && float)?;
+                        Some(if op == Cast::UiToFp {
+                            (a as f32).to_bits()
+                        } else {
+                            (a as i32 as f32).to_bits()
+                        })
+                    })(),
                     _ => None,
                 }
             }

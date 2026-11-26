@@ -5,13 +5,19 @@
 //! also refuses a shift LLVM leaves undefined) and compares the result with
 //! the host CPU's own conversion.
 //!
+//! And the whole-wave sum of 64-bit floats such a conversion reads in the
+//! title (`lower::f64_sum`): that the console compiler's expansion of it
+//! translates where the summand is 1.0, without DXIL doubles, and what
+//! refuses it otherwise; and the count's steps to a 64-bit float.
+//!
 //! [`Module::constant_call_args`]: super::bitcode::Module
 
+use super::bitcode::Module;
 use super::lower;
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
-use crate::{io, range, resource};
+use crate::{gfx10, io, ir, range, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 /// Operand codes: a literal dword follows; VGPR n; the constant 0.
@@ -332,5 +338,246 @@ fn v_cvt_f32_f64_reads_inline_constants_and_a_literal_as_the_high_dword() {
     let got = converted(&forms);
     for (i, (got, want)) in got.into_iter().zip(want).enumerate() {
         assert_eq!(got, Some(want), "operand {i}");
+    }
+}
+
+/// The count of a wave's lanes in a mask, as the console compiler makes it
+/// in 64-bit floats: the sum over the wave of `high` (with a low dword of
+/// 0; 1.0 is `0x3FF0_0000`) in the lanes of thread ids above 29 and 0.0 in
+/// the others, by DPP moves, `v_permlanex16_b32`, `v_readlane_b32` and
+/// `v_add_f64`, its two dwords copied before EXEC is restored; then
+/// converted and stored by every lane (34.0 on the console's wave64).
+fn count_of_lanes(high: u32) -> Vec<u32> {
+    const fn sop1(sdst: u32, op: u32, src: u32) -> u32 {
+        0xBE80_0000 | sdst << 16 | op << 8 | src
+    }
+    const fn vop3(op: u32, dst: u32, src0: u32, src1: u32, src2: u32) -> [u32; 2] {
+        [0xD400_0000 | op << 16 | dst, src0 | src1 << 9 | src2 << 18]
+    }
+    const fn v(reg: u32) -> u32 {
+        256 + reg
+    }
+    const K0: u32 = 128;
+    const DPP8: u32 = 0xE9;
+    const DPP16: u32 = 0xFA;
+    const VCC: u32 = 106;
+    let add = vop3(0x164, 2, v(4), v(2), 0); // v_add_f64 v[2:3], v[4:5], v[2:3]
+    let mut w = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7D82_009D, // v_cmp_lt_u32 vcc, 29, v0
+        vop1(1, 19, K0),
+        vop1(1, 20, LITERAL),
+        high,
+        sop1(6, 0x25, 193), // s_or_saveexec_b64 s[6:7], -1
+        vop1(1, 2, K0),
+        vop1(1, 3, K0),
+        0x8788_066A, // s_and_b64 s[8:9], vcc, s[6:7]
+    ];
+    assert_eq!(w[13] & 0xFF, VCC);
+    w.extend(vop3(0x101, 2, v(2), v(19), 8)); // v_cndmask_b32 v2, v2, v19, s[8:9]
+    w.extend(vop3(0x101, 3, v(3), v(20), 8));
+    // Pairs, fours and eights of lanes by DPP8, then the two eights of a
+    // row by its mirror image.
+    for lanes in [
+        [1, 0, 3, 2, 5, 4, 7, 6],
+        [2, 2, 0, 0, 6, 6, 4, 4],
+        [4, 4, 4, 4, 0, 0, 0, 0],
+    ] {
+        let sel = (0..8).fold(0, |s, i| s | lanes[i] << (3 * i));
+        w.extend([
+            vop1(1, 4, DPP8),
+            sel << 8 | 2,
+            vop1(1, 5, DPP8),
+            sel << 8 | 3,
+        ]);
+        w.extend(add);
+    }
+    let mirror = 0xFF00_0000 | 1 << 19 | 0x140 << 8;
+    w.extend([vop1(1, 4, DPP16), mirror | 2, vop1(1, 5, DPP16), mirror | 3]);
+    w.extend(add);
+    // The two rows of a half, then the two halves.
+    w.extend(vop3(0x378, 4, v(2), K0, K0)); // v_permlanex16_b32 v4, v2, 0, 0
+    w.extend(vop3(0x378, 5, v(3), K0, K0));
+    w.extend(add);
+    w.extend(vop3(0x360, 8, v(2), K0 + 32, 0)); // v_readlane_b32 s8, v2, 32
+    w.extend(vop3(0x360, 9, v(3), K0 + 32, 0));
+    w.extend(vop3(0x164, 2, 8, v(2), 0)); // v_add_f64 v[2:3], s[8:9], v[2:3]
+    w.extend(vop3(0x360, 8, v(2), K0, 0)); // v_readlane_b32 s8, v2, 0
+    w.extend(vop3(0x360, 9, v(3), K0, 0));
+    w.extend([
+        sop1(12, 0x03, 8),  // s_mov_b32 s12, s8
+        sop1(13, 0x03, 9),  // s_mov_b32 s13, s9
+        sop1(126, 0x04, 6), // s_mov_b64 exec, s[6:7]
+        vop1(CVT, 1, 12),   // v_cvt_f32_f64 v1, s[12:13]
+        0xE070_1000,
+        0x800A_0110, // buffer_store_dword v1, v16, s[40:43], 0 offen
+        S_ENDPGM,
+    ]);
+    w
+}
+
+/// `words` as a wave64 compute program of one row of 64 threads (s0: the
+/// address of a table with a raw unordered view at dword 16), lowered for a
+/// host of 32-lane waves (`host_wave32`) or of 64, with half-local reads
+/// (`local`) or without.
+fn lowered_wave64(
+    words: &[u32],
+    host_wave32: bool,
+    local: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 32,
+        layout: vec![RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 16,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 1,
+            threads: [64, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        halves_local: lower::HalvesLocal {
+            reads: local,
+            lds: false,
+        },
+        mac: Default::default(),
+        host_wave32,
+    })
+}
+
+/// The hand-encoded words are the instructions their comments name.
+#[test]
+fn the_count_of_lanes_is_the_expansion_its_comments_say() {
+    let code: Vec<u8> = count_of_lanes(0x3FF0_0000)
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_cmp_lt_u32 vcc, 29, v0",
+        "v_mov_b32 v19, 0",
+        "v_mov_b32 v20, lit(0x3ff00000)",
+        "s_or_saveexec_b64 s[6:7], -1",
+        "s_and_b64 s[8:9], vcc, s[6:7]",
+        "v_cndmask_b32 v2, v2, v19, s[8:9]",
+        "v_cndmask_b32 v3, v3, v20, s[8:9]",
+        "v_mov_b32 v4, v2 dpp8:[1,0,3,2,5,4,7,6]",
+        "v_mov_b32 v5, v3 dpp8:[2,2,0,0,6,6,4,4]",
+        "v_mov_b32 v4, v2 dpp8:[4,4,4,4,0,0,0,0]",
+        "v_mov_b32 v5, v3 row_mirror bound_ctrl:1",
+        "v_add_f64 v[2:3], v[4:5], v[2:3]",
+        "v_permlanex16_b32 v5, v3, 0, 0",
+        "v_readlane_b32 s9, v3, 32",
+        "v_add_f64 v[2:3], s[8:9], v[2:3]",
+        "v_readlane_b32 s8, v2, 0",
+        "s_mov_b32 s12, s8",
+        "s_mov_b32 s13, s9",
+        "s_mov_b64 exec, s[6:7]",
+        "v_cvt_f32_f64 v1, s[12:13]",
+        "buffer_store_dword v1, v16, s[40:43], 0 offen",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// The count translates, as a wave operation and not from constants; on a
+/// host of 32-lane waves as the 32-bit wave sums do: refused across the
+/// halves, in waves of 32 with half-local reads.
+#[test]
+fn a_whole_wave_sum_of_the_64_bit_float_one_translates() {
+    let words = count_of_lanes(0x3FF0_0000);
+    let whole = lowered_wave64(&words, false, false).expect("one wave64");
+    assert!(whole.wave_ops);
+    assert_eq!(whole.wave_size, Some(64));
+    assert_eq!(whole.stored_constants, [None]);
+    let refused = lowered_wave64(&words, true, false).map(drop).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("a wave reduction over both 32-lane halves"),
+        "{refused}"
+    );
+    let halves = lowered_wave64(&words, true, true).expect("in halves");
+    assert!(halves.wave_ops);
+    assert_eq!(halves.wave_size, Some(32));
+}
+
+/// Any other summand would need 64-bit float additions, which the host
+/// does not have: refused, by name.
+#[test]
+fn a_whole_wave_sum_of_other_64_bit_floats_is_refused() {
+    for high in [0x3FF8_0000, 0x4000_0000, 0xBFF0_0000, 0] {
+        let why = lowered_wave64(&count_of_lanes(high), false, false)
+            .map(drop)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            why.contains("a whole-wave sum of 64-bit floats other than of the constant 1.0"),
+            "{high:#x}: {why}"
+        );
+    }
+}
+
+/// A count's high dword as a 64-bit float, in the integer steps the
+/// translation emits: every count a wave can have and beyond, as far as
+/// the low dword stays 0.
+#[test]
+fn a_count_becomes_a_64_bit_float_in_integer_steps() {
+    let counts = (0..=4096u32)
+        .chain((12..21).flat_map(|b| [(1 << b) - 1, 1 << b, (1 << b) + 1]))
+        .chain([(1 << 21) - 1]);
+    for n in counts {
+        let mut m = Module::default();
+        let block = m.new_block();
+        let k = m.i32(n);
+        let high = lower::count_f64_high(&mut m, block, k);
+        let want = f64::from(n).to_bits();
+        assert_eq!(want as u32, 0, "{n}");
+        assert_eq!(m.constant_value(high), Some((want >> 32) as u32), "{n}");
     }
 }

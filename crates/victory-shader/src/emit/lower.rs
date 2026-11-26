@@ -5117,7 +5117,11 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        // Images at level 0, unordered ones too: D3DMetal answers an
+        // unordered view's size at the undefined level DXC passes with 0 x 0
+        // (and at level 0 with its view's level), which the code's
+        // "size - 1" fields turn into 65,536. Buffers take no level.
+        let mip = if image.is_some() {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -9769,8 +9773,10 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
+            // An unordered view has one level, its own: level 0 (D3DMetal
+            // answers the undefined level DXC passes with 0 x 0).
             let mip = if uav {
-                self.s.m.undef(self.s.t.i32)
+                self.s.m.i32(0)
             } else {
                 addr_val(self, 0)?
             };

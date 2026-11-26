@@ -90,7 +90,11 @@ fn program(dmask: u8, d16: bool, mip: Mip) -> NativeProgram {
     };
     words.extend(mimg_2d(op, 0, 4, 16, dmask, d16));
     words.push(S_ENDPGM);
+    uav_program(&words)
+}
 
+/// `words` as a compute program of [`program`]'s layout.
+fn uav_program(words: &[u32]) -> NativeProgram {
     NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -427,5 +431,85 @@ fn mip_stores_past_the_views_level_or_computed_stop_the_program() {
             ),
             "{e}"
         );
+    }
+}
+
+const IMAGE_GET_RESINFO: u8 = 0x0E;
+
+/// A writable image's size, as the code asks for it, stored to texel (0, 0)
+/// of a 4 x 2 RGBA32_UINT texture UAV (`pragyaangaur/VIctory-macOS#455`):
+/// `image_get_resinfo` (width, height, depth 1, one level) and the
+/// descriptor's dword 2 read as a number (width - 1 >> 2 in bits 0-13,
+/// height - 1 from bit 14). D3DMetal answered the size of a writable image
+/// asked at the undefined level DXC passes with 0 x 0, so the code saw
+/// sizes of 65,536 (the blocky 16x16 shadow edges of a tiled shadow
+/// program); asked at level 0 it answers the view's size.
+#[test]
+fn writable_image_sizes_are_their_views_on_the_host() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // s13 = 0: the table's high dword; the descriptor in s[16:23]; texel
+    // (0, 0) in v[5:6].
+    let head = |words: &mut Vec<u32>| {
+        words.push(s_mov_b32(13, 0x80));
+        words.extend(s_load_dwordx8(16, 12, 0));
+        words.push(v_mov_b32(5, 0x80));
+        words.push(v_mov_b32(6, 0x80));
+    };
+    // image_get_resinfo v[0:3], v4 (level 0), then the store.
+    let mut resinfo = Vec::new();
+    head(&mut resinfo);
+    resinfo.push(v_mov_b32(4, 0x80));
+    resinfo.extend(mimg_2d(IMAGE_GET_RESINFO, 0, 4, 16, 0xF, false));
+    resinfo.extend(mimg_2d(IMAGE_STORE, 0, 5, 16, 0xF, false));
+    resinfo.push(S_ENDPGM);
+    // v0 = s18 (dword 2), v[1:3] = 0, then the store.
+    let mut data = Vec::new();
+    head(&mut data);
+    data.push(v_mov_b32(0, 18));
+    for k in 1..4 {
+        data.push(v_mov_b32(k, 0x80));
+    }
+    data.extend(mimg_2d(IMAGE_STORE, 0, 5, 16, 0xF, false));
+    data.push(S_ENDPGM);
+    let cases = [
+        ("image_get_resinfo", resinfo, [4, 2, 1, 1]),
+        ("descriptor dword 2", data, [1 << 14, 0, 0, 0]),
+    ];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        for (what, words, texel) in &cases {
+            let shader = lower(&uav_program(words)).unwrap_or_else(|e| panic!("{what}: {e}"));
+            if let Ok(mut v) =
+                validator::Validator::load(validator::Validator::default_path().as_deref())
+            {
+                v.validate(&mut shader.dxil.clone())
+                    .unwrap_or_else(|e| panic!("{what}: {e}"));
+            }
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label} {what}: compute_pipeline: {e}"));
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::Uint4TextureUav(4, 2)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {what}: dispatch: {e}"));
+            assert_eq!(out[0][..4], texel[..], "{label} {what}: texel (0, 0)");
+        }
+        ran += 1;
+    }
+    if ran == 0 {
+        eprintln!("no host device could run these; skipped");
     }
 }

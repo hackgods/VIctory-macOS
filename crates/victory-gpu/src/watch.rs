@@ -265,6 +265,12 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// From 64bitMango 131721b7 (`VICTORY_VETTED_PAGES=1`): pages found to be
+    /// the runtime's GPU memory when they were last guarded, with the page
+    /// their region was known to end before: guarded again after a write
+    /// opened them, they are not asked about again. Forgotten when the
+    /// runtime maps or unmaps them and when no tracker holds them any more.
+    vetted: BTreeMap<usize, usize>,
     /// Tracked pages written this frame and the frame before (diagnostics).
     #[cfg(feature = "diagnostics")]
     written: BTreeSet<usize>,
@@ -277,6 +283,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    vetted: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
     #[cfg(feature = "diagnostics")]
@@ -287,7 +294,14 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 /// guard lock (in the title's write faults, elsewhere), microseconds in
 /// protection calls and their number ([`frame_line`]). A lock taken at once
 /// is not timed; a clock read costs a Wine call.
-static TIMES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static TIMES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Whether pages guarded before are guarded again without asking what memory
+/// they are (`VICTORY_VETTED_PAGES=1`, from 64bitMango 131721b7; off by default).
+fn vetted_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_VETTED_PAGES"))
+}
 
 /// mac: since the last frame line, the exceptions the write-fault handler
 /// (the first vectored handler) saw: write faults that opened a guarded
@@ -366,11 +380,12 @@ thread_local! {
 /// mac: the end of the frame line, per frame over `frames` frames: the
 /// guard lock's waits and the protection calls.
 pub(crate) fn frame_line(frames: f64) -> String {
-    let [faults, others, protect, calls] = TIMES.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let [faults, others, protect, calls, vetted] =
+        TIMES.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     let [opened, writable, foreign, other, found] =
         FAULTS.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     format!(
-        "; guard lock waits {:.1} ms ({:.1} ms of it in write faults), protection calls {:.1} ms ({calls:.0}); \
+        "; guard lock waits {:.1} ms ({:.1} ms of it in write faults), protection calls {:.1} ms ({calls:.0}), {vetted:.0} pages guarded again unasked (VICTORY_VETTED_PAGES); \
          exceptions {:.0}: write faults {opened:.0} opened a guarded block, {writable:.0} found it writable, \
          {foreign:.0} not ours, {found:.0} found it open (no lock, VICTORY_OPENED_FAULTS), {other:.0} others",
         (faults + others) / 1e3,
@@ -671,6 +686,7 @@ impl Drop for Tracked {
         for page in free {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
+                g.vetted.remove(&page);
                 open(&mut g, page);
                 // Nobody's any more: what is there next is not known open.
                 forget_opened(page, page + 1);
@@ -953,11 +969,20 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // (the runtime's page mappings make one per page) failed and was then
     // guarded page by page, one call more than needed.
     let mut allowed = RuntimeRegions::default();
+    // From 64bitMango 131721b7: asking costs up to three calls into Wine per
+    // page of a physical-page view (one view a page) under this lock, which
+    // the title's write faults wait for; what the answer depends on changes
+    // only when the runtime maps or unmaps the memory (`VICTORY_VETTED_PAGES`).
+    let vetted = vetted_pages();
     let (pages, ends): (Vec<usize>, Vec<usize>) = pages
         .into_iter()
         .filter_map(|p| {
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
+            }
+            if vetted && let Some(&end) = g.vetted.get(&p) {
+                TIMES[4].fetch_add(1, Ordering::Relaxed);
+                return Some((p, end));
             }
             allowed.region(p).map(|end| (p, end))
         })
@@ -979,16 +1004,23 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
             i += 1;
         }
         let run = &pages[first..=i];
+        let run_ends = &ends[first..=i];
         i += 1;
         if set(run[0], run[run.len() - 1] + 1) {
             g.protected.extend(run);
             taken.extend(run);
+            if vetted {
+                g.vetted.extend(run.iter().copied().zip(run_ends.iter().copied()));
+            }
             continue;
         }
-        for &page in run {
+        for (&page, &end) in run.iter().zip(run_ends) {
             if set(page, page + 1) {
                 g.protected.insert(page);
                 taken.push(page);
+                if vetted {
+                    g.vetted.insert(page, end);
+                }
             } else if unmapped(page) {
                 taken.push(page);
                 unmapped_pages.push(page);
@@ -1164,6 +1196,11 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let mut g = guards();
     // What it showed is gone already: nothing to keep.
     changed(&mut g, first, last, false);
+    // Nor what it was: asked about again when next guarded.
+    let gone: Vec<usize> = g.vetted.range(first..last).map(|(&p, _)| p).collect();
+    for page in gone {
+        g.vetted.remove(&page);
+    }
     // What it showed is not what it shows now: its links go, both ways.
     let stale: Vec<usize> = g.alias_of.range(first..last).map(|(&p, _)| p).collect();
     for page in stale {

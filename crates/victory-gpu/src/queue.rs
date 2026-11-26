@@ -683,6 +683,7 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
+        crate::gpu_pass::presented(frame);
         if crate::capture::listed(frame) || crate::capture::has_targets() {
             crate::capture::dump_targets(frame);
         }

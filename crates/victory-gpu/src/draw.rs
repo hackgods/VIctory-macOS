@@ -1244,6 +1244,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        list.count_work(true);
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -1324,6 +1326,8 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    list.count_work(false);
                     true
                 }
                 Err(_) => false,
@@ -1762,6 +1766,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1856,6 +1862,8 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2015,8 +2023,12 @@ impl State {
         crate::indirect::done(list, &clamped);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(true);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         true
     }

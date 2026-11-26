@@ -49,10 +49,17 @@ pub(crate) fn presented(n: u64) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let drawn = crate::draw::drawn();
     let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
-    if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
+    let wanted = !world_offsets().is_empty() || crate::gpu_pass::requested().is_some();
+    if draws >= 500 && WORLD.get().is_none() && wanted {
         let _ = WORLD.set(n);
         tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
     }
+}
+
+/// The world's first frame (the first that ran 500 draws), once known and
+/// asked for (`VICTORY_CAPTURE_WORLD`, `VICTORY_GPU_PASS_TIMING`).
+pub(crate) fn world() -> Option<u64> {
+    WORLD.get().copied()
 }
 
 /// Whether frame `n` is saved.

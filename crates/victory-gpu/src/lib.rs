@@ -40,6 +40,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 pub mod frame;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod gpu_pass;
 mod hold;
 #[cfg(windows)]
 mod host;

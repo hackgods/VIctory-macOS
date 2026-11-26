@@ -293,7 +293,7 @@ static TIMES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// (the first vectored handler) saw: write faults that opened a guarded
 /// block, that found it writable already (another thread's fault opened it),
 /// that were not ours, and every other exception.
-static FAULTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+static FAULTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn fault(kind: usize) {
     FAULTS[kind].fetch_add(1, Ordering::Relaxed);
@@ -313,19 +313,70 @@ fn timed_protect(f: impl FnOnce() -> bool) -> bool {
     done
 }
 
+/// From 64bitMango e4444060 (`VICTORY_OPENED_FAULTS=1`, off by default):
+/// blocks a title write fault opened that nothing has guarded since, by a
+/// slot their number picks (0: none). Set under the guard lock by the fault
+/// that opened the block, after every tracker holding it was marked;
+/// cleared before the block is guarded again (and when it is remapped or
+/// no tracker holds it); read without the lock by a fault on a block
+/// another thread's fault opened meanwhile, which then has nothing to do.
+/// One block's entry may push out another's: that one's next fault takes
+/// the lock, as before. Fixed and never allocated: the handler writes it.
+static OPENED_BLOCKS: [AtomicU64; 1 << 12] = [const { AtomicU64::new(0) }; 1 << 12];
+
+/// Whether faults on blocks found open skip the lock (`VICTORY_OPENED_FAULTS`).
+fn opened_faults() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_OPENED_FAULTS"))
+}
+
+fn opened_slot(page: usize) -> &'static AtomicU64 {
+    &OPENED_BLOCKS[((page as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize % OPENED_BLOCKS.len()]
+}
+
+/// A title write fault opened `page` (under the guard lock).
+fn note_opened(page: usize) {
+    if opened_faults() {
+        opened_slot(page).store(page as u64 + 1, Ordering::Release);
+    }
+}
+
+/// `[first, last)` is about to be guarded, or shows something new: not
+/// open from a fault any more.
+fn forget_opened(first: usize, last: usize) {
+    if opened_faults() {
+        for page in first..last {
+            let _ = opened_slot(page).compare_exchange(page as u64 + 1, 0, Ordering::AcqRel, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Whether a fault opened `page` and nothing guarded it since.
+fn opened(page: usize) -> bool {
+    opened_faults() && opened_slot(page).load(Ordering::Acquire) == page as u64 + 1
+}
+
+thread_local! {
+    /// The last block this thread found open, and how many faults in a row
+    /// it has had there: past three it takes the lock, should the block be
+    /// read-only for another reason.
+    static FOUND_OPEN: std::cell::Cell<(usize, u8)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// mac: the end of the frame line, per frame over `frames` frames: the
 /// guard lock's waits and the protection calls.
 pub(crate) fn frame_line(frames: f64) -> String {
     let [faults, others, protect, calls] = TIMES.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
-    let [opened, writable, foreign, other] = FAULTS.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let [opened, writable, foreign, other, found] =
+        FAULTS.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     format!(
         "; guard lock waits {:.1} ms ({:.1} ms of it in write faults), protection calls {:.1} ms ({calls:.0}); \
          exceptions {:.0}: write faults {opened:.0} opened a guarded block, {writable:.0} found it writable, \
-         {foreign:.0} not ours, {other:.0} others",
+         {foreign:.0} not ours, {found:.0} found it open (no lock, VICTORY_OPENED_FAULTS), {other:.0} others",
         (faults + others) / 1e3,
         faults / 1e3,
         protect / 1e3,
-        opened + writable + foreign + other
+        opened + writable + foreign + other + found
     )
 }
 
@@ -621,6 +672,8 @@ impl Drop for Tracked {
             let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
                 open(&mut g, page);
+                // Nobody's any more: what is there next is not known open.
+                forget_opened(page, page + 1);
             }
         }
     }
@@ -873,6 +926,9 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         #[cfg(test)]
         tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
+        // Before it is read-only: a fault that still finds it open writes
+        // while it is open, ahead of the caller's copy.
+        forget_opened(from, to);
         // SAFETY: title memory; only its protection changes.
         timed_protect(|| unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 })
     };
@@ -1100,6 +1156,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    forget_opened(at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     // First (before the guard lock): a texture copy-back landing there now
     // is let finish, and none pending lands after (`crate::texback`).
     crate::texback::remapped(at, len);
@@ -1242,6 +1299,23 @@ fn install() {
         let at = r.ExceptionInformation[1];
         #[cfg(feature = "diagnostics")]
         let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+        // From 64bitMango e4444060: another thread's fault opened the block
+        // while this one was on its way here; every tracker is marked and
+        // write access is back, so there is nothing to do and no lock to
+        // wait for (`VICTORY_OPENED_FAULTS`).
+        if opened(at / PAGE) {
+            let again = FOUND_OPEN.with(|f| {
+                let (last, n) = f.get();
+                let n = if last == at { n.saturating_add(1) } else { 1 };
+                f.set((at, n));
+                n
+            });
+            if again <= 3 {
+                fault(4);
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        FOUND_OPEN.with(|f| f.set((0, 0)));
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1259,6 +1333,9 @@ fn install() {
         IN_FAULT.with(|f| f.set(false));
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             fault(0);
+            // Every tracker holding it is marked: other threads' faults on
+            // it need no lock.
+            note_opened(at / PAGE);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             // mac: who wrote a block of the title's view heap last

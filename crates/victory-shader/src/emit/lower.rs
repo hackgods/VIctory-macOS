@@ -319,9 +319,9 @@ struct Lower<'a> {
     /// In halves: per IR block, whether each lane runs it once
     /// ([`once_per_lane`]), where lane masks can pass between the halves.
     once: Vec<bool>,
-    /// In halves: the group-shared dwords lane masks pass through, once made
-    /// ([`Lower::ballot_across_halves`]).
-    half_masks: Option<V>,
+    /// In halves: the group-shared dwords values pass between the halves
+    /// through, once made ([`Lower::exchange_halves`]).
+    half_words: Option<V>,
     /// The DXIL block the instruction being lowered starts in: every lane
     /// running its IR block runs it (no guard of the instruction's own).
     level: usize,
@@ -856,7 +856,7 @@ impl<'a> Lower<'a> {
             halves_refused,
             relabelled: None,
             once: if halves { once_per_lane(p) } else { Vec::new() },
-            half_masks: None,
+            half_words: None,
             level: 0,
             alike: if halves {
                 halves::lane_uniform(x)
@@ -1386,9 +1386,11 @@ impl<'a> Lower<'a> {
         }
         // An active reduction substitutes its identity for inactive lanes.
         // If the group fits one host wave, the absent upper half contributes
-        // only identities and the host wave contains all participating lanes.
-        if prefix.is_some() || !self.one_host_wave() {
-            self.same_half(ACROSS)?;
+        // only identities and the host wave holds the console wave's lanes in
+        // order. Otherwise the halves pass each other their results.
+        let across = self.halves && !self.one_host_wave();
+        if across && !self.across_here() {
+            return Err(ACROSS);
         }
         let c = self.cur;
         let &m = self
@@ -1453,6 +1455,26 @@ impl<'a> Lower<'a> {
                     &[arg, k, u],
                 )
             }
+        };
+        let r = if across {
+            // A prefix's half total: the sum of the half's lanes.
+            let total = match prefix {
+                None => r,
+                Some(_) => {
+                    let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(u8::from(!float)));
+                    self.s.op(
+                        c,
+                        &format!("waveActiveOp.{sfx}"),
+                        Attr::NoUnwind,
+                        ty,
+                        119,
+                        &[arg, sum, unsigned],
+                    )
+                }
+            };
+            self.reduce_across(op, r, total, prefix.is_some(), ident)?
+        } else {
+            r
         };
         Ok(if float { self.as_int(r) } else { r })
     }
@@ -7421,10 +7443,23 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
-                    self.same_half(
-                        "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
-                    )?;
                 }
+                if self.halves && !self.one_host_wave() {
+                    if !self.across_here() {
+                        return Err(
+                            "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
+                        );
+                    }
+                    let r = self.read_lane_across(a, lane)?;
+                    return int(self, r);
+                }
+                // In halves, a group of one host wave has no lane past 31.
+                let lane = if self.halves {
+                    let k31 = self.s.m.i32(31);
+                    self.s.m.bin(c, Bin::And, lane, k31)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -7500,7 +7535,12 @@ impl<'a> Lower<'a> {
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
-                    return Err(halves::FIRST_ACROSS);
+                    if !self.across_here() {
+                        return Err(halves::FIRST_ACROSS);
+                    }
+                    let a = s(self, 0)?;
+                    let r = self.first_lane_across(a)?;
+                    return int(self, r);
                 }
                 let a = s(self, 0)?;
                 // shortcut: without console lanes, the first lane of the host

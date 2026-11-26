@@ -657,7 +657,8 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// `merge` (macOS port): 1 also makes each output row that holds several
 /// elements one element in both stages, 2 makes every row a whole `float4`,
 /// 3 is 1 with the rows in the order that wastes least (`lower::plan_merge`),
-/// 4 is 3 with the rows of clip and cull distances last; then the size is not checked here, as Metal counts
+/// 4 is 3 with the rows of clip and cull distances last, 5 is 4 with the
+/// three-component rows first and the `float4` rows last; then the size is not checked here, as Metal counts
 /// it its own way (the caller logs what was made).
 pub fn translate_linked(
     mesh: &[u8],
@@ -713,7 +714,7 @@ pub fn translate_linked(
             Some(part) => signature(part.data)?,
             None => Vec::new(),
         };
-        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge == 4);
+        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge >= 4, merge == 5);
     }
     let linked_ms = emit_mesh(&reads)?;
     let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;

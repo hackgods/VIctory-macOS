@@ -413,8 +413,12 @@ impl Capture {
         let _ours = Ours::new();
         let device = r.device().ok_or("no device")?;
         let queues = lock(&r.queues).clone();
+        // The drawing queue made last: the host layer replaces one that
+        // macOS stopped running work on (`Host::replace_queue`), and what
+        // is sent to the old one then never runs.
         let direct = queues
             .iter()
+            .rev()
             .find(|q| q.1 == D3D12_COMMAND_LIST_TYPE_DIRECT.0)
             .ok_or("no drawing queue")?;
         let mut others = Vec::new();
@@ -852,11 +856,21 @@ impl Capture {
     fn submit(
         &mut self,
         r: &Recorder,
-        _queue: &ID3D12CommandQueue,
+        queue: &ID3D12CommandQueue,
         lists: &[Option<Arc<Vec<u8>>>],
     ) -> Result<(), Fault> {
         let first = !self.started;
         let began = Instant::now();
+        // The capture reads the card's memory through the queue the frame
+        // is sent on: one the host layer moved to since the capture was
+        // prepared takes the place of the one found then.
+        if self.worker.queue != *queue {
+            if first {
+                self.worker = Worker::new(&self.worker.device.clone(), queue)?;
+            } else {
+                r.problem("the frame's submissions went to more than one drawing queue: what the capture read of the card's memory may not be in their order");
+            }
+        }
         if first {
             self.start(r)?;
         } else {

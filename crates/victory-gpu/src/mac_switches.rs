@@ -295,9 +295,39 @@ fn clamps(value: Option<&str>) -> [bool; 2] {
     }
 }
 
+/// Whether the clamps of indirect dispatches go to the host list before
+/// too, as those of draws do with `VICTORY_BATCH_CLAMPS` (`crate::indirect`,
+/// `crate::list`): `VICTORY_DISPATCH_CLAMPS=1`, and only where
+/// `VICTORY_BATCH_CLAMPS` hoists (`1` batches them, `hoist` leaves each a
+/// dispatch of its own). A run of them ends at the title's next barrier,
+/// pipeline sync, copy, clear or immediate write, not at its dispatches.
+/// Off by default: each indirect dispatch has a clamp of ours just before
+/// it, about 960 a frame at the prison.
+pub(crate) fn dispatch_clamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = dispatch_rule(std::env::var("VICTORY_DISPATCH_CLAMPS").ok().as_deref());
+        let on = asked && batch_clamps()[0];
+        if on {
+            tracing::info!(
+                batch = batch_clamps()[1],
+                "VICTORY_DISPATCH_CLAMPS: the clamps of a run of indirect dispatches go to the host list before it too (a run ends at the title's next barrier)"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_DISPATCH_CLAMPS=1 does nothing without VICTORY_BATCH_CLAMPS=1 or hoist");
+        }
+        on
+    })
+}
+
+/// `VICTORY_DISPATCH_CLAMPS`'s rule: on only for `1`.
+fn dispatch_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 #[cfg(test)]
 mod clamp_tests {
-    use super::clamps;
+    use super::{clamps, dispatch_rule};
 
     #[test]
     fn the_clamp_switch_is_off_unless_it_is_1_or_hoist() {
@@ -307,6 +337,15 @@ mod clamp_tests {
         assert_eq!(clamps(Some("1")), [true, true]);
         assert_eq!(clamps(Some(" 1 ")), [true, true]);
         assert_eq!(clamps(Some("hoist")), [true, false]);
+    }
+
+    #[test]
+    fn the_dispatch_clamp_switch_is_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("hoist"), Some("2")] {
+            assert!(!dispatch_rule(off), "{off:?}");
+        }
+        assert!(dispatch_rule(Some("1")));
+        assert!(dispatch_rule(Some(" 1 ")));
     }
 }
 

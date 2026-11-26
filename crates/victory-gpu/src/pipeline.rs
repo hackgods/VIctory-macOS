@@ -624,6 +624,13 @@ pub(crate) fn ray_pass_left_out(this: This) -> bool {
     true
 }
 
+/// [`ray_pass_left_out`], asked ahead and not counted (mac: hoisted clamps
+/// of indirect dispatches, `crate::list`).
+#[cfg(windows)]
+pub(crate) fn ray_pass_is_left_out(this: This) -> bool {
+    !this.is_null() && pipeline(this).ray_pass != 0 && !builder::runs()
+}
+
 /// What the title pipeline's programs are to the ambient stand-in
 /// ([`crate::ambient`]): bits, 0 for nothing.
 #[cfg(windows)]

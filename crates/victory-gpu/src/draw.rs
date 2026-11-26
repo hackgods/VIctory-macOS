@@ -103,11 +103,14 @@ pub(crate) struct State {
 
 /// Where the clamps of a run of indirect draws go: `clamps`, the host list
 /// before the one at `into`, still open, as long as that one has `writes`
-/// dispatches and copies (a later one may write the arguments).
+/// dispatches and copies (a later one may write the arguments). Those of
+/// indirect dispatches as long as it has `orders` barriers, syncs and
+/// copies (`crate::indirect::hoisting_dispatches`).
 struct Hoist {
     clamps: std::sync::Arc<HostList>,
     into: usize,
     writes: u64,
+    orders: u64,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -383,10 +386,37 @@ impl State {
             .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
     }
 
+    /// Whether an indirect dispatch recorded now would have its clamp
+    /// hoisted (`crate::indirect::hoisting_dispatches`): one that is not
+    /// dropped or left out before its clamp.
+    pub(crate) fn dispatch_hoistable(&self) -> bool {
+        let pipeline = self.pipeline as This;
+        !crate::pipeline::held_back(pipeline)
+            && !crate::pipeline::ray_pass_is_left_out(pipeline)
+            && crate::pipeline::host_pipeline(pipeline).is_some_and(|p| p.compute)
+    }
+
+    /// Whether the clamps of indirect dispatches recorded in `list` now go
+    /// to the host list before it: nothing that orders an earlier write
+    /// before them was recorded since the run began. The title's
+    /// dispatches since may have written their arguments, but D3D12 reads
+    /// such arguments only after a barrier, which ends the run (as does a
+    /// copy, clear or immediate write, and a clamp in `list` itself).
+    pub(crate) fn hoists_dispatches_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.orders == list.orders())
+    }
+
     /// From here on the clamps of `into`'s indirect draws go to `clamps`,
     /// the host list before it.
     pub(crate) fn hoist(&mut self, clamps: std::sync::Arc<HostList>, into: &HostList) {
-        self.hoist = Some(Hoist { clamps, into: std::ptr::from_ref(into) as usize, writes: into.writes() });
+        self.hoist = Some(Hoist {
+            clamps,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+            orders: into.orders(),
+        });
     }
 
     /// The host list the clamps of the run being recorded go to, if any.
@@ -1280,7 +1310,7 @@ impl State {
         self.probe_reads(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
-        list.count_write();
+        list.count_dispatch();
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -2111,7 +2141,14 @@ impl State {
         // ours comes between the draws. That list reads the arguments and
         // the count, so both are brought up to date with it (the count
         // with this list too, whose execution reads it).
-        let hoisted = (kind != DISPATCH && self.hoists_into(list))
+        // An indirect dispatch's too, with VICTORY_DISPATCH_CLAMPS: a run of
+        // them ends at a barrier, not at a dispatch.
+        let hoists = if kind == DISPATCH {
+            crate::indirect::hoisting_dispatches() && self.hoists_dispatches_into(list)
+        } else {
+            self.hoists_into(list)
+        };
+        let hoisted = hoists
             .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
             .flatten()
             .and_then(|clamps| {
@@ -2137,7 +2174,13 @@ impl State {
             s.refresh(list, *at, 4);
         }
         let (clamped, clamped_at) = match hoisted {
-            Some(h) => h,
+            Some(h) => {
+                // The dispatch may write arguments a later draw reads.
+                if kind == DISPATCH {
+                    list.count_dispatch();
+                }
+                h
+            }
             None => {
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own.
@@ -2432,7 +2475,7 @@ const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 
 /// Indirect argument kinds (PC numbering) of dispatches and mesh dispatches.
-const INDIRECT_DISPATCH: u32 = 2;
+pub(crate) const INDIRECT_DISPATCH: u32 = 2;
 const INDIRECT_MESH: u32 = 10;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;

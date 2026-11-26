@@ -1788,7 +1788,10 @@ impl State {
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| {
-            crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
+            crate::pipeline::note_why(format!(
+                "indirect kind {kind}: {what} {}",
+                crate::pipeline::shaders_of(pipeline)
+            ));
             list.note_op(|| format!("DROPPED indirect kind {kind} max {max} ({what}) {}", crate::pipeline::shaders_of(pipeline)));
         };
         #[cfg(not(feature = "diagnostics"))]

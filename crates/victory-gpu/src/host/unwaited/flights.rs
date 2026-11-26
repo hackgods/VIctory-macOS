@@ -60,7 +60,8 @@ pub(crate) fn on() -> bool {
                 tracing::info!(
                     "VICTORY_FLIGHTS: the title's next submission is prepared while the one left to the host GPU \
                      runs, and that one is finished at the first step that could see what it owes, at the latest \
-                     before the next goes to the GPU"
+                     before the next goes to the GPU; held waits its pending writes meet count as met, and Signals \
+                     go behind it"
                 );
             }
             on
@@ -357,13 +358,14 @@ pub(super) fn log(frames: f64) {
     let by: [f64; WHYS] = std::array::from_fn(|i| FINISHED_BY[i].swap(0, Relaxed) as f64 / frames);
     let ms: [f64; WHYS] = std::array::from_fn(|i| WAITED_BY[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
     let refused = REFUSED.swap(0, Relaxed) as f64 / frames;
+    let met = MET.swap(0, Relaxed) as f64 / frames;
     tracing::info!(
         "flights: {beside:.1}/frame prepared while the submission before ran on the host GPU, {beside_ms:.1} ms/frame \
          of preparing beside it; it was finished by (its GPU work done, eviction, unordered views made again, heap \
          sync, texture uploads, a title copy, a step of ours, a shader-write declaration, a title-memory program, a \
          fill from what it may write, refreshes of what it may write, the next going to the GPU, a view heap made): \
          {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the GPU; {refused:.1} early refreshes refused (0 if \
-         the rules hold)"
+         the rules hold); {met:.1} held-wait looks/frame answered from a pending write"
     );
 }
 
@@ -372,3 +374,7 @@ pub(super) fn log(frames: f64) {
 pub(super) fn finished_beside() -> u64 {
     FINISHED_BY.iter().map(|n| n.load(Relaxed)).sum()
 }
+
+/// Since the last frame line: looks at a held wait answered from the
+/// pending writes of the submission left ([`super::pending_value`]).
+pub(super) static MET: AtomicU64 = AtomicU64::new(0);

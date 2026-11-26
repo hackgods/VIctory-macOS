@@ -125,7 +125,9 @@ pub(crate) fn prewarms() -> bool {
 fn signals() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     on() && *ON.get_or_init(|| {
-        let on = crate::switch::on("VICTORY_ASYNC_SIGNALS") && !all() && idler().is_some();
+        // mac: with flights, also with `VICTORY_ASYNC_SETTLE_ALL=1`.
+        let asked = (crate::switch::on("VICTORY_ASYNC_SIGNALS") && !all()) || flights::on();
+        let on = asked && idler().is_some();
         if on {
             tracing::info!(
                 "VICTORY_ASYNC_SIGNALS: a queue's Signal does not wait for the submission left to the host GPU; \
@@ -193,9 +195,10 @@ struct Left {
     memory: bool,
     /// mac: with [`flights`] (else empty): title memory its shaders may
     /// write as its lists declared, and that its work for after lands in
-    /// (address, end);
-    /// whether it runs an upload list of ours.
+    /// (address, end); its bottom-of-pipe writes in order (address, the
+    /// value if it is one, bytes); whether it runs an upload list of ours.
     declared: Vec<(usize, usize)>,
+    values: Vec<(usize, Option<u64>, usize)>,
     uploads: bool,
     ran: Ran,
 }
@@ -266,7 +269,8 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
     }
     // Read after the value: a submission of `queue` cannot be left
     // meanwhile, as its Signal and its submissions come one at a time.
-    if QUEUE.load(Acquire) != queue && !all() {
+    // mac: with flights, every queue's Signal goes behind it (`signal_after`).
+    if QUEUE.load(Acquire) != queue && !(all() && !flights::on()) {
         SPARED[0].fetch_add(1, Relaxed);
         return false;
     }
@@ -282,7 +286,9 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
 /// wait for the queue's work either. False (nothing done) with the switch
 /// off, with nothing of the queue's left, or while it is being finished.
 pub(crate) fn signal_behind(queue: usize, fence: usize, value: u64) -> bool {
-    if !signals() || VALUE.load(Acquire) == 0 || QUEUE.load(Acquire) != queue {
+    // mac: with flights, any queue's (hyphennn 578d459: a fence signalled
+    // while flights are in the air is set behind them).
+    if !signals() || VALUE.load(Acquire) == 0 || (QUEUE.load(Acquire) != queue && !flights::on()) {
         return false;
     }
     crate::fence::keep(fence as crate::object::This);
@@ -334,15 +340,25 @@ pub(crate) fn settle_waits(
     seen: &mut u64,
 ) -> bool {
     if VALUE.load(Acquire) != 0 {
+        let flights = flights::on();
         let owed = match LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(left) => left
-                .writes
-                .iter()
-                .any(|&(at, n)| waits.iter().any(|w| w.reads(at, n))),
+            // mac: with flights, not for a value its writes are known to
+            // leave there: the pump read that already ([`pending_value`]),
+            // and finishing it first would not change what the wait sees.
+            Some(left) => left.writes.iter().any(|&(at, n)| {
+                waits.iter().any(|w| {
+                    w.reads(at, n)
+                        && !(flights
+                            && matches!(
+                                crate::flights::after_writes(&left.values, w.address as usize, usize::from(w.bytes)),
+                                Some(Some(_))
+                            ))
+                })
+            }),
             // Being finished right now: `settle` waits for that.
             None => true,
         };
-        if owed || all() {
+        if owed || (all() && !flights) {
             let next: Vec<&HostList> = next.iter().map(|l| &***l).collect();
             settle_before(By::Wait, &next);
         } else {
@@ -351,6 +367,22 @@ pub(crate) fn settle_waits(
     }
     let now = finished();
     std::mem::replace(seen, now) != now
+}
+
+/// mac: with [`flights`], what the `bytes` at `address` (a held wait's
+/// value) will hold once the submission left is finished, if one of its
+/// bottom-of-pipe writes stores all of them and its value is known (else
+/// `None`: memory says). The wait's work is then prepared beside it, and
+/// goes to the GPU behind it, which is the order the wait asks for
+/// (hyphennn 578d459, `late_met`).
+pub(crate) fn pending_value(address: u64, bytes: u8) -> Option<u64> {
+    if VALUE.load(Acquire) == 0 || !flights::on() {
+        return None;
+    }
+    let left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    let value = crate::flights::after_writes(&left.as_ref()?.values, address as usize, usize::from(bytes))??;
+    flights::MET.fetch_add(1, Relaxed);
+    Some(value)
 }
 
 /// The thread that finishes a submission left to the host GPU when nothing
@@ -701,7 +733,7 @@ impl Host {
                     .any(|s| matches!(s, Step::Memory(_)))
             });
         // mac: what flights need to know of it (`flights::Footprint`).
-        let mut declared = Vec::new();
+        let (mut declared, mut values) = (Vec::new(), Vec::new());
         if flights::on() {
             for l in title {
                 let deferred = l.deferred();
@@ -712,6 +744,13 @@ impl Host {
                 }
                 declared.extend(deferred.lands.iter().map(|&(at, n)| (at, at + n)));
                 declared.extend(deferred.texture_backs.iter().map(|b| b.lands()));
+                values.extend(deferred.writes.iter().map(|&(at, what, n)| {
+                    let value = match what {
+                        crate::queue::Written::Value(v) => Some(v),
+                        _ => None,
+                    };
+                    (at, value, n)
+                }));
             }
         }
         *LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Left {
@@ -723,6 +762,7 @@ impl Host {
             signals: Vec::new(),
             memory,
             declared,
+            values,
             uploads,
             ran,
         });
@@ -1067,6 +1107,7 @@ mod tests {
         settle(By::Signal);
         let order = std::sync::Arc::new(Mutex::new(Vec::new()));
         let word = Box::new(AtomicU64::new(0));
+        let at = word.as_ptr() as u64;
         let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
         for (i, list) in lists.iter().enumerate() {
             let log = order.clone();
@@ -1081,6 +1122,13 @@ mod tests {
         }
         let before = finished_beside();
         let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        // Left (unless a diagnostics build captures): its value is known
+        // before it is in memory.
+        if VALUE.load(Acquire) != 0 {
+            assert_eq!(pending_value(at, 8), Some(5));
+            assert_eq!(pending_value(at, 4), Some(5));
+            assert_eq!(pending_value(at + 8, 8), None);
+        }
         back.extend(host.execute_title(1, vec![lists[1].clone()]));
         settle(By::Signal);
         drop(flights);
@@ -1090,6 +1138,7 @@ mod tests {
             "the first's work for after ran first, and its write was there before the second's"
         );
         assert_eq!(word.load(Acquire), 6, "the second's write is the last");
+        assert_eq!(pending_value(at, 8), None, "nothing is left");
         // (A diagnostics build that captures waits for every submission.)
         #[cfg(not(feature = "diagnostics"))]
         assert!(finished_beside() > before, "the first was finished beside the second");

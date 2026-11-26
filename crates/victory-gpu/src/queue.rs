@@ -198,7 +198,10 @@ fn pump(held: &mut Holding, why: Why) {
         return;
     }
     let Some(host) = crate::host::host() else { return };
-    let read = read_value;
+    // mac: with flights, a value the submission left to the host GPU will
+    // write counts as there (`unwaited::pending_value`): the work behind
+    // the wait goes to the GPU behind it.
+    let read = |address: u64, bytes: u8| unwaited::pending_value(address, bytes).or_else(|| read_value(address, bytes));
     for (queue, waits) in held.force_older_than(VALVE) {
         account().forced += 1;
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");

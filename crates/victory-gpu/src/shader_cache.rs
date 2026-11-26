@@ -100,6 +100,17 @@ fn atomic_locks() -> bool {
     })
 }
 
+/// Whether the lanes of a wave first try their 64-bit atomics' locks in
+/// rounds before the lanes still not done take turns (`emit`, "Atomic
+/// locks"; #240): opt-in while it is measured, `VICTORY_ATOMIC_LOCK_ROUNDS=1`.
+/// Only with [`atomic_locks`].
+fn atomic_lock_rounds() -> bool {
+    static ROUNDS: OnceLock<bool> = OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        atomic_locks() && std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").as_deref() == Ok("1")
+    })
+}
+
 /// Whether compute shaders' biased samples run as scaled gradient samples:
 /// under Wine, whose D3DMetal ignores the bias there (#30).
 /// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
@@ -143,23 +154,30 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, narrow waves): their own cache entries, one per
-/// combination.
+/// [`build`] for translations with host workarounds (atomic locks and
+/// their rounds, bias as gradients, narrow waves): their own cache entries,
+/// one per combination.
 pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
     let locks = options.atomic_locks;
     let bias = options.bias_as_gradients;
     let narrow = options.narrow_waves;
+    let rounds = locks && options.atomic_lock_rounds;
     if !locks && !bias && !narrow {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
-    let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
+    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    let n = usize::from(locks)
+        | usize::from(bias) << 1
+        | usize::from(narrow) << 2
+        | usize::from(rounds) << 3;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
         if locks {
             h.update(b"atomic locks");
+        }
+        if rounds {
+            h.update(b"atomic lock rounds");
         }
         if bias {
             h.update(b"bias as gradients");
@@ -180,6 +198,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
+        atomic_lock_rounds: atomic_lock_rounds(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),

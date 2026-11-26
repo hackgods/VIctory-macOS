@@ -671,6 +671,15 @@ mod tests {
         ] {
             assert!(listed(saved.as_bytes(), &changed).is_empty());
         }
+        // The locks' rounds change their translation, so they key it too.
+        let rounds = |on| {
+            translation_build(victory_shader::emit::Options {
+                atomic_locks: true,
+                atomic_lock_rounds: on,
+                ..options
+            })
+        };
+        assert_ne!(rounds(true), rounds(false));
         assert_eq!(
             tag(b"library"),
             current(

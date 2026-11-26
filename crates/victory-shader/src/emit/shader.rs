@@ -57,6 +57,10 @@ pub const VIEW_READS: u32 = VIEW_WRITE_BITS;
 /// the read marks in the same buffer (`emit`, "Atomic locks"); a power of
 /// two.
 pub const ATOMIC_LOCKS: u32 = 1 << 16;
+/// Rounds in which every lane of a wave tries its lock once, before the
+/// lanes still not done take turns (`emit`, "Atomic locks", with
+/// [`Options::atomic_lock_rounds`](super::Options)).
+pub const ATOMIC_LOCK_ROUNDS: u32 = 4;
 /// Where the lock words start in the buffer bound at `u`[`VIEW_WRITES`], in
 /// bytes: after the written pages and the read marks.
 pub const ATOMIC_LOCKS_AT: u32 = (VIEW_READS + HEAP_VIEWS) / 8;

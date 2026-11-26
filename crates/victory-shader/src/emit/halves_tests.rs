@@ -152,6 +152,7 @@ fn lowered_with(
         mesh_stride: 0,
         view_marks: false,
         atomic_locks: false,
+        atomic_lock_rounds: false,
         bias_as_gradients: false,
         narrow_waves,
         host_wave32,

@@ -4148,6 +4148,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Options {
                 view_marks: true,
                 atomic_locks: false,
+                atomic_lock_rounds: false,
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,

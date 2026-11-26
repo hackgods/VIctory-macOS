@@ -180,7 +180,15 @@
 //!   chosen by a hash of the coordinates (texels that share one only wait
 //!   for each other), so such a shader sets [`HostShader::view_marks`] and
 //!   the host makes that buffer [`VIEW_WRITES_BYTES`] long, zeroed. Locks
-//!   are free again when the shader ends.
+//!   are free again when the shader ends. The lanes of a wave take turns,
+//!   one lane a turn. With [`Options::atomic_lock_rounds`] (added
+//!   2026-11-26, #240) every lane first tries its lock once in each of
+//!   [`ATOMIC_LOCK_ROUNDS`] rounds, the lanes that take it finishing in
+//!   that round together, and only the lanes still not done take turns,
+//!   in a branch a wave whose lanes all finished skips. On D3DMetal (M5 Pro)
+//!   a wave's 64-bit `umax` on distinct texels took 29 µs in turns and
+//!   6 µs in rounds. In a pixel program helper lanes skip the lock in
+//!   rounds: their atomics are discarded, so they could never take it.
 //! * **Read marks** (with [`Options::view_marks`]; added 2026-11-25):
 //!   every image instruction that reads a texture shader view the program
 //!   takes from the resource heap itself (not through a table, whose slots
@@ -257,10 +265,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
 pub use shader::{
-    ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
-    ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
-    VIEW_WRITES_BYTES,
+    ATOMIC_LOCK_ROUNDS, ATOMIC_LOCKS, ATOMIC_LOCKS_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE,
+    NULL_BUFFER_VIEW, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE,
+    VIEW_MARKS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS,
+    VIEW_WRITES, VIEW_WRITES_BYTES,
 };
 
 /// The loop limit without an override: 2^14.
@@ -402,6 +410,11 @@ pub struct Options {
     /// stores (module notes, "Atomic locks"), for hosts that claim the
     /// 64-bit atomics and leave the texels untouched (D3DMetal).
     pub atomic_locks: bool,
+    /// With [`Options::atomic_locks`]: every lane of a wave first tries its
+    /// lock in [`ATOMIC_LOCK_ROUNDS`] rounds, and only lanes still not done
+    /// take turns (module notes, "Atomic locks"). The translation differs,
+    /// so the shader cache keys on it.
+    pub atomic_lock_rounds: bool,
     /// Compute-stage biased samples run as gradient samples with the quad
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
@@ -792,6 +805,7 @@ fn emit_pruned(
         mesh_stride,
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
+        atomic_lock_rounds: options.atomic_lock_rounds,
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,

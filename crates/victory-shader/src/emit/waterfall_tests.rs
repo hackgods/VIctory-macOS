@@ -70,6 +70,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,

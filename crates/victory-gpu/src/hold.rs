@@ -85,9 +85,28 @@ pub(crate) struct Pumped {
     pub(crate) unknown: u32,
 }
 
+/// One ready step popped from [`Held`] so the caller can release the `HELD`
+/// lock while running it on the host GPU.
+#[cfg(any(windows, test))]
+pub(crate) enum Ready<S> {
+    /// Consecutive ready segments from `queue`. `queue` stays marked running
+    /// until [`Held::finish_running`] is called so later submissions and
+    /// signals on the same queue wait behind it.
+    Segments {
+        queue: usize,
+        segments: Vec<S>,
+        waited: Vec<(usize, Duration)>,
+        unknown: u32,
+    },
+    /// A fence signal ready at the head of `queue`.
+    Signal { fence: usize, value: u64 },
+}
+
 /// Every queue's held work.
 pub(crate) struct Held<S> {
     queues: Vec<(usize, Fifo<S>)>,
+    /// Queue whose popped segments are currently executing outside the lock.
+    running: Option<usize>,
 }
 
 /// A queue's items, each with when it was pushed and whether it is fresh
@@ -102,7 +121,10 @@ impl<S> Default for Held<S> {
 
 impl<S> Held<S> {
     pub(crate) const fn new() -> Self {
-        Held { queues: Vec::new() }
+        Held {
+            queues: Vec::new(),
+            running: None,
+        }
     }
 }
 
@@ -215,14 +237,101 @@ impl<S> Held<S> {
             .collect()
     }
 
-    /// Whether no queue holds anything.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.queues.is_empty()
+    /// Pops the next ready batch of segments or ready fence signal so the
+    /// caller can drop the `HELD` lock before invoking the host GPU.
+    /// When [`Ready::Segments`] is returned, the caller must call
+    /// [`Self::finish_running`] with the same `queue` once the submission
+    /// call returns.
+    #[cfg(any(windows, test))]
+    pub(crate) fn take_ready(
+        &mut self,
+        read: &dyn Fn(u64, u8) -> Option<u64>,
+        fence: &dyn Fn(usize) -> u64,
+    ) -> Option<Ready<S>> {
+        for (queue, items) in &mut self.queues {
+            if self.running == Some(*queue) {
+                continue;
+            }
+            let mut segments = Vec::new();
+            let mut waited = Vec::new();
+            let mut unknown = 0u32;
+            loop {
+                match items.front_mut() {
+                    None => break,
+                    Some((Item::FenceWait(f, v), _, fresh)) => {
+                        if fence(*f) >= *v {
+                            items.pop_front();
+                            continue;
+                        }
+                        *fresh = false;
+                        break;
+                    }
+                    Some((Item::Signal(..), ..)) => {
+                        if !segments.is_empty() {
+                            break;
+                        }
+                        if let Some((Item::Signal(f, v), ..)) = items.pop_front() {
+                            self.queues.retain(|(_, q)| !q.is_empty());
+                            return Some(Ready::Signal { fence: f, value: v });
+                        }
+                        break;
+                    }
+                    Some((Item::Segment(_, waits), since, fresh)) => {
+                        let mut ok = true;
+                        for wait in waits.iter() {
+                            match wait.holds(read) {
+                                Some(true) => {}
+                                Some(false) => ok = false,
+                                None => unknown += 1,
+                            }
+                        }
+                        if !ok {
+                            *fresh = false;
+                            break;
+                        }
+                        if !*fresh {
+                            waited.push((*queue, since.elapsed()));
+                        }
+                        if let Some((Item::Segment(s, _), ..)) = items.pop_front() {
+                            segments.push(s);
+                        }
+                    }
+                }
+            }
+            if !segments.is_empty() {
+                let q = *queue;
+                self.running = Some(q);
+                return Some(Ready::Segments {
+                    queue: q,
+                    segments,
+                    waited,
+                    unknown,
+                });
+            }
+        }
+        self.queues.retain(|(_, items)| !items.is_empty());
+        None
     }
 
-    /// Whether `queue` holds anything.
+    /// Clears the running marker set by [`Self::take_ready`] once the popped
+    /// batch has been handed to the host GPU.
+    #[cfg(any(windows, test))]
+    pub(crate) fn finish_running(&mut self, queue: usize) {
+        if self.running == Some(queue) {
+            self.running = None;
+        }
+        self.queues.retain(|(_, items)| !items.is_empty());
+    }
+
+    /// Whether no queue holds anything and none is currently running.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.running.is_none() && self.queues.is_empty()
+    }
+
+    /// Whether `queue` holds anything or has a popped batch still launching.
     pub(crate) fn holds_work(&self, queue: usize) -> bool {
-        self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
+        self.running == Some(queue)
+            || self.queues.iter().any(|(q, items)| *q == queue && !items.is_empty())
     }
 
     /// Releases work held longer than `limit` at the heads of blocked
@@ -440,5 +549,48 @@ mod tests {
         assert_eq!(forced, [(2, vec![ge(0x100, 1)])]);
         pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q2: stuck"]);
+    }
+
+    #[test]
+    fn take_ready_marks_queue_running_until_finished() {
+        let mut held = Held::default();
+        held.push(1, Item::Segment("a", vec![]));
+        held.push(1, Item::Signal(9, 1));
+        held.push(1, Item::Segment("b", vec![]));
+        let read = |_: u64, _| Some(0u64);
+        let fence = |_: usize| 0u64;
+
+        match held.take_ready(&read, &fence) {
+            Some(Ready::Segments {
+                queue, segments, ..
+            }) => {
+                assert_eq!(queue, 1);
+                assert_eq!(segments, ["a"]);
+            }
+            _ => panic!("expected segments"),
+        }
+        // Queue 1 is marked running: holds_work stays true and take_ready
+        // must not pop its queued Signal before finish_running(1).
+        assert!(held.holds_work(1));
+        assert!(!held.is_empty());
+        assert!(held.take_ready(&read, &fence).is_none());
+
+        held.finish_running(1);
+        match held.take_ready(&read, &fence) {
+            Some(Ready::Signal { fence: f, value }) => assert_eq!((f, value), (9, 1)),
+            _ => panic!("expected signal"),
+        }
+        match held.take_ready(&read, &fence) {
+            Some(Ready::Segments {
+                queue, segments, ..
+            }) => {
+                assert_eq!(queue, 1);
+                assert_eq!(segments, ["b"]);
+            }
+            _ => panic!("expected trailing segment"),
+        }
+        held.finish_running(1);
+        assert!(!held.holds_work(1));
+        assert!(held.is_empty());
     }
 }

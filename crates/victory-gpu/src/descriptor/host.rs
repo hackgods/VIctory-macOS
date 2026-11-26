@@ -1637,7 +1637,11 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) 
             let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
             match (unordered, d[1]) {
                 (_, 6 | 7) => (ty, 0, 1),
-                (true, _) => (ty, d[4], 1),
+                // An unordered view's one level is its word 2 (`MipSlice`:
+                // its union starts at byte 8); word 4 is an array's size or
+                // a 3D view's depth. A shader view's first level and count
+                // are words 4 and 5 (its union starts at byte 16).
+                (true, _) => (ty, d[2], 1),
                 (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
             }
         }
@@ -3513,9 +3517,16 @@ mod tests {
         // Its whole chain from level 1.
         (view[4], view[5]) = (1, u32::MAX);
         assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
-        // An unordered view of level 3: that level alone.
-        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        // An unordered view of level 3 (`MipSlice`, word 2): that level alone.
+        let uav = [0, 4, 3, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // An unordered view of level 2 of six array slices (`ArraySize`,
+        // word 4): the level is not the slice count.
+        let uav = [0, 5, 2, 1, 6, 0, 0, 0, 0, 0];
+        assert_eq!(
+            image_words(&array, Some(&uav), true)[3],
+            0xFAC | 2 << 12 | 2 << 16 | 13 << 28
+        );
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);

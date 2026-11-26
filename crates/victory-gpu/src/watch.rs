@@ -1231,6 +1231,19 @@ impl Drop for Timed {
     }
 }
 
+/// Like [`Timed`], in nanoseconds: for spans of well under a microsecond
+/// that add up (a lock or a page read per page of a heap sync).
+#[cfg(feature = "diagnostics")]
+pub(crate) struct TimedNs(pub(crate) std::time::Instant, pub(crate) crate::copystat::C);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for TimedNs {
+    fn drop(&mut self) {
+        let c = std::mem::replace(&mut self.1, crate::copystat::C::Submissions);
+        crate::copystat::add(c, self.0.elapsed().as_nanos() as u64);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

@@ -244,7 +244,14 @@ pub(crate) fn sync_heaps() {
     for (start, at, ranges) in work {
         for (from, to) in ranges {
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
+                #[cfg(feature = "diagnostics")]
+                let waited = crate::watch::TimedNs(
+                    std::time::Instant::now(),
+                    crate::copystat::C::SyncLockNs,
+                );
                 let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+                #[cfg(feature = "diagnostics")]
+                drop(waited);
                 if !heaps.iter().any(|&(s, _, h)| (s, h) == (start, at)) {
                     break;
                 }
@@ -259,9 +266,19 @@ pub(crate) fn sync_heaps() {
                 let len = end - page;
                 // By page: read the whole mapped range once; one with nothing
                 // mapped (the title unmaps heap pages too) holds no records.
-                if !crate::host::read_into(page as *const u8, &mut page_buf[..len]) {
+                #[cfg(feature = "diagnostics")]
+                let reading = crate::watch::TimedNs(
+                    std::time::Instant::now(),
+                    crate::copystat::C::SyncReadNs,
+                );
+                let mapped = crate::host::read_into(page as *const u8, &mut page_buf[..len]);
+                #[cfg(feature = "diagnostics")]
+                drop(reading);
+                if !mapped {
                     continue;
                 }
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncPages, 1);
                 let (first, last) = (
                     (page as u64 - start) / step,
                     (end as u64 - start).div_ceil(step),
@@ -675,6 +692,8 @@ pub(crate) fn forget(resource: usize) {
     }
     if removed {
         VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::copystat::add(crate::copystat::C::ViewsForgot, 1);
     }
 }
 

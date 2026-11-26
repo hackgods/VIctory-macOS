@@ -140,8 +140,26 @@ pub(crate) enum C {
     TwinToDepthBytes,
     TwinToTwin,
     TwinToTwinBytes,
+    /// The heap sync (`crate::descriptor::sync_heaps`): pages of title heaps
+    /// read, and of their slots those skipped as made from the record they
+    /// hold, those holding no view, those checked under the locks (and of
+    /// them those in blocks not verified since views were last forgotten),
+    /// and those made again; the time spent reading pages, waiting for the
+    /// heaps' lock, checking and making; the title's releases that forgot
+    /// views (each makes every block check its slots again).
+    SyncPages,
+    SyncFast,
+    SyncNoView,
+    SyncChecked,
+    SyncUnverified,
+    SyncMade,
+    SyncReadNs,
+    SyncLockNs,
+    SyncCheckNs,
+    SyncMakeNs,
+    ViewsForgot,
 }
-const COUNTERS: usize = C::TwinToTwinBytes as usize + 1;
+const COUNTERS: usize = C::ViewsForgot as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -449,6 +467,23 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TwinToDepthBytes as usize]),
         c[C::TwinToTwin as usize],
         mb(c[C::TwinToTwinBytes as usize]),
+    );
+    tracing::info!(
+        "  heap sync per frame: {:.0} pages, {:.0} slots: {:.0} made from their record already, {:.0} no view, \
+         {:.0} checked ({:.0} in blocks not verified) in {:.1} ms, {:.0} made again in {:.1} ms; pages read in \
+         {:.1} ms, {:.1} ms waiting for the heaps' lock; {:.1} releases forgot views",
+        c[C::SyncPages as usize],
+        c[C::SyncSlots as usize],
+        c[C::SyncFast as usize],
+        c[C::SyncNoView as usize],
+        c[C::SyncChecked as usize],
+        c[C::SyncUnverified as usize],
+        c[C::SyncCheckNs as usize] / 1e6,
+        c[C::SyncMade as usize],
+        c[C::SyncMakeNs as usize] / 1e6,
+        c[C::SyncReadNs as usize] / 1e6,
+        c[C::SyncLockNs as usize] / 1e6,
+        c[C::ViewsForgot as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

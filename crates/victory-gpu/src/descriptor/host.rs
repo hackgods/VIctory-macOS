@@ -1366,7 +1366,7 @@ fn buffer_srv(
         return None;
     }
     let host = host()?;
-    if crate::shader_cache::under_wine()
+    if under_wine()
         && matches!(desc.Format.0, 6..=8)
         && let Some(w) = widened_w(desc.Format.0)
         && let Some(widened) = shadow.widened(start, u64::from(count) * 12, w)
@@ -1393,6 +1393,17 @@ fn buffer_srv(
         shadow.buffer.clone(),
         own.then(|| HeldSource::Shadow(shadow)),
     )))
+}
+
+/// [`crate::shader_cache::under_wine`], asked once. That function asks the
+/// loader for ntdll and for an export of it by name at every call, under
+/// Wine's loader lock, and [`buffer_srv`] asked it for every buffer view made:
+/// each slot a heap sync makes again (25,000 to 40,000 a frame in the
+/// world) and each view of a draw's fresh table, on the recording threads at
+/// the same time. The answer cannot change while the process runs.
+fn under_wine() -> bool {
+    static UNDER_WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNDER_WINE.get_or_init(crate::shader_cache::under_wine)
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in

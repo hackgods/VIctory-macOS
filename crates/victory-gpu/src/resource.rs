@@ -1494,6 +1494,53 @@ pub(crate) fn texture_desc(this: This) -> Option<[u32; 14]> {
     Some(words)
 }
 
+/// Width, height and format of title texture `this` if it is a 2D texture
+/// of one sample (`crate::texback`'s kinds); `None` otherwise.
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    const TEXTURE_2D: u32 = 3;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Title texture `this`'s console layout (one plane), where it starts in
+/// title memory and the bytes of that layout (`crate::texback`); `None`
+/// for a buffer, a texture of more planes, and one whose layout is larger
+/// than the memory it was given (committed or placed; at an address the
+/// title mapped itself, the title's word is taken).
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    let size = usize::try_from(t.size).ok()?;
+    let room = match r.backing {
+        Backing::Committed(ref memory) => Some(memory.layout.size()),
+        // SAFETY: a placed resource holds its heap.
+        Backing::Placed { heap, offset } => unsafe { &*heap.cast::<Heap>() }
+            .desc
+            .size
+            .checked_sub(offset)
+            .and_then(|n| usize::try_from(n).ok()),
+        Backing::Address(_) => None,
+    };
+    if plane.layout.size > t.size || room.is_some_and(|room| size > room) {
+        return None;
+    }
+    Some((plane.layout.clone(), r.data() as usize, size))
+}
+
 /// A texture's format as the title gave it.
 pub(crate) fn title_format(this: This) -> Option<u32> {
     (!this.is_null()).then(|| resource(this).desc.format)
@@ -1850,6 +1897,8 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
+        // Another texture's copy-back pending there no longer lands.
+        crate::texback::replaced(resource.data() as usize);
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
@@ -1905,6 +1954,11 @@ pub(crate) fn alias_source(placed: This) -> Option<This> {
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        // First, while its memory is still there: a copy-back landing in it
+        // now is let finish, and none lands after (`crate::texback`).
+        if self.desc.dimension != BUFFER {
+            crate::texback::released(std::ptr::from_ref::<Resource>(self) as usize);
+        }
         #[cfg(feature = "diagnostics")]
         if made(self).is_some_and(|h| std::sync::Arc::strong_count(&h) > 2)
         {
@@ -3129,6 +3183,120 @@ mod tests {
             want[to..to + 8].copy_from_slice(&bytes[from..from + 8]);
         }
         assert!(read == want.as_slice(), "the region's rows, and nothing else");
+    }
+
+    /// A texture of a kind copied back (`crate::texback`: 64x64
+    /// R32G32_FLOAT, three mips, unordered access) that the GPU wrote (here
+    /// by copies, noted as a dispatch's unordered view is): once its list
+    /// has run, its title memory holds every mip's texels where the
+    /// console's layout puts them, and the bytes no texel covers are as
+    /// they were. A second one, released by the title after its list was
+    /// closed and before it ran, lands nothing.
+    #[cfg(windows)]
+    #[test]
+    fn a_texture_shaders_wrote_lands_tiled_in_title_memory() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        crate::texback::force(true);
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const UNORDERED_ACCESS: u32 = 0x8;
+        let desc = ResourceDesc { flags: UNORDERED, ..texture(64, 64, 16, 3) };
+        let h = heap(1 << 20);
+        let place = |offset: u64| {
+            let mut out = null;
+            assert_eq!(create_placed(null, h, offset, &desc, 0, null.cast(), iid, &mut out), S_OK);
+            out
+        };
+        let (image, freed) = (place(0), place(1 << 19));
+        let (layout, at, size) = title_texture(image).expect("one plane inside its memory");
+        let (_, freed_at, _) = title_texture(freed).unwrap();
+        for p in [at, freed_at] {
+            // SAFETY: the textures' title memory, inside our heap.
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0xcd, size) };
+        }
+        // The texels, laid out as the host copies them.
+        let copy = host_copy(image).unwrap();
+        // SAFETY: a live texture.
+        let host_desc = unsafe { copy.texture.GetDesc() };
+        let mut placed = [D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); 3];
+        let mut total = 0;
+        // SAFETY: outputs for three subresources.
+        unsafe { host.device.GetCopyableFootprints(&host_desc, 0, 3, 0, Some(placed.as_mut_ptr()), None, None, Some(&mut total)) };
+        let mut source = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &buffer(total), 0, null.cast(), iid, &mut source), S_OK);
+        let (data, _) = buffer_bytes(source).unwrap();
+        let texel = |mip: u32, x: u32, y: u32| ((u64::from(mip) + 1) << 48 | u64::from(y) << 16 | u64::from(x)).to_le_bytes();
+        for (mip, p) in placed.iter().enumerate() {
+            for y in 0..p.Footprint.Height {
+                for x in 0..p.Footprint.Width {
+                    let at = p.Offset as usize + (y * p.Footprint.RowPitch + x * 8) as usize;
+                    // SAFETY: inside the buffer, which holds `total` bytes.
+                    unsafe { std::slice::from_raw_parts_mut(data.add(at), 8) }.copy_from_slice(&texel(mip as u32, x, y));
+                }
+            }
+        }
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]), &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &guid(0x6102dee4, 0xaf59, 0x4b09, [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24]), &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &guid(0x5b160d0f, 0xac1b, 0x4185, [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55]), &mut list),
+            S_OK
+        );
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type Copy = extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let copy_region = slot::<Copy>(list, 0x80);
+        for target in [image, freed] {
+            for (mip, p) in placed.iter().enumerate() {
+                let f = p.Footprint;
+                let rows = PlacedFootprint { offset: p.Offset, format: 16, width: f.Width, height: f.Height, depth: 1, row_pitch: f.RowPitch };
+                // A subresource index shares the footprint's first dword.
+                let to = Location { resource: target, kind: 0, footprint: PlacedFootprint { offset: mip as u64, ..rows } };
+                copy_region(list, &to, 0, 0, 0, &Location { resource: source, kind: 1, footprint: rows }, null.cast());
+            }
+            // As `crate::draw::readable` does for a dispatch's unordered view.
+            let recording = crate::list::host_list(list).unwrap();
+            crate::list::ensure_state(recording, target, UNORDERED_ACCESS);
+            recording.texture_written(target);
+        }
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        // The title lets the second texture go before it submits the list.
+        assert_eq!(slot::<Release>(freed, 0x10)(freed), 0);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        crate::texback::force(false);
+        // SAFETY: the textures' title memory, inside our heap; the
+        // submission has run.
+        let memory = |p: usize| unsafe { std::slice::from_raw_parts(p as *const u8, size) }.to_vec();
+        let landed = memory(at);
+        let mut covered = vec![false; size];
+        for (mip, p) in placed.iter().enumerate() {
+            for y in 0..p.Footprint.Height {
+                for x in 0..p.Footprint.Width {
+                    let t = layout.offset(mip as u32, x, y, 0).unwrap() as usize;
+                    assert_eq!(landed[t..t + 8], texel(mip as u32, x, y), "mip {mip} ({x}, {y})");
+                    covered[t..t + 8].fill(true);
+                }
+            }
+        }
+        assert!(landed.iter().zip(&covered).all(|(&b, &c)| c || b == 0xcd), "the bytes no texel covers kept");
+        assert!(memory(freed_at).iter().all(|&b| b == 0xcd), "nothing lands for a texture released");
+        for r in [image, source, h] {
+            assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+        }
     }
 
     /// Two queues, as Grand Theft Auto VI's: a compute list copies a buffer,

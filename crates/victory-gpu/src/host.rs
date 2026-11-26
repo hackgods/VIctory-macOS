@@ -366,6 +366,7 @@ fn create() -> windows::core::Result<Host> {
         crate::pipeline::note_skips();
         crate::ambient::announce();
         crate::ray_skip::announce();
+        crate::texback::announce();
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -1205,6 +1206,11 @@ struct Deferred {
     /// the part before it reads (`crate::list`): it starts a host
     /// submission ([`copy_order_parts`]).
     after_copy: bool,
+    /// Title textures of the kinds copied back (`crate::texback`) that the
+    /// list's shaders write, copied when it closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Those copies, which land in title memory once the list has run.
+    texture_backs: Vec<std::sync::Arc<crate::texback::Back>>,
 }
 
 impl Host {
@@ -1844,6 +1850,12 @@ impl Host {
                 crate::memory::drop_withheld(address, len);
             }
         }
+        // Textures shaders wrote that the title reads on the CPU
+        // (`crate::texback`): the lists that copied them have run.
+        if crate::texback::on() {
+            let backs: Vec<_> = runs.iter().flat_map(|l| l.deferred().texture_backs.clone()).collect();
+            crate::texback::land_all(&backs);
+        }
         for list in runs {
             for work in &list.deferred().after {
                 work();
@@ -2218,6 +2230,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        self.textures_back();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -2345,6 +2358,38 @@ impl HostList {
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => o.get_mut().again(side, writes),
+        }
+    }
+
+    /// A draw or dispatch being prepared writes title texture `resource`
+    /// through unordered access: if it is of a kind copied back
+    /// (`crate::texback`), the list copies it when it closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource)
+            || self.deferred().back_wanted.iter().any(|t| t.owner() == resource as usize)
+        {
+            return;
+        }
+        if let Some(target) = crate::texback::Target::new(resource) {
+            self.deferred().back_wanted.push(target);
+        }
+    }
+
+    /// As the list closes: the textures its shaders wrote that are copied
+    /// back go into read-back buffers (`crate::texback::record`).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            if target.valid()
+                && let Some(barrier) = self.move_texture(&target.copy, COPY_SOURCE)
+            {
+                // SAFETY: an open list; the barrier names a live texture.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
+            if let Some(back) = crate::texback::record(self, target) {
+                self.deferred().texture_backs.push(std::sync::Arc::new(back));
+            }
         }
     }
 
@@ -3568,6 +3613,11 @@ impl Host {
         self.mapped_buffer(size, false)
     }
 
+    /// A buffer in the readback heap, mapped, in the copy-destination state.
+    pub(crate) fn readback_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        self.mapped_buffer(size, true)
+    }
+
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
@@ -3747,6 +3797,7 @@ impl Meter {
             );
             unwaited::log(report_frames);
             crate::ray_skip::log(report_frames);
+            crate::texback::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

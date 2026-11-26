@@ -82,6 +82,9 @@ mod mac_switches;
 mod switch;
 #[cfg(windows)]
 mod tdr;
+// Its rules are plain std, so their tests run everywhere.
+#[cfg(any(windows, test))]
+mod texback;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]

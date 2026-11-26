@@ -2144,6 +2144,10 @@ impl Host {
                         }
                     }
                     None => {
+                        // mac: without timestamps, at least what the slow
+                        // list holds: a list that binds no title pipeline
+                        // (copies, clears, passes of ours) is blank above.
+                        tracing::warn!("slow list commands by kind: {}", runs[i].kinds(12));
                         static SAID: std::sync::Once = std::sync::Once::new();
                         SAID.call_once(|| {
                             tracing::warn!(
@@ -2660,6 +2664,36 @@ impl HostList {
                 Some((heap?, back?))
             })
             .as_ref()
+    }
+
+    /// The list's noted commands by kind (and pipeline, for draws,
+    /// dispatches and passes of ours), the `n` most frequent first, as
+    /// "count kind" (diagnostics; the commands are noted with
+    /// `VICTORY_D3D12_DRED` on).
+    #[cfg(feature = "diagnostics")]
+    fn kinds(&self, n: usize) -> String {
+        let notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut by: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        for (note, _) in notes.iter() {
+            let head = note.split(" | ").next().unwrap_or_default();
+            let kind = head.split(' ').next().unwrap_or_default();
+            let pipeline = ["[compute ", "[vertex ", "[mesh ", "[ambient "].iter().find_map(|p| head.find(p));
+            let key = match pipeline {
+                Some(at) => format!("{kind} {}", head[at..].chars().take(96).collect::<String>()),
+                None => kind.to_owned(),
+            };
+            *by.entry(key).or_default() += 1;
+        }
+        if by.is_empty() {
+            return "none noted (VICTORY_D3D12_DRED=1 notes them)".to_owned();
+        }
+        let mut by: Vec<(String, u32)> = by.into_iter().collect();
+        by.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut text = by.iter().take(n).map(|(kind, count)| format!("{count} {kind}")).collect::<Vec<_>>().join(", ");
+        if by.len() > n {
+            text.push_str(&format!(", and {} other kinds", by.len() - n));
+        }
+        text
     }
 
     /// The noted commands that took longest on the GPU, longest first, as

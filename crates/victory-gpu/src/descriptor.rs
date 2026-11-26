@@ -11,6 +11,8 @@ use crate::object::{self, DESCRIPTOR_HEAP, E_INVALIDARG, HRESULT, Iid, Object, T
 use crate::resource::{Memory, PAGEABLE_IIDS};
 
 #[cfg(windows)]
+pub(crate) mod ahead;
+#[cfg(windows)]
 pub(crate) mod host;
 // Also built for tests, which run where `host` cannot.
 #[cfg(any(windows, test))]
@@ -212,6 +214,22 @@ fn mirror(handle: u64) {
 /// heap at indices in their data, where a slot never mirrored reads nothing.
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
+    sync(None);
+}
+
+/// A round of [`sync_heaps`] while the host GPU runs a submission left to
+/// it ([`ahead`]): what the title wrote so far for the lists to come, but
+/// for the slots a round leaves ([`host::HostHeap::mirror`]). `ran` says
+/// that the GPU has run the submission: the round stops at the next page,
+/// and the pages it took and did not look at are kept for the next sync.
+#[cfg(windows)]
+pub(crate) fn sync_heaps_ahead(ran: &dyn Fn() -> bool) {
+    let _round = ahead::Round::start();
+    sync(Some(ran));
+}
+
+#[cfg(windows)]
+fn sync(ran: Option<&dyn Fn() -> bool>) {
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
@@ -223,12 +241,29 @@ pub(crate) fn sync_heaps() {
             continue;
         };
         let step = u64::from(step);
-        for (from, to) in written.take(start as usize, usize::MAX) {
+        let mut runs = written.take(start as usize, usize::MAX);
+        // mac: what rounds ahead left comes first, the slots only before a
+        // submission.
+        if ahead::on() {
+            runs = host.with_left(runs);
+            if ran.is_none() {
+                host.sync_left(start, step);
+            }
+        }
+        let mut runs = runs.into_iter();
+        while let Some((from, to)) = runs.next() {
             // By page: one with nothing mapped (the title unmaps heap pages
             // too) holds no records.
             let page_size = crate::watch::PAGE;
             for page in (from & !(page_size - 1)..to).step_by(page_size) {
                 let (page, end) = (page.max(from), (page + page_size).min(to));
+                // mac: a round ahead ends when the GPU has run the
+                // submission; the rest of what it took is kept.
+                if ran.is_some_and(|ran| ran()) {
+                    host.leave(std::iter::once((page, to)).chain(runs));
+                    ahead::cut();
+                    return;
+                }
                 if !crate::host::read_into(page as *const u8, &mut [0u8; 4]) {
                     continue;
                 }

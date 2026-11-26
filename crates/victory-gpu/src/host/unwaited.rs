@@ -405,6 +405,7 @@ pub(super) fn log(frames: f64) {
          the giving, and our own submissions' waits); {spared:.1?} per frame went on without finishing it \
          (Signals of other queues, waits it owed no write to)"
     );
+    crate::descriptor::ahead::log(frames);
     if !prewarms() {
         return;
     }
@@ -548,11 +549,23 @@ impl Host {
     /// event was asked for when the submission was left, so it may be set
     /// already, or (under D3DMetal, #50) never: the fence is looked at
     /// first and then every 2 ms.
-    fn wait_left(&self, value: u64) -> Duration {
+    ///
+    /// `working`: the wait does rounds of the heap sync meanwhile
+    /// (`crate::descriptor::ahead`), the first at once.
+    fn wait_left(&self, value: u64, working: bool) -> Duration {
         let started = Instant::now();
         let mut seconds = 1;
+        let pause = crate::descriptor::ahead::pause().filter(|_| working);
+        let mut round = pause.map(|_| started);
+        // SAFETY: a plain query of our fence.
+        let ran = || unsafe { self.fence.GetCompletedValue() } >= value;
         // SAFETY: our fence and event.
         while unsafe { self.fence.GetCompletedValue() } < value {
+            if round.is_some_and(|at| Instant::now() >= at) {
+                crate::descriptor::sync_heaps_ahead(&ran);
+                round = pause.map(|pause| Instant::now() + pause);
+                continue;
+            }
             // SAFETY: as above.
             unsafe { WaitForSingleObject(self.event, 2) };
             if started.elapsed().as_secs() >= seconds {
@@ -582,7 +595,7 @@ impl Host {
             .filter(|l| l.signalled && !l.stood)
             .map(|l| l.value);
         if let Some(value) = value {
-            let waited = self.wait_left(value).as_micros() as u64;
+            let waited = self.wait_left(value, false).as_micros() as u64;
             // The same one: it is only finished under the lock we hold.
             if let Some(left) = left().as_mut() {
                 left.stood = true;
@@ -746,7 +759,7 @@ impl Host {
             ..
         } = left;
         if signalled && !stood {
-            ran.gpu = self.wait_left(value);
+            ran.gpu = self.wait_left(value, crate::descriptor::ahead::on());
             WAITED_US[by as usize].fetch_add(ran.gpu.as_micros() as u64, Relaxed);
             SUBMISSION_US[1].fetch_add(ran.gpu.as_micros() as u64, Relaxed);
         }

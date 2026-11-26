@@ -29,6 +29,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// mac: what heap syncs ahead of a submission left for a later sync
+    /// (`super::ahead`): slots found rewritten whose views are left for a
+    /// read to make ([`HostHeap::mirror`], for the sync before the
+    /// submission), and runs of title heap memory a round took as written
+    /// and did not look at (for the next sync of any kind).
+    left: Mutex<Left>,
     /// Per title slot, its record once the slot is made from it and holds
     /// what a draw reads (a texture's view not left null), else 0: what
     /// [`HostHeap::mirror`] finds without the `made` lock, which every
@@ -74,6 +80,9 @@ pub(crate) struct HostHeap {
     /// What the title slots view that title memory feeds (`crate::bindless`).
     pub(crate) viewed: std::sync::Arc<crate::bindless::Viewed>,
 }
+
+/// mac: slots, and runs of title heap memory (`HostHeap::left`).
+type Left = (Vec<u32>, Vec<(usize, usize)>);
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
 /// device-removed reports: a shader indexing a heap past its end faults.
@@ -220,6 +229,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            left: Mutex::default(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -756,12 +766,50 @@ impl HostHeap {
                 .map(|(i, _)| i)
                 .collect()
         };
+        if super::ahead::on() {
+            super::ahead::changed(stale.len());
+        }
         // mac: a view heap's buffer shader views from one lookup per record.
         if !self.sampler && quick::on() {
             return self.sync_quick(&stale, at);
         }
         for i in stale {
             self.mirror(i, at(i), false);
+        }
+    }
+
+    /// mac: `runs` (title heap memory a sync took as written), after the
+    /// runs a round ahead took and did not look at.
+    pub(crate) fn with_left(&self, runs: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        let mut left = std::mem::take(&mut self.left.lock().unwrap_or_else(|e| e.into_inner()).1);
+        if left.is_empty() {
+            return runs;
+        }
+        left.extend(runs);
+        left
+    }
+
+    /// mac: a round ahead ends with `runs` taken and not looked at.
+    pub(crate) fn leave(&self, runs: impl Iterator<Item = (usize, usize)>) {
+        self.left.lock().unwrap_or_else(|e| e.into_inner()).1.extend(runs);
+    }
+
+    /// mac: the sync before a submission, of the slots rounds ahead of it
+    /// left ([`HostHeap::mirror`]): each made from the record it holds now,
+    /// as a sync that had found it rewritten would. A slot whose heap page
+    /// the title has unmapped since holds no record (the sync asks the same
+    /// of every page it looks at), and one left by several rounds is made
+    /// once.
+    pub(crate) fn sync_left(&self, start: u64, step: u64) {
+        let mut left = std::mem::take(&mut self.left.lock().unwrap_or_else(|e| e.into_inner()).0);
+        left.sort_unstable();
+        left.dedup();
+        super::ahead::changed(left.len());
+        for i in left {
+            let at = start + u64::from(i) * step;
+            if crate::host::read_into(at as *const u8, &mut [0u8; 4]) {
+                self.mirror(i, at, false);
+            }
         }
     }
 
@@ -860,6 +908,14 @@ impl HostHeap {
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
+        // mac: a heap sync ahead of the submission leaves the slot as it is,
+        // for the sync before it: made now, its read mark would be forgotten
+        // under the running submission's shaders (`super::ahead`).
+        if later && super::ahead::running() {
+            self.left.lock().unwrap_or_else(|e| e.into_inner()).0.push(index);
+            super::ahead::left();
+            return Some(view);
+        }
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -2481,6 +2537,56 @@ mod tests {
         unsafe { std::ptr::write_bytes((start + 32) as *mut u8, 0, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(0) && !host.made(1), "a cleared record leaves its slot");
+    }
+
+    /// mac: a heap sync ahead of the submission makes a slot whose record
+    /// changed, but leaves one whose record is a view of a texture the
+    /// title placed itself as it was; the sync before the submission then
+    /// notes that record, as it always did.
+    #[test]
+    fn a_sync_ahead_leaves_placed_texture_views_for_the_sync_before_the_submission() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), 0);
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        // Slot 0: a 4x1 RGBA8 texture in memory of its own, and a 2D view.
+        let memory = vec![0u8; 1 << 16];
+        let address = memory.as_ptr() as u64;
+        let words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut view = [0u32; 16];
+        view[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+        (view[10], view[11]) = (address as u32, (address >> 32) as u32);
+        crate::descriptor::create_placed_srv(null, &words, &view, start);
+        // Slot 2: a constant buffer view (of no memory, as above).
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], start + 64);
+        let host = title_heap.host().expect("a host view heap");
+        assert!(host.made(0) && host.made(2));
+        // The title copies both records as bytes: slot 0's to 1, 2's to 3.
+        // SAFETY: slots of the heap's memory, 32 bytes each.
+        unsafe {
+            std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32);
+            std::ptr::copy_nonoverlapping((start + 64) as *const u8, (start + 96) as *mut u8, 32);
+        }
+        assert!(!host.made(1) && !host.made(3), "copied as bytes: not seen yet");
+        {
+            let _round = super::super::ahead::Round::start();
+            host.sync_slots(0, 4, start, 32);
+        }
+        assert!(host.made(3), "the buffer view is made ahead");
+        assert!(!host.made(1), "the placed texture's view is left as it was");
+        // Before the submission: the slots left, then what was written since.
+        host.sync_left(start, 32);
+        assert!(host.made(1), "its record is noted");
+        assert!(!host.kept(1), "and its view left for a read to make");
+        host.sync_left(start, 32);
+        host.sync_slots(0, 4, start, 32);
+        assert!(host.made(0) && host.made(1) && host.made(2) && host.made(3));
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

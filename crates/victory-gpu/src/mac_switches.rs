@@ -105,6 +105,17 @@ fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     }
 }
 
+/// `VICTORY_ASYNC_HEAP_SYNC`'s rule (`crate::descriptor::ahead`): off when
+/// unset, empty or `0`; else on, and the milliseconds between a round of
+/// the heap sync and the next while the GPU still runs: 8 for `1` (or
+/// anything that is no number), a larger number for itself.
+pub(crate) fn heap_sync_pause(value: Option<&str>) -> Option<u64> {
+    match value {
+        None | Some("" | "0") => None,
+        Some(v) => Some(v.parse::<u64>().ok().filter(|&ms| ms > 1).unwrap_or(8)),
+    }
+}
+
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -145,7 +156,18 @@ pub(crate) fn key(
 
 #[cfg(test)]
 mod tests {
-    use super::{key, quick, setting, writers};
+    use super::{heap_sync_pause, key, quick, setting, writers};
+
+    #[test]
+    fn the_heap_sync_ahead_is_off_unless_asked_and_takes_its_pause() {
+        assert_eq!(heap_sync_pause(None), None);
+        assert_eq!(heap_sync_pause(Some("")), None);
+        assert_eq!(heap_sync_pause(Some("0")), None);
+        assert_eq!(heap_sync_pause(Some("1")), Some(8));
+        assert_eq!(heap_sync_pause(Some("yes")), Some(8));
+        assert_eq!(heap_sync_pause(Some("4")), Some(4));
+        assert_eq!(heap_sync_pause(Some("1000")), Some(1000));
+    }
 
     #[test]
     fn the_quick_sync_switch_names_its_parts() {

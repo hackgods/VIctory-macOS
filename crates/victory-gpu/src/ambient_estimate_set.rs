@@ -127,12 +127,16 @@ pub(crate) struct Settle {
     pub(crate) fresh: f32,
 }
 
-/// What `VICTORY_AMBIENT_SETTLE` is when unset.
-const SETTLE_UNSET: &str = "0";
+/// What `VICTORY_AMBIENT_SETTLE` is when unset: by the clock, as in the
+/// fork from 9576c45f on (rooms stopped being too bright or too dark for
+/// seconds after walking in). At this line's frame rates the slow mean
+/// then goes most of the way in one frame.
+const SETTLE_UNSET: &str = "250,3";
 
 /// `VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
-/// seconds>]]` (jump 3 and fresh 0 when left out). Unset or 0: `None`, the
-/// slow mean goes [`FOLLOW`] of the way a frame whatever the frame rate.
+/// seconds>]]` (jump 3 and fresh 0 when left out); unset: 250,3. 0: `None`,
+/// the slow mean goes [`FOLLOW`] of the way a frame whatever the frame
+/// rate.
 pub(crate) fn settle(value: Option<&str>) -> Option<Settle> {
     let mut parts = value.unwrap_or(SETTLE_UNSET).split(',').map(|p| p.trim().parse::<f32>().ok());
     let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
@@ -1060,7 +1064,7 @@ mod tests {
     /// the seconds since the last jump counted.
     #[test]
     fn the_slow_mean_settles_by_the_clock() {
-        assert_eq!(settle(None), None);
+        assert_eq!(settle(None), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
         assert_eq!(settle(Some("0")), None);
         assert_eq!(settle(Some("")), None);
         assert_eq!(settle(Some("x,3")), None);

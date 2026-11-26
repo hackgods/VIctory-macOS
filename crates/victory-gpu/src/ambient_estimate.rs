@@ -34,9 +34,10 @@
 //!   at sunset.
 //!
 //! - `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` (from avatarmanz
-//!   b4ba4bbb): the slow mean follows by a time constant, not by 0.04 a
-//!   frame (25 frames: 8 s at this line's 3 frames a second), and takes a
-//!   change by more than the jump factor at once.
+//!   b4ba4bbb; unset: 250,3, from 9576c45f): the slow mean follows by a
+//!   time constant, not by 0.04 a frame (`0`; 25 frames: 8 s at this line's
+//!   3 frames a second), and takes a change by more than the jump factor
+//!   at once.
 //!
 //! What it assumes: what is not on screen sends out what is (with the slow
 //! mean, so that turning into a dark corner is not black at once). No
@@ -128,8 +129,8 @@ fn air_bound() -> f32 {
 }
 
 /// How the slow mean of the light around settles
-/// (`VICTORY_AMBIENT_SETTLE`, `set::settle`; `None`: 0.04 of the way a
-/// frame).
+/// (`VICTORY_AMBIENT_SETTLE`, `set::settle`; by the clock unless it says
+/// 0: then `None`, 0.04 of the way a frame).
 fn settle() -> Option<set::Settle> {
     static SET: OnceLock<Option<set::Settle>> = OnceLock::new();
     *SET.get_or_init(|| set::settle(var("VICTORY_AMBIENT_SETTLE").as_deref()))

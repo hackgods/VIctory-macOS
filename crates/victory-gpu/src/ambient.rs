@@ -179,6 +179,15 @@ pub(crate) fn sky_drawn(image: usize) {
     }
 }
 
+/// What the constant light is made of now, for the floor under the
+/// estimate (`crate::ambient_estimate`): its level and colour, the gain,
+/// least level and power with which it follows the sky (if it does), and
+/// the sky image the title last drew (if any).
+pub(crate) fn light_now() -> (f32, [f32; 3], Option<[f32; 3]>, Option<std::sync::Arc<HostTexture>>) {
+    let sky = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    (live_level().unwrap_or_else(level), tint(), follow(), sky)
+}
+
 /// The light follows the sky: its level and colour are the sky image's mean
 /// times a gain, over a least bluish level. Hand-set levels that looked
 /// right in the fork were 0.07 at night, 0.3 at dusk and 1.4 at noon (runs

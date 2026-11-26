@@ -68,6 +68,12 @@
 //! - The fork's four fixed numbers of a texel's light (the slow mean's
 //!   part, the normal's turn, the least and the most) can be set
 //!   (`VICTORY_AMBIENT_MIX`); unset they are the fork's.
+//! - No texel gets less than a floor: a share of the constant stand-in's
+//!   light (`VICTORY_AMBIENT_FLOOR`, 0.3; `set::floor`), worked out once a
+//!   frame from the sky dome at the keeping. Where little light is on
+//!   screen the estimate has nothing to spread (a room lit only by its own
+//!   bounce settles at black); in the fork the title's own resolve is under
+//!   it there, which on this line leaves nothing.
 //! - Reflections are held to a part of the light around, as the constant
 //!   stand-in holds them to a part of its level ([`hold`],
 //!   `VICTORY_AMBIENT_REFLECT`); the fork leaves them alone (`0` here).
@@ -170,19 +176,28 @@ fn mix() -> [f32; 4] {
     *SET.get_or_init(|| set::mix(var("VICTORY_AMBIENT_MIX").as_deref()))
 }
 
+/// The floor: the least any texel gets, as a share of the constant
+/// stand-in's light (`VICTORY_AMBIENT_FLOOR`, `set::floor`; 0: none).
+fn floor_share() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| set::floor(var("VICTORY_AMBIENT_FLOOR").as_deref()))
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if let Some(share) = share() {
         tracing::info!(
             "{}",
-            set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part(), mix())
+            set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part(), mix(), floor_share())
         );
     }
 }
 
 /// Passes' views, used in turn: more than the passes of every list in
-/// flight (two views a pass).
+/// flight ([`VIEWS`] views a pass).
 const SLOTS: u32 = 1024;
+/// Views a pass: the image written, the image read, the sky dome.
+const VIEWS: u32 = 3;
 
 /// One pass: its pipeline and the root signature it was made with (the
 /// same layout for all).
@@ -217,11 +232,11 @@ unsafe impl Sync for Pass {}
 
 /// A pass of `set::SOURCE`, compiled with the system's compiler (Wine's
 /// under Wine); its root signature is built here (`crate::compute`): the
-/// constants, a table of the image written and the image read, and the two
-/// buffers, each as a structured and as a raw view.
+/// constants, a table of the image written, the image read and the sky
+/// dome, and the two buffers, each as a structured and as a raw view.
 fn stage(pass: &str, name: PCSTR) -> windows::core::Result<Stage> {
     use crate::compute::{Param, srv, uav};
-    let ranges = [uav(0, 1), srv(0, 1)];
+    let ranges = [uav(0, 1), srv(0, 2)];
     let params = [
         Param::Constants { register: 0, count: set::CONSTANTS as u32 },
         Param::Table(&ranges),
@@ -261,7 +276,7 @@ fn make(host: &Host) -> windows::core::Result<Pass> {
     unsafe {
         let views = host.device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: kind,
-            NumDescriptors: SLOTS * 2,
+            NumDescriptors: SLOTS * VIEWS,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
             NodeMask: 0,
         })?;
@@ -327,9 +342,10 @@ struct Image<'a> {
 }
 
 impl Pass {
-    /// Makes the two views of a pass's table in slots no list in flight
-    /// reads, and sets the passes' view heap in `list`: the table. A null
-    /// view where the pass has no image.
+    /// Makes the views of a pass's table in slots no list in flight reads,
+    /// and sets the passes' view heap in `list`: the table. A null view
+    /// where the pass has no image. `sky`: the first slice of the sky dome
+    /// (the keeping's, for the floor).
     ///
     /// # Safety
     /// An open list; live textures the list keeps.
@@ -339,8 +355,9 @@ impl Pass {
         list: &ID3D12GraphicsCommandList,
         written: Option<Image>,
         read: Option<Image>,
+        sky: Option<Image>,
     ) -> D3D12_GPU_DESCRIPTOR_HANDLE {
-        let slot = self.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 2;
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % SLOTS * VIEWS;
         // SAFETY: the caller's; the slots are inside the heap.
         unsafe {
             let cpu = self.views.GetCPUDescriptorHandleForHeapStart();
@@ -371,6 +388,16 @@ impl Pass {
             };
             let beside = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + self.step as usize };
             host.device.CreateShaderResourceView(read.map(|r| r.image), Some(&seen), beside);
+            let around = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: sky.map_or(DXGI_FORMAT_R16G16B16A16_FLOAT, |s| s.format),
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MipLevels: 1, ArraySize: 1, ..Default::default() },
+                },
+            };
+            let third = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + 2 * self.step as usize };
+            host.device.CreateShaderResourceView(sky.map(|s| s.image), Some(&around), third);
             list.SetDescriptorHeaps(&[Some(self.views.clone())]);
             D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + u64::from(slot * self.step) }
         }
@@ -405,8 +432,18 @@ impl Pass {
     }
 
     /// The keeping: the cells' light from `radiance` (a shader resource of
-    /// `size` texels in `list` now), then the slow mean.
-    fn keep(&self, host: &Host, list: &HostList, radiance: Image, size: [u32; 2], given: &set::Pass) {
+    /// `size` texels in `list` now), then the slow mean and the floor's
+    /// light (from `sky`, the sky dome as a shader resource, if the floor
+    /// follows it: `given.sky`).
+    fn keep(
+        &self,
+        host: &Host,
+        list: &HostList,
+        radiance: Image,
+        size: [u32; 2],
+        sky: Option<Image>,
+        given: &set::Pass,
+    ) {
         list.keep(&self.cells);
         list.keep(&self.views);
         let l = &list.list;
@@ -415,7 +452,7 @@ impl Pass {
         // SAFETY: an open list; a live texture the caller's list keeps, in
         // a shader-resource state.
         unsafe {
-            let table = self.table(host, l, None, Some(radiance));
+            let table = self.table(host, l, None, Some(radiance), sky);
             self.run(l, &self.keep, &constants, table, [set::CX / 8, set::CY / 4, 1]);
             self.run(l, &self.mean, &constants, table, [1, 1, 1]);
         }
@@ -443,7 +480,7 @@ impl Pass {
         // SAFETY: an open list; live textures the caller's list keeps, in
         // the states named.
         unsafe {
-            let table = self.table(host, l, Some(light), depth);
+            let table = self.table(host, l, Some(light), depth, None);
             if depth.is_some() {
                 self.run(l, &self.place, &constants, table, [set::CX / 8, set::CY / 4, 1]);
                 self.run(l, &self.gather, &constants, table, [set::PX / 8, set::PY / 2, 1]);
@@ -467,7 +504,7 @@ impl Pass {
         // SAFETY: an open list; a live texture the caller's list keeps, in
         // the unordered-access state.
         unsafe {
-            let table = self.table(host, l, Some(scattered), None);
+            let table = self.table(host, l, Some(scattered), None, None);
             let groups = [size[0].div_ceil(8), size[1].div_ceil(8), scattered.slices.div_ceil(2)];
             self.run(l, &self.air, &constants, table, groups);
         }
@@ -486,7 +523,7 @@ impl Pass {
         // SAFETY: an open list; a live texture the caller's list keeps, in
         // the unordered-access state.
         unsafe {
-            let table = self.table(host, l, Some(image), None);
+            let table = self.table(host, l, Some(image), None, None);
             self.run(l, &self.hold, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
         }
     }
@@ -517,11 +554,17 @@ pub(crate) fn log(frames: f64) {
     let seen = made.map(|pass| {
         // SAFETY: inside the buffers' mappings, which live as the passes do.
         let float4 = |at: usize, index: u32| unsafe { ((at + index as usize * 16) as *const [f32; 4]).read_volatile() };
-        let mean = float4(pass.cells_at, set::CELLS);
+        let rgb = |index: u32| {
+            let v = float4(pass.cells_at, index);
+            [v[0], v[1], v[2]]
+        };
+        let (mean, floor) = (rgb(set::CELLS), rgb(set::FLOOR_AT));
+        let luminance = floor[0] * 0.2126 + floor[1] * 0.7152 + floor[2] * 0.0722;
         let points = (0..set::PX * set::PY).map(|i| [0, 1, 2].map(|colour| float4(pass.points_at, i * 3 + colour)[3]));
-        ([mean[0], mean[1], mean[2]], set::over_the_picture(points))
+        let (points, written, under) = set::over_the_picture(points, share, luminance);
+        set::Seen { mean, floor, points, written, under }
     });
-    tracing::info!("{}", set::frame_line(share, seen, per_frame));
+    tracing::info!("{}", set::frame_line(share, floor_share(), seen, per_frame));
 }
 
 /// What the passes are given now.
@@ -540,6 +583,9 @@ fn settings(share: f32) -> set::Pass {
         dt: 0.0,
         held: reflect_part(),
         mix: mix(),
+        sky: [0.0, 0.0, 1.0],
+        floor: [0.0; 3],
+        sky_size: [0, 0],
     }
 }
 
@@ -588,10 +634,54 @@ pub(crate) fn keep(list: &HostList, radiance: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     let radiance = Image { image: &copy.texture, format, slices: 0 };
+    // The floor: a share of the constant stand-in's light as it is now,
+    // from the sky dome if that light follows it and the title has drawn
+    // it (read in the format its program draws it in).
+    let (level, tint, follows, dome) = crate::ambient::light_now();
+    let dome = dome.filter(|dome| {
+        // SAFETY: a live resource.
+        let d = unsafe { dome.texture.GetDesc() };
+        d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+            && viewed_as(dome, d.Format, DXGI_FORMAT_R16G16B16A16_FLOAT)
+    });
+    let (sky, floor) = set::floor_of(floor_share(), level, tint, follows, dome.is_some());
+    let dome = dome.filter(|_| sky[0] > 0.0);
+    let mut sky_size = [0, 0];
+    if let Some(dome) = &dome {
+        // SAFETY: a live resource.
+        let d = unsafe { dome.texture.GetDesc() };
+        sky_size = [d.Width as u32, d.Height];
+        list.keep(&dome.texture);
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        if let Some(barrier) = list.move_texture(dome, read as u32) {
+            // SAFETY: an open list and a live texture the list keeps.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+        static FOLLOWS: std::sync::Once = std::sync::Once::new();
+        FOLLOWS.call_once(|| {
+            tracing::info!(
+                share = floor_share(),
+                gain = sky[0],
+                least = sky[1],
+                power = sky[2],
+                width = d.Width,
+                height = d.Height,
+                "ambient estimate: its floor follows the sky dome"
+            );
+        });
+    }
+    let dome = dome.as_ref().map(|dome| Image { image: &dome.texture, format: DXGI_FORMAT_R16G16B16A16_FLOAT, slices: 0 });
     // The slow mean goes on by the time since the last keeping.
     let ms = frame_ms();
-    let given = set::Pass { follow: set::follow(settle(), ms), dt: ms / 1000.0, ..settings(share) };
-    pass.keep(host, list, radiance, [d.Width as u32, d.Height], &given);
+    let given = set::Pass {
+        follow: set::follow(settle(), ms),
+        dt: ms / 1000.0,
+        sky,
+        floor,
+        sky_size,
+        ..settings(share)
+    };
+    pass.keep(host, list, radiance, [d.Width as u32, d.Height], dome, &given);
     KEPT.store(true, Ordering::Relaxed);
     RECORDED[0].fetch_add(1, Ordering::Relaxed);
     true
@@ -888,10 +978,14 @@ mod tests {
     /// image holding `was` before: the cells' light, the slow mean, the
     /// cells' places, the points and the light image after.
     #[allow(clippy::type_complexity)]
-    fn run(host: &Host, pass: &Pass, given: &set::Pass, was: V3, depth: bool) -> (Vec<V4>, V4, Vec<V4>, Vec<V4>, Vec<u32>) {
+    fn run(host: &Host, pass: &Pass, given: &set::Pass, was: V3, depth: bool) -> (Vec<V4>, V4, Vec<V4>, Vec<V4>, Vec<u32>, V4) {
         let run = host.new_list().unwrap();
         let l = &run.list;
         let mut keep = Vec::new();
+        // The sky dome, where the floor follows it.
+        let given = &set::Pass { sky_size: SKY, ..*given };
+        let dome = (given.sky[0] > 0.0).then(|| sky_texture(host, l, &mut keep));
+        let dome = dome.as_ref().map(|dome| Image { image: dome, format: DXGI_FORMAT_R16G16B16A16_FLOAT, slices: 0 });
         let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
         let texels = |size: [u32; 2], at: &dyn Fn(u32, u32) -> u32| -> Vec<u32> {
             (0..size[0] * size[1]).map(|i| at(i % size[0], i / size[0])).collect()
@@ -923,7 +1017,7 @@ mod tests {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             &mut keep,
         );
-        pass.keep(host, &run, Image { image: &radiance, format: DXGI_FORMAT_R11G11B10_FLOAT, slices: 0 }, RADIANCE, given);
+        pass.keep(host, &run, Image { image: &radiance, format: DXGI_FORMAT_R11G11B10_FLOAT, slices: 0 }, RADIANCE, dome, given);
         pass.raise(
             host,
             &run,
@@ -947,7 +1041,8 @@ mod tests {
         let mean = floats(pass.cells_at, set::CELLS, 1)[0];
         let places = floats(pass.cells_at, set::CELLS + 1, set::CELLS);
         let points = floats(pass.points_at, 0, set::PX * set::PY * 3);
-        (cells, mean, places, points, written)
+        let floor = floats(pass.cells_at, set::FLOOR_AT, 1)[0];
+        (cells, mean, places, points, written, floor)
     }
 
     const BASE: set::Pass = set::Pass {
@@ -964,7 +1059,66 @@ mod tests {
         dt: 0.25,
         held: 0.5,
         mix: set::MIX,
+        sky: [0.0, 0.0, 1.0],
+        floor: [0.0; 3],
+        sky_size: [0, 0],
     };
+
+    /// The sky dome of the GPU tests: 16x8, a bright blue half (with texels
+    /// brighter than the 8 a texel counts for) and a dim warm half.
+    const SKY: [u32; 2] = [16, 8];
+
+    fn sky_at(x: u32, y: u32) -> V3 {
+        if x < 8 { [2.0, 4.0, if y == 3 { 32.0 } else { 6.0 }] } else { [0.5, 0.25, 0.125] }
+    }
+
+    /// A value as a 16-bit float; exact for the values used here.
+    fn half(v: f32) -> u16 {
+        if v <= 0.0 {
+            return 0;
+        }
+        let e = v.log2().floor() as i32;
+        ((e + 15) as u16) << 10 | ((v / 2f32.powi(e) - 1.0) * 1024.0).round() as u16
+    }
+
+    /// The sky dome as an R16G16B16A16_FLOAT texture, left readable by
+    /// shaders; its upload buffer goes to `keep`.
+    fn sky_texture(host: &Host, list: &ID3D12GraphicsCommandList, keep: &mut Vec<ID3D12Resource>) -> ID3D12Resource {
+        let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let texture = crate::composite::result_texture(&host.device, SKY[0].into(), SKY[1], format).unwrap();
+        let pitch = (SKY[0] * 8).next_multiple_of(256);
+        let (upload, data) = host.upload_buffer(u64::from(pitch) * u64::from(SKY[1])).unwrap();
+        // SAFETY: a mapped upload buffer written in bounds; an open list
+        // and copy locations naming live resources.
+        unsafe {
+            for y in 0..SKY[1] {
+                for x in 0..SKY[0] {
+                    let [r, g, b] = sky_at(x, y).map(half);
+                    data.add((y * pitch + x * 8) as usize).cast::<[u16; 4]>().write_unaligned([r, g, b, half(1.0)]);
+                }
+            }
+            list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.CopyTextureRegion(&whole(&texture), 0, 0, 0, &rows(&upload, format, SKY, pitch), None);
+            list.ResourceBarrier(&[transition(&texture, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)]);
+        }
+        keep.push(upload);
+        texture
+    }
+
+    /// The dome's mean as the `MEAN` pass takes it: 8x8 texels, each held
+    /// to 8.
+    fn sky_mean() -> V3 {
+        let mut sum = [0.0f32; 3];
+        for y in 0..8 {
+            for x in 0..8 {
+                let there = sky_at((x * 2 + 1) * SKY[0] / 16, (y * 2 + 1) * SKY[1] / 16);
+                for k in 0..3 {
+                    sum[k] += there[k].clamp(0.0, 8.0);
+                }
+            }
+        }
+        sum.map(|v| v / 64.0)
+    }
 
     /// The passes on the GPU give what the arithmetic on the CPU gives
     /// (`set::reference`): the cells' light and places, the slow mean, the
@@ -989,9 +1143,18 @@ mod tests {
             (set::Pass { most: 4.0, fresh: 2.0, jump: 3.0, ..base }, [9.0, 0.0, 9.0], true),
             // Another mix: half the slow mean, no turn, narrower bounds.
             (set::Pass { mix: [0.5, 0.0, 0.5, 1.5], ..base }, [0.0; 3], true),
+            // A floor of a constant light, and one that follows the sky
+            // dome (also with what the resolve left, and without depth).
+            (set::Pass { floor: [0.4, 0.3, 0.2], ..base }, [0.0; 3], true),
+            (set::Pass { sky: [0.108, 0.05, 0.4], ..base }, [0.0; 3], true),
+            (set::Pass { sky: [0.36, 0.05, 0.4], most: 4.0, ..base }, [9.0, 0.0, 9.0], true),
+            (set::Pass { sky: [0.36, 0.05, 0.4], ..base }, [0.0; 3], false),
             (base, [0.0; 3], false),
         ] {
-            let (cells, mean, places, points, written) = run(host, &pass, &given, was, depth);
+            let (cells, mean, places, points, written, floor) = run(host, &pass, &given, was, depth);
+            // The floor's light: the constant one, or from the dome.
+            let least = reference::floor_light(&given, sky_mean());
+            assert!((0..3).all(|k| near(floor[k], least[k], 2e-3)), "floor: {floor:?} {least:?}");
             for (i, (got, want)) in cells.iter().zip(&want_cells).enumerate() {
                 assert!((0..3).all(|k| near(got[k], want[k], 1e-3)), "cell {i}: {got:?} {want:?}");
             }
@@ -999,8 +1162,9 @@ mod tests {
             slow = reference::mean(&want_cells, slow, given.follow, given.jump, given.dt);
             assert!((0..4).all(|k| near(mean[k], slow[k], 1e-3)) && mean[3] > 0.0, "{mean:?} {slow:?}");
             if !depth {
-                // The slow mean alone, everywhere.
-                let flat = reference::pack([0, 1, 2].map(|k| slow[k] * given.level));
+                // The slow mean alone, everywhere, or the floor where that
+                // is more.
+                let flat = reference::pack([0, 1, 2].map(|k| (slow[k] * given.level).max(least[k])));
                 let odd = written.iter().filter(|&&w| !close(reference::unpack(w), reference::unpack(flat))).count();
                 assert_eq!(odd, 0, "texels that are not the slow mean");
                 continue;
@@ -1022,7 +1186,7 @@ mod tests {
             let mut odd = 0;
             for y in 0..LIGHT[1] {
                 for x in 0..LIGHT[0] {
-                    let want = scene.raise([x as i32, y as i32], &want_points, slow, &given, reference::unpack(reference::pack(was)));
+                    let want = scene.raise_over([x as i32, y as i32], &want_points, slow, &given, reference::unpack(reference::pack(was)), least);
                     let got = reference::unpack(written[(y * LIGHT[0] + x) as usize]);
                     if !close(got, reference::unpack(reference::pack(want))) {
                         odd += 1;
@@ -1047,7 +1211,7 @@ mod tests {
         };
         let pass = make(host).expect("the passes");
         // The light around, as a keeping and a raising leave it.
-        let (_, mean, _, points, _) = run(host, &pass, &BASE, [0.0; 3], true);
+        let (_, mean, _, points, _, _) = run(host, &pass, &BASE, [0.0; 3], true);
         let size = [40u32, 24, 6];
         let scattered_at = |x: u32, y: u32, z: u32| -> V3 {
             match (x + y + z) % 3 {
@@ -1149,7 +1313,7 @@ mod tests {
             return;
         };
         let pass = make(host).expect("the passes");
-        let (_, mean, _, points, _) = run(host, &pass, &BASE, [0.0; 3], true);
+        let (_, mean, _, points, _, _) = run(host, &pass, &BASE, [0.0; 3], true);
         // A reflection image of another size than the light's.
         let size = [96u32, 54];
         let there_at = |x: u32, y: u32| -> V3 {

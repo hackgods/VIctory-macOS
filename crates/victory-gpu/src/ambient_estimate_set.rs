@@ -69,6 +69,50 @@ pub(crate) fn mix(value: Option<&str>) -> [f32; 4] {
     mix
 }
 
+/// What `VICTORY_AMBIENT_FLOOR` is when unset.
+pub(crate) const FLOOR: f32 = 0.3;
+
+/// `VICTORY_AMBIENT_FLOOR=<share>`: the least any texel gets, as a share of
+/// the constant stand-in's light (`crate::ambient`: by default the light
+/// that follows the sky dome, `gain * mean^power + least`). The share cuts
+/// the sky's part; the formula's least level, the night's, is kept whole.
+/// 0: no floor, the estimate alone, as in the fork. 1: never darker than
+/// the constant stand-in.
+///
+/// Where little light is on screen the estimate has nothing to spread: a
+/// room lit only by its own bounce (the windows off screen, no lamp, no sun
+/// patch) settles at black, since each frame's light is the walls' colour
+/// times the last frame's, and a night street stays black where the
+/// constant shows the asphalt (the opening, run 21:38:20 of 26 November:
+/// 0.0002 to 0.03 written where the constant's least is 0.05). The fork has
+/// the title's own resolve under the estimate there; on this line that
+/// leaves nothing. The floor is the light from what is not on screen.
+pub(crate) fn floor(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|s: &f32| s.is_finite() && *s >= 0.0)
+        .unwrap_or(FLOOR)
+}
+
+/// What the floor is made of, as the passes are given it
+/// ([`Pass::sky`], [`Pass::floor`]): `share` of the constant stand-in's
+/// light, which is `level` times `tint`, or with `follow` (gain, least,
+/// power) and the sky dome drawn (`dome`) follows the dome's mean.
+pub(crate) fn floor_of(
+    share: f32,
+    level: f32,
+    tint: [f32; 3],
+    follow: Option<[f32; 3]>,
+    dome: bool,
+) -> ([f32; 3], [f32; 3]) {
+    match follow.filter(|_| dome && share > 0.0) {
+        // The sky's part cut to the share, the least level whole.
+        Some([gain, least, power]) => ([gain * share, least, power], [0.0; 3]),
+        // The constant light (also until the dome is drawn).
+        None => ([0.0, 0.0, 1.0], tint.map(|t| t * level * share)),
+    }
+}
+
 /// The program that keeps the light visible surfaces send out, for the
 /// title's own screen traces, by the start of its name, and where it writes
 /// it (R11G11B10_FLOAT, half the picture's size): root parameter and place
@@ -134,9 +178,13 @@ pub(crate) const CELLS: u32 = CX * CY;
 pub(crate) const PX: u32 = 160;
 pub(crate) const PY: u32 = 90;
 
-/// Bytes of the cells' buffer (their light, the slow mean, their places)
+/// Bytes of the cells' buffer (their light, the slow mean, their places,
+/// the floor's light)
 /// and of the points' (three `float4` a point).
-pub(crate) const CELL_BYTES: u64 = (2 * CELLS as u64 + 1) * 16;
+pub(crate) const CELL_BYTES: u64 = (2 * CELLS as u64 + 2) * 16;
+/// Where the floor's light is among the cells' `float4`s (after the cells'
+/// light, the slow mean and the cells' places).
+pub(crate) const FLOOR_AT: u32 = 2 * CELLS + 1;
 pub(crate) const POINT_BYTES: u64 = PX as u64 * PY as u64 * 48;
 
 /// The share of the way the slow mean goes at every keeping, while it does
@@ -226,16 +274,20 @@ pub(crate) const SOURCE: &str = r#"
 #define CELLS 2304
 #define PX 160
 #define PY 90
+#define FLOOR_AT (2 * CELLS + 1)
 cbuffer Set : register(b0) {
     float level; float strength; float radius; float near_z;
     float tan_y; float follow; float most; uint width;
     uint height; uint flat; float air; uint slices;
     float jump; float fresh; float dt; float held;
     float mean_part; float turn; float least_part; float most_part;
+    float sky_gain; float sky_least; float sky_power; float floor_r;
+    float floor_g; float floor_b; uint sky_width; uint sky_height;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
-// CELLS + 1 on where they are. Read through the structured view, written
-// through the raw one (the same buffer).
+// CELLS + 1 on where they are, and at FLOOR_AT the least light any texel
+// gets. Read through the structured view, written through the raw one (the
+// same buffer).
 RWStructuredBuffer<float4> cells : register(u1);
 RWByteAddressBuffer cells_out : register(u2);
 // Three a point: red, green and blue, each a direction and a mean.
@@ -290,6 +342,7 @@ void main(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef MEAN
+Texture2DArray<float4> sky : register(t1);
 [numthreads(1, 1, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
     float3 sum = 0.0;
@@ -308,6 +361,29 @@ void main(uint3 at : SV_DispatchThreadID) {
         mean = lerp(was.rgb, mean, follow);
     }
     cells_out.Store4(CELLS * 16, asuint(float4(mean, age)));
+    // The floor: the least any texel gets, the light from what is not on
+    // screen. A share of the constant stand-in's light: of its level and
+    // colour, or (gain above 0) of the light that follows the sky dome, as
+    // `crate::ambient_set::SOURCE` works it out.
+    float3 least_light = float3(floor_r, floor_g, floor_b);
+    if (sky_gain > 0.0) {
+        float3 all = 0.0;
+        const int N = 8;
+        for (int y = 0; y < N; y++)
+            for (int x = 0; x < N; x++) {
+                // The sun's own texels are held down: it lights by itself.
+                float3 there = sky.Load(int4((x * 2 + 1) * sky_width / (N * 2), (y * 2 + 1) * sky_height / (N * 2), 0, 0)).rgb;
+                all += clamp(there, 0.0, 8.0);
+            }
+        float3 dome = all / (N * N);
+        float m = luma(dome);
+        // The sky's colour, half washed out; a dark sky has none worth
+        // following.
+        const float3 NIGHT = float3(0.6, 0.75, 1.0);
+        float3 hue = lerp(NIGHT, lerp(float3(1.0, 1.0, 1.0), dome / max(m, 1e-6), 0.5), saturate(m / 0.05));
+        least_light = hue * (sky_gain * pow(max(m, 0.0), sky_power) + sky_least);
+    }
+    cells_out.Store4(FLOOR_AT * 16, asuint(float4(least_light, 1.0)));
 }
 #endif
 
@@ -362,6 +438,8 @@ void main(uint3 at : SV_DispatchThreadID) {
     float4 around = cells[CELLS];
     // Without the scene's depth: the slow mean alone.
     float3 found = around.rgb * level;
+    // How open the texel is (1 without depth).
+    float open = 1.0;
     if (flat == 0) {
         float3 c = seen(p, size);
         float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
@@ -371,7 +449,6 @@ void main(uint3 at : SV_DispatchThreadID) {
         float3 n = normalize(cross(dy, dx) + float3(0.0, 0.0, -1e-9));
         if (dot(n, c) > 0.0) n = -n;
         // How open it is (as in beloooo's cd9f78ce).
-        float open = 1.0;
         float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
         float noise = frac(52.9829189 * frac(dot((float2)p, float2(0.06711056, 0.00583715))));
         if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
@@ -411,6 +488,8 @@ void main(uint3 at : SV_DispatchThreadID) {
         lit = clamp(lit, least_part * all, most_part * all);
         found = lerp(lit, around.rgb, mean_part) * level * open;
     }
+    // No less than the floor, shaded as the estimate is.
+    found = max(found, cells[FLOOR_AT].rgb * open);
     // What the program left counts as far as it can be true (`most` times
     // the estimate; 0: not at all): the sky's light outdoors, not the
     // blocks of other memory. For `fresh` seconds after the light around
@@ -441,7 +520,7 @@ void main(uint3 at : SV_DispatchThreadID) {
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float away = (float)at.z / (float)slices;
-    float cap = air * lerp(luma(cells[CELLS].rgb), luma(seen_there), away);
+    float cap = air * max(lerp(luma(cells[CELLS].rgb), luma(seen_there), away), luma(cells[FLOOR_AT].rgb));
     float3 c = scattered[at];
     float has = luma(c);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -458,7 +537,7 @@ void main(uint3 at : SV_DispatchThreadID) {
     uint2 q = min((uint2)(((float2)at.xy + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float cap = luma(lerp(seen_there, cells[CELLS].rgb, mean_part)) * level * held;
+    float cap = max(luma(lerp(seen_there, cells[CELLS].rgb, mean_part)) * level, luma(cells[FLOOR_AT].rgb)) * held;
     float3 there = unpack(light[at.xy]);
     float has = luma(there);
     if (has > cap) light[at.xy] = pack(there * (cap / has));
@@ -516,10 +595,16 @@ pub(crate) struct Pass {
     pub(crate) held: f32,
     /// [`mix`]: the slow mean's part, the turn, the least and the most.
     pub(crate) mix: [f32; 4],
+    /// The floor ([`floor_of`]): gain (0: `floor` is the floor's light),
+    /// least level and power of its sky part; its light without one; and
+    /// the size of the sky dome's image.
+    pub(crate) sky: [f32; 3],
+    pub(crate) floor: [f32; 3],
+    pub(crate) sky_size: [u32; 2],
 }
 
 /// Dwords of the passes' constant buffer.
-pub(crate) const CONSTANTS: usize = 20;
+pub(crate) const CONSTANTS: usize = 28;
 
 /// A pass's root constants, in the order the constant buffer declares them
 /// (all scalars, so four to a row whatever the compiler's packing).
@@ -532,7 +617,10 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
     }
     out[7..12].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat), p.air.to_bits(), p.slices]);
     out[12..16].copy_from_slice(&[p.jump, p.fresh, p.dt, p.held].map(f32::to_bits));
-    out[16..].copy_from_slice(&p.mix.map(f32::to_bits));
+    out[16..20].copy_from_slice(&p.mix.map(f32::to_bits));
+    out[20..23].copy_from_slice(&p.sky.map(f32::to_bits));
+    out[23..26].copy_from_slice(&p.floor.map(f32::to_bits));
+    out[26..].copy_from_slice(&p.sky_size);
     out
 }
 
@@ -545,7 +633,16 @@ pub(crate) fn start_line(
     settle: Option<Settle>,
     held: f32,
     mix: [f32; 4],
+    floor: f32,
 ) -> String {
+    let floored = if floor > 0.0 {
+        format!(
+            "no texel gets less than the floor, {floor} of the constant stand-in's light \
+             (VICTORY_AMBIENT_FLOOR)"
+        )
+    } else {
+        "no floor under it".to_owned()
+    };
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
     let left = if most > 0.0 {
         format!("what the title's resolve left counts up to {most} times it")
@@ -573,7 +670,7 @@ pub(crate) fn start_line(
         "VICTORY_AMBIENT=estimate: the screen probes' indirect diffuse light is replaced by an \
          estimate from the light visible surfaces send out ({share} of it; {CX}x{CY} cells, \
          {PX}x{PY} points; a texel is {} the slow mean, turned {} by its normal, between {} and {} \
-         times the mean around it), {shaded}; {left}; {reflections}; {air}; {settles}",
+         times the mean around it), {shaded}; {floored}; {left}; {reflections}; {air}; {settles}",
         mix[0], mix[1], mix[2], mix[3]
     )
 }
@@ -582,32 +679,60 @@ fn luminance(c: [f32; 3]) -> f32 {
     c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722
 }
 
-/// The mean, the least and the most luminance of the points' light (each
-/// point's red, green and blue means), leaving out what is not a number.
-pub(crate) fn over_the_picture(points: impl Iterator<Item = [f32; 3]>) -> [f32; 3] {
+/// What the buffers show of the estimate, for the frame line.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Seen {
+    /// The slow mean of the light around.
+    pub(crate) mean: [f32; 3],
+    /// The floor's light.
+    pub(crate) floor: [f32; 3],
+    /// The points' luminance: mean, least and most.
+    pub(crate) points: [f32; 3],
+    /// The mean luminance written (each point's share of the estimate, or
+    /// the floor where that is more), and the part of the points under the
+    /// floor.
+    pub(crate) written: f32,
+    pub(crate) under: f32,
+}
+
+/// What the points' light (each point's red, green and blue means) comes
+/// to with the estimate's `share` over a floor of luminance `floor`: the
+/// mean, the least and the most luminance of the points, the mean
+/// luminance written and the part of the points under the floor. Points
+/// that are not a number are left out.
+pub(crate) fn over_the_picture(points: impl Iterator<Item = [f32; 3]>, share: f32, floor: f32) -> ([f32; 3], f32, f32) {
     let (mut sum, mut least, mut most, mut n) = (0.0f64, f32::INFINITY, 0.0f32, 0u32);
+    let (mut written, mut under) = (0.0f64, 0u32);
     for l in points.map(luminance).filter(|l| l.is_finite()) {
         sum += f64::from(l);
         least = least.min(l);
         most = most.max(l);
+        written += f64::from((l * share).max(floor));
+        under += u32::from(l * share < floor);
         n += 1;
     }
-    if n == 0 { [0.0; 3] } else { [(sum / f64::from(n)) as f32, least, most] }
+    if n == 0 {
+        return ([0.0; 3], 0.0, 0.0);
+    }
+    let per = |v: f64| (v / f64::from(n)) as f32;
+    ([per(sum), least, most], per(written), per(f64::from(under)))
 }
 
-/// The line logged with the frame line: the slow mean of the light around
-/// and the points' luminance (`seen`; `None`: nothing kept yet), and the
-/// keepings and raisings recorded a frame.
-pub(crate) fn frame_line(share: f32, seen: Option<([f32; 3], [f32; 3])>, per_frame: [f64; 4]) -> String {
+/// The line logged with the frame line: the slow mean of the light around,
+/// the floor and the points' luminance (`seen`; `None`: nothing kept yet),
+/// and the keepings and raisings recorded a frame.
+pub(crate) fn frame_line(share: f32, floor: f32, seen: Option<Seen>, per_frame: [f64; 4]) -> String {
     let [keeps, raises, airs, holds] = per_frame;
     let what = match seen {
-        Some(([r, g, b], [mean, least, most])) => format!(
+        Some(Seen { mean: [r, g, b], floor: least_light, points: [mean, least, most], written, under }) => format!(
             "the light around (slow mean) is {r:.4} {g:.4} {b:.4}, luminance {:.4}; the picture's \
              {PX}x{PY} points hold a luminance of {mean:.4} on average (least {least:.4}, most \
-             {most:.4}); texels are written about {:.4}, the share {share} of it (the constant \
-             stand-in writes its level)",
+             {most:.4}); the floor (VICTORY_AMBIENT_FLOOR={floor}) is {:.4}, and {:.0}% of the points \
+             are under it; texels are written about {written:.4} (the share {share} of the \
+             estimate, or the floor; the constant stand-in writes its level)",
             luminance([r, g, b]),
-            mean * share,
+            luminance(least_light),
+            under * 100.0,
         ),
         None => format!(
             "nothing kept yet: no dispatch of {} seen, the title's own light stays",
@@ -761,12 +886,29 @@ pub(crate) mod reference {
         /// The `RAISE` pass at texel `p`: the light written there, before
         /// it is packed. `was` is what the title's resolve left.
         pub(crate) fn raise(&self, p: [i32; 2], points: &[[V4; 3]], around: V4, set: &super::Pass, was: V3) -> V3 {
+            self.raise_over(p, points, around, set, was, [0.0; 3])
+        }
+
+        /// [`Scene::raise`] over the floor's light `least`
+        /// ([`floor_light`]): no texel gets less, shaded as the estimate
+        /// is.
+        pub(crate) fn raise_over(
+            &self,
+            p: [i32; 2],
+            points: &[[V4; 3]],
+            around: V4,
+            set: &super::Pass,
+            was: V3,
+            least: V3,
+        ) -> V3 {
             let age = around[3];
             let around = [around[0], around[1], around[2]];
             let mut found = around.map(|v| v * set.level);
+            let mut open = 1.0;
             if !set.flat {
                 let c = self.seen(p);
-                let (n, open) = self.surface(p, set.shade[0], set.shade[1]);
+                let n;
+                (n, open) = self.surface(p, set.shade[0], set.shade[1]);
                 let noise = noise(p);
                 let g = [0, 1].map(|k| {
                     (p[k] as f32 + 0.5) / self.size[k] as f32 * [PX, PY][k] as f32 - 0.5 + (noise - 0.5) * 0.5
@@ -801,6 +943,7 @@ pub(crate) mod reference {
                     *found = (lit + (around[k] - lit) * mean_part) * set.level * open;
                 }
             }
+            let found = [0, 1, 2].map(|k| found[k].max(least[k] * open));
             if set.most <= 0.0 {
                 return found;
             }
@@ -871,8 +1014,14 @@ pub(crate) mod reference {
     /// (the slow mean `around` near the eye, the light of the point seen in
     /// that direction, `seen_there`, far away).
     pub(crate) fn bound_air(c: V3, air: f32, around: V3, seen_there: V3, away: f32) -> V3 {
+        bound_air_over(c, air, around, seen_there, away, [0.0; 3])
+    }
+
+    /// [`bound_air`] with the floor's light `least` counted as light
+    /// around.
+    pub(crate) fn bound_air_over(c: V3, air: f32, around: V3, seen_there: V3, away: f32, least: V3) -> V3 {
         let (near, far) = (luma(around), luma(seen_there));
-        let cap = air * (near + (far - near) * away);
+        let cap = air * (near + (far - near) * away).max(luma(least));
         let has = luma(c);
         if has > cap { c.map(|v| v * (cap / has)) } else { c }
     }
@@ -881,10 +1030,36 @@ pub(crate) mod reference {
     /// the light around the point seen there (`seen_there`, a fifth of it
     /// the slow mean `around`), `level` being the estimate's share.
     pub(crate) fn hold(there: V3, set: &super::Pass, around: V3, seen_there: V3) -> V3 {
+        hold_over(there, set, around, seen_there, [0.0; 3])
+    }
+
+    /// [`hold`] with the floor's light `least` counted as light around.
+    pub(crate) fn hold_over(there: V3, set: &super::Pass, around: V3, seen_there: V3, least: V3) -> V3 {
         let light = [0, 1, 2].map(|k| seen_there[k] + (around[k] - seen_there[k]) * set.mix[0]);
-        let cap = luma(light) * set.level * set.held;
+        let cap = (luma(light) * set.level).max(luma(least)) * set.held;
         let has = luma(there);
         if has > cap { there.map(|v| v * (cap / has)) } else { there }
+    }
+
+    /// The light that follows the sky dome, as the `MEAN` pass (and
+    /// `crate::ambient_set::SOURCE`) works it out from the dome's mean
+    /// `dome`, with gain, least level and power `follow`.
+    pub(crate) fn sky_light(dome: V3, follow: [f32; 3]) -> V3 {
+        let [gain, least, power] = follow;
+        let m = luma(dome);
+        let night = [0.6, 0.75, 1.0];
+        let t = (m / 0.05).clamp(0.0, 1.0);
+        let level = gain * m.max(0.0).powf(power) + least;
+        [0, 1, 2].map(|k| {
+            let washed = 1.0 + (dome[k] / m.max(1e-6) - 1.0) * 0.5;
+            (night[k] + (washed - night[k]) * t) * level
+        })
+    }
+
+    /// The floor's light a pass with `set` writes: its constant light, or
+    /// with a sky part the light that follows a dome of mean `dome`.
+    pub(crate) fn floor_light(set: &super::Pass, dome: V3) -> V3 {
+        if set.sky[0] > 0.0 { sky_light(dome, set.sky) } else { set.floor }
     }
 
     /// R9G9B9E5 as the shader packs it.
@@ -987,6 +1162,90 @@ mod tests {
         assert_eq!(mix(Some("3,-1,5,nan")), [1.0, 1.2, 5.0, 5.0]);
     }
 
+    /// The floor: a share of the constant stand-in's light, by default 0.3,
+    /// its sky part cut to the share and the least level whole.
+    #[test]
+    fn the_floor_is_a_share_of_the_constant_light() {
+        assert_eq!(floor(None), 0.3);
+        assert_eq!(floor(Some("x")), 0.3);
+        assert_eq!(floor(Some("-1")), 0.3);
+        assert_eq!(floor(Some(" 0 ")), 0.0);
+        assert_eq!(floor(Some("1")), 1.0);
+        let (tint, follow) = ([1.0, 0.98, 0.94], Some([0.36, 0.05, 0.4]));
+        // Following the dome: the gain cut, the least and the power kept.
+        assert_eq!(floor_of(0.5, 0.6, tint, follow, true), ([0.18, 0.05, 0.4], [0.0; 3]));
+        // Until the dome is drawn, and with the sky not followed: the
+        // constant level and colour.
+        let constant = ([0.0, 0.0, 1.0], [0.3, 0.6 * 0.98 * 0.5, 0.6 * 0.94 * 0.5]);
+        assert_eq!(floor_of(0.5, 0.6, tint, follow, false), constant);
+        assert_eq!(floor_of(0.5, 0.6, tint, None, true), constant);
+        // No floor: nothing, whatever the sky.
+        assert_eq!(floor_of(0.0, 0.6, tint, follow, true), ([0.0, 0.0, 1.0], [0.0; 3]));
+        use super::reference::{floor_light, sky_light};
+        // At night the sky's part is next to nothing and the least level
+        // stays: 0.05 and a little, bluish.
+        let night = sky_light([0.001; 3], [0.36 * 0.3, 0.05, 0.4]);
+        assert!(luma(night) > 0.04 && luma(night) < 0.06 && night[2] > night[0], "{night:?}");
+        // The constant stand-in's own night light: a level of 0.07, bluish.
+        assert!(near(luma(sky_light([0.001; 3], [0.36, 0.05, 0.4])), 0.054, 0.03));
+        // By day: the share of the sky's part plus the least, in the sky's
+        // colour half washed out.
+        let day = sky_light([4.0, 5.0, 8.0], [0.36 * 0.3, 0.05, 0.4]);
+        let m = luma([4.0, 5.0, 8.0]);
+        assert!(near(luma(day), 0.108 * m.powf(0.4) + 0.05, 1e-4) && day[2] > day[1] && day[1] > day[0], "{day:?}");
+        let set = Pass { sky: [0.36 * 0.3, 0.05, 0.4], ..SET };
+        assert_eq!(floor_light(&set, [4.0, 5.0, 8.0]), day);
+        assert_eq!(floor_light(&Pass { floor: [0.2, 0.1, 0.05], ..SET }, [4.0, 5.0, 8.0]), [0.2, 0.1, 0.05]);
+    }
+
+    /// With a floor no texel gets less than it: a room with nothing lit on
+    /// screen is the floor (shaded in creases), a lit one is untouched, and
+    /// reflections and the air are bounded against the floor too.
+    #[test]
+    fn no_texel_gets_less_than_the_floor() {
+        let depth = wall(4.0);
+        let scene = Scene { depth: &depth, size: [640, 360], near: 0.1, tan_y: 0.45 };
+        let least = [0.25f32, 0.25, 0.3];
+        // The apartment of the opening: nearly nothing on screen.
+        let dark = vec![[0.002f32; 3]; CELLS as usize];
+        let points = scene.gather(&dark, &scene.place());
+        let got = scene.raise_over([320, 180], &points, [0.002, 0.002, 0.002, 1.0], &SET, [0.0; 3], least);
+        assert_eq!(got, least);
+        assert!(scene.raise([320, 180], &points, [0.002, 0.002, 0.002, 1.0], &SET, [0.0; 3])[0] < 0.003);
+        // The same without depth.
+        let flat = Pass { flat: true, ..SET };
+        assert_eq!(scene.raise_over([320, 180], &points, [0.002, 0.002, 0.002, 1.0], &flat, [0.0; 3], least), least);
+        // A lit room keeps its own light, each colour by itself.
+        let lit = vec![[1.0f32, 0.5, 0.1]; CELLS as usize];
+        let points = scene.gather(&lit, &scene.place());
+        let got = scene.raise_over([320, 180], &points, [1.0, 0.5, 0.1, 1.0], &SET, [0.0; 3], least);
+        assert!(near(got[0], 1.0, 1e-3) && near(got[1], 0.5, 1e-3) && near(got[2], 0.3, 1e-6), "{got:?}");
+        // What the resolve left counts against the floored light.
+        let left = Pass { most: 4.0, ..SET };
+        let dark_points = scene.gather(&dark, &scene.place());
+        let got = scene.raise_over([320, 180], &dark_points, [0.002, 0.002, 0.002, 1.0], &left, [9.0; 3], [0.25; 3]);
+        assert!(near(got[0], 1.0, 1e-3), "{got:?}");
+        // The floor is shaded in a crease as the estimate is.
+        let size = [640u32, 360];
+        let corner = move |_: u32, y: u32| {
+            let down = ((y as f32 + 0.5) / size[1] as f32 * 2.0 - 1.0) * 0.45;
+            0.1 / if down > 0.0 { (0.6 / down).min(3.0) } else { 3.0 }
+        };
+        let scene = Scene { depth: &corner, size, near: 0.1, tan_y: 0.45 };
+        let points = scene.gather(&dark, &scene.place());
+        let crease = ((0.2 / 0.45 + 1.0) / 2.0 * 360.0) as i32 + 3;
+        let (_, open) = scene.surface([320, crease], 1.0, 0.6);
+        let got = scene.raise_over([320, crease], &points, [0.002, 0.002, 0.002, 1.0], &SET, [0.0; 3], [0.25; 3]);
+        assert!(open < 0.9 && near(got[0], 0.25 * open, 1e-5), "{open} {got:?}");
+        // Reflections: held to a part of the floor where the room is dark.
+        use super::reference::{bound_air_over, hold, hold_over};
+        assert!(hold([9.0; 3], &SET, [0.002; 3], [0.002; 3])[0] < 0.002);
+        assert!(near(hold_over([9.0; 3], &SET, [0.002; 3], [0.002; 3], [0.25; 3])[0], 0.125, 1e-4));
+        assert!(near(hold_over([9.0; 3], &SET, [2.0; 3], [2.0; 3], [0.25; 3])[0], 1.0, 1e-4));
+        // The air: bounded by a multiple of the floor at least.
+        assert!(near(bound_air_over([9.0; 3], 3.0, [0.002; 3], [0.002; 3], 0.5, [0.25; 3])[0], 0.75, 1e-4));
+    }
+
     #[test]
     fn what_the_resolve_left_is_replaced_by_default() {
         assert_eq!(left(None), 0.0);
@@ -1038,19 +1297,27 @@ mod tests {
             dt: 0.3,
             held: 0.5,
             mix: [0.25, 1.0, 0.5, 2.0],
+            sky: [0.108, 0.05, 0.4],
+            floor: [0.18, 0.17, 0.16],
+            sky_size: [128, 64],
         };
         let c = constants(&p);
         let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
         assert_eq!(floats, [0.8, 1.0, 0.6, 0.1, 0.45, 0.04, 4.0]);
         assert_eq!(c[7..12], [2560, 1440, 1, 3.0f32.to_bits(), 64]);
         assert_eq!(
-            c[12..].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
+            c[12..20].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
             [3.0, 1.5, 0.3, 0.5, 0.25, 1.0, 0.5, 2.0]
         );
+        assert_eq!(
+            c[20..26].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
+            [0.108, 0.05, 0.4, 0.18, 0.17, 0.16]
+        );
+        assert_eq!(c[26..], [128, 64]);
         let declared = declared(SOURCE);
         assert_eq!(
             declared,
-            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held", "mean_part", "turn", "least_part", "most_part"]
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held", "mean_part", "turn", "least_part", "most_part", "sky_gain", "sky_least", "sky_power", "floor_r", "floor_g", "floor_b", "sky_width", "sky_height"]
         );
         assert_eq!(declared.len(), CONSTANTS);
     }
@@ -1093,18 +1360,21 @@ mod tests {
             assert_eq!(body.contains("seen("), source.contains("#define SEES\n"), "{pass}");
             assert_eq!(body.contains("pack("), source.contains("#define PACKS\n"), "{pass}");
         }
-        assert_eq!((CELLS, CELL_BYTES, POINT_BYTES), (2304, 73_744, 691_200));
+        assert_eq!((CELLS, CELL_BYTES, POINT_BYTES, FLOOR_AT), (2304, 73_760, 691_200, 4609));
+        assert!(SOURCE.contains("#define FLOOR_AT (2 * CELLS + 1)\n"));
         assert!(SOURCE.contains("#define CELLS 2304\n") && SOURCE.contains("#define PX 160\n"));
     }
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0, None, 0.5, MIX);
+        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0, None, 0.5, MIX, 0.3);
+        assert!(line.contains("shaded from depth; no texel gets less than the floor, 0.3 of the constant stand-in's light (VICTORY_AMBIENT_FLOOR); what the title's"), "{line}");
         assert!(line.starts_with("VICTORY_AMBIENT=estimate: "), "{line}");
         assert!(line.contains("(1 of it; 64x36 cells, 160x90 points; a texel is 0.2 the slow mean, turned 1.2 by its normal, between 0.2 and 2.5 times the mean around it), shaded from depth"), "{line}");
         assert!(line.contains("what the title's resolve left is replaced; reflections held to 0.5 of the light around; what the air scatters is left alone; "), "{line}");
         assert!(line.ends_with("the mean of the light around goes 0.04 of the way a frame"), "{line}");
-        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0, settle(Some("250,3")), 0.0, MIX);
+        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0, settle(Some("250,3")), 0.0, MIX, 0.0);
+        assert!(line.contains("not shaded; no floor under it; "), "{line}");
         assert!(line.contains("(0.5 of it;") && line.contains("not shaded"), "{line}");
         assert!(line.contains("counts up to 4 times it; reflections left alone; "), "{line}");
         assert!(line.contains("the air scatters no more than 3 times the light around (VICTORY_AMBIENT_AIR); "), "{line}");
@@ -1113,18 +1383,21 @@ mod tests {
 
     #[test]
     fn the_frame_line_says_what_the_estimate_is() {
-        let line = frame_line(0.5, Some(([0.2, 0.1, 0.05], [0.3, 0.01, 2.0])), [1.0, 2.0, 0.0, 1.0]);
+        let seen = Seen { mean: [0.2, 0.1, 0.05], floor: [0.25; 3], points: [0.3, 0.01, 2.0], written: 0.31, under: 0.6 };
+        let line = frame_line(0.5, 0.3, Some(seen), [1.0, 2.0, 0.0, 1.0]);
         assert!(line.starts_with("ambient estimate (VICTORY_AMBIENT=estimate): the light around (slow mean) is 0.2000 0.1000 0.0500, luminance 0.1177;"), "{line}");
         assert!(line.contains("160x90 points hold a luminance of 0.3000 on average (least 0.0100, most 2.0000)"), "{line}");
-        assert!(line.contains("texels are written about 0.1500, the share 0.5 of it"), "{line}");
+        assert!(line.contains("the floor (VICTORY_AMBIENT_FLOOR=0.3) is 0.2500, and 60% of the points are under it; texels are written about 0.3100 (the share 0.5 of the estimate, or the floor;"), "{line}");
         assert!(line.ends_with("; 1.0 keepings, 2.0 raisings, 1.0 holds of reflections and 0.0 bounds of the air/frame"), "{line}");
-        let line = frame_line(1.0, None, [0.0; 4]);
+        let line = frame_line(1.0, 0.3, None, [0.0; 4]);
         assert!(line.contains("nothing kept yet: no dispatch of CS_CacheScreenSpaceRadiance seen"), "{line}");
-        // The points' luminance: mean, least and most, without what is no number.
+        // The points' luminance: mean, least and most, without what is no
+        // number; what is written is the share of each or the floor.
         let points = [[1.0f32; 3], [3.0; 3], [f32::NAN, 0.0, 0.0], [2.0; 3]];
-        let [mean, least, most] = over_the_picture(points.into_iter());
+        let ([mean, least, most], written, under) = over_the_picture(points.into_iter(), 0.5, 0.75);
         assert!(near(mean, 2.0, 1e-5) && near(least, 1.0, 1e-5) && near(most, 3.0, 1e-5));
-        assert_eq!(over_the_picture(std::iter::empty()), [0.0; 3]);
+        assert!(near(written, (0.75 + 1.5 + 1.0) / 3.0, 1e-5) && near(under, 1.0 / 3.0, 1e-5), "{written} {under}");
+        assert_eq!(over_the_picture(std::iter::empty(), 1.0, 0.0), ([0.0; 3], 0.0, 0.0));
     }
 
     fn near(a: f32, b: f32, part: f32) -> bool {
@@ -1234,6 +1507,9 @@ mod tests {
         dt: 0.0,
         held: 0.5,
         mix: MIX,
+        sky: [0.0, 0.0, 1.0],
+        floor: [0.0; 3],
+        sky_size: [0, 0],
     };
 
     /// Texels are placed by their depth: the picture's middle straight

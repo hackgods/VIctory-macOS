@@ -74,7 +74,7 @@ const WAITING: u32 = 0x076d_5098;
 /// entries in use at +0x10, in the upper half of the free list's head at
 /// +0x20 a count of the entries ever freed, and at +0x28 a dword per entry
 /// whose low 17 bits are all set while the entry is in use.
-const BUILDINGS: u32 = 0x0a9e_c938;
+pub(crate) const BUILDINGS: u32 = 0x0a9e_c938;
 const OBJECTS: u32 = 0x0abb_e2e8;
 /// The pool of interiors (0x150 bytes each): the 14 wanted levels at +0xb2,
 /// the state at +0xc1.
@@ -85,9 +85,9 @@ const MODULES: usize = 14;
 /// number of slots at +0x44 (a guess), a bit per slot in use at +0x60. A
 /// slot starts with the pointer to its loaded contents, which has its
 /// entities' pointers at +0x8 and their number at +0x10.
-const STORE: u32 = 0x0a02_4230;
+pub(crate) const STORE: u32 = 0x0a02_4230;
 /// Pointer to the entity the interiors' distance check measures from.
-const FOCUS: u32 = 0x0ab5_6e38;
+pub(crate) const FOCUS: u32 = 0x0ab5_6e38;
 /// The streaming engine (pointer): 503 buckets of 0xa0 bytes; a bucket's
 /// records (28 bytes, the object's number in the low 28 bits of the first
 /// dword) are counted at +0x24 and start at the pointer at +0x28, both
@@ -102,7 +102,7 @@ const FAR: f32 = 3000.0;
 const GROUPS: usize = 6;
 /// An entity's position, and the side of the squares the title counts in
 /// the position's fourth dword.
-const POSITION: usize = 0x70;
+pub(crate) const POSITION: usize = 0x70;
 const SECTOR: f32 = 32.0;
 /// The side of a square of the log's lines, and the map's reach: a
 /// position further out than this is not one.
@@ -136,7 +136,7 @@ fn pool_from(header: &[u8; 0x28]) -> Pool {
 
 /// The x and y of the map, in metres, of an entity's 16 position bytes;
 /// `None` if they are not a place on the map.
-fn place_of(position: &[u8; 16]) -> Option<(f32, f32)> {
+pub(crate) fn place_of(position: &[u8; 16]) -> Option<(f32, f32)> {
     let float = |at: usize| f32::from_le_bytes(position[at..at + 4].try_into().unwrap());
     let word = |at: usize| f32::from(i16::from_le_bytes(position[at..at + 2].try_into().unwrap()));
     let (x, y) = (float(0) + SECTOR * word(12), float(4) + SECTOR * word(14));
@@ -326,7 +326,7 @@ fn known(base: u64) -> bool {
 /// runs of readable pages) are kept until [`Reader::forget`].
 #[cfg(windows)]
 #[derive(Default)]
-struct Reader {
+pub(crate) struct Reader {
     /// Runs of committed, readable pages, `start..end`.
     runs: [(usize, usize); 16],
     next: usize,
@@ -335,7 +335,7 @@ struct Reader {
 #[cfg(windows)]
 impl Reader {
     /// Forgets the answers: the title maps and unmaps memory as it runs.
-    fn forget(&mut self) {
+    pub(crate) fn forget(&mut self) {
         *self = Self::default();
     }
 
@@ -362,7 +362,7 @@ impl Reader {
         ok
     }
 
-    fn bytes<const N: usize>(&mut self, address: usize) -> Option<[u8; N]> {
+    pub(crate) fn bytes<const N: usize>(&mut self, address: usize) -> Option<[u8; N]> {
         if address == 0 || !self.readable(address) || !self.readable(address + N - 1) {
             return None;
         }
@@ -371,16 +371,16 @@ impl Reader {
         Some(unsafe { std::ptr::read_volatile(address as *const [u8; N]) })
     }
 
-    fn pointer(&mut self, address: usize) -> Option<usize> {
+    pub(crate) fn pointer(&mut self, address: usize) -> Option<usize> {
         self.bytes::<8>(address).map(usize::from_le_bytes)
     }
 
-    fn pool(&mut self, at: usize) -> Option<Pool> {
+    pub(crate) fn pool(&mut self, at: usize) -> Option<Pool> {
         let header = self.pointer(at)?;
         self.bytes::<0x28>(header).map(|h| pool_from(&h))
     }
 
-    fn dword(&mut self, address: usize) -> Option<u32> {
+    pub(crate) fn dword(&mut self, address: usize) -> Option<u32> {
         self.bytes::<4>(address).map(u32::from_le_bytes)
     }
 

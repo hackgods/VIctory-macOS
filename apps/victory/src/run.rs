@@ -154,6 +154,17 @@ pub fn run(
             Err(why) => println!("lookup guard   not applied: {why}"),
         }
     }
+    // macOS port: map pieces nobody asks for any more are put out when the
+    // title's pool of buildings fills up (victory_loader::map_evict); off
+    // unless asked for.
+    if victory_loader::map_evict::wanted(std::env::var(victory_loader::map_evict::SWITCH).ok().as_deref()) {
+        match victory_loader::map_evict::patch(image.base() as u64) {
+            Ok(()) => println!(
+                "map evict      on: pieces let go of, 1.5 km from the player for 10 s, go while the building pool is half full"
+            ),
+            Err(why) => println!("map evict      not applied: {why}"),
+        }
+    }
     // macOS port: on a Series S the title's upscaler choice returns its own
     // upscaler (type 6), not FSR 4, whose passes show nothing here
     // (victory_loader::upscaler_patch); `VICTORY_UPSCALER_PATCH=0` leaves it.

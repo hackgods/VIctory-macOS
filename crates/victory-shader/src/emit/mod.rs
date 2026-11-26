@@ -698,8 +698,9 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// 4 is 3 with the rows of clip and cull distances last, 5 is 4 with the
 /// three-component rows first and the `float4` rows last, 6 is the order
 /// that is smallest by the measured rule (`mesh_size`), with elements the
-/// pixel shader reads with a gap declared as their read parts, 7 is 6 with
-/// the clip distances of a pair still over Metal's limit passed as an
+/// pixel shader reads with a gap declared as their read parts, 8 is 6 with
+/// clip distances that never clip left out (`lower::idle_clip`, exact), 7 is
+/// 8 with the clip distances of a pair still over Metal's limit passed as an
 /// ordinary element that the pixel shader discards by (not exact:
 /// `lower::mesh`, `Lower::soft_clip`); then the size is not checked here
 /// (the caller logs what was made, with Metal's count).
@@ -769,7 +770,24 @@ pub fn translate_linked(
             }
             _ => None,
         };
-        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge >= 4, merge == 5, merge >= 6, soft_clip);
+        // Levels 7 and 8: clip distances that never clip are left out,
+        // unless the pixel shader reads a clip distance.
+        let reads_clip = match Container::parse(&full_ps.dxil)?.part(FourCC::ISG1) {
+            Some(part) => {
+                // As `pixel_input_reads`: the system value at +12 (2: clip
+                // distance), the components read at +25.
+                let count = crate::dxbc::u32_at(part.data, 0)? as usize;
+                let base = crate::dxbc::u32_at(part.data, 4)? as usize;
+                (0..count).any(|i| {
+                    let at = base + 32 * i;
+                    crate::dxbc::u32_at(part.data, at + 12).is_ok_and(|sv| sv == 2)
+                        && part.data.get(at + 25).is_none_or(|&rw| rw != 0)
+                })
+            }
+            None => false,
+        };
+        let live_clip = if merge >= 7 && !reads_clip { lower::idle_clip(&mp.p, &mp.io, &outputs) } else { Vec::new() };
+        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge >= 4, merge == 5, merge >= 6, soft_clip, &live_clip);
     }
     let linked_ms = emit_mesh(&reads)?;
     let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
@@ -3231,7 +3249,7 @@ mod tests {
         let mut reads = pixel_input_reads(&full_ps.dxil).unwrap();
         assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1101));
         let outputs = signature(mc.part(FourCC::OSG1).unwrap().data).unwrap();
-        lower::plan_merge(&mut reads, &outputs, false, true, true, false, true, None);
+        lower::plan_merge(&mut reads, &outputs, false, true, true, false, true, None, &[]);
         let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
         let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
         let declared = |dxil: &[u8], part| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -3445,7 +3463,7 @@ mod tests {
         let outputs = signature(mc.part(FourCC::OSG1).unwrap().data).unwrap();
         let linked = |soft: bool| {
             let mut reads = pixel_input_reads(&full_ps.dxil).unwrap();
-            lower::plan_merge(&mut reads, &outputs, false, true, true, false, true, soft.then_some(0));
+            lower::plan_merge(&mut reads, &outputs, false, true, true, false, true, soft.then_some(0), &[]);
             let ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
             let ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
             (ms, ps)
@@ -3458,6 +3476,24 @@ mod tests {
         };
         let (hard_ms, hard_ps) = linked(false);
         let (soft_ms, soft_ps) = linked(true);
+        // Levels 7 and 8: the three distances the program writes as the
+        // constant 1.0 never clip, and only the first is declared.
+        let live = lower::idle_clip(&mp, &mio, &outputs);
+        assert_eq!(live, vec![(1, 0b0001)]);
+        let (trim_ms, trim_ps) = {
+            let mut reads = pixel_input_reads(&full_ps.dxil).unwrap();
+            lower::plan_merge(&mut reads, &outputs, false, true, true, false, true, None, &live);
+            let ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+            let ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+            (ms, ps)
+        };
+        let trimmed = declared(&trim_ms.dxil, FourCC::OSG1);
+        assert_eq!(
+            trimmed,
+            vec![("TEXCOORD".to_string(), 0, Some(1), 4), ("SV_ClipDistance".to_string(), 6, Some(2), 1)]
+        );
+        assert_eq!(declared(&trim_ps.dxil, FourCC::ISG1), trimmed);
+        assert_eq!(mesh_outputs(&trim_ms.dxil).unwrap().vertex_bytes, 52);
         // With the clipper: 16 bytes more than the elements' own.
         assert!(declared(&hard_ms.dxil, FourCC::OSG1).contains(&("SV_ClipDistance".to_string(), 6, Some(2), 4)));
         assert_eq!(mesh_outputs(&hard_ms.dxil).unwrap().vertex_bytes, 64);
@@ -3525,6 +3561,7 @@ mod tests {
                 };
                 let hard = picture(&hard_ms, &hard_ps);
                 let soft = picture(&soft_ms, &soft_ps);
+                assert_eq!(picture(&trim_ms, &trim_ps), hard, "{label}: one distance declared");
                 let drawn = |t: &[[f32; 4]]| -> Vec<bool> { t.iter().map(|p| *p == [1.0, 0.5, 0.5, 1.0]).collect() };
                 // The right half of each of the 16 rows, nothing else.
                 let half: Vec<bool> = (0..256).map(|i| i % 16 >= 8).collect();

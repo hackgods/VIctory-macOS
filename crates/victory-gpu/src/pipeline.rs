@@ -278,9 +278,13 @@ fn link_mesh_outputs() -> bool {
 /// or as 4 with the three-component rows first, `float4` rows last (5, a test),
 /// or in the order that is smallest by the measured rule, with components
 /// the pixel shader never reads left out of the elements around them (6),
-/// or as 6 with the clip distances of a pair still over Metal's limit
-/// passed as an ordinary element that the pixel shader discards by (7, not
-/// exact); see `victory_shader::emit::translate_linked`.
+/// or as 6 with the clip distances the mesh program writes as a constant
+/// that is not negative, which clip nothing, left out (8, exact: the last
+/// two ground pairs then fit with the clipper), or as 8 with the clip
+/// distances of a pair still over Metal's limit passed as an ordinary
+/// element that the pixel shader discards by (7, not exact, and costly
+/// where it applies: such a pixel shader loses its early depth test);
+/// see `victory_shader::emit::translate_linked`.
 #[cfg(windows)]
 pub(crate) fn merge_mesh_rows() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -292,7 +296,7 @@ pub(crate) fn merge_mesh_rows() -> u8 {
         // prison yard, runs 26 November 15:14 and 15:28). `=3` is the
         // reorder before the measured rule, `=0` off.
         let default = if crate::shader_cache::under_wine() { 6 } else { 0 };
-        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 7).unwrap_or(default)
+        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 8).unwrap_or(default)
     })
 }
 

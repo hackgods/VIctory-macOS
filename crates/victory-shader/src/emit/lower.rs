@@ -28,7 +28,7 @@ pub(crate) mod lds_order;
 mod mac;
 mod mesh;
 mod together;
-pub(crate) use mesh::{KeptOutputs, plan_merge};
+pub(crate) use mesh::{KeptOutputs, idle_clip, plan_merge};
 pub(crate) use halves::Local as HalvesLocal;
 pub(crate) use mac::Mac;
 pub(crate) use exchange::wanted as exchanges_wanted;
@@ -10935,20 +10935,28 @@ impl<'a> Lower<'a> {
                     if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
                         return Err("render-target or viewport index exports");
                     }
-                    // (Softened clip distances are still the clip distances:
-                    // `mesh::distance`.)
-                    let mut dists: Vec<usize> = (0..outputs.len())
-                        .filter(|&i| mesh::distance(&outputs[i]).is_some())
-                        .collect();
-                    dists.sort_by_key(|&i| mesh::distance(&outputs[i]));
-                    let flat: Vec<(usize, u8)> = dists
+                    // The console signature's distance channels in order,
+                    // each found in what is declared now: softened clip
+                    // distances are still the clip distances, and columns
+                    // that never clip may be gone (`mesh::distance`,
+                    // `mesh::trim_clip`).
+                    let mut dists: Vec<&SigElement> =
+                        self.x.outputs.iter().filter(|o| matches!(o.kind, 6 | 7) && o.row.is_some()).collect();
+                    dists.sort_by_key(|o| (o.kind, o.index));
+                    let flat: Vec<Option<(usize, u8)>> = dists
                         .iter()
-                        .flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c)))
+                        .flat_map(|o| (0..o.cols).map(move |c| (o.row, o.col + c)))
+                        .map(|(row, c)| {
+                            outputs
+                                .iter()
+                                .position(|o| mesh::distance(o).is_some() && o.row == row && c >= o.col && c < o.col + o.cols)
+                                .map(|id| (id, c - outputs[id].col))
+                        })
                         .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
                     let k = usize::from(n - 1) * 4 + usize::from(ch);
-                    flat.get(k).copied()
+                    flat.get(k).copied().flatten()
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),

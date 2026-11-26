@@ -53,6 +53,10 @@ const PART_NAME: &str = "VPART";
 /// the rows whose clip distances the pixel shader clips by ([`soften_clip`]);
 /// the value is the element's column mask.
 const CLIP_KEY: &str = "\u{0}soft-clip";
+/// The reserved [`KeptOutputs`] key under which a linked translation carries
+/// the columns of a row's clip distance element that can clip
+/// ([`idle_clip`], [`trim_clip`]); the value is their mask, 0 for none.
+const IDLE_KEY: &str = "\u{0}idle-clip";
 /// The semantic of clip distances passed as an ordinary element; its index
 /// is four times the row plus the element's first column.
 pub(super) const CLIP_NAME: &str = "VCLIP";
@@ -95,6 +99,12 @@ pub(super) const CLIP_NAME: &str = "VCLIP";
 /// element and the pixel shader discards where one is negative
 /// ([`soften_clip`], [`Lower::soft_clip`]). Not exact as the rest is: see
 /// there.
+///
+/// `live_clip` (from [`idle_clip`]; before the clipper is given up) names
+/// rows whose clip distance element has columns that never clip, with the
+/// mask of those that can: both stages then declare only these
+/// ([`trim_clip`]), which is exact and saves 4 bytes a distance, or the
+/// distances' 16 and the clipper's 16 where none can clip.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_merge(
     keep: &mut KeptOutputs,
@@ -105,7 +115,11 @@ pub(crate) fn plan_merge(
     xyz_first: bool,
     fitted: bool,
     soft_clip: Option<u32>,
+    live_clip: &[(u32, u8)],
 ) {
+    for &(r, mask) in live_clip {
+        keep.insert((IDLE_KEY.to_string(), r), mask);
+    }
     let mut pruned = outputs.to_vec();
     prune_signature(&mut pruned, keep);
     let arbitrary = |r: u32| pruned.iter().filter(move |e| e.kind == 0 && e.row == Some(r));
@@ -271,6 +285,7 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
         at += 1;
     }
     split_rows(elements, keep);
+    trim_clip(elements, keep);
     // The signature lists the elements that move in the order of their host
     // registers, in the places those elements had.
     let slots: Vec<usize> = (0..elements.len())
@@ -282,6 +297,103 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
         elements[i] = e;
     }
     soften_clip(elements, keep);
+}
+
+/// The clip distance elements of the mesh program's signature with a
+/// distance that never clips, as (row, mask of the columns that can clip):
+/// a distance every export writes as a constant that is not negative (a
+/// `v_mov_b32` of +0.0 or more, for every lane; the title's ground
+/// materials write three of their four so). The clipper removes what is under zero, so such a
+/// distance removes nothing. Only elements whose other columns are one run
+/// (or none) are named, and none where a row holds anything else.
+pub(crate) fn idle_clip(p: &crate::ir::Program, io: &crate::io::Io, outputs: &[SigElement]) -> Vec<(u32, u8)> {
+    use crate::io::Target;
+    use crate::gfx10::Fields;
+    // A value that is, for every lane, a constant that is not negative: one
+    // a `v_mov_b32` gives, a VGPR nothing set on entry (lowered as zero:
+    // `Lower::inputs`), or a phi of such values (itself among them).
+    fn idle(p: &crate::ir::Program, io: &crate::io::Io, v: crate::ir::Value, seen: &mut Vec<crate::ir::Value>) -> bool {
+        if seen.contains(&v) {
+            return true;
+        }
+        seen.push(v);
+        if let Some(phi) = p.blocks.iter().flat_map(|b| &b.phis).find(|f| f.value == v) {
+            return seen.len() < 64 && phi.args.iter().all(|&a| idle(p, io, a, seen));
+        }
+        if p.inputs.iter().any(|i| i.1 == v && matches!(i.0, crate::ir::Reg::V(_))) {
+            return !io.inputs.iter().any(|i| i.0 == v);
+        }
+        let inst = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v));
+        inst.is_some_and(|i| match &i.fields {
+            Fields::Valu(f) if i.name() == "v_mov_b32" && f.neg == 0 && f.abs == 0 => {
+                f.src.first().and_then(|&o| super::scalar_constant(o)).is_some_and(|bits| bits <= 0x7F80_0000)
+            }
+            _ => false,
+        })
+    }
+    let idle = |v: crate::ir::Value| idle(p, io, v, &mut Vec::new());
+    // The distance channels in the order the position exports carry them.
+    let mut dists: Vec<&SigElement> = outputs.iter().filter(|e| matches!(e.kind, 6 | 7) && e.row.is_some()).collect();
+    dists.sort_by_key(|e| (e.kind, e.index));
+    let flat: Vec<(u32, u8)> =
+        dists.iter().flat_map(|e| (0..e.cols).map(move |c| (e.row.unwrap_or(0), e.col + c))).collect();
+    let mut found = Vec::new();
+    for e in dists.iter().filter(|e| e.kind == 6) {
+        let Some(r) = e.row else { continue };
+        if outputs.iter().filter(|o| o.row == Some(r)).count() != 1 {
+            continue;
+        }
+        let mut live = 0u8;
+        for col in e.col..e.col + e.cols {
+            let Some(k) = flat.iter().position(|&at| at == (r, col)) else { continue };
+            // What writes the channel: its position export, and a
+            // parameter export of the same row.
+            let mut writes = 0;
+            let mut all_idle = true;
+            for x in &io.exports {
+                let ch = match x.target {
+                    Target::Position(n) if usize::from(n) == 1 + k / 4 => k % 4,
+                    Target::Param { row, .. } if u32::from(row) == r => usize::from(col),
+                    _ => continue,
+                };
+                if let Some(v) = x.values[ch] {
+                    writes += 1;
+                    all_idle &= idle(v);
+                }
+            }
+            if writes == 0 || !all_idle {
+                live |= 1 << col;
+            }
+        }
+        let span = ((1u8 << e.cols) - 1) << e.col;
+        let run = live == 0 || (live >> live.trailing_zeros()) & ((live >> live.trailing_zeros()) + 1) == 0;
+        if live != span && run {
+            found.push((r, live));
+        }
+    }
+    found
+}
+
+/// Declares a clip distance element [`plan_merge`] has the columns for
+/// ([`idle_clip`]) as those columns only, or not at all, in both stages.
+/// Exports to the columns left out are dropped as those to a pruned
+/// element are.
+fn trim_clip(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    elements.retain_mut(|e| {
+        let live = match (e.kind, e.row) {
+            (6, Some(r)) => keep.get(&(IDLE_KEY.to_string(), r)).copied(),
+            _ => None,
+        };
+        let Some(live) = live.map(|m| m & (((1u8 << e.cols) - 1) << e.col)) else { return true };
+        if live == 0 {
+            return false;
+        }
+        let col = live.trailing_zeros() as u8;
+        let cols = (live >> col).trailing_ones() as u8;
+        e.usage = (e.usage >> (col - e.col)) & ((1 << cols) - 1);
+        (e.col, e.cols) = (col, cols);
+        true
+    });
 }
 
 /// Declares the clip distance elements of the rows [`plan_merge`] marked for
@@ -625,7 +737,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, false, false, false, false, None);
+        plan_merge(&mut keep, &outputs, false, false, false, false, false, None, &[]);
         let mut mesh = outputs.clone();
         merge_rows(&mut mesh, &keep);
         let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -651,7 +763,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, true, false, false, false, false, None);
+        plan_merge(&mut keep, &outputs, true, false, false, false, false, None, &[]);
         let mut wide = outputs.clone();
         merge_rows(&mut wide, &keep);
         assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
@@ -673,7 +785,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, true, false, false, false, None);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false, None, &[]);
         let finish = |mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>, u8)> {
             merge_rows(&mut els, &keep);
             renumber_rows(&mut els, &keep);
@@ -720,7 +832,7 @@ mod tests {
             els.iter().map(|e| (e.name.clone(), e.row)).collect()
         };
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, true, false, false, None);
+        plan_merge(&mut keep, &outputs, false, true, true, false, false, None, &[]);
         let mesh = shape(&keep, outputs.clone());
         let row = |name: &str, r: u32| (name.to_string(), Some(r));
         assert_eq!(
@@ -751,7 +863,7 @@ mod tests {
         assert_eq!(shape(&keep, pixel), mesh[1..]);
         // Level 3 leaves the clip distance at its register.
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, false, false, false, None);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false, None, &[]);
         assert_eq!(shape(&keep, outputs.clone())[1], row("SV_ClipDistance", 1));
     }
 
@@ -773,7 +885,7 @@ mod tests {
             for e in outputs.iter().filter(|e| e.kind == 0) {
                 keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
             }
-            plan_merge(&mut keep, outputs, false, true, true, xyz_first, false, None);
+            plan_merge(&mut keep, outputs, false, true, true, xyz_first, false, None, &[]);
             keep
         };
         let shape = |keep: &KeptOutputs, mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>)> {
@@ -859,7 +971,7 @@ mod tests {
         };
         let plan = |seven: bool, level: u8| {
             let (outputs, mut keep) = ground_shape(seven);
-            plan_merge(&mut keep, &outputs, false, true, level >= 4, level == 5, level >= 6, (level == 7).then_some(256));
+            plan_merge(&mut keep, &outputs, false, true, level >= 4, level == 5, level >= 6, (level == 7).then_some(256), &[]);
             let mesh = finish(&keep, outputs.clone());
             (outputs, keep, mesh)
         };
@@ -905,7 +1017,7 @@ mod tests {
         use crate::emit::mesh_probe_tests::line;
         let made = |seven: bool, level: u8| {
             let (outputs, mut keep) = ground_shape(seven);
-            plan_merge(&mut keep, &outputs, false, true, true, false, true, (level == 7).then_some(256));
+            plan_merge(&mut keep, &outputs, false, true, true, false, true, (level == 7).then_some(256), &[]);
             let finish = |mut els: Vec<SigElement>, pixel: bool| {
                 prune_signature(&mut els, &keep);
                 merge_rows(&mut els, &keep);
@@ -943,7 +1055,58 @@ mod tests {
         assert!(made(true, 6).0.iter().any(|e| e.kind == 6));
     }
 
-    /// The second ground shape as level 7 makes it.
+    /// Levels 7 and 8 on the two ground shapes, whose programs write three
+    /// of the four clip distances as the constant 0: both stages declare
+    /// the one that can clip, the clipper stays, and both shapes fit (244
+    /// and 248 bytes, by the rule and by the probe). Nothing is left for
+    /// the pixel shader to clip. With no distance that can clip the
+    /// element goes, and the clipper's 16 bytes with it.
+    #[test]
+    fn clip_distances_that_never_clip_are_left_out() {
+        use crate::emit::mesh_probe_tests::line;
+        let made = |seven: bool, live: u8| {
+            let (outputs, mut keep) = ground_shape(seven);
+            plan_merge(&mut keep, &outputs, false, true, true, false, true, Some(256), &[(1, live)]);
+            let finish = |mut els: Vec<SigElement>, pixel: bool| {
+                prune_signature(&mut els, &keep);
+                merge_rows(&mut els, &keep);
+                if pixel {
+                    soft_clip_inputs(&mut els, &keep);
+                }
+                renumber_rows(&mut els, &keep);
+                els
+            };
+            (finish(outputs.clone(), false), finish(outputs[1..].iter().rev().cloned().collect(), true))
+        };
+        let shape = |els: &[SigElement]| -> Vec<(String, u32, u8, Option<u32>, u8, u8)> {
+            let mut s: Vec<_> = els.iter().map(|e| (e.name.clone(), e.index, e.kind, e.row, e.col, e.cols)).collect();
+            s.sort();
+            s
+        };
+        for (seven, text, bytes) in [(false, ONE_FITTED, 244), (true, ONE_SECOND, 248)] {
+            let (mesh, pixel) = made(seven, 0b0001);
+            assert_eq!(line(&mesh), text, "the signature the probe measured");
+            assert_eq!(mesh_size::struct_bytes(&mesh), bytes);
+            let clip: Vec<&SigElement> = mesh.iter().filter(|e| e.kind == 6).collect();
+            assert_eq!(clip.len(), 1);
+            assert_eq!((clip[0].name.as_str(), clip[0].index, clip[0].col, clip[0].cols), ("SV_ClipDistance", 0, 0, 1));
+            assert!(!mesh.iter().any(|e| e.name == CLIP_NAME));
+            assert_eq!(shape(&pixel), shape(&mesh[1..]));
+        }
+        // No distance can clip: 16 + 53 components and nothing else.
+        let (mesh, pixel) = made(true, 0);
+        assert!(!mesh.iter().chain(&pixel).any(|e| e.kind == 6 || e.name == CLIP_NAME));
+        assert_eq!(mesh_size::struct_bytes(&mesh), 16 + 4 * 53);
+    }
+
+    /// The ground shapes with one clip distance, as levels 7 and 8 make them.
+    const ONE_FITTED: &str =
+        "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f2@6 f2@7 f1@7.3 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 C1@17";
+    const ONE_SECOND: &str =
+        "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f2@7 f1@7.3 C1@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f2@17";
+
+    /// The second ground shape as level 7 made it before clip distances
+    /// that never clip were left out (and makes a shape with four live ones).
     const SOFT: &str =
         "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f3@6 f3@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f4@14 f4@15 f2@16 f2@17 f1@17.3";
 

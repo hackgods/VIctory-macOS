@@ -628,6 +628,8 @@ extern "system" fn present(
     account_frame(frame);
     #[cfg(windows)]
     crate::shadow::trim_pool();
+    #[cfg(windows)]
+    crate::descriptor::host::forget_made_views();
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
     if frame.is_power_of_two() {

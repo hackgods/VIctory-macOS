@@ -3477,6 +3477,91 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// The write shaders' root signature: a table of one unordered view.
     const WRITES: &[Param] = &[Param::Table(&[uav(0, 1)])];
 
+    /// A view of a resource made again in another slot is a copy of the
+    /// first made (`descriptor::host::made_view`), and shaders read through
+    /// it what they read through the first: a typed buffer view and a
+    /// constant buffer (a raw view), each written into two slots.
+    #[test]
+    fn a_view_made_again_as_a_copy_reads_what_it_views() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let va = title_memory(1 << 16);
+        // SAFETY: inside the title memory just made.
+        unsafe {
+            for i in 0..64u32 {
+                (va as *mut u32).add(i as usize).write(0x5EED_0000 + i);
+            }
+        }
+        let buffer = buffer_at_address(va, 1 << 16);
+        let (_, title_heap, heap_host) = view_heap(4);
+        let _ = host.log_messages();
+        let slot = |i: u64| title_heap.start + i * 32;
+        // R32_UINT, 16 elements from element 4; a constant buffer of 64
+        // bytes from byte 128.
+        let srv_words: [u32; 10] = [42, 1, 0x1688, 0, 4, 0, 16, 0, 0, 0];
+        let cbv = [(va + 128) as u32, ((va + 128) >> 32) as u32, 64, 0];
+        for s in 0..2 {
+            crate::descriptor::create_srv(null, buffer, &srv_words, slot(s));
+            crate::descriptor::create_cbv(null, &cbv, slot(2 + s));
+        }
+        let typed = compile_cs(
+            r#"
+Buffer<uint> src : register(t0);
+RWByteAddressBuffer dst : register(u1);
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src[id.x]);
+}
+"#,
+            READS,
+        );
+        let raw = compile_cs(
+            r#"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u1);
+[numthreads(16, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(id.x * 4, src.Load(id.x * 4));
+}
+"#,
+            READS,
+        );
+        let (out, data) = host.shared_buffer(4 * 64).unwrap();
+        // SAFETY: inside the mapped output buffer.
+        unsafe { std::ptr::write_bytes(data, 0, 4 * 64) };
+        let list = host.new_list().unwrap();
+        for s in 0..4u32 {
+            let view = heap_host.mirror(s, slot(u64::from(s)), true).unwrap();
+            readable(&list, &used(ResourceType::Srv), &view, false);
+            let pso = if s < 2 { &typed } else { &raw };
+            // SAFETY: an open list and live objects.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&pso.0);
+                list.list.SetPipelineState(&pso.1);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(s));
+                list.list.SetComputeRootUnorderedAccessView(
+                    1,
+                    out.GetGPUVirtualAddress() + u64::from(s) * 64,
+                );
+                list.list.Dispatch(1, 1, 1);
+            }
+        }
+        list.close();
+        host.execute(&[&list]);
+        for s in 0..4usize {
+            // SAFETY: inside the mapped output buffer.
+            let got = unsafe { std::slice::from_raw_parts((data as *const u32).add(s * 16), 16) };
+            let first = if s < 2 { 4 } else { 32 };
+            let want: Vec<u32> = (first..first + 16).map(|i| 0x5EED_0000 + i).collect();
+            assert_eq!(got, want, "slot {s}");
+        }
+        assert_eq!(host.log_messages(), None, "D3D12 debug errors");
+    }
+
     /// One texture memory written through an unordered view of a resource
     /// object in one format and read through a placed view in another: a
     /// castable pair shares one host texture (no copy), a pair of other

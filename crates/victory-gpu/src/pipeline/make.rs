@@ -43,7 +43,9 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// A pass over the screen (see [`screen`]).
     screen: bool,
-    #[cfg(feature = "diagnostics")]
+    /// Its shader named by `VICTORY_SKIP_PIPELINES`, if one is: it has no
+    /// host pipeline and is never queued.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     pub(super) skipped_shader: Option<String>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
@@ -61,7 +63,7 @@ impl Pending {
     pub(crate) fn new(
         shaders: Vec<Arc<Shader>>,
         graphics: Option<Box<GraphicsState>>,
-        #[cfg(feature = "diagnostics")] skip_hashes: &[String],
+        skip_hashes: &[String],
     ) -> Pending {
         let key = key(&shaders, graphics.as_deref());
         #[cfg(feature = "diagnostics")]
@@ -69,11 +71,9 @@ impl Pending {
             let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
             format!("{shaders:?}\t{state}")
         });
-        #[cfg(feature = "diagnostics")]
         let skipped_shader = super::skipped_shader(&shaders, skip_hashes).map(str::to_owned);
         let made = OnceLock::new();
         // Publish the completed result before the pipeline can be queued.
-        #[cfg(feature = "diagnostics")]
         if skipped_shader.is_some() {
             let _ = made.set(None);
         }
@@ -86,7 +86,6 @@ impl Pending {
             now: AtomicBool::new(false),
             taken: AtomicBool::new(false),
             made,
-            #[cfg(feature = "diagnostics")]
             skipped_shader,
             used: AtomicBool::new(false),
         }
@@ -450,7 +449,6 @@ mod tests {
         let p = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&p, false), Some(false));
@@ -460,7 +458,6 @@ mod tests {
         let q = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&q, false), Some(false));
@@ -469,7 +466,6 @@ mod tests {
         let r = Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         );
         assert_eq!(enqueue(&r, true), Some(true));
@@ -485,7 +481,6 @@ mod tests {
         let p = Arc::new(Pending::new(
             Vec::new(),
             None,
-            #[cfg(feature = "diagnostics")]
             &[],
         ));
         assert!(ready(&p).is_none());
@@ -523,7 +518,7 @@ mod tests {
         assert!(!screen_pass(&[shader("compute")], None));
     }
 
-    #[cfg(feature = "diagnostics")]
+    /// In every build, not only with diagnostics.
     #[test]
     fn skipped_pipeline_stays_off_the_queue() {
         let hashes = crate::pipeline::parse_skip_hashes(" 0123456789ABCDEF ");

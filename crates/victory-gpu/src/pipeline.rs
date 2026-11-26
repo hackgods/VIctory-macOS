@@ -448,8 +448,9 @@ pub(crate) fn making() -> u64 {
 #[cfg(all(windows, feature = "diagnostics"))]
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
-/// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(feature = "diagnostics", any(windows, test)))]
+/// Shader hashes as printed in the pipeline diagnostics and by `shader
+/// translated` lines.
+#[cfg(any(windows, test))]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -469,16 +470,45 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// `VICTORY_SKIP_PIPELINES=<hash>,...`: a pipeline with any of these shaders
+/// gets no host pipeline, so its draws and dispatches are dropped as those of
+/// a shader that does not translate are. Read once; in every build (it was a
+/// diagnostics switch), to leave the title's costly passes out of a normal
+/// run. Unset, the list is empty and [`skipped_shader`] returns at its first
+/// line: once per pipeline the title creates, nothing per draw.
+#[cfg(windows)]
 fn skip_hashes() -> &'static [String] {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     HASHES.get_or_init(|| {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
-        parse_skip_hashes(&value)
+        let hashes = parse_skip_hashes(&value);
+        if let Some(line) = skip_line(&value, hashes.len()) {
+            tracing::info!("{line}");
+        }
+        hashes
     })
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// The line logged once when `VICTORY_SKIP_PIPELINES` is set to `value` and
+/// `hashes` of its entries are shader hashes; none when it is unset or empty.
+#[cfg(any(windows, test))]
+fn skip_line(value: &str, hashes: usize) -> Option<String> {
+    (!value.trim().is_empty()).then(|| {
+        format!(
+            "VICTORY_SKIP_PIPELINES: pipelines with any of {hashes} shader hashes get no host pipeline; \
+             their draws and dispatches are dropped"
+        )
+    })
+}
+
+/// Reads `VICTORY_SKIP_PIPELINES` now (the host device is ready), so that its
+/// line is logged at start and not with the title's first pipeline.
+#[cfg(windows)]
+pub(crate) fn note_skips() {
+    let _ = skip_hashes();
+}
+
+#[cfg(windows)]
 fn skipped_shader<'a>(shaders: &'a [Arc<Shader>], hashes: &[String]) -> Option<&'a str> {
     if hashes.is_empty() {
         return None;
@@ -573,7 +603,6 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(
         shaders.clone(),
         graphics,
-        #[cfg(feature = "diagnostics")]
         skip_hashes(),
     ));
     #[cfg(windows)]
@@ -912,7 +941,6 @@ pub fn wanted_early(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "diagnostics")]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
         assert!(super::parse_skip_hashes(" , ").is_empty());
@@ -920,6 +948,21 @@ mod tests {
             super::parse_skip_hashes(" 0123456789ABCDEF, 0123456789abcde, xyz, 0011223344556677,"),
             ["0123456789abcdef", "0011223344556677"]
         );
+    }
+
+    /// Unset or empty, `VICTORY_SKIP_PIPELINES` gives no hashes and no line;
+    /// set, one line with the count of hashes taken (0 if none was one).
+    #[test]
+    fn skip_line_only_when_set() {
+        assert!(super::parse_skip_hashes("").is_empty());
+        assert_eq!(super::skip_line("", 0), None);
+        assert_eq!(super::skip_line("  ", 0), None);
+        let value = "0123456789abcdef,0011223344556677,xyz";
+        let hashes = super::parse_skip_hashes(value);
+        let line = super::skip_line(value, hashes.len()).expect("a line when set");
+        assert!(line.starts_with("VICTORY_SKIP_PIPELINES: ") && line.contains(" 2 shader hashes "), "{line}");
+        let none = super::skip_line("xyz", 0).expect("a line when set");
+        assert!(none.contains(" 0 shader hashes "), "{none}");
     }
 
     use super::*;

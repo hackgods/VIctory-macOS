@@ -49,56 +49,71 @@ pub fn drop_barriers(cmds: Vec<Cmd>, of: impl Fn(u32) -> bool) -> (Vec<Cmd>, u32
 /// the argument clamps, kept from a run that made them ([`keep_clamped`]).
 pub const RESULTS: u32 = u32::MAX - 1;
 
+/// The root parameters of the host layer's clamp pass (`crate::indirect`):
+/// its constants (kind, stride, records, flags; on this line a fifth, the
+/// widest dispatch) and its view of where the clamped arguments go.
+const CONSTANTS: u32 = 0;
+const DEST: u32 = 3;
+
+/// Where the host layer's argument clamps of a frame write, from list to
+/// list in the frame's order (a list of clamps alone may come before the
+/// lists whose calls they serve), and how much of [`RESULTS`] is taken.
+#[derive(Clone, Debug, Default)]
+pub struct Clamped {
+    /// By buffer and offset a clamp wrote to last: its place in
+    /// [`RESULTS`] (several calls may read what one clamp wrote).
+    places: std::collections::HashMap<(u32, u64), u64>,
+    /// The buffers clamps wrote.
+    buffers: HashSet<u32>,
+    pub next: u64,
+}
+
 /// The host layer's argument clamps in a list: before a call that reads its
 /// arguments from a buffer, a pass of the host layer's own copies them, cut
-/// to what is safe, into the list's argument buffer, which the call then
-/// reads. `clamps` are that pass's pipelines; `bytes` says how many bytes of
-/// arguments a call of a command signature reads at the most. For each
-/// clamped call, in order: the command that calls, its place in
-/// [`RESULTS`] (from `next` on, which moves on) and its bytes.
+/// to what is safe, into an argument buffer of the list's, which the call
+/// then reads. `clamps` are that pass's pipelines. Every clamp gets a place
+/// of its own in [`RESULTS`]: by command, the place of each clamp's
+/// dispatch and of each call that reads what a clamp wrote.
 fn clamped(
     cmds: &[Cmd],
     clamps: &HashSet<u32>,
-    bytes: &dyn Fn(u32, u32) -> u64,
-    next: &mut u64,
-) -> Vec<(usize, u64, u64)> {
-    let mut out = Vec::new();
+    state: &mut Clamped,
+) -> std::collections::HashMap<usize, u64> {
+    let mut out = std::collections::HashMap::new();
     let mut bound = NONE;
-    // The buffers and offsets the compute side has bound for writing, and
-    // those the last clamp wrote.
-    let mut views: Vec<(u32, u32, u64)> = Vec::new();
-    let mut written: Vec<(u32, u64)> = Vec::new();
+    // What the compute side has bound: where the pass writes, and how much.
+    let mut dest = None;
+    let mut bytes = 0;
     for (i, c) in cmds.iter().enumerate() {
         match c {
             Cmd::Pipeline { pso } => bound = *pso,
             Cmd::RootSignature {
                 graphics: false, ..
-            } => views.clear(),
+            } => dest = None,
+            Cmd::Constants {
+                graphics: false,
+                param: CONSTANTS,
+                offset: 0,
+                values,
+            } if values.len() >= 4 => bytes = u64::from(values[1]) * u64::from(values[2].max(1)),
             Cmd::RootView {
                 graphics: false,
                 kind: super::wire::slot::UAV,
-                param,
+                param: DEST,
                 va: super::wire::Va::At { res, offset },
-            } => {
-                views.retain(|v| v.0 != *param);
-                views.push((*param, *res, *offset));
-            }
+            } => dest = Some((*res, *offset)),
             Cmd::Dispatch { .. } if clamps.contains(&bound) => {
-                written = views.iter().map(|v| (v.1, v.2)).collect();
-            }
-            Cmd::Indirect {
-                signature,
-                most,
-                args,
-                at,
-                ..
-            } => {
-                if written.contains(&(*args, *at)) {
-                    let n = bytes(*signature, *most).next_multiple_of(4);
-                    out.push((i, *next, n));
-                    *next += n;
+                if let Some(dest) = dest {
+                    state.places.insert(dest, state.next);
+                    state.buffers.insert(dest.0);
+                    out.insert(i, state.next);
+                    state.next += bytes.next_multiple_of(16);
                 }
-                written.clear();
+            }
+            Cmd::Indirect { args, at, .. } => {
+                if let Some(place) = state.places.get(&(*args, *at)) {
+                    out.insert(i, *place);
+                }
             }
             _ => {}
         }
@@ -106,32 +121,55 @@ fn clamped(
     out
 }
 
-/// The list with, before each clamped call, a copy of the arguments the
-/// clamp made into [`RESULTS`]: a run of it keeps what [`skip_clamped`]'s
-/// calls read.
-pub fn keep_clamped(
-    cmds: Vec<Cmd>,
-    clamps: &HashSet<u32>,
-    bytes: &dyn Fn(u32, u32) -> u64,
-    next: &mut u64,
-) -> Vec<Cmd> {
-    let found = clamped(&cmds, clamps, bytes, next);
-    let mut out = Vec::with_capacity(cmds.len() + found.len());
-    let mut found = found.into_iter().peekable();
+/// The list with every clamp writing to its place in [`RESULTS`], and the
+/// calls reading there: a run of it keeps what [`skip_clamped`]'s calls
+/// read. (No copies of what the clamps wrote where they do: a copy with no
+/// barriers of its own is not sure to run where it stands.) The frame's
+/// lists in order, with one `state`.
+pub fn keep_clamped(cmds: Vec<Cmd>, clamps: &HashSet<u32>, state: &mut Clamped) -> Vec<Cmd> {
+    let found = clamped(&cmds, clamps, state);
+    let mut out: Vec<Cmd> = Vec::with_capacity(cmds.len());
     for (i, c) in cmds.into_iter().enumerate() {
-        if let Some(&(_, to, len)) = found.peek().filter(|f| f.0 == i)
-            && let Cmd::Indirect { args, at, .. } = &c
-        {
-            out.push(Cmd::CopyBuffer {
-                dst: RESULTS,
-                dst_at: to,
-                src: *args,
-                src_at: *at,
-                len,
-            });
-            found.next();
+        let Some(&place) = found.get(&i) else {
+            out.push(c);
+            continue;
+        };
+        match c {
+            Cmd::Indirect {
+                signature,
+                most,
+                count,
+                count_at,
+                ..
+            } => out.push(Cmd::Indirect {
+                signature,
+                most,
+                args: RESULTS,
+                at: place,
+                count,
+                count_at,
+            }),
+            c => {
+                // The clamp's dispatch: the view it writes through, set
+                // last, becomes one of its place.
+                if let Some(Cmd::RootView { va, .. }) = out.iter_mut().rev().find(|c| {
+                    matches!(
+                        c,
+                        Cmd::RootView {
+                            graphics: false,
+                            param: DEST,
+                            ..
+                        }
+                    )
+                }) {
+                    *va = super::wire::Va::At {
+                        res: RESULTS,
+                        offset: place,
+                    };
+                }
+                out.push(c);
+            }
         }
-        out.push(c);
     }
     out
 }
@@ -139,28 +177,21 @@ pub fn keep_clamped(
 /// The list without its argument clamps: the clamp passes (with what binds
 /// them, and the barriers of the buffers they write) are left out, and the
 /// calls they served read the arguments kept in [`RESULTS`]. How many
-/// passes and how many barriers were left out.
+/// passes and how many barriers were left out. The frame's lists in order,
+/// with one `state`.
 pub fn skip_clamped(
     cmds: Vec<Cmd>,
     clamps: &HashSet<u32>,
     roots: &HashSet<u32>,
-    bytes: &dyn Fn(u32, u32) -> u64,
-    next: &mut u64,
+    state: &mut Clamped,
 ) -> (Vec<Cmd>, u32, u32) {
-    let found = clamped(&cmds, clamps, bytes, next);
-    let buffers: HashSet<u32> = found
-        .iter()
-        .filter_map(|f| match &cmds[f.0] {
-            Cmd::Indirect { args, .. } => Some(*args),
-            _ => None,
-        })
-        .collect();
+    let found = clamped(&cmds, clamps, state);
+    let buffers = state.buffers.clone();
     let (mut passes, mut barriers) = (0, 0);
     let mut out: Vec<Cmd> = Vec::with_capacity(cmds.len());
     // Where the binding of a clamp pass began, if one is being bound.
     let mut binding: Option<usize> = None;
     let mut bound = NONE;
-    let mut found = found.into_iter().peekable();
     for (i, c) in cmds.into_iter().enumerate() {
         match &c {
             Cmd::RootSignature {
@@ -201,7 +232,7 @@ pub fn skip_clamped(
             }
             _ => binding = None,
         }
-        if let Some(&(_, from, _)) = found.peek().filter(|f| f.0 == i)
+        if let Some(&from) = found.get(&i)
             && let Cmd::Indirect {
                 signature,
                 most,
@@ -218,7 +249,6 @@ pub fn skip_clamped(
                 count: *count,
                 count_at: *count_at,
             });
-            found.next();
             continue;
         }
         out.push(c);
@@ -577,6 +607,13 @@ mod tests {
             param,
             va: Va::At { res, offset },
         };
+        // Two records of 12 bytes.
+        let constants = Cmd::Constants {
+            graphics: false,
+            param: 0,
+            offset: 0,
+            values: vec![2, 12, 2, 0],
+        };
         let transition = |res, before, after| Cmd::Barriers {
             all: vec![
                 Barrier::Uav { flags: 0, res: NONE },
@@ -602,13 +639,15 @@ mod tests {
             // The title's own pass, and a call it feeds unclamped.
             root(false, 1),
             pipeline(1),
-            view(0, 40, 0),
+            view(3, 40, 0),
             dispatch.clone(),
             call(40, 0),
             // A clamped call.
             transition(50, 0, 8),
             root(false, clamp_root),
             pipeline(clamp),
+            constants.clone(),
+            view(2, 70, 0),
             view(3, 50, 16),
             dispatch.clone(),
             transition(50, 8, 0x200),
@@ -616,43 +655,70 @@ mod tests {
             pipeline(1),
             call(50, 16),
             transition(50, 0x200, 0),
-            // A call of the same buffer with no clamp before it.
+            // Another call that reads what that clamp wrote.
             call(50, 16),
         ];
-        let bytes = |_: u32, most: u32| u64::from(most) * 12;
         let clamps = HashSet::from([clamp]);
-        let mut next = 100;
-        let kept = keep_clamped(cmds.clone(), &clamps, &bytes, &mut next);
-        assert_eq!(next, 124);
-        assert_eq!(kept.len(), cmds.len() + 1);
-        assert_eq!(
-            kept[13],
-            Cmd::CopyBuffer {
-                dst: RESULTS,
-                dst_at: 100,
-                src: 50,
-                src_at: 16,
-                len: 24
-            }
-        );
-        let mut next = 100;
-        let (left, passes, barriers) =
-            skip_clamped(cmds.clone(), &clamps, &HashSet::from([clamp_root]), &bytes, &mut next);
-        assert_eq!((passes, barriers, next), (1, 6, 124));
+        let mut state = Clamped {
+            next: 96,
+            ..Default::default()
+        };
+        // Kept: the clamp writes to its place, and its calls read there.
+        let kept = keep_clamped(cmds.clone(), &clamps, &mut state);
+        assert_eq!(state.next, 128);
+        let mut expected = cmds.clone();
+        expected[10] = view(3, RESULTS, 96);
+        expected[15] = call(RESULTS, 96);
+        expected[17] = call(RESULTS, 96);
+        assert_eq!(kept, expected);
+        let mut state = Clamped {
+            next: 96,
+            ..Default::default()
+        };
+        let roots = HashSet::from([clamp_root]);
+        let (left, passes, barriers) = skip_clamped(cmds.clone(), &clamps, &roots, &mut state);
+        assert_eq!((passes, barriers, state.next), (1, 6, 128));
         assert_eq!(
             left,
             [
                 cmds[0].clone(),
                 cmds[1].clone(),
                 cmds[2].clone(),
-                dispatch,
+                dispatch.clone(),
                 call(40, 0),
                 root(false, 1),
                 pipeline(1),
-                call(RESULTS, 100),
-                call(50, 16),
+                call(RESULTS, 96),
+                call(RESULTS, 96),
             ]
         );
+        // A list of clamps alone, and the calls they serve in the next one;
+        // a place written twice is read as it was written last.
+        let ahead: Vec<Cmd> = [0, 24, 0]
+            .into_iter()
+            .flat_map(|at| {
+                [
+                    root(false, clamp_root),
+                    pipeline(clamp),
+                    constants.clone(),
+                    view(3, 60, at),
+                    dispatch.clone(),
+                ]
+            })
+            .collect();
+        let calls = vec![call(60, 24), call(60, 0), call(60, 48)];
+        let mut state = Clamped::default();
+        let first = keep_clamped(ahead.clone(), &clamps, &mut state);
+        assert_eq!(first[3], view(3, RESULTS, 0));
+        assert_eq!(first[8], view(3, RESULTS, 32));
+        assert_eq!(first[13], view(3, RESULTS, 64));
+        let second = keep_clamped(calls.clone(), &clamps, &mut state);
+        assert_eq!(second, [call(RESULTS, 32), call(RESULTS, 64), call(60, 48)]);
+        let mut state = Clamped::default();
+        let (first, passes, _) = skip_clamped(ahead, &clamps, &roots, &mut state);
+        assert_eq!((first.len(), passes), (0, 3));
+        let (second, _, _) = skip_clamped(calls, &clamps, &roots, &mut state);
+        assert_eq!(second, [call(RESULTS, 32), call(RESULTS, 64), call(60, 48)]);
     }
 
     #[test]

@@ -44,6 +44,8 @@ const STAGING: u64 = 256 << 20;
 /// The name of the pipeline of the host layer's argument clamp
 /// (`crate::indirect`, as `crate::compute::pipeline` names it).
 const CLAMP: &str = "victory: clamp";
+/// And of its batches of clamps, which `--skip-clamps` leaves in.
+const CLAMP_BATCH: &str = "victory: clamps";
 
 /// How the frame's submissions are sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1015,6 +1017,10 @@ impl Player {
 
     fn va(&self, va: &Va) -> u64 {
         match va {
+            Va::At { res, offset } if *res == edit::RESULTS => {
+                // SAFETY: a plain query on a live buffer.
+                self.results.as_ref().map_or(0, |r| unsafe { r.GetGPUVirtualAddress() } + offset)
+            }
             Va::At { res, offset } => self.objects.get(res).map_or(0, |o| o.va + offset),
             _ => 0,
         }
@@ -2708,7 +2714,8 @@ impl Player {
         skip.extend(also);
         let mut barriers = 0;
         let clamps = self.clamps();
-        let (mut next, mut clamped) = (0u64, (0, 0));
+        let mut kept = edit::Clamped::default();
+        let mut clamped = (0, 0);
         if !o.skip_shaders.is_empty() {
             report
                 .notes
@@ -2738,8 +2745,7 @@ impl Player {
                         cmds,
                         &clamps.0,
                         &clamps.1,
-                        &|signature, most| self.arguments(signature, most),
-                        &mut next,
+                        &mut kept,
                     );
                     clamped = (clamped.0 + passes, clamped.1 + n);
                 }
@@ -2771,8 +2777,15 @@ impl Player {
                 "{} argument clamps were left out, with {} barriers of theirs; their calls read {} KB of arguments kept from a run with them",
                 clamped.0,
                 clamped.1,
-                next >> 10
+                kept.next >> 10
             ));
+            // This line's batches of clamps are another pipeline's work
+            // (`crate::indirect`, "victory: clamps").
+            if self.frame.pipelines.iter().any(|p| p.name == CLAMP_BATCH) {
+                report.notes.push(format!(
+                    "batches of clamps (\"{CLAMP_BATCH}\", VICTORY_BATCH_CLAMPS=1) stay, and their calls read what they write: record with VICTORY_BATCH_CLAMPS=0 to leave out every clamp"
+                ));
+            }
         }
         if o.one_texel {
             report
@@ -2813,27 +2826,15 @@ impl Player {
         (all.iter().map(|p| p.id).collect(), roots)
     }
 
-    /// The bytes of arguments a call of command signature `signature` reads
-    /// at the most, for `most` commands.
-    fn arguments(&self, signature: u32, most: u32) -> u64 {
-        let stride = self
-            .frame
-            .signatures
-            .iter()
-            .find(|s| s.id == signature)
-            .map_or(0, |s| s.stride);
-        u64::from(stride) * u64::from(most)
-    }
-
-    /// Runs the frame once with every clamp's arguments copied to a buffer
-    /// of ours ([`edit::RESULTS`]), from which the calls of a frame without
-    /// the clamps read them; once for good.
+    /// Runs the frame once with every clamp writing its arguments to a
+    /// buffer of ours ([`edit::RESULTS`]), from which the calls of a frame
+    /// without the clamps read them; once for good.
     fn keep_clamps(&mut self) -> Result<()> {
         if self.results.is_some() {
             return Ok(());
         }
         let clamps = self.clamps();
-        let mut next = 0u64;
+        let mut kept = edit::Clamped::default();
         let mut submits = Vec::new();
         for s in &self.frame.submits {
             let mut lists = Vec::new();
@@ -2841,17 +2842,17 @@ impl Player {
                 lists.push(edit::keep_clamped(
                     self.commands[l as usize].clone(),
                     &clamps.0,
-                    &|signature, most| self.arguments(signature, most),
-                    &mut next,
+                    &mut kept,
                 ));
             }
             submits.push(lists);
         }
+        let next = kept.next;
         let (results, _) = gpu::buffer(
             &self.device,
             D3D12_HEAP_TYPE_DEFAULT,
-            next.max(4),
-            D3D12_RESOURCE_FLAG_NONE,
+            next.max(16),
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
         )?;
         self.results = Some(results);
         let plain = Options::default();

@@ -1602,6 +1602,8 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        list.count_work(true);
         self.ambient(list);
     }
 
@@ -1850,6 +1852,8 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    list.count_work(false);
                     true
                 }
                 Err(_) => false,
@@ -2452,6 +2456,8 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2548,6 +2554,8 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2763,10 +2771,14 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(true);
             self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            list.count_work(false);
         }
         true
     }

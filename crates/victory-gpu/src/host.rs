@@ -1482,6 +1482,13 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// `VICTORY_GPU_PASS_TIMING`: the list was cut at a pipeline for
+    /// timing, and runs on its own (`crate::gpu_pass`); its draws and
+    /// dispatches since the reset.
+    #[cfg(feature = "diagnostics")]
+    pass_timed: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "diagnostics")]
+    work: [std::sync::atomic::AtomicU32; 2],
 }
 
 // SAFETY: D3D12 objects are free-threaded; a host list is recorded by the
@@ -1990,6 +1997,10 @@ impl HostGpu for Host {
                 targets: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                #[cfg(feature = "diagnostics")]
+                pass_timed: false.into(),
+                #[cfg(feature = "diagnostics")]
+                work: Default::default(),
             })
         }
     }
@@ -2111,8 +2122,12 @@ impl Host {
                 }
             }
         }
+        // `VICTORY_GPU_PASS_TIMING` times lists cut for it one by one, as
+        // `VICTORY_GPU_TIMING` times all.
         #[cfg(feature = "diagnostics")]
-        let gpu_timing = timing();
+        let pass_timed = runs.iter().any(|l| l.pass_timed.load(Ordering::Relaxed));
+        #[cfg(feature = "diagnostics")]
+        let gpu_timing = timing() || pass_timed;
         #[cfg(not(feature = "diagnostics"))]
         let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
@@ -2299,6 +2314,25 @@ impl Host {
                 // SAFETY: a plain query.
                 let frequency = unsafe { queue.GetTimestampFrequency() }.unwrap_or(1);
                 gpu_times(started.elapsed(), &runs[i].slowest(frequency, usize::MAX).unwrap_or_default());
+            }
+            #[cfg(feature = "diagnostics")]
+            if pass_timed {
+                let list = runs[i];
+                let pipelines: Vec<String> = list
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .collect();
+                crate::gpu_pass::record(
+                    started.elapsed(),
+                    *submitted,
+                    list.id,
+                    list.work[0].load(Ordering::Relaxed),
+                    list.work[1].load(Ordering::Relaxed),
+                    pipelines.join(" "),
+                );
             }
             #[cfg(feature = "diagnostics")]
             if groups.len() > 1 && started.elapsed() > std::time::Duration::from_millis(50) {
@@ -3075,6 +3109,11 @@ impl HostList {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        {
+            self.pass_timed.store(false, Ordering::Relaxed);
+            self.work.iter().for_each(|n| n.store(0, Ordering::Relaxed));
+        }
         self.trim_scratch();
         self.reset_hoisted_clamps();
         // SAFETY: the list is not executing.
@@ -3628,6 +3667,25 @@ impl HostList {
                 .unwrap_or_else(|e| e.into_inner())
                 .push((what, range));
         }
+    }
+
+    /// The list was cut at a pipeline for `VICTORY_GPU_PASS_TIMING`: it
+    /// runs and is timed on its own.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn mark_pass_timed(&self) {
+        self.pass_timed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the list was cut for pass timing (tests).
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(crate) fn is_pass_timed(&self) -> bool {
+        self.pass_timed.load(Ordering::Relaxed)
+    }
+
+    /// A draw (or with `dispatch`, a dispatch) recorded (pass timing).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn count_work(&self, dispatch: bool) {
+        self.work[usize::from(dispatch)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Notes a texture the list renders to or writes, in a listed frame.

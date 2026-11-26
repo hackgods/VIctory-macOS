@@ -226,6 +226,33 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// `VICTORY_GPU_PASS_TIMING` (`crate::gpu_pass`): before the title list
+/// sets another pipeline, what it recorded is cut off as at a wait, and the
+/// rest goes on in a host list of its own; both run and are timed on their
+/// own.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn cut_for_timing(this: This) {
+    let Some(current) = host_list(this) else {
+        return;
+    };
+    current.mark_pass_timed();
+    if current.is_empty() {
+        return;
+    }
+    let Some(next) = next_segment(this) else {
+        return;
+    };
+    CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    current.close();
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    list.state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .cut(next);
+    next.mark_pass_timed();
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1375,6 +1402,10 @@ static ALLOCATOR_FUNCTIONS: Table<24> = {
 
 extern "system" fn set_pipeline(this: This, pipeline: This) {
     crate::pipeline::bound(pipeline);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if crate::gpu_pass::cutting() {
+        cut_for_timing(this);
+    }
     #[cfg(windows)]
     with_state(this, |_, state| state.set_pipeline(pipeline));
     #[cfg(not(windows))]
@@ -2174,6 +2205,40 @@ mod tests {
                 assert_eq!(release(pipeline), 0);
             }
         });
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// `VICTORY_GPU_PASS_TIMING`: setting a pipeline after commands cuts
+    /// the title list into a host list of its own, as a wait does; with
+    /// nothing recorded since the last cut it cuts nothing. Every part is
+    /// timed on its own.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn a_pipeline_set_after_commands_cuts_a_timed_list() {
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let Some(first) = host_list(list) else {
+            return; // no host GPU here
+        };
+        first.defer_host(|| {});
+        cut_for_timing(list);
+        cut_for_timing(list);
+        let parts = segments(list);
+        assert_eq!(parts.len(), 2, "one cut: nothing was recorded after it");
+        assert!(parts.iter().all(|h| h.is_pass_timed()));
+        assert!(std::ptr::eq(Arc::as_ptr(&parts[0]), first));
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
     }
 

@@ -424,6 +424,15 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// `RootType::Other` code of a user-data dword the host fills at a dispatch
+/// whose counts are threads, not groups (the console's `DispatchX` with its
+/// thread-dimensions flag): how many threads along x run, the lanes past
+/// that count leaving at once; 0, every lane of every group. Its
+/// [`UserData::dword`] is the group's width. Read only in translations
+/// with [`Options::thread_limits`], by compute programs of one dimension
+/// whose lanes never wait for each other (`Lower::leave_past_the_count`).
+/// After DexNom/VIctory bc3cd4b0.
+pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,6 +488,12 @@ pub struct Options {
     pub narrow_waves: bool,
     /// Keep the per-lane translation for wave64 programs on 32-lane hosts.
     pub disable_literal_halves: bool,
+    /// A compute program of one dimension whose lanes never wait for each
+    /// other reads [`USER_DISPATCH_THREADS_X`]: the lanes past a dispatch's
+    /// count of threads leave at once, as the console never starts them.
+    /// The host asks for it only for programs a dispatch counted in threads
+    /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
+    pub thread_limits: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -972,14 +987,15 @@ fn emit_pruned(
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
     };
-    let l = match lower::lower_pruned(&parts(st, res), keep, !options.disable_literal_halves) {
+    let (literal, limits) = (!options.disable_literal_halves, options.thread_limits);
+    let l = match lower::lower_limited(&parts(st, res), keep, literal, limits) {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).
         Err(_) if !st.discards.is_empty() => {
             let st = structure::killing(p)?;
             let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
-            lower::lower_pruned(&parts(&st, &res), keep, false)?
+            lower::lower_limited(&parts(&st, &res), keep, false, limits)?
         }
         l => l?,
     };

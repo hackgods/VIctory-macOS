@@ -109,8 +109,58 @@ pub(crate) const PY: u32 = 90;
 pub(crate) const CELL_BYTES: u64 = (2 * CELLS as u64 + 1) * 16;
 pub(crate) const POINT_BYTES: u64 = PX as u64 * PY as u64 * 48;
 
-/// The share of the way the slow mean goes at every keeping.
+/// The share of the way the slow mean goes at every keeping, while it does
+/// not settle by the clock: 25 frames, 0.8 s at the console's 30 frames a
+/// second, 8 s at 3.
 pub(crate) const FOLLOW: f32 = 0.04;
+
+/// How the slow mean of the light around settles by the clock: the time
+/// constant in milliseconds; the factor of a change (either way) that is
+/// taken at once, as a new room is (0: none); and for how many seconds
+/// after such a jump what the title's resolve left counts for no more than
+/// the estimate, rising back to `VICTORY_AMBIENT_LEFT` times it by the end
+/// (0: no such time; nothing while that multiple is 0).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Settle {
+    pub(crate) ms: f32,
+    pub(crate) jump: f32,
+    pub(crate) fresh: f32,
+}
+
+/// What `VICTORY_AMBIENT_SETTLE` is when unset.
+const SETTLE_UNSET: &str = "0";
+
+/// `VICTORY_AMBIENT_SETTLE=<time constant in ms>[,<jump factor>[,<fresh
+/// seconds>]]` (jump 3 and fresh 0 when left out). Unset or 0: `None`, the
+/// slow mean goes [`FOLLOW`] of the way a frame whatever the frame rate.
+pub(crate) fn settle(value: Option<&str>) -> Option<Settle> {
+    let mut parts = value.unwrap_or(SETTLE_UNSET).split(',').map(|p| p.trim().parse::<f32>().ok());
+    let ms = parts.next().flatten().filter(|v| v.is_finite() && *v > 0.0)?;
+    let jump = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(3.0);
+    let fresh = parts.next().flatten().filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    Some(Settle { ms, jump, fresh })
+}
+
+/// The milliseconds a keeping counts for, `since` those after the one
+/// before (`None`: the first): a frame of 33 for the first and after a
+/// pause of over a second, 1 for two in one millisecond.
+pub(crate) fn frame_ms(since: Option<u64>) -> f32 {
+    match since {
+        Some(0) => 1.0,
+        Some(ms) if ms <= 1000 => ms as f32,
+        _ => 33.0,
+    }
+}
+
+/// The share of the way the slow mean goes at a keeping that counts for
+/// `frame_ms`: the same share a second whatever the frame rate, if it
+/// settles by the clock.
+pub(crate) fn follow(settle: Option<Settle>, frame_ms: f32) -> f32 {
+    match settle {
+        Some(settle) => 1.0 - (-frame_ms / settle.ms).exp(),
+        None => FOLLOW,
+    }
+}
 
 /// The passes. From the fork's shader (`victory-gpu/src/ambient.rs` at
 /// avatarmanz 9576c45f), with what Wine's HLSL compiler (vkd3d-shader 1.18
@@ -146,6 +196,7 @@ cbuffer Set : register(b0) {
     float level; float strength; float radius; float near_z;
     float tan_y; float follow; float most; uint width;
     uint height; uint flat; float air; uint slices;
+    float jump; float fresh; float dt;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are. Read through the structured view, written
@@ -210,9 +261,18 @@ void main(uint3 at : SV_DispatchThreadID) {
     for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
     float4 was = cells[CELLS];
     float3 mean = sum / CELLS;
-    // Its fourth part: above 0 once something is kept.
-    if (was.a > 0.0) mean = lerp(was.rgb, mean, follow);
-    cells_out.Store4(CELLS * 16, asuint(float4(mean, 1.0)));
+    // (`jump` > 0: a change of more than that factor either way is
+    // followed at once, as a new room is.)
+    float a = max(luma(mean), 1e-5), b = max(luma(was.rgb), 1e-5);
+    bool jumped = jump > 0.0 && max(a / b, b / a) > jump;
+    // Its fourth part: seconds since the light around last jumped (from
+    // 0.001; 0: nothing kept yet).
+    float age = 0.001;
+    if (was.a > 0.0 && !jumped) {
+        age = was.a + dt;
+        mean = lerp(was.rgb, mean, follow);
+    }
+    cells_out.Store4(CELLS * 16, asuint(float4(mean, age)));
 }
 #endif
 
@@ -318,11 +378,15 @@ void main(uint3 at : SV_DispatchThreadID) {
     }
     // What the program left counts as far as it can be true (`most` times
     // the estimate; 0: not at all): the sky's light outdoors, not the
-    // blocks of other memory.
+    // blocks of other memory. For `fresh` seconds after the light around
+    // jumped (a new room) it counts for no more than the estimate, then up
+    // to `most` times it again: its history holds the place before.
     float3 written = found;
     if (most > 0.0) {
         float3 was = unpack(light[at.xy]);
-        float top = max(luma(found) * most, 1e-6);
+        float bound = most;
+        if (fresh > 0.0) bound = lerp(1.0, most, saturate(around.a / fresh));
+        float top = max(luma(found) * bound, 1e-6);
         was *= min(1.0, top / max(luma(was), 1e-6));
         written = max(was, found);
     }
@@ -388,10 +452,15 @@ pub(crate) struct Pass {
     /// [`air`], and the slices of the volume the air's pass bounds.
     pub(crate) air: f32,
     pub(crate) slices: u32,
+    /// [`Settle`]'s jump factor and fresh seconds (0: none), and the
+    /// seconds this keeping counts for.
+    pub(crate) jump: f32,
+    pub(crate) fresh: f32,
+    pub(crate) dt: f32,
 }
 
 /// Dwords of the passes' constant buffer.
-pub(crate) const CONSTANTS: usize = 12;
+pub(crate) const CONSTANTS: usize = 15;
 
 /// A pass's root constants, in the order the constant buffer declares them
 /// (all scalars, so four to a row whatever the compiler's packing).
@@ -402,12 +471,13 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
     for (to, f) in out.iter_mut().zip(floats) {
         *to = f.to_bits();
     }
-    out[7..].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat), p.air.to_bits(), p.slices]);
+    out[7..12].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat), p.air.to_bits(), p.slices]);
+    out[12..].copy_from_slice(&[p.jump, p.fresh, p.dt].map(f32::to_bits));
     out
 }
 
 /// The line logged once at start when the estimate is on.
-pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32, air: f32) -> String {
+pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32, air: f32, settle: Option<Settle>) -> String {
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
     let left = if most > 0.0 {
         format!("what the title's resolve left counts up to {most} times it")
@@ -419,10 +489,17 @@ pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32, air: f32) -> St
     } else {
         "what the air scatters is left alone".to_owned()
     };
+    let settles = match settle {
+        Some(Settle { ms, jump, fresh }) => format!(
+            "the mean of the light around settles by the clock (VICTORY_AMBIENT_SETTLE: {ms} ms, a \
+             change by more than {jump} times at once, {fresh} s fresh)"
+        ),
+        None => format!("the mean of the light around goes {FOLLOW} of the way a frame"),
+    };
     format!(
         "VICTORY_AMBIENT=estimate: the screen probes' indirect diffuse light is replaced by an \
          estimate from the light visible surfaces send out ({share} of it; {CX}x{CY} cells, \
-         {PX}x{PY} points), {shaded}; {left}; {air}"
+         {PX}x{PY} points), {shaded}; {left}; {air}; {settles}"
     )
 }
 
@@ -608,7 +685,9 @@ pub(crate) mod reference {
 
         /// The `RAISE` pass at texel `p`: the light written there, before
         /// it is packed. `was` is what the title's resolve left.
-        pub(crate) fn raise(&self, p: [i32; 2], points: &[[V4; 3]], around: V3, set: &super::Pass, was: V3) -> V3 {
+        pub(crate) fn raise(&self, p: [i32; 2], points: &[[V4; 3]], around: V4, set: &super::Pass, was: V3) -> V3 {
+            let age = around[3];
+            let around = [around[0], around[1], around[2]];
             let mut found = around.map(|v| v * set.level);
             if !set.flat {
                 let c = self.seen(p);
@@ -649,7 +728,11 @@ pub(crate) mod reference {
             if set.most <= 0.0 {
                 return found;
             }
-            let top = (luma(found) * set.most).max(1e-6);
+            let mut bound = set.most;
+            if set.fresh > 0.0 {
+                bound = 1.0 + (set.most - 1.0) * (age / set.fresh).clamp(0.0, 1.0);
+            }
+            let top = (luma(found) * bound).max(1e-6);
             let scale = (top / luma(was).max(1e-6)).min(1.0);
             [0, 1, 2].map(|k| (was[k] * scale).max(found[k]))
         }
@@ -686,8 +769,10 @@ pub(crate) mod reference {
     }
 
     /// The `MEAN` pass: the slow mean after a keeping of `cells`, from the
-    /// one before (`was`; its fourth part 0: none).
-    pub(crate) fn mean(cells: &[V3], was: V4, follow: f32) -> V4 {
+    /// one before (`was`; its fourth part 0: none), and in its fourth part
+    /// the seconds since it last jumped (by more than `jump` times; 0:
+    /// never), this keeping counting for `dt`.
+    pub(crate) fn mean(cells: &[V3], was: V4, follow: f32, jump: f32, dt: f32) -> V4 {
         let mut now = [0.0f32; 3];
         for c in cells {
             for k in 0..3 {
@@ -695,11 +780,13 @@ pub(crate) mod reference {
             }
         }
         let now = now.map(|v| v / cells.len() as f32);
-        if was[3] > 0.0 {
+        let (a, b) = (luma(now).max(1e-5), luma([was[0], was[1], was[2]]).max(1e-5));
+        let jumped = jump > 0.0 && (a / b).max(b / a) > jump;
+        if was[3] > 0.0 && !jumped {
             let m = [0, 1, 2].map(|k| was[k] + (now[k] - was[k]) * follow);
-            [m[0], m[1], m[2], 1.0]
+            [m[0], m[1], m[2], was[3] + dt]
         } else {
-            [now[0], now[1], now[2], 1.0]
+            [now[0], now[1], now[2], 0.001]
         }
     }
 
@@ -831,15 +918,19 @@ mod tests {
             flat: true,
             air: 3.0,
             slices: 64,
+            jump: 3.0,
+            fresh: 1.5,
+            dt: 0.3,
         };
         let c = constants(&p);
         let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
         assert_eq!(floats, [0.8, 1.0, 0.6, 0.1, 0.45, 0.04, 4.0]);
-        assert_eq!(c[7..], [2560, 1440, 1, 3.0f32.to_bits(), 64]);
+        assert_eq!(c[7..12], [2560, 1440, 1, 3.0f32.to_bits(), 64]);
+        assert_eq!(c[12..].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(), [3.0, 1.5, 0.3]);
         let declared = declared(SOURCE);
         assert_eq!(
             declared,
-            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices"]
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt"]
         );
         assert_eq!(declared.len(), CONSTANTS);
     }
@@ -888,14 +979,16 @@ mod tests {
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0);
+        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0, None);
         assert!(line.starts_with("VICTORY_AMBIENT=estimate: "), "{line}");
         assert!(line.contains("(1 of it; 64x36 cells, 160x90 points), shaded from depth"), "{line}");
-        assert!(line.ends_with("what the title's resolve left is replaced; what the air scatters is left alone"), "{line}");
-        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0);
+        assert!(line.contains("what the title's resolve left is replaced; what the air scatters is left alone; "), "{line}");
+        assert!(line.ends_with("the mean of the light around goes 0.04 of the way a frame"), "{line}");
+        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0, settle(Some("250,3")));
         assert!(line.contains("(0.5 of it;") && line.contains("not shaded"), "{line}");
         assert!(line.contains("counts up to 4 times it; "), "{line}");
-        assert!(line.ends_with("the air scatters no more than 3 times the light around (VICTORY_AMBIENT_AIR)"), "{line}");
+        assert!(line.contains("the air scatters no more than 3 times the light around (VICTORY_AMBIENT_AIR); "), "{line}");
+        assert!(line.ends_with("settles by the clock (VICTORY_AMBIENT_SETTLE: 250 ms, a change by more than 3 times at once, 0 s fresh)"), "{line}");
     }
 
     #[test]
@@ -950,16 +1043,56 @@ mod tests {
     fn the_slow_mean_follows_by_a_share() {
         let dark = vec![[0.0f32; 3]; CELLS as usize];
         let lit = vec![[2.0f32, 1.0, 0.5]; CELLS as usize];
-        let first = mean(&lit, [0.0; 4], FOLLOW);
+        let first = mean(&lit, [0.0; 4], FOLLOW, 0.0, 0.1);
         assert!(near(first[0], 2.0, 1e-5) && near(first[2], 0.5, 1e-5) && first[3] > 0.0);
-        let next = mean(&dark, first, FOLLOW);
+        let next = mean(&dark, first, FOLLOW, 0.0, 0.1);
         assert!(near(next[0], 2.0 * 0.96, 1e-5), "{next:?}");
         // 25 keepings: to 1/e of the way, about.
         let mut m = first;
         for _ in 0..25 {
-            m = mean(&dark, m, FOLLOW);
+            m = mean(&dark, m, FOLLOW, 0.0, 0.1);
         }
         assert!(near(m[0], 2.0 * 0.96f32.powi(25), 1e-4) && m[0] < 2.0 * 0.37);
+    }
+
+    /// Settling by the clock: the same share of the way a second whatever
+    /// the frame rate, a change by more than the jump factor at once, and
+    /// the seconds since the last jump counted.
+    #[test]
+    fn the_slow_mean_settles_by_the_clock() {
+        assert_eq!(settle(None), None);
+        assert_eq!(settle(Some("0")), None);
+        assert_eq!(settle(Some("")), None);
+        assert_eq!(settle(Some("x,3")), None);
+        assert_eq!(settle(Some("250")), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
+        assert_eq!(settle(Some(" 500 , 0 , 1.5 ")), Some(Settle { ms: 500.0, jump: 0.0, fresh: 1.5 }));
+        assert_eq!(settle(Some("250,-1,x")), Some(Settle { ms: 250.0, jump: 3.0, fresh: 0.0 }));
+        // A keeping's time: the first and after a pause as a frame of 33 ms.
+        assert_eq!([frame_ms(None), frame_ms(Some(0)), frame_ms(Some(300)), frame_ms(Some(1000)), frame_ms(Some(1001))], [33.0, 1.0, 300.0, 1000.0, 33.0]);
+        // Not by the clock: 0.04 whatever the time.
+        assert_eq!(follow(None, 300.0), FOLLOW);
+        // By the clock, three frames of 100 ms go as far as one of 300 ms.
+        let by = settle(Some("250"));
+        let (short, long) = (follow(by, 100.0), follow(by, 300.0));
+        assert!(near(1.0 - (1.0 - short).powi(3), long, 1e-5) && near(long, 1.0 - (-1.2f32).exp(), 1e-6), "{short} {long}");
+        // At this line's 3 frames a second, 0.04 a frame takes 25 frames
+        // (8 s) for what 250 ms does in one.
+        assert!(long > 0.69 && FOLLOW * 17.0 < long);
+        let lit = vec![[1.0f32; 3]; CELLS as usize];
+        let dim = vec![[0.5f32; 3]; CELLS as usize];
+        let dark = vec![[0.1f32; 3]; CELLS as usize];
+        let first = mean(&lit, [0.0; 4], long, 3.0, 0.3);
+        assert!(near(first[0], 1.0, 1e-5) && near(first[3], 0.001, 1e-5));
+        // Half the light: followed, and the time since the jump runs.
+        let next = mean(&dim, first, long, 3.0, 0.3);
+        assert!(near(next[0], 1.0 - 0.5 * long, 1e-5) && near(next[3], 0.301, 1e-4), "{next:?}");
+        // A tenth of it (more than 3 times less): taken at once.
+        let jumped = mean(&dark, next, long, 3.0, 0.3);
+        assert!(near(jumped[0], 0.1, 1e-3) && near(jumped[3], 0.001, 1e-5), "{jumped:?}");
+        // And as much more.
+        assert!(near(mean(&lit, jumped, long, 3.0, 0.3)[0], 1.0, 1e-5));
+        // No jump factor: followed.
+        assert!(near(mean(&dark, next, long, 0.0, 0.3)[0], next[0] + (0.1 - next[0]) * long, 1e-3));
     }
 
     /// A wall straight ahead at `metres`.
@@ -976,6 +1109,9 @@ mod tests {
         flat: false,
         air: 0.0,
         slices: 0,
+        jump: 0.0,
+        fresh: 0.0,
+        dt: 0.0,
     };
 
     /// Texels are placed by their depth: the picture's middle straight
@@ -1018,10 +1154,10 @@ mod tests {
         for p in [[0, 0], [320, 180], [639, 359], [17, 301]] {
             let (n, open) = scene.surface(p, 1.0, 0.6);
             assert!(n[2] < -0.999 && open == 1.0, "{n:?} {open}");
-            let written = scene.raise(p, &points, [0.5, 0.25, 0.125], &SET, [0.0; 3]);
+            let written = scene.raise(p, &points, [0.5, 0.25, 0.125, 1.0], &SET, [0.0; 3]);
             assert!(near(written[0], 0.5, 1e-3) && near(written[2], 0.125, 1e-3), "{written:?}");
             // A share of it.
-            let half = scene.raise(p, &points, [0.5, 0.25, 0.125], &Pass { level: 0.5, ..SET }, [0.0; 3]);
+            let half = scene.raise(p, &points, [0.5, 0.25, 0.125, 1.0], &Pass { level: 0.5, ..SET }, [0.0; 3]);
             assert!(near(half[0], 0.25, 1e-3), "{half:?}");
         }
     }
@@ -1044,13 +1180,13 @@ mod tests {
         assert!(points.iter().all(|p| p[1] == [0.0; 4] && p[2] == [0.0; 4]));
         // Texels in between are given what lies between their points, and
         // never less than a fifth nor more than 2.5 times the mean there.
-        let around = [0.5, 0.0, 0.0];
+        let around = [0.5, 0.0, 0.0, 1.0];
         let dark = scene.raise([600, 180], &points, around, &SET, [0.0; 3])[0];
         let lit = scene.raise([40, 180], &points, around, &SET, [0.0; 3])[0];
         assert!(lit > 0.75 && lit < 1.0 && dark >= 0.1 - 1e-4 && dark < 0.25, "{lit} {dark}");
         // Without a depth image: the slow mean alone.
         let flat = scene.raise([40, 180], &points, around, &Pass { flat: true, ..SET }, [0.0; 3]);
-        assert_eq!(flat, around);
+        assert_eq!(flat, [0.5, 0.0, 0.0]);
     }
 
     /// The crease between a floor and a wall is darker than the open floor.
@@ -1082,7 +1218,7 @@ mod tests {
         let light = vec![[0.5f32; 3]; CELLS as usize];
         let points = scene.gather(&light, &scene.place());
         let set = Pass { most: 4.0, ..SET };
-        let raise = |was: V3| scene.raise([320, 180], &points, [0.5; 3], &set, was);
+        let raise = |was: V3| scene.raise([320, 180], &points, [0.5, 0.5, 0.5, 1.0], &set, was);
         assert!(near(raise([0.0; 3])[0], 0.5, 1e-3));
         assert!(near(raise([1.0; 3])[0], 1.0, 1e-3));
         assert!(near(raise([100.0; 3])[0], 2.0, 1e-3));
@@ -1090,7 +1226,12 @@ mod tests {
         let magenta = raise([50.0, 0.0, 50.0]);
         assert!(near(luma(magenta), luma([0.5; 3]) * 4.0, 0.3) && magenta[1] >= 0.5 - 1e-3, "{magenta:?}");
         // Replaced when the multiple is 0.
-        assert!(near(scene.raise([320, 180], &points, [0.5; 3], &SET, [100.0; 3])[0], 0.5, 1e-3));
+        assert!(near(scene.raise([320, 180], &points, [0.5, 0.5, 0.5, 1.0], &SET, [100.0; 3])[0], 0.5, 1e-3));
+        // For the fresh seconds after the light around jumped, what was left
+        // counts for no more than the estimate, then rises to the multiple.
+        let fresh = Pass { fresh: 2.0, ..set };
+        let after = |age: f32| scene.raise([320, 180], &points, [0.5, 0.5, 0.5, age], &fresh, [100.0; 3])[0];
+        assert!(near(after(0.001), 0.5, 2e-3) && near(after(1.0), 1.25, 1e-3) && near(after(2.0), 2.0, 1e-3) && near(after(9.0), 2.0, 1e-3));
     }
 
     /// The light is packed as R9G9B9E5 and comes back within a 512th of its

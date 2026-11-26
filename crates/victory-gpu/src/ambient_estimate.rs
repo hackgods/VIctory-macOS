@@ -33,6 +33,11 @@
 //!   without rays the air of a room is lit by the sky's light, a brown veil
 //!   at sunset.
 //!
+//! - `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` (from avatarmanz
+//!   b4ba4bbb): the slow mean follows by a time constant, not by 0.04 a
+//!   frame (25 frames: 8 s at this line's 3 frames a second), and takes a
+//!   change by more than the jump factor at once.
+//!
 //! What it assumes: what is not on screen sends out what is (with the slow
 //! mean, so that turning into a dark corner is not black at once). No
 //! occlusion but the creases'.
@@ -61,7 +66,7 @@
 //!   written; the fork then leaves the title's output.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::{PCSTR, s};
@@ -122,10 +127,27 @@ fn air_bound() -> f32 {
     *SET.get_or_init(|| set::air(var("VICTORY_AMBIENT_AIR").as_deref()))
 }
 
+/// How the slow mean of the light around settles
+/// (`VICTORY_AMBIENT_SETTLE`, `set::settle`; `None`: 0.04 of the way a
+/// frame).
+fn settle() -> Option<set::Settle> {
+    static SET: OnceLock<Option<set::Settle>> = OnceLock::new();
+    *SET.get_or_init(|| set::settle(var("VICTORY_AMBIENT_SETTLE").as_deref()))
+}
+
+/// The milliseconds this keeping counts for (`set::frame_ms` of the time
+/// since the one before; once a frame).
+fn frame_ms() -> f32 {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let now = std::time::Instant::now();
+    let last = LAST.lock().unwrap_or_else(|e| e.into_inner()).replace(now);
+    set::frame_ms(last.map(|last| now.duration_since(last).as_millis() as u64))
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if let Some(share) = share() {
-        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound()));
+        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound(), settle()));
     }
 }
 
@@ -460,6 +482,9 @@ fn settings(share: f32) -> set::Pass {
         flat: false,
         air: air_bound(),
         slices: 0,
+        jump: settle().map_or(0.0, |s| s.jump),
+        fresh: settle().map_or(0.0, |s| s.fresh),
+        dt: 0.0,
     }
 }
 
@@ -508,7 +533,10 @@ pub(crate) fn keep(list: &HostList, radiance: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
     let radiance = Image { image: &copy.texture, format, slices: 0 };
-    pass.keep(host, list, radiance, [d.Width as u32, d.Height], &settings(share));
+    // The slow mean goes on by the time since the last keeping.
+    let ms = frame_ms();
+    let given = set::Pass { follow: set::follow(settle(), ms), dt: ms / 1000.0, ..settings(share) };
+    pass.keep(host, list, radiance, [d.Width as u32, d.Height], &given);
     KEPT.store(true, Ordering::Relaxed);
     RECORDED[0].fetch_add(1, Ordering::Relaxed);
     true
@@ -831,6 +859,9 @@ mod tests {
         flat: false,
         air: 0.0,
         slices: 0,
+        jump: 0.0,
+        fresh: 0.0,
+        dt: 0.25,
     };
 
     /// The passes on the GPU give what the arithmetic on the CPU gives
@@ -851,6 +882,9 @@ mod tests {
         for (given, was, depth) in [
             (base, [9.0, 0.0, 9.0], true),
             (set::Pass { most: 4.0, shade: [0.0, 0.6, 0.1, 0.45], ..base }, [9.0, 0.0, 9.0], true),
+            // 0.5 s after a jump of 2 fresh seconds: what was left counts
+            // for 1.75 times the estimate.
+            (set::Pass { most: 4.0, fresh: 2.0, jump: 3.0, ..base }, [9.0, 0.0, 9.0], true),
             (base, [0.0; 3], false),
         ] {
             let (cells, mean, places, points, written) = run(host, &pass, &given, was, depth);
@@ -858,8 +892,8 @@ mod tests {
                 assert!((0..3).all(|k| near(got[k], want[k], 1e-3)), "cell {i}: {got:?} {want:?}");
             }
             // The second keeping goes a share of the way from the first.
-            slow = reference::mean(&want_cells, slow, given.follow);
-            assert!((0..3).all(|k| near(mean[k], slow[k], 1e-3)) && mean[3] > 0.0, "{mean:?} {slow:?}");
+            slow = reference::mean(&want_cells, slow, given.follow, given.jump, given.dt);
+            assert!((0..4).all(|k| near(mean[k], slow[k], 1e-3)) && mean[3] > 0.0, "{mean:?} {slow:?}");
             if !depth {
                 // The slow mean alone, everywhere.
                 let flat = reference::pack([0, 1, 2].map(|k| slow[k] * given.level));
@@ -881,11 +915,10 @@ mod tests {
                 }
             }
             let want_points: Vec<[V4; 3]> = want_points.clone();
-            let around = [slow[0], slow[1], slow[2]];
             let mut odd = 0;
             for y in 0..LIGHT[1] {
                 for x in 0..LIGHT[0] {
-                    let want = scene.raise([x as i32, y as i32], &want_points, around, &given, reference::unpack(reference::pack(was)));
+                    let want = scene.raise([x as i32, y as i32], &want_points, slow, &given, reference::unpack(reference::pack(was)));
                     let got = reference::unpack(written[(y * LIGHT[0] + x) as usize]);
                     if !close(got, reference::unpack(reference::pack(want))) {
                         odd += 1;

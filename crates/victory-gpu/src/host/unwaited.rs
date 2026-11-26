@@ -996,4 +996,47 @@ mod tests {
             );
         }
     }
+
+    /// `VICTORY_COPY_ORDER=split` with submissions not waited for: a piece
+    /// split at a list that starts after a copy (`copy_order_parts`) runs
+    /// as two submissions, and the second's steps (the copy is its first)
+    /// are done only when the first has run and been finished (its work
+    /// for after is done). As one submission, every list's steps are done
+    /// before any of it has run.
+    #[test]
+    fn a_split_piece_prepares_its_second_part_when_the_first_has_run() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        for (forced, split) in [(true, true), (false, true), (true, false)] {
+            FORCED.store(forced, Relaxed);
+            let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+            let log = order.clone();
+            lists[0].defer_after(move || log.lock().unwrap().push("the first has run"));
+            if split {
+                lists[1].starts_after_copy();
+            }
+            let log = order.clone();
+            lists[1].defer_host(move || log.lock().unwrap().push("the second's steps"));
+            lists.iter().for_each(|l| l.close());
+            let parts = copy_order_parts(lists.to_vec());
+            assert_eq!(parts.len(), if split { 2 } else { 1 });
+            let mut back = Vec::new();
+            for part in parts {
+                back.extend(host.execute_title(1, part));
+            }
+            settle(By::Signal);
+            FORCED.store(false, Relaxed);
+            let want = if split {
+                ["the first has run", "the second's steps"]
+            } else {
+                ["the second's steps", "the first has run"]
+            };
+            assert_eq!(*order.lock().unwrap(), want, "not waited for: {forced}, split: {split}");
+            drop(back);
+            drop(take_done());
+        }
+    }
 }

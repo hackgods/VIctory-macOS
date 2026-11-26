@@ -209,12 +209,17 @@ fn pump(held: &mut Holding, why: Why) {
     // (`crate::host::unwaited`).
     let ran = std::cell::Cell::new(std::time::Duration::ZERO);
     let mut run = |queue: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let at = std::time::Instant::now();
-        // The lists that have run: these, unless the host GPU was left
-        // with them (then they come back with a later piece).
-        let done = host.execute_title(queue, segments);
-        ran.set(ran.get() + at.elapsed());
-        done.into_iter().for_each(crate::list::recycle);
+        // One host submission, or with `VICTORY_COPY_ORDER=split` one more
+        // for each title copy in the piece that changes what its earlier
+        // lists read: the part before it has run when the copy is made.
+        for part in crate::host::copy_order_parts(segments) {
+            let at = std::time::Instant::now();
+            // The lists that have run: these, unless the host GPU was left
+            // with them (then they come back with a later piece).
+            let done = host.execute_title(queue, part);
+            ran.set(ran.get() + at.elapsed());
+            done.into_iter().for_each(crate::list::recycle);
+        }
     };
     // The title's fence moves once the work before the Signal has run.
     let mut signal = |f: usize, value: u64| {
@@ -315,9 +320,23 @@ fn account() -> std::sync::MutexGuard<'static, Account> {
 #[cfg(windows)]
 fn account_frame(frame: u64) {
     let (cuts, early) = crate::list::take_cuts();
+    let (copy_cuts, copy_splits) = (crate::list::take_copy_cuts(), crate::host::take_copy_splits());
     let (fence_waits, fence_waited) = crate::fence::take_waited();
     let a = std::mem::take(&mut *account());
     let blocked = held().blocked(&read_value);
+    // `VICTORY_COPY_ORDER=split`: what it did this frame, on a line of its
+    // own (the line below is only written when work was held).
+    if copy_cuts > 0 || copy_splits > 0 {
+        tracing::info!(
+            frame,
+            copy_cuts,
+            copy_splits,
+            pieces = a.pieces,
+            "copy order this frame: title lists cut at a copy that changes what their earlier commands read; \
+             host submissions added for such copies (the cuts, and copies that change what an earlier list of \
+             the piece reads); the queues' pieces before the splits"
+        );
+    }
     if a.released.is_empty() && blocked.is_empty() && a.forced == 0 && a.unknown == 0 && a.mappings == 0 {
         return;
     }

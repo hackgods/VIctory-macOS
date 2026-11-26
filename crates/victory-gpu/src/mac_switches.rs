@@ -193,6 +193,55 @@ pub(crate) fn walk() -> bool {
     })
 }
 
+/// Whether a title copy recorded in a list keeps its order with the
+/// commands before it that read what it changes, and the longest read
+/// range looked at: only with `VICTORY_COPY_ORDER=split` (every range) or
+/// `split:<bytes>` (ranges of at most so many bytes).
+///
+/// On the console a list's copies (`CopyBufferRegion`, buffer
+/// `CopyResource`, `CopyMemoryToMemoryX`) and its draws and dispatches run
+/// in their order. Here every copy of a host submission is done on the CPU
+/// before its first GPU command, into the one host copy of each buffer, so
+/// a command recorded before such a copy ran with the bytes meant for the
+/// commands after it (the title's TAA passes worked on a quarter of the
+/// screen, `notes/uav-size.md`, "Copy order"). With the switch the title
+/// list is cut at such a copy (`crate::list`) and a queue's piece is split
+/// there into two host submissions (`crate::host::copy_order_parts`): the
+/// first has run on the GPU before the copy is made. `0`, `keep` and
+/// anything else leave it off (the diagnostics of `crate::host` read the
+/// same variable).
+pub(crate) fn copy_order_split() -> Option<usize> {
+    #[cfg(test)]
+    if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        return Some(usize::MAX);
+    }
+    static RULE: OnceLock<Option<usize>> = OnceLock::new();
+    *RULE.get_or_init(|| {
+        let rule = copy_order(std::env::var("VICTORY_COPY_ORDER").ok().as_deref());
+        match rule {
+            Some(usize::MAX) => tracing::info!(
+                "VICTORY_COPY_ORDER=split: a title copy that changes what earlier commands of its submission read starts a new host submission"
+            ),
+            Some(bytes) => tracing::info!(
+                bytes,
+                "VICTORY_COPY_ORDER=split:<bytes>: a title copy that changes a range of at most so many bytes that earlier commands of its submission read starts a new host submission"
+            ),
+            None => {}
+        }
+        rule
+    })
+}
+
+/// `VICTORY_COPY_ORDER`'s rule for the split: `split` is every read range,
+/// `split:<bytes>` those of at most `bytes` (1 or more); anything else is
+/// off.
+fn copy_order(value: Option<&str>) -> Option<usize> {
+    match value?.trim().strip_prefix("split")? {
+        "" => Some(usize::MAX),
+        bound => bound.strip_prefix(':')?.parse().ok().filter(|&bytes| bytes > 0),
+    }
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -269,8 +318,42 @@ pub(crate) fn key(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{heap_sync_pause, key, quick, setting, uav_size, writers};
+pub(crate) mod tests {
+    use super::{copy_order, heap_sync_pause, key, quick, setting, uav_size, writers};
+
+    /// How many tests have the copy-order split forced on right now.
+    pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// While it lives, `copy_order_split` is on for the process, as with
+    /// `VICTORY_COPY_ORDER=split` (other tests then only note what their
+    /// lists read).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct ForcedCopyOrder;
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    impl ForcedCopyOrder {
+        pub(crate) fn on() -> ForcedCopyOrder {
+            FORCED_COPY_ORDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ForcedCopyOrder
+        }
+    }
+
+    impl Drop for ForcedCopyOrder {
+        fn drop(&mut self) {
+            FORCED_COPY_ORDER.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn the_copy_order_switch_is_split_with_an_optional_bound() {
+        for off in [None, Some(""), Some("0"), Some("1"), Some("keep"), Some("split:"), Some("split:0"), Some("split:x"), Some("splits")] {
+            assert_eq!(copy_order(off), None, "{off:?}");
+        }
+        assert_eq!(copy_order(Some("split")), Some(usize::MAX));
+        assert_eq!(copy_order(Some(" split ")), Some(usize::MAX));
+        assert_eq!(copy_order(Some("split:256")), Some(256));
+        assert_eq!(copy_order(Some("split:65536")), Some(65536));
+    }
 
     #[test]
     fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {

@@ -55,6 +55,15 @@ impl Ranges {
         self.0.splice(first..last, left.into_iter().chain(right));
     }
 
+    /// Whether any byte of `[from, to)` is in the set.
+    pub(crate) fn overlaps(&self, from: usize, to: usize) -> bool {
+        from < to
+            && self
+                .0
+                .get(self.0.partition_point(|&(_, e)| e <= from))
+                .is_some_and(|&(s, _)| s < to)
+    }
+
     /// The parts of `[from, to)` not in the set, in order.
     pub(crate) fn missing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
         let mut out = Vec::new();
@@ -73,6 +82,40 @@ impl Ranges {
         }
         out
     }
+}
+
+/// Where a queue's piece (host lists in the order they run, each with the
+/// buffer ranges its commands read, the ranges its title copies write, and
+/// whether it starts at a title copy that changes what the list before it
+/// reads) is to be split into host submissions, so that no title copy
+/// changes what a list earlier in the same submission reads
+/// (`VICTORY_COPY_ORDER=split`; `crate::host::copy_order_parts`): the
+/// indices of the lists that start a new submission, in order.
+///
+/// A submission's copies are all done before its first GPU command; a
+/// copy and the commands of an earlier list keep the title's order only
+/// in different submissions. A copy that changes what its own list read
+/// before it is not seen here: the list is cut there when it is recorded
+/// (`crate::list`), and the second part says so (`after_copy`).
+pub(crate) fn copy_order_splits<'a>(
+    lists: impl IntoIterator<Item = (&'a Ranges, &'a [(usize, usize)], bool)>,
+) -> Vec<usize> {
+    let mut splits = Vec::new();
+    // The reads of the lists of the submission being gathered.
+    let mut reads: Vec<&Ranges> = Vec::new();
+    for (i, (read, copied, after_copy)) in lists.into_iter().enumerate() {
+        let changes = |reads: &[&Ranges]| {
+            copied
+                .iter()
+                .any(|&(at, len)| reads.iter().any(|r| r.overlaps(at, at.saturating_add(len))))
+        };
+        if !reads.is_empty() && (after_copy || changes(&reads)) {
+            splits.push(i);
+            reads.clear();
+        }
+        reads.push(read);
+    }
+    splits
 }
 
 /// How many of a submission's largest refresh ranges are logged.
@@ -209,7 +252,74 @@ impl SmallReads {
 
 #[cfg(test)]
 mod tests {
-    use super::{REFRESH_TOP, Ranges, RefreshSummary, SMALL_READ, SmallReads};
+    use super::{REFRESH_TOP, Ranges, RefreshSummary, SMALL_READ, SmallReads, copy_order_splits};
+
+    #[test]
+    fn overlaps_is_true_for_any_shared_byte() {
+        let mut r = Ranges::default();
+        assert!(!r.overlaps(0, usize::MAX));
+        r.insert(0x100, 0x120, 0);
+        r.insert(0x400, 0x500, 0);
+        for (from, to, want) in [
+            (0x100, 0x120, true),
+            (0x0, 0x101, true),
+            (0x11f, 0x200, true),
+            (0x0, 0x100, false),
+            (0x120, 0x400, false),
+            (0x110, 0x110, false),
+            (0x4ff, 0x500, true),
+            (0x500, 0x600, false),
+            (0x0, 0x1000, true),
+        ] {
+            assert_eq!(r.overlaps(from, to), want, "{from:#x}..{to:#x}");
+        }
+    }
+
+    /// A piece is split before the list whose copy changes what an earlier
+    /// list of the same part reads, and before a list cut at such a copy;
+    /// the lists after a split are looked at against the new part only.
+    #[test]
+    fn a_piece_is_split_where_a_copy_changes_what_an_earlier_list_reads() {
+        let reads = |r: &[(usize, usize)]| {
+            let mut set = Ranges::default();
+            for &(from, to) in r {
+                set.insert(from, to, 0);
+            }
+            set
+        };
+        let (x, other, none) = (reads(&[(0x1fe0, 0x2000)]), reads(&[(0x9000, 0x9040)]), reads(&[]));
+        let splits = |lists: &[(&Ranges, &[(usize, usize)], bool)]| copy_order_splits(lists.iter().copied());
+        // Nothing to split: no copies, a copy elsewhere, a copy before any
+        // read, a copy into what only a later list reads.
+        assert!(splits(&[]).is_empty());
+        assert!(splits(&[(&x, &[], false), (&x, &[], false)]).is_empty());
+        assert!(splits(&[(&x, &[], false), (&other, &[(0x3000, 32)], false)]).is_empty());
+        assert!(splits(&[(&none, &[(0x1fe0, 32)], false), (&x, &[], false)]).is_empty());
+        // A list's own reads do not split it from itself (the cut does).
+        assert!(splits(&[(&x, &[(0x1fe0, 32)], false)]).is_empty());
+        // The title's TAA case across two lists, a byte's overlap, and a
+        // reader two lists back.
+        assert_eq!(splits(&[(&x, &[], false), (&x, &[(0x1fe0, 32)], false)]), [1]);
+        assert_eq!(splits(&[(&x, &[], false), (&none, &[(0x1fff, 0x1000)], false)]), [1]);
+        assert_eq!(splits(&[(&x, &[], false), (&other, &[], false), (&none, &[(0x1ff0, 4)], false)]), [2]);
+        // A list cut at a copy starts a submission unless it is the first
+        // of the piece (the part before it ran in an earlier piece).
+        assert!(splits(&[(&none, &[(0x1fe0, 32)], true)]).is_empty());
+        assert_eq!(splits(&[(&x, &[], false), (&x, &[(0x1fe0, 32)], true)]), [1]);
+        assert_eq!(splits(&[(&none, &[], false), (&none, &[], true)]), [1]);
+        // After a split only the new part's reads count: the third list's
+        // copy changes what the second read, the fourth's what the first
+        // read, which ran two submissions before.
+        assert_eq!(
+            splits(&[
+                (&x, &[], false),
+                (&other, &[(0x1fe0, 32)], false),
+                (&none, &[(0x9000, 8)], false),
+                (&none, &[(0x1fe0, 32)], false),
+            ]),
+            [1, 2]
+        );
+    }
 
     /// A copy writes the small ranges read before it where they overlap,
     /// counted per range; long ranges and ranges read after it are not its.

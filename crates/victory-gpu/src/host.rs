@@ -1193,6 +1193,18 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// With `VICTORY_COPY_ORDER=split` (else all empty): the buffer ranges
+    /// (title addresses) the list's commands read so far, as their
+    /// refreshes name them ([`HostList::defer_refresh`]: table views,
+    /// vertex and index buffers, root views, indirect arguments).
+    reads: crate::ranges::Ranges,
+    /// The ranges the title's copies recorded in the list write (address,
+    /// bytes).
+    copied: Vec<(usize, usize)>,
+    /// The list is the part of a title list after a copy that changes what
+    /// the part before it reads (`crate::list`): it starts a host
+    /// submission ([`copy_order_parts`]).
+    after_copy: bool,
 }
 
 impl Host {
@@ -2532,10 +2544,42 @@ impl HostList {
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
+            // What the commands read, for the order of title copies.
+            if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+                deferred.reads.insert(address, address.saturating_add(len), 0);
+            }
             deferred
                 .copies
                 .push(Step::Refresh(shadow.clone(), address, len));
         }
+    }
+
+    /// Whether a title copy into `[dst, dst + len)` recorded now changes
+    /// what a command recorded in this list reads (always false without
+    /// `VICTORY_COPY_ORDER=split`): the title list is then cut before it
+    /// (`crate::list`).
+    pub(crate) fn read_before(&self, dst: usize, len: usize) -> bool {
+        self.deferred().reads.overlaps(dst, dst.saturating_add(len))
+    }
+
+    /// The title records a copy into `[dst, dst + len)` in this list
+    /// (noted with `VICTORY_COPY_ORDER=split`, for [`copy_order_parts`]).
+    pub(crate) fn title_copies(&self, dst: usize, len: usize) {
+        if len > 0 && crate::mac_switches::copy_order_split().is_some() {
+            self.deferred().copied.push((dst, len));
+        }
+    }
+
+    /// The list goes on a title list after a copy that changes what the
+    /// part before it reads.
+    pub(crate) fn starts_after_copy(&self) {
+        self.deferred().after_copy = true;
+    }
+
+    /// Whether [`HostList::starts_after_copy`] was called since the reset.
+    #[cfg(test)]
+    pub(crate) fn after_copy(&self) -> bool {
+        self.deferred().after_copy
     }
 
     /// Brings the buffer range of the view currently in `index` up to date
@@ -2867,6 +2911,71 @@ impl HostList {
     }
 }
 
+/// Pieces split so that a title copy keeps its order with the commands
+/// before it, since the last frame line ([`take_copy_splits`]).
+static COPY_SPLITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The host submissions added by [`copy_order_parts`] since the last call.
+pub(crate) fn take_copy_splits() -> u64 {
+    COPY_SPLITS.swap(0, Ordering::Relaxed)
+}
+
+/// A queue's piece (`lists`, in the order they run) as the host
+/// submissions it is run in: one, unless `VICTORY_COPY_ORDER=split` and a
+/// title copy recorded in one of the lists changes a buffer range that a
+/// command of an earlier list reads, or a list is the part of a title list
+/// cut at such a copy (`crate::ranges::copy_order_splits`). The parts are
+/// run one after the other: each is prepared (its copies made, its buffer
+/// copies brought up to date) only when the one before has run on the host
+/// GPU and been finished, also when the title's submissions are not waited
+/// for ([`unwaited`], [`Host::submissions`]).
+///
+/// Seen: the ranges [`HostList::defer_refresh`] is given (constant buffers
+/// and buffer views in tables, vertex and index buffers, root views,
+/// indirect arguments), whole 64 KiB pages for unordered views that mark
+/// their writes. Not seen, and able to have the same fault: what shaders
+/// read through the view heap itself or through title memory's page table
+/// (`Step::Heap`, `Step::Memory`: any buffer the heap reaches), memory the
+/// runtime shows at two addresses, title memory of textures (uploaded
+/// before a submission's lists, so a copy into it is a submission late for
+/// every reader), and a copy whose source or destination an earlier
+/// command of the submission writes on the GPU.
+pub(crate) fn copy_order_parts(
+    lists: Vec<std::sync::Arc<HostList>>,
+) -> Vec<Vec<std::sync::Arc<HostList>>> {
+    if lists.len() < 2 || crate::mac_switches::copy_order_split().is_none() {
+        return vec![lists];
+    }
+    // One list's lock at a time (a title may submit a list twice). Most
+    // pieces have no copy after their first list: nothing more is read.
+    let copies: Vec<(Vec<(usize, usize)>, bool)> = lists
+        .iter()
+        .map(|l| {
+            let d = l.deferred();
+            (d.copied.clone(), d.after_copy)
+        })
+        .collect();
+    if copies[1..].iter().all(|(copied, after_copy)| copied.is_empty() && !after_copy) {
+        return vec![lists];
+    }
+    let reads: Vec<crate::ranges::Ranges> = lists.iter().map(|l| l.deferred().reads.clone()).collect();
+    let splits = crate::ranges::copy_order_splits(
+        reads.iter().zip(&copies).map(|(r, (copied, after_copy))| (r, copied.as_slice(), *after_copy)),
+    );
+    if splits.is_empty() {
+        return vec![lists];
+    }
+    COPY_SPLITS.fetch_add(splits.len() as u64, Ordering::Relaxed);
+    let mut parts = Vec::with_capacity(splits.len() + 1);
+    let mut rest = lists;
+    for &at in splits.iter().rev() {
+        parts.push(rest.split_off(at));
+    }
+    parts.push(rest);
+    parts.reverse();
+    parts
+}
+
 /// A submission's refreshes not done yet, as the ranges of each buffer copy
 /// asked for (ranges less than [`JOIN`] apart are done as one): done before
 /// a step that writes title memory or gives a range to shaders, and before
@@ -3024,7 +3133,9 @@ impl Batch {
     /// done before its first GPU command, so it runs with the new ones
     /// (the title's TAA passes then work on a quarter of the screen,
     /// `notes/uav-size.md`). The first 32 such copies of a run and those
-    /// of listed capture frames; `VICTORY_COPY_ORDER=0` turns it off.
+    /// of listed capture frames; `VICTORY_COPY_ORDER=0` turns it off. With
+    /// `VICTORY_COPY_ORDER=split` such a copy starts a submission of its
+    /// own, so a line here then names one the split did not see.
     ///
     /// Returns whether the copy is to be left out: with
     /// `VICTORY_COPY_ORDER=keep`, an experiment, when all it writes is one

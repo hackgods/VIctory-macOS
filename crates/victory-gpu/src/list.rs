@@ -186,6 +186,47 @@ pub(crate) fn take_cuts() -> (u64, u64) {
     (CUTS.swap(0, Relaxed), EARLY_RESETS.swap(0, Relaxed))
 }
 
+/// Title lists cut at a copy that changes what their earlier commands read
+/// (`VICTORY_COPY_ORDER=split`, [`copy_into`]).
+static COPY_CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Those cuts since the last call (the frame line).
+pub(crate) fn take_copy_cuts() -> u64 {
+    COPY_CUTS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The host list a title copy into `len` bytes at `dst` is recorded into,
+/// noted there as one of its copies.
+///
+/// With `VICTORY_COPY_ORDER=split`, when a command the title recorded
+/// earlier in the current host list reads some of those bytes
+/// (`HostList::read_before`), the title list goes on in a new host list,
+/// as at a wait after commands ([`wait`]), and that one is marked: the
+/// queue runs it in a host submission after the one the first part is in
+/// (`crate::host::copy_order_parts`), so the first part's commands have
+/// run on the GPU with the old bytes when the copy is made. On the console
+/// a list's copies and commands run in their order; here a submission's
+/// copies are all made before its first GPU command.
+#[cfg(windows)]
+fn copy_into<'a>(this: This, dst: *const u8, len: u64) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    let (at, len) = (dst as usize, usize::try_from(len).unwrap_or(usize::MAX));
+    let into = match current.read_before(at, len).then(|| next_segment(this)).flatten() {
+        Some(next) => {
+            COPY_CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            current.close();
+            // SAFETY: the title passes one of our lists.
+            let list = unsafe { &*this.cast::<List>() };
+            list.state.lock().unwrap_or_else(|e| e.into_inner()).cut(next);
+            next.starts_after_copy();
+            next
+        }
+        None => current,
+    };
+    into.title_copies(at, len);
+    Some(into)
+}
+
 /// `Wait32BitValueX(address, comparison, reference, mask, flags)` and
 /// `Wait64BitValueX(address, comparison, reference, flags)`: the GPU waits
 /// until the value compares true. Recorded at the start of the current host
@@ -632,9 +673,10 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
+    if host_list(this).is_some()
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
+        && let Some(list) = copy_into(this, to, len)
     {
         list.defer_copy(to, from, len as usize);
     }
@@ -666,6 +708,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
+            let list = copy_into(this, to, a.min(b)).unwrap_or(list);
             list.defer_copy(to, from, a.min(b) as usize);
         }
     }
@@ -1105,9 +1148,9 @@ extern "system" fn clear_dsv(
 /// both are known to be committed, as work that may write anywhere.
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
+    if dst != 0
         && src != 0
+        && let Some(list) = copy_into(this, dst as *const u8, len)
     {
         if src.abs_diff(dst) >= len {
             list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
@@ -1994,6 +2037,172 @@ mod tests {
             }
         });
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A title buffer of `bytes` bytes.
+    #[cfg(windows)]
+    fn title_buffer(bytes: u32) -> This {
+        let desc: [u32; 14] = [1, 0, 0, 0, bytes, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut out = std::ptr::null();
+        let iid = guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let made = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut out,
+        );
+        assert_eq!(made, S_OK);
+        out
+    }
+
+    /// The whole way with `VICTORY_COPY_ORDER=split`: a title list that
+    /// reads 32 bytes, copies over them and goes on is submitted to a
+    /// queue; the part before the copy has run and been finished (its work
+    /// for after is done, title memory still holding the old bytes) when
+    /// the second part's steps make the copy.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_cut_at_a_copy_runs_as_two_submissions_through_its_queue() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let null = std::ptr::null();
+        let (target, source) = (title_buffer(4096), title_buffer(256));
+        let at = crate::resource::buffer_bytes(target).unwrap().0 as u64 + 0x100;
+        let from = crate::resource::buffer_bytes(source).unwrap().0 as u64;
+        let copy = crate::shadow::find(at, 32).expect("the buffer's host copy");
+        // SAFETY: inside the two title buffers.
+        unsafe {
+            std::ptr::write_bytes(at as *mut u8, 0xaa, 32);
+            std::ptr::write_bytes(from as *mut u8, 0xbb, 32);
+        }
+        let queue_iid = guid(0x0ec870a6, 0x5d7e, 0x4c22, [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed]);
+        let mut queue = null;
+        assert_eq!(crate::queue::create(null, [0u32; 4].as_ptr().cast(), &queue_iid, &mut queue), S_OK);
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // What title memory holds there, as each part sees it.
+        // SAFETY: inside the title buffer, which outlives the submission.
+        let now = move || unsafe { (at as *const u8).read_volatile() };
+
+        let first = host_list(list).unwrap();
+        copy.refresh(first, at, 32);
+        let log = order.clone();
+        first.defer_after(move || log.lock().unwrap().push(("the first part has run", now())));
+        copy_memory(list, at, from, 32, 0);
+        let second = host_list(list).unwrap();
+        assert!(!std::ptr::eq(first, second) && second.after_copy());
+        let log = order.clone();
+        second.defer_host(move || log.lock().unwrap().push(("the second part's steps", now())));
+        // A command of the second part reads the bytes too.
+        copy.refresh(second, at, 32);
+        assert_eq!(close(list), S_OK);
+
+        let splits = crate::host::take_copy_splits();
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+        // (Another test may have submissions not waited for just now.)
+        crate::host::unwaited::settle(crate::host::unwaited::By::Signal);
+        assert_eq!(
+            *order.lock().unwrap(),
+            [("the first part has run", 0xaa), ("the second part's steps", 0xbb)]
+        );
+        assert!(crate::host::take_copy_splits() + splits >= 1);
+        assert_eq!(copy.read_host(at, 1), [0xbbbb_bbbb], "the second part's commands read the new bytes");
+
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+        assert_eq!(release(queue), 0);
+    }
+
+    /// With `VICTORY_COPY_ORDER=split`, a title copy into bytes that a
+    /// command recorded earlier in the list reads moves the recording to a
+    /// new host list, marked as starting after a copy and holding the copy;
+    /// a copy before any read, a copy elsewhere, and a second copy into
+    /// the same bytes (the new part has read nothing yet) do not.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_into_what_the_list_read_cuts_it_with_the_split_on() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let null = std::ptr::null();
+        let (target, source) = (title_buffer(4096), title_buffer(256));
+        let at = crate::resource::buffer_bytes(target).unwrap().0 as u64;
+        let from = crate::resource::buffer_bytes(source).unwrap().0 as u64;
+        let copy = crate::shadow::find(at, 4096).expect("the buffer's host copy");
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let parts = || segments(list).len();
+        let _ = take_copy_cuts();
+
+        // Before any read.
+        copy_memory(list, at + 0x100, from, 32, 0);
+        assert_eq!(parts(), 1);
+        // A command reads 32 bytes at 0x100 (a table's constant buffer).
+        copy.refresh(host_list(list).unwrap(), at + 0x100, 32);
+        // A copy next to them, to the byte.
+        copy_memory(list, at + 0x120, from, 32, 0);
+        copy_memory(list, at + 0xe0, from, 32, 0);
+        assert_eq!(parts(), 1);
+        // A copy into eight of them.
+        copy_memory(list, at + 0x110, from, 8, 0);
+        assert_eq!(parts(), 2);
+        let hosts = segments(list);
+        assert!(!hosts[0].after_copy() && hosts[1].after_copy());
+        assert!(hosts[0].read_before(at as usize + 0x100, 1) && !hosts[1].read_before(at as usize, 4096));
+        // The new part has read nothing: the same copy again stays in it.
+        copy_memory(list, at + 0x100, from, 32, 0);
+        assert_eq!(parts(), 2);
+        // The other calls that copy title buffers: a region, a whole buffer.
+        copy.refresh(host_list(list).unwrap(), at + 0x300, 16);
+        copy_buffer_region(list, target, 0x308, source, 0, 16);
+        assert_eq!(parts(), 3);
+        // (The shorter buffer's 256 bytes are copied: a read past them
+        // does not count, one inside them does.)
+        copy.refresh(host_list(list).unwrap(), at + 0xf00, 4);
+        copy_resource(list, target, source);
+        assert_eq!(parts(), 3);
+        copy.refresh(host_list(list).unwrap(), at + 0xfc, 4);
+        copy_resource(list, target, source);
+        assert_eq!(parts(), 4);
+        assert!(segments(list)[3].after_copy());
+        // (Counted for the frame line; another test may cut lists too.)
+        assert!(take_copy_cuts() >= 3);
+
+        assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Without the switch nothing is noted and no copy cuts a list.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_cuts_no_list_without_the_split() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        // Another test may have the split forced on just now.
+        if crate::mac_switches::copy_order_split().is_some() {
+            return;
+        }
+        let list = crate::host::host().unwrap().new_list().unwrap();
+        assert!(!list.read_before(0, usize::MAX));
+        list.title_copies(0x1000, 32);
+        assert!(crate::host::copy_order_parts(vec![Arc::new(list)]).len() == 1);
     }
 
     /// ClearUnorderedAccessViewUint/Float and DiscardResource come before

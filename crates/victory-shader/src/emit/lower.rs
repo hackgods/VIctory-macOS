@@ -233,6 +233,8 @@ type HandleKey = (usize, Site, u8, bool, (u32, u32));
 
 struct Lower<'a> {
     s: Shader,
+    /// A linked pair's plan (`mesh::plan_merge`), for the registers at the end.
+    keep: Option<&'a KeptOutputs>,
     x: &'a Parts<'a>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: Map<Value, Why>,
@@ -627,7 +629,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&'a KeptOutputs>) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -786,6 +788,7 @@ impl<'a> Lower<'a> {
         }
         Lower {
             s,
+            keep,
             x,
             bad,
             lane_fail: Map::default(),
@@ -1591,7 +1594,13 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
-            dxil: self.s.finish(),
+            dxil: {
+                if let Some(keep) = self.keep {
+                    mesh::renumber_rows(&mut self.s.inputs, keep);
+                    mesh::renumber_rows(&mut self.s.outputs, keep);
+                }
+                self.s.finish()
+            },
             user_data,
             samplers: self.samplers,
         })

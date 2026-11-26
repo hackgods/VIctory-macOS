@@ -35,6 +35,10 @@ pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs
 /// The reserved [`KeptOutputs`] key under which a linked translation carries
 /// the rows to merge (no semantic has this name); the value is the mode.
 const MERGE_KEY: &str = "\u{0}merge-row";
+/// The reserved [`KeptOutputs`] key under which a linked translation carries
+/// the host register of a console row ([`plan_merge`]); the value is the
+/// register.
+const ORDER_KEY: &str = "\u{0}host-row";
 /// The semantic of a merged row; its index is the row.
 const MERGED_NAME: &str = "VROW";
 
@@ -43,7 +47,13 @@ const MERGED_NAME: &str = "VROW";
 /// one component type, so both stages of a linked pair make each such row
 /// one element ([`merge_rows`]). D3DMetal sizes a row of several elements
 /// (`xyz` and `w`, say) well above the 16 bytes one `float4` takes.
-pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: bool) {
+///
+/// With `reorder` the arbitrary rows also trade registers among themselves so
+/// that whole `float4` rows come first, then three, two and one components:
+/// Metal lays the rows out in register order, a `float4` on a 16-byte
+/// boundary and three components packed in 12 bytes, so a `float4` after an
+/// odd number of `xyz` rows costs 4 bytes of padding (notes/mesh-size.md).
+pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: bool, reorder: bool) {
     let mut pruned = outputs.to_vec();
     prune_signature(&mut pruned, keep);
     let arbitrary = |r: u32| pruned.iter().filter(move |e| e.kind == 0 && e.row == Some(r));
@@ -54,6 +64,41 @@ pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: 
         let same = arbitrary(r).all(|e| e.comp == first.comp && e.half == first.half);
         if same && (widen || arbitrary(r).count() > 1) {
             keep.insert((MERGE_KEY.to_string(), r), 1 + u8::from(widen));
+        }
+    }
+    if reorder {
+        merge_rows(&mut pruned, keep);
+        // Rows still shared by elements of several types keep their place.
+        let mut rows: Vec<(u32, u8)> = Vec::new();
+        for e in pruned.iter().filter(|e| e.kind == 0) {
+            let Some(r) = e.row else { continue };
+            match rows.iter_mut().find(|(row, _)| *row == r) {
+                Some((_, cols)) => *cols = 0,
+                None => rows.push((r, e.cols)),
+            }
+        }
+        rows.retain(|&(_, cols)| cols != 0);
+        let mut registers: Vec<u32> = rows.iter().map(|&(r, _)| r).collect();
+        registers.sort_unstable();
+        rows.sort_by_key(|&(r, cols)| (std::cmp::Reverse(cols), r));
+        for (&(r, _), register) in rows.iter().zip(registers) {
+            keep.insert((ORDER_KEY.to_string(), r), register as u8);
+        }
+    }
+}
+
+/// The host register [`plan_merge`] gave the arbitrary element at console
+/// row `row`, if it moved it.
+fn host_row(keep: &KeptOutputs, row: u32) -> Option<u32> {
+    keep.get(&(ORDER_KEY.to_string(), row)).map(|&r| u32::from(r))
+}
+
+/// Gives the arbitrary elements the registers [`plan_merge`] chose. Last:
+/// lowering finds an element by its console row.
+pub(super) fn renumber_rows(elements: &mut [SigElement], keep: &KeptOutputs) {
+    for e in elements.iter_mut().filter(|e| e.kind == 0) {
+        if let Some(register) = e.row.and_then(|r| host_row(keep, r)) {
+            e.row = Some(register);
         }
     }
 }
@@ -93,6 +138,16 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
         e.cols = if mode == 2 { 4 } else { end };
         e.usage = usage;
         at += 1;
+    }
+    // The signature lists the arbitrary elements in the order of their host
+    // registers, in the places arbitrary elements had.
+    let slots: Vec<usize> = (0..elements.len())
+        .filter(|&i| elements[i].kind == 0 && elements[i].row.is_some_and(|r| host_row(keep, r).is_some()))
+        .collect();
+    let mut moved: Vec<SigElement> = slots.iter().map(|&i| elements[i].clone()).collect();
+    moved.sort_by_key(|e| e.row.and_then(|r| host_row(keep, r)));
+    for (i, e) in slots.into_iter().zip(moved) {
+        elements[i] = e;
     }
 }
 
@@ -193,7 +248,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false);
+        plan_merge(&mut keep, &outputs, false, false);
         let mut mesh = outputs.clone();
         merge_rows(&mut mesh, &keep);
         let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -219,9 +274,46 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, true);
+        plan_merge(&mut keep, &outputs, true, false);
         let mut wide = outputs.clone();
         merge_rows(&mut wide, &keep);
         assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
+    }
+
+    /// Reordering gives the widest rows the lowest registers, the same in
+    /// both stages, and leaves system values where they were.
+    #[test]
+    fn reordered_rows_put_whole_rows_first() {
+        let outputs = vec![
+            element("SV_Position", 0, 3, 9, 0, 0, 4),
+            element("TEXCOORD", 0, 0, 9, 1, 0, 3),
+            element("TEXCOORD", 1, 0, 9, 2, 0, 4),
+            element("TEXCOORD", 2, 0, 9, 3, 0, 1),
+            element("TEXCOORD", 3, 0, 9, 4, 0, 3),
+            element("TEXCOORD", 4, 0, 9, 4, 3, 1),
+        ];
+        let mut keep = KeptOutputs::new();
+        for e in outputs.iter().filter(|e| e.kind == 0) {
+            keep.insert((e.name.clone(), e.index), 0xF);
+        }
+        plan_merge(&mut keep, &outputs, false, true);
+        let finish = |mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>, u8)> {
+            merge_rows(&mut els, &keep);
+            renumber_rows(&mut els, &keep);
+            els.iter().map(|e| (e.name.clone(), e.index, e.row, e.cols)).collect()
+        };
+        let mesh = finish(outputs.clone());
+        assert_eq!(
+            mesh,
+            vec![
+                ("SV_Position".to_string(), 0, Some(0), 4),
+                ("TEXCOORD".to_string(), 1, Some(1), 4),
+                ("VROW".to_string(), 4, Some(2), 4),
+                ("TEXCOORD".to_string(), 0, Some(3), 3),
+                ("TEXCOORD".to_string(), 2, Some(4), 1),
+            ]
+        );
+        let pixel = finish(vec![outputs[5].clone(), outputs[3].clone(), outputs[4].clone(), outputs[1].clone(), outputs[2].clone()]);
+        assert_eq!(pixel, mesh[1..]);
     }
 }

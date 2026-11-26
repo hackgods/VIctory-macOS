@@ -269,14 +269,15 @@ fn link_mesh_outputs() -> bool {
 
 /// macOS port, `VICTORY_MERGE_MESH_ROWS`: a linked mesh and pixel pair also
 /// gets each output row that holds several elements as one element (1), or
-/// every row as a whole `float4` (2); see `victory_shader::emit::translate_linked`.
+/// every row as a whole `float4` (2), or as 1 with the rows reordered (3); see `victory_shader::emit::translate_linked`.
 #[cfg(windows)]
 pub(crate) fn merge_mesh_rows() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| {
-        // On under D3DMetal, whose limit this is for; `=0` switches it off.
-        let default = u8::from(crate::shader_cache::under_wine());
-        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 2).unwrap_or(default)
+        // On, reordered, under D3DMetal, whose limit this is for; `=0`
+        // switches it off.
+        let default = if crate::shader_cache::under_wine() { 3 } else { 0 };
+        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 3).unwrap_or(default)
     })
 }
 

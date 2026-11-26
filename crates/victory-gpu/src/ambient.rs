@@ -44,7 +44,7 @@ use crate::host::{Host, HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
 
-pub(crate) use set::{DEPTH, ENDS_REFLECTIONS, LIGHT, REFLECTIONS, RESOLVES};
+pub(crate) use set::{DEPTH, DRAWS_SKY, ENDS_REFLECTIONS, LIGHT, REFLECTIONS, RESOLVES};
 
 /// Whether the stand-in is on: `VICTORY_AMBIENT=1` (off when unset, empty,
 /// `0` or `off`). Read once.
@@ -60,7 +60,7 @@ fn var(name: &str) -> Option<String> {
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if on() {
-        tracing::info!("{}", set::start_line(level(), shade(), keep()));
+        tracing::info!("{}", set::start_line(level(), shade(), keep(), follow()));
     }
 }
 
@@ -126,6 +126,52 @@ fn tint() -> [f32; 3] {
 fn keep() -> f32 {
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
+}
+
+/// The sky dome the title's sky program (`set::SKY`) last drew into: the
+/// host copy, held, since the title's object may go at any time.
+///
+/// The program draws twice a frame, on two lists recorded at once: the dome
+/// (128x128, R16G16B16A16_FLOAT) and another image of the sky (R11G11B10).
+/// Following whichever was recorded last made the light jump between the
+/// two, three times apart, from frame to frame (the fork's run don1,
+/// 2026-11-25).
+static SKY_IMAGE: Mutex<Option<std::sync::Arc<HostTexture>>> = Mutex::new(None);
+
+/// The sky program draws into the title texture `image`.
+pub(crate) fn sky_drawn(image: usize) {
+    let Some(copy) = crate::resource::host_copy(image as This) else { return };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || !viewed_as(&copy, d.Format, DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        return;
+    }
+    let mut held = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.as_ref().is_some_and(|h| std::sync::Arc::ptr_eq(h, &copy)) {
+        *held = Some(copy);
+    }
+}
+
+/// The light follows the sky: its level and colour are the sky image's mean
+/// times a gain, over a least bluish level. Hand-set levels that looked
+/// right in the fork were 0.07 at night, 0.3 at dusk and 1.4 at noon (runs
+/// lum1, pr1, av1, 2026-11-25), with sky means of 0.001 at night and 0.65
+/// at dawn; one level for all hours either drowned the title's own shadows
+/// or left what the sun does not reach black. On unless
+/// `VICTORY_AMBIENT_SKY=off`, which keeps the constant; `gain,least,power`
+/// sets it.
+/// shortcut: the sky's mean stands in for the light the title's traced
+/// probes would gather; indoors it is the sky's too.
+///
+/// Gain, least level and power: the level is `gain * mean^power + least`.
+/// The power is under one because the title's exposure follows the light:
+/// the sky's mean goes from 0.001 at night to several units by day, the
+/// levels that look right only from 0.07 to 1.4.
+fn follow() -> Option<[f32; 3]> {
+    static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
+    *SET.get_or_init(|| set::follow(var("VICTORY_AMBIENT_SKY").as_deref()))
 }
 
 /// How much less of the light reaches creases and corners, worked out from
@@ -279,6 +325,36 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         );
     });
     let slot = pass.next.fetch_add(1, Ordering::Relaxed) % SLOTS * 3;
+    // The sky image, if the light follows it and the title has drawn it.
+    let sky_image = SKY_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let sky = follow().and_then(|f| {
+        let copy = sky_image.as_ref()?;
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        Some((copy, f, [d.Width as u32, d.Height], d))
+    });
+    static FOLLOWS: std::sync::Once = std::sync::Once::new();
+    if let Some((copy, f, _, d)) = &sky {
+        FOLLOWS.call_once(|| {
+            tracing::info!(
+                gain = f[0],
+                least = f[1],
+                power = f[2],
+                format = d.Format.0,
+                width = d.Width,
+                height = d.Height,
+                slices = d.DepthOrArraySize,
+                "ambient light follows the sky dome"
+            );
+        });
+        list.keep(&copy.texture);
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0;
+        if let Some(barrier) = list.move_texture(copy, read as u32) {
+            // SAFETY: an open list and a live texture the list keeps.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
+        }
+    }
     list.keep(&light.texture);
     // The depth the resolve just read, in the state it read it in; of the
     // light's size, or the shading is left out.
@@ -298,11 +374,11 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         level,
         tint: tint(),
         shade,
-        follow: [0.0, 0.0, 1.0],
+        follow: sky.as_ref().map_or([0.0, 0.0, 1.0], |s| s.1),
         held,
         floor: 0.0,
         size: [d.Width as u32, d.Height],
-        sky: [0, 0],
+        sky: sky.as_ref().map_or([0, 0], |s| s.2),
     });
     let l = &list.list;
     uav_barrier(l);
@@ -343,7 +419,7 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
             },
         };
         let third = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: at.ptr + 2 * pass.step as usize };
-        host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&around), third);
+        host.device.CreateShaderResourceView(sky.as_ref().map(|s| &s.0.texture), Some(&around), third);
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);

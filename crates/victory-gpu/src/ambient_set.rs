@@ -20,7 +20,8 @@ pub(crate) fn is_on(value: Option<&str>) -> bool {
 pub(crate) const LEVEL: f32 = 0.6;
 
 /// `VICTORY_AMBIENT_LEVEL=<level>`: the light's level
-/// ([`LEVEL`] by default; 0 is no indirect diffuse light at all).
+/// while it does not follow the sky ([`LEVEL`] by default; 0 is no indirect
+/// diffuse light at all).
 pub(crate) fn level(value: Option<&str>) -> f32 {
     value
         .and_then(|v| v.trim().parse().ok())
@@ -63,6 +64,19 @@ pub(crate) fn keep(value: Option<&str>) -> f32 {
         .unwrap_or(0.5)
 }
 
+/// `VICTORY_AMBIENT_SKY`: gain, least level and power of the light that
+/// follows the sky (`gain * mean^power + least`); `off` keeps the constant
+/// level. On unless `off`; `gain,least,power` sets them, values left out
+/// keep their defaults.
+pub(crate) fn follow(value: Option<&str>) -> Option<[f32; 3]> {
+    if value.is_some_and(|v| v.trim().eq_ignore_ascii_case("off")) {
+        return None;
+    }
+    let mut follow = [0.36, 0.05, 0.4];
+    overlay(&mut follow, value);
+    Some(follow)
+}
+
 /// Replaces the first values of `to` by those of the comma list `value`
 /// that read as numbers, each in its place.
 fn overlay(to: &mut [f32], value: Option<&str>) {
@@ -90,9 +104,14 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const REFLECTED: &[u8] = b"CS_UpdateHistory";
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
+/// The program that draws the sky as the title reflects it, by the start of
+/// its name: a small image of the whole sky, in the light's own units.
+pub(crate) const SKY: &[u8] = b"ps_sky_paraboloid_reflection";
+
 /// What a program is to the stand-in (bits; 0: nothing).
 pub(crate) const RESOLVES: u8 = 1;
 pub(crate) const ENDS_REFLECTIONS: u8 = 2;
+pub(crate) const DRAWS_SKY: u8 = 4;
 
 /// What the program of shader container `container` is to the stand-in.
 pub(crate) fn role_of(container: &[u8]) -> u8 {
@@ -103,6 +122,9 @@ pub(crate) fn role_of(container: &[u8]) -> u8 {
     if holds(container, REFLECTED) {
         role |= ENDS_REFLECTIONS;
     }
+    if holds(container, SKY) {
+        role |= DRAWS_SKY;
+    }
     role
 }
 
@@ -111,6 +133,7 @@ pub(crate) fn role_name(role: u8) -> &'static str {
     match role {
         RESOLVES => "resolves the indirect diffuse light",
         ENDS_REFLECTIONS => "writes the reflections last",
+        DRAWS_SKY => "draws the sky dome",
         _ => "several",
     }
 }
@@ -291,8 +314,15 @@ pub(crate) fn start_line(
     level: f32,
     shade: [f32; 4],
     keep: f32,
+    follow: Option<[f32; 3]>,
 ) -> String {
-    let light = format!("a constant ambient light of level {level}");
+    let light = match follow {
+        Some([gain, least, power]) => format!(
+            "an ambient light that follows the sky dome (gain {gain}, least {least}, power \
+             {power}; level {level} until the dome is drawn)"
+        ),
+        None => format!("a constant ambient light of level {level}"),
+    };
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
     let reflections = if keep > 0.0 {
         format!("reflections held to {keep} of it")
@@ -337,6 +367,10 @@ mod tests {
         assert_eq!(keep(None), 0.5);
         assert_eq!(keep(Some("-2")), 0.5);
         assert_eq!(keep(Some("0")), 0.0);
+        assert_eq!(follow(None), Some([0.36, 0.05, 0.4]));
+        assert_eq!(follow(Some(" off ")), None);
+        assert_eq!(follow(Some("0.5")), Some([0.5, 0.05, 0.4]));
+        assert_eq!(follow(Some("0.5,0.1,0.3")), Some([0.5, 0.1, 0.3]));
     }
 
     /// Programs are known by the start of their name, anywhere in the
@@ -355,6 +389,7 @@ mod tests {
         );
         assert_eq!(role_of(&container("CS_ScreenProbes_TemporalResolve_CB_a1c765aa")), RESOLVES);
         assert_eq!(role_of(&container("CS_UpdateHistory_e877ef6e")), ENDS_REFLECTIONS);
+        assert_eq!(role_of(&container("ps_sky_paraboloid_reflection_c3dfdbd9")), DRAWS_SKY);
         assert_eq!(role_of(&container("CS_ScreenProbes_ActivateRays_d60186e6")), 0);
         assert_eq!(role_of(&container("CS_ScreenProbes_TemporalResolv")), 0);
         assert_eq!(role_of(b""), 0);
@@ -421,11 +456,14 @@ mod tests {
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(0.6, [1.0, 0.6, 0.1, 0.45], 0.5);
+        let line = start_line(0.6, [1.0, 0.6, 0.1, 0.45], 0.5, Some([0.36, 0.05, 0.4]));
         assert!(line.starts_with("VICTORY_AMBIENT: "), "{line}");
-        assert!(line.contains("constant ambient light of level 0.6, shaded from depth"), "{line}");
-        assert!(line.ends_with("reflections held to 0.5 of it"), "{line}");
-        let plain = start_line(1.4, [0.0, 0.6, 0.1, 0.45], 0.0);
-        assert!(plain.contains("level 1.4, not shaded; reflections left alone"), "{plain}");
+        assert!(line.contains("follows the sky dome (gain 0.36, least 0.05, power 0.4"), "{line}");
+        assert!(line.ends_with("shaded from depth; reflections held to 0.5 of it"), "{line}");
+        let plain = start_line(1.4, [0.0, 0.6, 0.1, 0.45], 0.0, None);
+        assert!(
+            plain.contains("a constant ambient light of level 1.4, not shaded; reflections left alone"),
+            "{plain}"
+        );
     }
 }

@@ -378,7 +378,17 @@ fn idle_event() -> Option<HANDLE> {
 /// [`idler`]'s work: sleeps while no submission is left; while one is,
 /// looks at the host fence every millisecond (or when its event wakes it)
 /// and finishes the submission once the GPU has run it.
+///
+/// With the heap sync ahead on (`crate::descriptor::ahead`), it also does
+/// rounds of that sync while the GPU runs the submission and nothing else
+/// holds the submission lock ([`Host::round_if_free`]): a title thread that
+/// went on after its submission or its Signal does none, as it does not
+/// wait here. The first a millisecond after the submission was left (the
+/// title's next submission, which knows what runs next, comes first if it
+/// comes at once), the next a pause after the last ended.
 fn idle() {
+    // The submission rounds are paced for, and when the next one is due.
+    let mut round = (0, Instant::now());
     loop {
         let value = VALUE.load(Acquire);
         if value == 0 {
@@ -390,7 +400,18 @@ fn idle() {
         // SAFETY: a plain query of our fence.
         if unsafe { host.fence.GetCompletedValue() } >= value {
             settle(By::Idle);
-        } else if let Some(event) = idle_event().filter(|_| signals()) {
+            continue;
+        }
+        if let Some(pause) = crate::descriptor::ahead::pause() {
+            if round.0 != value {
+                round = (value, Instant::now() + Duration::from_millis(1));
+            } else if Instant::now() >= round.1 {
+                host.round_if_free(value);
+                round.1 = Instant::now() + pause;
+                continue;
+            }
+        }
+        if let Some(event) = idle_event().filter(|_| signals()) {
             // SAFETY: our event; the fence decides, above.
             unsafe { WaitForSingleObject(event, 1) };
         } else {
@@ -686,6 +707,31 @@ impl Host {
             }
         }
         started.elapsed()
+    }
+
+    /// A round of the heap sync ahead by our thread, if nothing holds the
+    /// submission lock and the submission left is still the one with fence
+    /// value `value`: for 4 ms at most, so that a title thread that comes
+    /// to wait for the submission (and then does the rounds itself) is not
+    /// kept long.
+    fn round_if_free(&self, value: u64) {
+        let _submitted = match self.submitted.try_lock() {
+            Ok(submitted) => submitted,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        // Finished, or another one left, meanwhile (both under the lock).
+        if VALUE.load(Acquire) != value {
+            return;
+        }
+        let _holding = Holding::enter();
+        let started = Instant::now();
+        let ran = || {
+            // SAFETY: a plain query of our fence.
+            let completed = unsafe { self.fence.GetCompletedValue() };
+            completed >= value || started.elapsed() >= Duration::from_millis(4)
+        };
+        crate::descriptor::sync_heaps_ahead(&ran);
     }
 
     /// [`Host::quiet`]'s part: the host GPU has run the submission left to

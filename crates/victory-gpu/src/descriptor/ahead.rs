@@ -6,7 +6,8 @@
 //! whose record the title rewrote as bytes: 80 to 160 ms a world frame on
 //! the submitting thread, which then waits about as long again for the GPU.
 //! With the switch on, the thread that waits for a submission left to the
-//! GPU does rounds of the sync in that wait ([`super::sync_heaps_ahead`]):
+//! GPU does rounds of the sync in that wait, and the unwaited thread does
+//! them while nothing waits ([`super::sync_heaps_ahead`]):
 //! the first at once, the next a pause after the last ended ([`pause`]:
 //! 8 ms with `=1`, a larger number is the pause in ms; a round guards the
 //! heap pages it took again, so each costs the title's threads a write
@@ -103,9 +104,10 @@ pub(super) fn running() -> bool {
 }
 
 /// Since the last frame line: rounds; slots they found changed; of those,
-/// slots left for the sync before the next submission; rounds cut short as
-/// the GPU finished; slots that sync then made (left ones and its own);
-/// microseconds in rounds.
+/// slots left for the sync before the next submission; rounds cut short
+/// (the GPU finished, or a round of the unwaited thread's reached its
+/// time); slots that sync then made (left ones and its own); microseconds
+/// in rounds.
 static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// A sync found `n` slots changed (in a round ahead, or before a submission).
@@ -118,7 +120,7 @@ pub(super) fn left() {
     COUNTS[2].fetch_add(1, Relaxed);
 }
 
-/// A round stopped as the GPU finished.
+/// A round stopped before it had looked at all it took.
 pub(super) fn cut() {
     COUNTS[3].fetch_add(1, Relaxed);
 }
@@ -130,8 +132,9 @@ pub(crate) fn log(frames: f64) {
     }
     let c: [f64; 6] = std::array::from_fn(|i| COUNTS[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "heap sync ahead: {:.1} ms/frame of heap sync done while the host GPU ran (counted in the frame line's GPU \
-         time, not in its preparing), in {:.1} rounds/frame ({:.1} cut short as the GPU finished): {:.0} slots/frame \
+        "heap sync ahead: {:.1} ms/frame of heap sync done while the host GPU ran (what a wait did is in the frame \
+         line's GPU time, what our thread did in neither; none in its preparing), in {:.1} rounds/frame ({:.1} cut short: the GPU finished, or our thread's \
+         4 ms were up): {:.0} slots/frame \
          found changed, {:.0} of them left for the sync before the next submission (views of textures the title \
          placed itself); that sync found {:.0} slots/frame changed, the left ones among them",
         c[5] / 1000.0,

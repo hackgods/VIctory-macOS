@@ -59,6 +59,22 @@ impl Scratch {
         null: u32,
         out: &'out mut Outputs,
     ) -> Built<'scratch, 'out> {
+        self.build_with_regions(copies, pairs, null, &[], out)
+    }
+
+    /// [`Scratch::build`], and a block of entries that name no copy for
+    /// each 256 MiB region of `regions` (level-1 indices) no copy has one
+    /// in, while there is room: a shader reading there marks the page it
+    /// missed, not the region (block 0's bits are regions), so the page
+    /// can be named. They read as missing, as the null block does.
+    pub fn build_with_regions<'scratch, 'out>(
+        &'scratch mut self,
+        copies: &[(u64, u64)],
+        pairs: &[u32],
+        null: u32,
+        regions: &[usize],
+        out: &'out mut Outputs,
+    ) -> Built<'scratch, 'out> {
         self.order.clear();
         self.order.extend(0..copies.len());
         self.order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
@@ -115,6 +131,13 @@ impl Scratch {
                 }
                 run[from..to].fill(Some(k));
                 page = upto + 1;
+            }
+        }
+        for &l1 in regions {
+            if l1 < LEVEL1 && self.level1[l1] == 0 && out.blocks.len() <= CAPACITY {
+                self.level1[l1] = out.blocks.len() as u32;
+                out.blocks.push(l1);
+                owners.resize(owners.len() + BLOCK, None);
             }
         }
         // The level-1 index, then a pair and an address dword per entry,
@@ -205,6 +228,25 @@ mod tests {
             });
         }
         (dwords, blocks, owners, full)
+    }
+
+    /// A region asked for gets a block of entries naming no copy (they
+    /// read the null pair), after the copies' blocks; one a copy has a
+    /// block in already, or past the level-1 index, gets none.
+    #[test]
+    fn regions_asked_for_get_blocks_of_no_copy() {
+        let (mut scratch, mut out) = (Scratch::default(), Outputs::default());
+        let copies = [(3u64 << 28 | 0x1_0000, 0x2_0000)];
+        let built = scratch.build_with_regions(&copies, &[7], 9, &[5, 3, LEVEL1], &mut out);
+        assert_eq!(built.blocks, [usize::MAX, 3, 5]);
+        assert!(!built.full);
+        assert_eq!(built.dwords[5], 2, "region 5's block");
+        assert!(built.owners[2 * BLOCK..3 * BLOCK].iter().all(Option::is_none));
+        let entries = &built.dwords[LEVEL1 + 2 * 2 * BLOCK..LEVEL1 + 2 * 3 * BLOCK];
+        assert!(entries.chunks(2).all(|e| e == [9, 0]), "they read the null pair");
+        assert_eq!(built.owners[BLOCK + 1], Some(0), "the copy's pages as before");
+        let plain = scratch.build(&copies, &[7], 9, &mut out);
+        assert_eq!(plain.blocks, [usize::MAX, 3]);
     }
 
     /// A block at a time, the build names the same copy for every entry

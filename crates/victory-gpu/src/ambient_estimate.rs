@@ -65,6 +65,9 @@
 //!   the estimate, fixed).
 //! - Without a depth image of the light's size the slow mean alone is
 //!   written; the fork then leaves the title's output.
+//! - Reflections are held to a part of the light around, as the constant
+//!   stand-in holds them to a part of its level ([`hold`],
+//!   `VICTORY_AMBIENT_REFLECT`); the fork leaves them alone (`0` here).
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -145,10 +148,22 @@ fn frame_ms() -> f32 {
     set::frame_ms(last.map(|last| now.duration_since(last).as_millis() as u64))
 }
 
+/// The most a reflection may hold, as a part of the light around: the
+/// constant stand-in's `VICTORY_AMBIENT_REFLECT=<part>` (0.5 by default; 0
+/// leaves the title's reflections alone, as the fork does).
+///
+/// Without rays the reflections are the sky's, unoccluded, wherever a
+/// surface is glossy (`crate::ambient`): that does not change with how the
+/// diffuse light is stood in for.
+fn reflect_part() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| crate::ambient_set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if let Some(share) = share() {
-        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound(), settle()));
+        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part()));
     }
 }
 
@@ -170,6 +185,7 @@ struct Pass {
     gather: Stage,
     raise: Stage,
     air: Stage,
+    hold: Stage,
     /// The cells' light, the slow mean and the cells' places
     /// (`set::CELL_BYTES`), and where the CPU sees them.
     cells: ID3D12Resource,
@@ -212,6 +228,7 @@ fn make(host: &Host) -> windows::core::Result<Pass> {
     let gather = stage(set::GATHER, s!("ambient estimate: gather"))?;
     let raise = stage(set::RAISE, s!("ambient estimate: raise"))?;
     let air = stage(set::AIR_PASS, s!("ambient estimate: air"))?;
+    let hold = stage(set::HOLD, s!("ambient estimate: hold"))?;
     // Buffers the CPU sees too (`log` reads them), all zero to begin with:
     // nothing kept, no light.
     let buffer = |bytes: u64, what: &'static str| {
@@ -242,6 +259,7 @@ fn make(host: &Host) -> windows::core::Result<Pass> {
             gather,
             raise,
             air,
+            hold,
             cells,
             cells_at,
             points,
@@ -441,15 +459,36 @@ impl Pass {
             self.run(l, &self.air, &constants, table, groups);
         }
     }
+
+    /// The hold: the reflections in `image` (of `size` texels, in the
+    /// unordered-access state in `list` now) are no brighter than a part of
+    /// the light around.
+    fn hold(&self, host: &Host, list: &HostList, image: Image, size: [u32; 2], given: &set::Pass) {
+        list.keep(&self.cells);
+        list.keep(&self.points);
+        list.keep(&self.views);
+        let l = &list.list;
+        let constants = set::constants(&set::Pass { size, ..*given });
+        uav_barrier(l);
+        // SAFETY: an open list; a live texture the caller's list keeps, in
+        // the unordered-access state.
+        unsafe {
+            let table = self.table(host, l, Some(image), None);
+            self.run(l, &self.hold, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
+        }
+    }
 }
 
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: AtomicBool = AtomicBool::new(false);
 
-/// Keepings, raisings and bounds of the air recorded since the last frame
-/// line.
-static RECORDED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Raisings with a depth image so far: the points hold a light.
+static RAISED: AtomicU64 = AtomicU64::new(0);
+
+/// Keepings, raisings, bounds of the air and holds of reflections recorded
+/// since the last frame line.
+static RECORDED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// With the frame line, over `frames` frames: what the estimate is, to
 /// compare with the constant stand-in's level in a run log. Read from the
@@ -460,7 +499,7 @@ pub(crate) fn log(frames: f64) {
     let Some(share) = share() else {
         return;
     };
-    let per_frame = [0, 1, 2].map(|i| RECORDED[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let per_frame = [0, 1, 2, 3].map(|i| RECORDED[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     let made = KEPT.load(Ordering::Relaxed).then(|| host().and_then(pass)).flatten();
     let seen = made.map(|pass| {
         // SAFETY: inside the buffers' mappings, which live as the passes do.
@@ -486,6 +525,7 @@ fn settings(share: f32) -> set::Pass {
         jump: settle().map_or(0.0, |s| s.jump),
         fresh: settle().map_or(0.0, |s| s.fresh),
         dt: 0.0,
+        held: reflect_part(),
     }
 }
 
@@ -608,6 +648,9 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     let depth = depth.as_ref().map(|d| Image { image: d, format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, slices: 0 });
     pass.raise(host, list, image, depth, [d.Width as u32, d.Height], &settings(share));
     RECORDED[1].fetch_add(1, Ordering::Relaxed);
+    if depth.is_some() {
+        RAISED.fetch_add(1, Ordering::Relaxed);
+    }
     true
 }
 
@@ -659,6 +702,48 @@ pub(crate) fn air(list: &HostList, scattered: This) -> bool {
     let scattered = Image { image: &copy.texture, format, slices };
     pass.air(host, list, scattered, [d.Width as u32, d.Height], &settings(share));
     RECORDED[2].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// After the title's program that writes its reflections for the last time
+/// in a frame, in `list`: those in `image` are held to a part of the light
+/// around (`VICTORY_AMBIENT_REFLECT`; nothing if that is 0). Whether it
+/// recorded anything (the list's heaps, compute root signature and pipeline
+/// are then ours).
+pub(crate) fn hold(list: &HostList, image: This) -> bool {
+    let (Some(share), Some(host)) = (share(), host()) else {
+        return false;
+    };
+    // The points' light is of the last raising: none before one.
+    if reflect_part() <= 0.0 || RAISED.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let Some(copy) = crate::resource::host_copy(image) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || !(d.Format == DXGI_FORMAT_R32_TYPELESS || viewed_as(&copy, d.Format, DXGI_FORMAT_R32_UINT))
+    {
+        return false;
+    }
+    let Some(pass) = pass(host) else {
+        return false;
+    };
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(
+            held = reflect_part(),
+            width = d.Width,
+            height = d.Height,
+            "ambient estimate: reflections held to the light around"
+        );
+    });
+    list.keep(&copy.texture);
+    let reflections = Image { image: &copy.texture, format: DXGI_FORMAT_R32_UINT, slices: 0 };
+    pass.hold(host, list, reflections, [d.Width as u32, d.Height], &settings(share));
+    RECORDED[3].fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -863,6 +948,7 @@ mod tests {
         jump: 0.0,
         fresh: 0.0,
         dt: 0.25,
+        held: 0.5,
     };
 
     /// The passes on the GPU give what the arithmetic on the CPU gives
@@ -1036,6 +1122,58 @@ mod tests {
             }
         }
         assert!(bounded > 0 && kept > 0, "{bounded} bounded, {kept} kept");
+    }
+
+    /// The hold's pass keeps every reflection to a part of the light around
+    /// the point seen there, as the arithmetic on the CPU does.
+    #[test]
+    fn reflections_are_held_on_the_gpu() {
+        let Some(host) = host() else {
+            return;
+        };
+        let pass = make(host).expect("the passes");
+        let (_, mean, _, points, _) = run(host, &pass, &BASE, [0.0; 3], true);
+        // A reflection image of another size than the light's.
+        let size = [96u32, 54];
+        let there_at = |x: u32, y: u32| -> V3 {
+            match (x + 2 * y) % 3 {
+                0 => [40.0, 30.0, 20.0],
+                1 => [0.75, 0.5, 0.25],
+                _ => [0.0078125, 0.015625, 0.0078125],
+            }
+        };
+        let list = host.new_list().unwrap();
+        let l = &list.list;
+        let mut keep = Vec::new();
+        let words: Vec<u32> = (0..size[0] * size[1]).map(|i| reference::pack(there_at(i % size[0], i / size[0]))).collect();
+        let image = texture(host, l, DXGI_FORMAT_R32_UINT, size, &words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mut keep);
+        pass.hold(host, &list, Image { image: &image, format: DXGI_FORMAT_R32_UINT, slices: 0 }, size, &BASE);
+        let pitch = (size[0] * 4).next_multiple_of(256);
+        let (back, data) = host.readback_buffer(u64::from(pitch) * u64::from(size[1])).unwrap();
+        // SAFETY: an open list and live resources.
+        unsafe {
+            l.ResourceBarrier(&[transition(&image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&rows(&back, DXGI_FORMAT_R32_UINT, size, pitch), 0, 0, 0, &whole(&image), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let (mut held, mut kept) = (0, 0);
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                // SAFETY: the copy has run; inside the mapped buffer.
+                let got = reference::unpack(unsafe { data.add((y * pitch + x * 4) as usize).cast::<u32>().read_volatile() });
+                let q = [0, 1].map(|k| {
+                    (((([x, y][k] as f32 + 0.5) / size[k] as f32) * [set::PX, set::PY][k] as f32) as u32).min([set::PX, set::PY][k] - 1)
+                });
+                let point = ((q[1] * set::PX + q[0]) * 3) as usize;
+                let seen_there = [points[point][3], points[point + 1][3], points[point + 2][3]];
+                let was = reference::unpack(reference::pack(there_at(x, y)));
+                let want = reference::hold(was, BASE.held, BASE.level, [mean[0], mean[1], mean[2]], seen_there);
+                assert!(close(got, reference::unpack(reference::pack(want))), "reflection at {x},{y}: {got:?} {want:?} (was {was:?})");
+                if want == was { kept += 1 } else { held += 1 }
+            }
+        }
+        assert!(held > 0 && kept > 0, "{held} held, {kept} kept");
     }
 
     /// Two packed lights within a fiftieth of the brighter one's top part

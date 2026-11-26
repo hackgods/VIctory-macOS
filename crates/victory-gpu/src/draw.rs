@@ -1304,7 +1304,11 @@ impl State {
                     }
                 }
             } else {
-                false
+                // The reflections, held to the light around.
+                match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                    Some((_, reflections)) => estimate::hold(list, *reflections),
+                    None => false,
+                }
             }
         } else if role & crate::ambient::RESOLVES != 0 {
             let light = image(ResourceType::Uav, crate::ambient::LIGHT);

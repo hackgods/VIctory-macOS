@@ -11762,7 +11762,11 @@ impl<'a> Lower<'a> {
                     (None, _) if !self.uniform_join(b) && self.no_mask_lane_on_edge(b, &phi.args, n) => {
                         self.s.m.bool(false)
                     }
-                    (None, _) => return Err(unsupported(offset, UNTRACKED)),
+                    // A mask nothing else read as one (`Structured::joined`).
+                    (None, _) => match self.x.st.joined.get(&arg) {
+                        Some(&m) => self.boolean(m, qb).map_err(|w| unsupported(offset, w))?,
+                        None => return Err(unsupported(offset, UNTRACKED)),
+                    },
                 };
                 incoming.push((x, qb));
             }

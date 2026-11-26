@@ -15,12 +15,12 @@ use crate::native::{
 };
 use crate::{gfx10, io, ir, resource, structure};
 
-const S_ENDPGM: u32 = 0xBF81_0000;
+pub(super) const S_ENDPGM: u32 = 0xBF81_0000;
 const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 const EXEC: u8 = 126;
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
-const PROLOGUE: [u32; 5] = [
+pub(super) const PROLOGUE: [u32; 5] = [
     0xBE84_0300, // s_mov_b32 s4, s0
     0xBE85_0380, // s_mov_b32 s5, 0
     0xF408_0A02,
@@ -29,22 +29,22 @@ const PROLOGUE: [u32; 5] = [
 ];
 
 /// Each lane's store address: its thread id times 32.
-const V16_IS_32_TIMES_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
+pub(super) const V16_IS_32_TIMES_V0: u32 = 0x3420_0085; // v_lshlrev_b32 v16, 5, v0
 
 /// `buffer_store_dword v<vdata>, v16, s[40:43], 0 offen offset:<offset>`.
-const fn store(vdata: u8, offset: u32) -> [u32; 2] {
+pub(super) const fn store(vdata: u8, offset: u32) -> [u32; 2] {
     [0xE070_1000 | offset, 0x800A_0010 | (vdata as u32) << 8]
 }
 
-const fn sop1(sdst: u8, op: u8, ssrc0: u8) -> u32 {
+pub(super) const fn sop1(sdst: u8, op: u8, ssrc0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | (op as u32) << 8 | ssrc0 as u32
 }
 
-const fn vop1(vdst: u8, op: u8, src0: u16) -> u32 {
+pub(super) const fn vop1(vdst: u8, op: u8, src0: u16) -> u32 {
     (0x3F << 25) | (vdst as u32) << 17 | (op as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
-const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
+pub(super) const fn vop2(vdst: u8, op: u8, src0: u16, vsrc1: u8) -> u32 {
     (op as u32) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
 }
 
@@ -54,7 +54,7 @@ const fn dpp16(vsrc0: u8, ctrl: u16) -> u32 {
     0xFF00_0000 | (ctrl as u32) << 8 | vsrc0 as u32
 }
 
-const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
+pub(super) const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     [
         0xD400_0000 | (op as u32) << 16 | vdst as u32,
         (src0 as u32 & 0x1FF) | ((src1 as u32 & 0x1FF) << 9) | ((src2 as u32 & 0x1FF) << 18),
@@ -64,10 +64,10 @@ const fn vop3(vdst: u8, op: u16, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
 const V_ADD_NC_U32: u8 = 0x25;
 const V_READLANE_B32: u16 = 0x360;
 /// Operand codes: a VGPR, the constant `k` (0 to 64), src0 taken by DPP.
-const fn v(reg: u16) -> u16 {
+pub(super) const fn v(reg: u16) -> u16 {
     256 + reg
 }
-const fn k(n: u16) -> u16 {
+pub(super) const fn k(n: u16) -> u16 {
     128 + n
 }
 const DPP: u16 = 0xFA;
@@ -256,7 +256,7 @@ fn within_halves() -> Vec<u32> {
     w
 }
 
-fn native(words: &[u32], threads: u32, lds_bytes: u32) -> NativeProgram {
+pub(super) fn native(words: &[u32], threads: u32, lds_bytes: u32) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -541,7 +541,7 @@ fn shared_lds_of_a_one_wave64_group_runs_unsynced_with_its_own_setting() {
 
 /// What each half answers on its own, per lane `l` of the group of 64.
 #[cfg(windows)]
-mod gpu {
+pub(super) mod gpu {
     use super::super::host::{Dispatch, Host, Root, Stride, View};
     use super::*;
 
@@ -578,7 +578,7 @@ mod gpu {
 
     /// [`differences`] for a program with `lds_bytes` of LDS, with the
     /// halves' settings as given.
-    fn differences_with(
+    pub(in super::super) fn differences_with(
         what: &str,
         words: &[u32],
         lds_bytes: u32,

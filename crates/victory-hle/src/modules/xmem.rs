@@ -985,6 +985,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         victory_gpu::title_memory_aliased(base + k * PAGE, shown);
         shown.push(base + k * PAGE);
     }
+    // mac: `VICTORY_PHYSICAL_RUNS` counts what refreshes copy from runs of a section's pages.
+    victory_gpu::physical_mapped(base, len, Arc::as_ptr(&slice.section) as usize, slice.index);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -1107,6 +1109,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        victory_gpu::physical_unmapped(at);
         for k in 0..size / PAGE {
             let key = slice.key(k);
             if let Some(addresses) = physical.shown.get_mut(&key) {

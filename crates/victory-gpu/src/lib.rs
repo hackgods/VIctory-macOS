@@ -83,6 +83,9 @@ pub mod query;
 pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
+mod physical_runs;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
 mod ranges;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
@@ -138,6 +141,8 @@ pub use alias::{
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
+#[cfg(windows)]
+pub use physical_runs::{mapped as physical_mapped, unmapped as physical_unmapped};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

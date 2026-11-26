@@ -4234,8 +4234,9 @@ impl Batch {
             for ((shadow, _), done) in work.into_iter().zip(results) {
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
                 let (start, len) = shadow.range();
-                let before = total;
+                let (before, mut spent) = (total, 0);
                 for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                    spent += us;
                     #[cfg(feature = "diagnostics")]
                     {
                         counted.range(from, to - from, us, 0);
@@ -4259,6 +4260,9 @@ impl Batch {
                 if total > before {
                     self.copied.0 += 1;
                     self.copied.1 += total - before;
+                    if crate::physical_runs::on() {
+                        crate::physical_runs::refreshed(start as usize, len as usize, total - before, spent);
+                    }
                 }
             }
             return total;
@@ -4266,11 +4270,12 @@ impl Batch {
         for (shadow, ranges) in work {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
-            let before = total;
+            let (before, mut spent) = (total, 0);
             for (from, to) in ranges.iter() {
                 let started = std::time::Instant::now();
                 let copied = refresh(&shadow, from, to - from, self.early);
                 let us = started.elapsed().as_micros() as u64;
+                spent += us;
                 #[cfg(feature = "diagnostics")]
                 {
                     counted.range(from, to - from, us, 0);
@@ -4297,6 +4302,10 @@ impl Batch {
             if total > before {
                 self.copied.0 += 1;
                 self.copied.1 += total - before;
+                // mac: where the copied memory lies (`VICTORY_PHYSICAL_RUNS`).
+                if crate::physical_runs::on() {
+                    crate::physical_runs::refreshed(start as usize, len as usize, total - before, spent);
+                }
             }
         }
         total
@@ -5039,6 +5048,7 @@ impl Meter {
             unwaited::log(report_frames);
             crate::ray_skip::log(report_frames);
             crate::texback::log(report_frames);
+            crate::physical_runs::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
             crate::descriptor::pool::log(report_frames);

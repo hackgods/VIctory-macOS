@@ -2485,6 +2485,83 @@ fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
     assert!(!uav.early_depth_stencil);
 }
 
+/// `DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`: the console tests depth before
+/// the pixel shader, so a pixel behind closer geometry never makes the
+/// shader's writes. The host shader then tests depth first too, title UAV
+/// writes and discards notwithstanding; a depth export still keeps it late.
+#[test]
+fn console_depth_before_shader_keeps_early_depth_stencil_with_uav_writes() {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    let uav_store = [
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 64
+        0xFA00_0040,
+        0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+        0xE070_0000, // buffer_store_dword v2, off, s[8:11], 0
+        0x8002_0000,
+    ];
+    let color = [0xF800_180F, 0x0504_0302]; // exp mrt0 v2, v3, v4, v5 done vm
+    for view_marks in [false, true] {
+        let uav = lower_ps_for_early_z(
+            &uav_store,
+            color,
+            Vec::new(),
+            DEPTH_BEFORE_SHADER,
+            view_marks,
+        );
+        assert!(
+            uav.early_depth_stencil,
+            "title UAV store, view marks {view_marks}"
+        );
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut uav.dxil.clone()).unwrap();
+        }
+    }
+
+    // Conditional discard (as in `pixel_shader_skips_..._or_uav`).
+    let discard = lower_ps_for_early_z(
+        &[
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0480, // v_cmpx_lt_f32 exec, 0, v2
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0004, // s_cbranch_scc0 -> kill
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xF800_180F, // exp mrt0 v2, v3, v4, v5 done vm
+            0x0504_0302,
+            S_ENDPGM,
+        ],
+        [0xF800_1890, 0x0000_0000], // kill: exp null done vm
+        Vec::new(),
+        DEPTH_BEFORE_SHADER,
+        true,
+    );
+    assert!(discard.early_depth_stencil, "discard");
+
+    // Depth export (exp mrtz v2, off, off, off done vm).
+    let depth_out = vec![crate::emit::container::SigElement {
+        name: "SV_Depth".into(),
+        index: 0,
+        kind: 17,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    }];
+    let depth = lower_ps_for_early_z(
+        &[],
+        [0xF800_1881, 0x0000_0002],
+        depth_out,
+        DEPTH_BEFORE_SHADER,
+        true,
+    );
+    assert!(!depth.early_depth_stencil, "depth export");
+}
+
 /// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
 const fn global(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
     [

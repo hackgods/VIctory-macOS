@@ -1277,10 +1277,17 @@ mod host {
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     fn scripted() -> Vec<u8> {
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
+        // macOS port: `<seconds>:<key>[:<seconds held>]`; a key is held
+        // 0.2 s unless the entry says how long (a stick direction needs
+        // seconds at a frame or two per second).
+        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8, Duration)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
+                let (key, held) = match key.split_once(':') {
+                    Some((key, held)) => (key, Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?),
+                    None => (key, Duration::from_millis(200)),
+                };
                 let vk = match key.trim() {
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
@@ -1298,6 +1305,7 @@ mod host {
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
+                    held,
                 ))
             });
             (Instant::now(), keys.collect())
@@ -1305,8 +1313,8 @@ mod host {
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
         keys.iter()
-            .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
-            .map(|&(_, vk)| vk)
+            .filter(|&&(at, _, held)| (at..at + held).contains(&now))
+            .map(|&(_, vk, _)| vk)
             .collect()
     }
 

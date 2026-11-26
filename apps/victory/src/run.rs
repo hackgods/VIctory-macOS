@@ -263,6 +263,16 @@ pub fn run(
     if guard_lookup {
         victory_loader::probe_guard::watch();
     }
+    // macOS port: the title's map data pools and waiting list in the log
+    // (victory_loader::mapdata_pace); off unless asked for.
+    if victory_loader::mapdata_pace::watch_wanted(
+        std::env::var(victory_loader::mapdata_pace::WATCH_SWITCH).ok().as_deref(),
+    ) {
+        match victory_loader::mapdata_pace::watch(image.base() as u64) {
+            Ok(()) => println!("map data watch on: pools and waiting slots are logged every 5 s"),
+            Err(why) => println!("map data watch not started: {why}"),
+        }
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg);
     let late = LateDlls {

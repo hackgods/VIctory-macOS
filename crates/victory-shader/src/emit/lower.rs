@@ -23,7 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod bvh;
 mod halves;
 mod mesh;
-pub(crate) use mesh::KeptOutputs;
+pub(crate) use mesh::{KeptOutputs, plan_merge};
 pub(crate) use halves::Local as HalvesLocal;
 use mesh::prune_signature;
 
@@ -641,8 +641,10 @@ impl<'a> Lower<'a> {
         if let Some(keep) = keep {
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
+                mesh::merge_rows(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
                 prune_signature(&mut s.outputs, keep);
+                mesh::merge_rows(&mut s.outputs, keep);
             }
         }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);

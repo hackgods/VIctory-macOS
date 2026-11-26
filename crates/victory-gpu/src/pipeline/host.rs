@@ -455,7 +455,7 @@ impl HostPipeline {
         // pruning outputs the pixel shader never reads.
         let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
             let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
-            if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
+            if bytes <= super::link_mesh_over() {
                 return None;
             }
             super::translate_linked(ms, find("pixel").map(Arc::as_ref))

@@ -622,10 +622,16 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// `None` for depth-only draws), pruning arbitrary mesh outputs the pixel
 /// shader never reads so the mesh shader fits within [`METAL_MESH_OUTPUT_BYTES`]
 /// (32 KiB) while keeping both stages' signatures linked for D3D12.
+///
+/// `merge` (macOS port): 1 also makes each output row that holds several
+/// elements one element in both stages, 2 makes every row a whole `float4`
+/// (`lower::plan_merge`); then the size is not checked here, as Metal counts
+/// it its own way (the caller logs what was made).
 pub fn translate_linked(
     mesh: &[u8],
     pixel: Option<&[u8]>,
     options: Options,
+    merge: u8,
 ) -> Result<(HostShader, Option<HostShader>), ShaderError> {
     let mp = prepare(mesh)?;
     let ms_in = EmitInput {
@@ -643,7 +649,7 @@ pub fn translate_linked(
                 "linked shader has no mesh output declaration",
             ))?
             .bytes();
-        if bytes > METAL_MESH_OUTPUT_BYTES {
+        if merge == 0 && bytes > METAL_MESH_OUTPUT_BYTES {
             return Err(ShaderError::Unsupported {
                 offset: 0,
                 what: "mesh outputs required by the next stage exceed 32 KiB",
@@ -669,7 +675,14 @@ pub fn translate_linked(
         res: &pp.res,
     };
     let full_ps = emit_pruned(&ps_in, options, None)?;
-    let reads = pixel_input_reads(&full_ps.dxil)?;
+    let mut reads = pixel_input_reads(&full_ps.dxil)?;
+    if merge != 0 {
+        let outputs = match mp.c.part(FourCC::OSG1) {
+            Some(part) => signature(part.data)?,
+            None => Vec::new(),
+        };
+        lower::plan_merge(&mut reads, &outputs, merge == 2);
+    }
     let linked_ms = emit_mesh(&reads)?;
     let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
     Ok((linked_ms, Some(linked_ps)))

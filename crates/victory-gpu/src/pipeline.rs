@@ -150,9 +150,7 @@ impl Shader {
                         self.stage == "pixel"
                             || (self.stage == "mesh"
                                 && victory_shader::emit::mesh_outputs(&t.host.dxil)
-                                    .is_some_and(|o| {
-                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
-                                    }))
+                                    .is_some_and(|o| o.bytes() > link_mesh_over()))
                     });
                     if !keep {
                         *container = Vec::new();
@@ -266,7 +264,35 @@ fn with_resources(
 #[cfg(windows)]
 fn link_mesh_outputs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS") || merge_mesh_rows() != 0)
+}
+
+/// macOS port, `VICTORY_MERGE_MESH_ROWS`: a linked mesh and pixel pair also
+/// gets each output row that holds several elements as one element (1), or
+/// every row as a whole `float4` (2); see `victory_shader::emit::translate_linked`.
+#[cfg(windows)]
+pub(crate) fn merge_mesh_rows() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        // On under D3DMetal, whose limit this is for; `=0` switches it off.
+        let default = u8::from(crate::shader_cache::under_wine());
+        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 2).unwrap_or(default)
+    })
+}
+
+/// The output size, as VIctory counts it, above which a mesh shader is
+/// translated again with its pixel shader: Metal's limit, or with
+/// `VICTORY_MERGE_MESH_ROWS` a lower mark (`VICTORY_LINK_MESH_OVER`, bytes;
+/// 24576 if unset), because D3DMetal counts rows of several elements larger.
+#[cfg(windows)]
+pub(crate) fn link_mesh_over() -> u32 {
+    static OVER: OnceLock<u32> = OnceLock::new();
+    *OVER.get_or_init(|| {
+        if merge_mesh_rows() == 0 {
+            return victory_shader::emit::METAL_MESH_OUTPUT_BYTES;
+        }
+        std::env::var("VICTORY_LINK_MESH_OVER").ok().and_then(|v| v.parse().ok()).unwrap_or(24576)
+    })
 }
 
 #[cfg(windows)]
@@ -330,6 +356,7 @@ pub(crate) fn translate_linked(
         &mesh_bytes,
         pixel_bytes.as_deref(),
         options,
+        merge_mesh_rows(),
     ) {
         Ok((ms_host, ps_host)) => {
             let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());

@@ -32,6 +32,70 @@ pub(super) fn prune_signature(elements: &mut Vec<SigElement>, keep: &KeptOutputs
     });
 }
 
+/// The reserved [`KeptOutputs`] key under which a linked translation carries
+/// the rows to merge (no semantic has this name); the value is the mode.
+const MERGE_KEY: &str = "\u{0}merge-row";
+/// The semantic of a merged row; its index is the row.
+const MERGED_NAME: &str = "VROW";
+
+/// macOS port (Metal's 32 KiB mesh output limit): marks in `keep` the rows
+/// of `outputs` that hold two or more arbitrary elements once pruned, all of
+/// one component type, so both stages of a linked pair make each such row
+/// one element ([`merge_rows`]). D3DMetal sizes a row of several elements
+/// (`xyz` and `w`, say) well above the 16 bytes one `float4` takes.
+pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: bool) {
+    let mut pruned = outputs.to_vec();
+    prune_signature(&mut pruned, keep);
+    let arbitrary = |r: u32| pruned.iter().filter(move |e| e.kind == 0 && e.row == Some(r));
+    let rows: std::collections::BTreeSet<u32> =
+        pruned.iter().filter(|e| e.kind == 0).filter_map(|e| e.row).collect();
+    for r in rows {
+        let first = arbitrary(r).next().expect("a row from the list");
+        let same = arbitrary(r).all(|e| e.comp == first.comp && e.half == first.half);
+        if same && (widen || arbitrary(r).count() > 1) {
+            keep.insert((MERGE_KEY.to_string(), r), 1 + u8::from(widen));
+        }
+    }
+}
+
+/// Makes each row [`plan_merge`] marked one element from column 0 to the
+/// row's last used column (all four when the plan widens), named by its row,
+/// so the mesh and the pixel shader of a pair declare the same thing whatever
+/// either leaves out. Exports and reads find their channel by row and
+/// column as before.
+pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    let mut done = std::collections::BTreeSet::new();
+    let mut at = 0;
+    while at < elements.len() {
+        let e = &elements[at];
+        let mode = match (e.kind, e.row) {
+            (0, Some(r)) => keep.get(&(MERGE_KEY.to_string(), r)).copied().map(|m| (r, m)),
+            _ => None,
+        };
+        let Some((r, mode)) = mode else {
+            at += 1;
+            continue;
+        };
+        if !done.insert(r) {
+            // A later element of a merged row: the first one holds it.
+            elements.remove(at);
+            continue;
+        }
+        let (mut end, mut usage) = (0, 0);
+        for o in elements.iter().filter(|o| o.kind == 0 && o.row == Some(r)) {
+            end = end.max(o.col + o.cols);
+            usage |= o.usage << o.col;
+        }
+        let e = &mut elements[at];
+        e.name = MERGED_NAME.to_string();
+        e.index = r;
+        e.col = 0;
+        e.cols = if mode == 2 { 4 } else { end };
+        e.usage = usage;
+        at += 1;
+    }
+}
+
 impl Lower<'_> {
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
@@ -90,5 +154,74 @@ impl Lower<'_> {
         );
         self.flat = Some(f);
         f
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn element(name: &str, index: u32, kind: u8, comp: u8, row: u32, col: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.to_string(),
+            index,
+            kind,
+            comp,
+            interp: 0,
+            row: Some(row),
+            col,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        }
+    }
+
+    /// A row shared by `xyz` and `w` elements becomes one `float4` named by
+    /// the row in both stages, whichever of the two a stage declares first;
+    /// rows of one element, of mixed types and system values stay.
+    #[test]
+    fn rows_of_several_elements_merge_the_same_way_in_both_stages() {
+        let outputs = vec![
+            element("SV_Position", 0, 3, 9, 0, 0, 4),
+            element("TEXCOORD", 4, 0, 9, 5, 0, 3),
+            element("TEXCOORD", 7, 0, 9, 5, 3, 1),
+            element("TEXCOORD", 5, 0, 9, 6, 0, 3),
+            element("COLOR", 3, 0, 5, 7, 0, 1),
+            element("TEXCOORD", 20, 0, 9, 7, 1, 1),
+        ];
+        let mut keep = KeptOutputs::new();
+        for e in outputs.iter().filter(|e| e.kind == 0) {
+            keep.insert((e.name.clone(), e.index), 0xF);
+        }
+        plan_merge(&mut keep, &outputs, false);
+        let mut mesh = outputs.clone();
+        merge_rows(&mut mesh, &keep);
+        let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
+            els.iter().map(|e| (e.name.clone(), e.index, e.row, e.col, e.cols)).collect()
+        };
+        assert_eq!(
+            shape(&mesh),
+            vec![
+                ("SV_Position".to_string(), 0, Some(0), 0, 4),
+                ("VROW".to_string(), 5, Some(5), 0, 4),
+                ("TEXCOORD".to_string(), 5, Some(6), 0, 3),
+                ("COLOR".to_string(), 3, Some(7), 0, 1),
+                ("TEXCOORD".to_string(), 20, Some(7), 1, 1),
+            ]
+        );
+        assert_eq!(mesh[1].usage, 0xF);
+        // The pixel shader declares the `w` element first and no position.
+        let mut pixel = vec![outputs[2].clone(), outputs[1].clone(), outputs[3].clone()];
+        merge_rows(&mut pixel, &keep);
+        assert_eq!(shape(&pixel), shape(&mesh[1..3]));
+        // Widening makes every arbitrary row of one type a whole float4.
+        let mut keep = KeptOutputs::new();
+        for e in outputs.iter().filter(|e| e.kind == 0) {
+            keep.insert((e.name.clone(), e.index), 0xF);
+        }
+        plan_merge(&mut keep, &outputs, true);
+        let mut wide = outputs.clone();
+        merge_rows(&mut wide, &keep);
+        assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
     }
 }

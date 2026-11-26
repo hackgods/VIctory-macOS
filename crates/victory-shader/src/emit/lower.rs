@@ -25,7 +25,7 @@ mod atomics;
 mod bvh;
 mod halves;
 mod mesh;
-use barriers::{group_uniform, in_step, split_wave_barriers};
+use barriers::{split_wave_barriers, step_and_cap};
 pub(crate) use mesh::KeptOutputs;
 use mesh::prune_signature;
 
@@ -106,6 +106,10 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
+    /// Group barriers written (`dx.op.barrier`), for structural tests of
+    /// the exchanges between 32-lane halves.
+    #[cfg(test)]
+    pub barriers: usize,
     /// The `WaveSize` the program declares.
     #[cfg(test)]
     pub wave_size: Option<u32>,
@@ -395,10 +399,15 @@ struct Lower<'a> {
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
     /// In halves: per IR block, whether every lane of the group runs it
-    /// together ([`in_step`]), where values can pass between the halves.
+    /// together ([`step_and_cap`]), where values can pass between the halves.
     step: Vec<bool>,
     /// In literal halves, the scalar values proven to agree across the group.
     group_scalars: Set<Value>,
+    /// Per IR block, whether a lane may have left the program early at a
+    /// capped back edge's iteration limit before reaching it
+    /// ([`step_and_cap`]): an explicit `s_barrier` there would wait for
+    /// lanes that are gone.
+    cap_escaped: Vec<bool>,
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
@@ -895,14 +904,9 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let (step, group_scalars) = if x.st.literal {
-            group_uniform(p, x.st)
-        } else {
-            (
-                if halves { in_step(p, x.st) } else { Vec::new() },
-                Set::default(),
-            )
-        };
+        // Literal halves read the group's blocks and scalars whatever `halves` says.
+        let (step, cap_escaped, group_scalars) = step_and_cap(p, x.st, halves || x.st.literal);
+        let group_scalars = if x.st.literal { group_scalars } else { Set::default() };
         Lower {
             s,
             x,
@@ -954,8 +958,9 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
-            step,
+            step: if halves || x.st.literal { step } else { Vec::new() },
             group_scalars,
+            cap_escaped,
             half_words: None,
             level: 0,
             alike: if halves {
@@ -1813,6 +1818,8 @@ impl<'a> Lower<'a> {
             },
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -4128,8 +4135,15 @@ impl<'a> Lower<'a> {
             Fields::Sop { .. } => self.sop(inst),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
-                self.group_barrier();
-                Ok(())
+                // A lane may have left the program early at a capped back
+                // edge's iteration limit before this block; a group barrier
+                // here would wait for lanes that are gone.
+                if self.cap_escaped.get(b).copied().unwrap_or(false) {
+                    Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
+                } else {
+                    self.group_barrier();
+                    Ok(())
+                }
             }
             Fields::Sopp { .. } => Ok(()),
             Fields::Smem { .. } => self.smem(inst, (b, i)),

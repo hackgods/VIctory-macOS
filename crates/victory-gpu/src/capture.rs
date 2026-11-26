@@ -662,6 +662,27 @@ fn dump_one(
         // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
         // decode it as depth, not as floats (all denormals, shown black).
         let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
+        // A texture a traced pipeline reads (`VICTORY_TRACE_READS`): its
+        // values are logged (the "target values" line before this one),
+        // nothing is saved: it may be one of the title's own textures.
+        if by.starts_with("read ") {
+            let rgba = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows);
+            let colour = match &rgba {
+                Some(rgba) if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) => "all zero",
+                Some(_) => "not all zero",
+                None => "format not decoded",
+            };
+            tracing::info!(
+                "read texture {prefix}-{i:02} {resource:?} {}x{}x{} f{} levels {} ({by}): {colour}",
+                d.Width,
+                d.Height,
+                d.DepthOrArraySize,
+                d.Format.0,
+                d.MipLevels
+            );
+            buffer.Unmap(0, None);
+            return;
+        }
         if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
             let mut name = format!(
                 "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",

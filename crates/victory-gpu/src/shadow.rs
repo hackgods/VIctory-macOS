@@ -258,6 +258,20 @@ impl Shadow {
         format!("copy {:#x}+{:#x} {v:?}", self.start, self.len)
     }
 
+    /// Up to `len` bytes of the copy at title address `address`, as hex
+    /// dwords (diagnostics: `VICTORY_TRACE_READS`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn peek_words(&self, address: u64, len: u64) -> String {
+        let at = address.saturating_sub(self.start) as usize;
+        let n = (len as usize).min((self.len as usize).saturating_sub(at)) / 4;
+        let words: Vec<String> = (0..n)
+            // SAFETY: inside the mapping (checked); a racing GPU write only
+            // makes the logged value stale.
+            .map(|i| format!("{:x}", unsafe { self.data.add(at + 4 * i).cast::<u32>().read_unaligned() }))
+            .collect();
+        words.join(" ")
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.base

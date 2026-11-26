@@ -1222,6 +1222,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        #[cfg(feature = "diagnostics")]
+        self.probe_reads(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         list.count_write();
@@ -1608,6 +1610,71 @@ impl State {
         }
     }
 
+    /// In a listed frame, for a pipeline with a shader `VICTORY_TRACE_READS`
+    /// names: every view its shaders read through a table, one line each
+    /// (a texture with its resource, as the target dumps name it). A
+    /// buffer's first bytes follow as hex dwords, as title memory holds
+    /// them now and as the host copy does once the list has run; a
+    /// texture's values are logged when its submission has run
+    /// (`crate::capture`, with `VICTORY_DUMP_TARGETS`; nothing is saved).
+    #[cfg(feature = "diagnostics")]
+    fn probe_reads(&self, list: &HostList, compute: bool) {
+        /// Bytes of a buffer shown.
+        const SHOWN: u64 = 3072;
+        if crate::host::traced_reads().is_empty() || !crate::capture::listed(crate::queue::presented() + 1) {
+            return;
+        }
+        let names = crate::pipeline::shaders_of(self.pipeline as This);
+        if !crate::host::traced_reads().iter().any(|h| names.contains(h.as_str())) {
+            return;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return };
+        let frame = crate::queue::presented() + 1;
+        let hex = |b: &[u8]| -> String {
+            let words: Vec<String> =
+                b.as_chunks::<4>().0.iter().map(|&c| format!("{:x}", u32::from_le_bytes(c))).collect();
+            words.join(" ")
+        };
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                let (RootType::Table, Some(Root::Table(table))) =
+                    (u.root, self.roots_ref(compute).get(usize::from(u.slot)))
+                else {
+                    continue;
+                };
+                let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                let who = format!("{} {:?} s{}+{}", stage.shader.hash, u.kind, u.slot, u.table_offset_dwords);
+                let (range, texture) = match view.as_deref() {
+                    Some(View::Constant(address, size)) => (Some((*address, u64::from(*size))), None),
+                    Some(v @ (View::Shader(r, _) | View::Unordered(r, ..))) => {
+                        if crate::resource::host_resource(*r as This).is_some() {
+                            (None, Some(*r))
+                        } else {
+                            (crate::descriptor::host::buffer_range(v), None)
+                        }
+                    }
+                    Some(v) => (crate::descriptor::host::buffer_range(v), None),
+                    None => (None, None),
+                };
+                let resource = texture.map_or_else(String::new, |r| format!(" resource {r:#x}"));
+                tracing::info!(target: "victory_gpu::trace", "reads {who} frame {frame}: {}{resource}", describe(view.as_deref()));
+                if let Some(r) = texture {
+                    list.note_target(r, &format!("read {who}"));
+                }
+                let Some((at, len)) = range.filter(|r| r.1 > 0) else { continue };
+                let shown = len.min(SHOWN);
+                let mut now = vec![0u8; shown as usize];
+                if crate::host::read_into(at as *const u8, &mut now) {
+                    tracing::info!(target: "victory_gpu::trace", "reads {who} {at:#x}+{len} title memory now: {}", hex(&now));
+                }
+                let Some(shadow) = crate::shadow::find(at, shown) else { continue };
+                list.defer_after(move || {
+                    tracing::info!(target: "victory_gpu::trace", "reads {who} {at:#x}+{len} host copy after the list: {}", shadow.peek_words(at, shown))
+                });
+            }
+        }
+    }
+
     /// In a listed frame, right after a dispatch: each 1D or 3D texture it
     /// writes through a table, read back in the list itself (what the
     /// dispatch left there, before anything later in the frame).
@@ -1756,6 +1823,8 @@ impl State {
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             #[cfg(feature = "diagnostics")]
             self.probe_small(list, false);
+            #[cfg(feature = "diagnostics")]
+            self.probe_reads(list, false);
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -2042,6 +2111,8 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        #[cfg(feature = "diagnostics")]
+        self.probe_reads(list, kind == DISPATCH);
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh) and the list's own, the
         // signature is cached.

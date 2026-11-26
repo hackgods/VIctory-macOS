@@ -4582,6 +4582,18 @@ pub(crate) fn traced_shaders() -> &'static [String] {
     })
 }
 
+/// The shader hashes `VICTORY_TRACE_READS` lists (comma-separated;
+/// diagnostics): in listed capture frames, what a pipeline with one of
+/// them reads is logged (`crate::draw`).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn traced_reads() -> &'static [String] {
+    static HASHES: OnceLock<Vec<String>> = OnceLock::new();
+    HASHES.get_or_init(|| {
+        let v = std::env::var("VICTORY_TRACE_READS").unwrap_or_default();
+        v.split(',').map(str::trim).filter(|h| !h.is_empty()).map(str::to_owned).collect()
+    })
+}
+
 /// Whether `what` names a shader [`traced_shaders`] lists.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn is_traced(what: &str) -> bool {

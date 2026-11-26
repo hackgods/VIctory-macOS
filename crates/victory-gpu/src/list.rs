@@ -195,6 +195,62 @@ pub(crate) fn take_copy_cuts() -> u64 {
     COPY_CUTS.swap(0, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Cuts for hoisted clamps since the last call (the frame line).
+pub(crate) fn take_hoists() -> u64 {
+    HOISTS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs of indirect draws whose clamps went to the host list before
+/// ([`hoist`]): each cut the title list once more.
+static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// of the list's draws already go to the host list before it and nothing
+/// since may have written arguments, the title list goes on in a new host
+/// list here, as at a wait. The one it leaves stays open for the clamps of
+/// the draws to come, so that no dispatch of ours comes between the draws;
+/// it ends where the run does ([`end_hoist`]).
+#[cfg(windows)]
+fn hoist(this: This, kind: u32) {
+    if !crate::indirect::hoisting() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    if state.hoistable(kind) {
+        start_run(this, &mut state);
+    }
+}
+
+/// [`hoist`] for a draw whose clamp can be hoisted, with the list's state.
+#[cfg(windows)]
+fn start_run(this: This, state: &mut crate::draw::State) {
+    let Some(current) = host_list(this) else { return };
+    if state.hoists_into(current) {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    state.end_hoist(current);
+    let k = list.segment.load(std::sync::atomic::Ordering::Relaxed);
+    let Some(clamps) = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).get(k).cloned() else {
+        return;
+    };
+    let Some(next) = next_segment(this) else { return };
+    HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    state.cut(next);
+    state.hoist(clamps, next);
+}
+
+/// Ends the run whose clamps go to the host list before the current one,
+/// if any: that list closes. Before anything that ends the current host
+/// list, or counts who holds the list's host lists.
+#[cfg(windows)]
+fn end_hoist(this: This) {
+    with_state(this, |list, s| s.end_hoist(list));
+}
+
 /// The host list a title copy into `len` bytes at `dst` is recorded into,
 /// noted there as one of its copies.
 ///
@@ -211,7 +267,12 @@ pub(crate) fn take_copy_cuts() -> u64 {
 fn copy_into<'a>(this: This, dst: *const u8, len: u64) -> Option<&'a crate::host::HostList> {
     let current = host_list(this)?;
     let (at, len) = (dst as usize, usize::try_from(len).unwrap_or(usize::MAX));
-    let into = match current.read_before(at, len).then(|| next_segment(this)).flatten() {
+    // (A run of hoisted clamps ends before the list it draws in does.)
+    let cut = current.read_before(at, len);
+    if cut {
+        end_hoist(this);
+    }
+    let into = match cut.then(|| next_segment(this)).flatten() {
         Some(next) => {
             COPY_CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             current.close();
@@ -245,6 +306,8 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     #[cfg(windows)]
     {
         let Some(current) = host_list(this) else { return };
+        // Clamps hoisted from here on would run before the wait holds.
+        end_hoist(this);
         if !current.is_empty() {
             let Some(next) = next_segment(this) else { return };
             CUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -471,6 +534,7 @@ extern "system" fn list_release(this: This) -> u32 {
     // the last of them takes what the list owned.
     #[cfg(windows)]
     if !this.is_null() && object::refs(this) == 1 {
+        end_hoist(this);
         // SAFETY: the title passes one of our lists.
         let list = unsafe { &*this.cast::<List>() };
         let held = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).iter().rfind(|h| std::sync::Arc::strong_count(h) > 1).cloned();
@@ -491,6 +555,7 @@ extern "system" fn list_type(this: This) -> u32 {
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
     if let Some(host) = host_list(this) {
+        end_hoist(this);
         host.close();
     }
     S_OK
@@ -505,6 +570,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
+        end_hoist(this);
         let held = restart(this);
         // SAFETY: the title passes one of our lists.
         let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
@@ -1695,6 +1761,7 @@ extern "system" fn execute_indirect(
         } else {
             *kind
         };
+        hoist(this, kind);
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2183,6 +2250,62 @@ mod tests {
         assert!(take_copy_cuts() >= 3);
 
         assert_eq!(close(list), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// Hoisted clamps (`crate::indirect::hoisting`): the first indirect
+    /// draw of a run cuts the title list, the host list before staying open
+    /// for the run's clamps; draws of the same run add no cut until
+    /// something may have written arguments, and a wait ends the run. The
+    /// host lists run in order, and a reset starts from one again.
+    #[cfg(windows)]
+    #[test]
+    fn indirect_draws_cut_lists_for_hoisted_clamps() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: our list.
+        let state = unsafe { &(*list.cast::<List>()).state };
+        let start = || start_run(list, &mut state.lock().unwrap());
+        for _ in 0..2 {
+            let viewport = windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT {
+                Width: 64.0,
+                Height: 64.0,
+                MaxDepth: 1.0,
+                ..Default::default()
+            };
+            state::viewports(list, 1, &viewport);
+            state::stencil_ref(list, 3);
+            start();
+            assert_eq!(segments(list).len(), 2);
+            let draws = host_list(list).unwrap();
+            assert!(state.lock().unwrap().hoists_into(draws));
+            start();
+            assert_eq!(segments(list).len(), 2, "the same run");
+            draws.count_write();
+            assert!(!state.lock().unwrap().hoists_into(draws));
+            start();
+            assert_eq!(segments(list).len(), 3, "arguments may have been written");
+            // A wait ends the run; with nothing recorded since the cut it
+            // adds none.
+            wait64(list, 0x1000, 0, 0, 0);
+            assert!(!state.lock().unwrap().hoists_into(host_list(list).unwrap()));
+            assert_eq!(segments(list).len(), 3);
+            start();
+            assert_eq!(segments(list).len(), 4);
+            assert_eq!(close(list), S_OK);
+            let all = segments(list);
+            host.execute(&all.iter().map(|s| &**s).collect::<Vec<_>>());
+            drop(all);
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert_eq!(segments(list).len(), 1);
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

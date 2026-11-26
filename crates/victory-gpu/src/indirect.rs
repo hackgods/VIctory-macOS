@@ -15,6 +15,12 @@
 //! records, so the clamp reads the count word and stops there: the maximum
 //! can be far above the count, and the records between never run.
 //!
+//! With `VICTORY_BATCH_CLAMPS=1` the clamps of a run of indirect draws go
+//! to the host list before the one that draws ([`bound_before`]): each
+//! clamp before its draw puts a dispatch of ours and three barriers between
+//! every two draws, which ends and restarts the host's render pass each
+//! time (from 64bitMango 18872f48, after Belobug ccab973).
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension except in x where [`widest`] allows more, 2^20
 //! per dispatch, one-dimensional mesh dispatches, the budget) cut
@@ -292,21 +298,47 @@ fn bound_with(
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, u32::from(count.is_some()), widest()];
-    // SAFETY: an open list; our root signature, pipeline and buffers, and
-    // title buffers' copies the caller's list holds.
+    // SAFETY: an open list; our buffers, and title buffers' copies the
+    // caller's list holds.
     unsafe {
         // Earlier shader writes (the title's argument passes) first.
         l.ResourceBarrier(&[
             uav_barrier(),
             transition(&out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
         ]);
+        run(l, c, budget, (gpu, count), (kind, stride, records), out.GetGPUVirtualAddress());
+        l.ResourceBarrier(&[
+            uav_barrier(),
+            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
+        ]);
+    }
+    Some(out)
+}
+
+/// Records the clamp's dispatch: the records at `gpu`, under the count at
+/// `count` if any, clamped into the memory at host address `dest`, in
+/// unordered access.
+///
+/// # Safety
+/// `l` is open; `budget`, `gpu`, `count` and `dest` are addresses in live
+/// buffers the list holds.
+unsafe fn run(
+    l: &ID3D12GraphicsCommandList,
+    c: &Clamp,
+    budget: u64,
+    (gpu, count): (u64, Option<u64>),
+    (kind, stride, records): (u32, u32, u32),
+    dest: u64,
+) {
+    let constants = [kind, stride, records, u32::from(count.is_some()), widest()];
+    // SAFETY: the caller's; our root signature and pipeline.
+    unsafe {
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
-        l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(3, dest);
         // Set even when not read: a root view has to be set.
         l.SetComputeRootShaderResourceView(4, count.unwrap_or(gpu));
         if c.words {
@@ -314,14 +346,66 @@ fn bound_with(
         }
         // One group walks every record (up to the count).
         l.Dispatch(records.min(1), 1, 1);
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
-        ]);
     }
     DISPATCHES.fetch_add(1, Ordering::Relaxed);
-    Some(out)
 }
+
+/// Whether the clamps of a run of indirect draws go to the host list
+/// before the one that draws (`VICTORY_BATCH_CLAMPS=1` or `hoist`,
+/// `crate::mac_switches::batch_clamps`); else each is recorded before its
+/// draw.
+pub(crate) fn hoisting() -> bool {
+    crate::mac_switches::batch_clamps()[0]
+}
+
+/// As [`bound`], recorded in `clamps`, the host list that runs before
+/// `into`, for an execution `into` records: the clamped records go to one
+/// of `into`'s own buffers ([`HostList::clamp_room`]), which the execution
+/// reads at the offset returned once `clamps` has ended
+/// ([`HostList::clamp_end`]). `None` also when there is no room: the
+/// caller clamps in `into`.
+///
+/// The clamps of a run charge the budget of `clamps` one after another, in
+/// the order of the draws (a barrier for shader writes before each): the
+/// records past the budget are the same ones from frame to frame. Clamps
+/// that did not wait for each other made whole mesh objects flicker in
+/// Belobug's fork (leaves, chairs, clothes; fixed there in 76387c2).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    into: &HostList,
+    gpu: u64,
+    (kind, stride, records): (u32, u32, u32),
+    count: Option<u64>,
+) -> Option<(ID3D12Resource, u64)> {
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    if !gpu.is_multiple_of(4) || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let count = count.filter(|at| at.is_multiple_of(4));
+    let (out, at) = into.clamp_room(clamps, u64::from(stride) * u64::from(records.max(1)))?;
+    RECORDS[0].fetch_add(u64::from(records), Ordering::Relaxed);
+    if count.is_some() {
+        RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
+    }
+    HOISTED.fetch_add(1, Ordering::Relaxed);
+    let l = &clamps.list;
+    // SAFETY: an open list; our buffers (`out` in unordered access), and
+    // title buffers' copies the caller's list holds.
+    unsafe {
+        // Earlier shader writes (the title's argument passes, the clamp
+        // before) first.
+        l.ResourceBarrier(&[uav_barrier()]);
+        run(l, c, budget, (gpu, count), (kind, stride, records), out.GetGPUVirtualAddress() + at);
+    }
+    Some((out, at))
+}
+
+/// Clamps recorded in the host list before their draw's since the last
+/// call (the frame line).
+pub(crate) fn take_hoisted() -> u64 {
+    HOISTED.swap(0, Ordering::Relaxed)
+}
+static HOISTED: AtomicU64 = AtomicU64::new(0);
 
 /// Dispatches of ours recorded for clamps since the last call (the frame
 /// line): one before every indirect execution, each ending the host's
@@ -579,6 +663,70 @@ mod tests {
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
+        }
+    }
+
+    /// Hoisted clamps (`bound_before`) leave the clamped records in the
+    /// drawing list's own buffer, one run of records after the other, and
+    /// charge the budget of the list before in the order of the draws: of
+    /// two draws of four garbage records (2^26 vertex instances each once
+    /// clamped) the first two records of the first fit, none of the second;
+    /// under a count of 1 only the first is clamped. Every barrier starts
+    /// from the buffer's current state, the title's copy is never
+    /// transitioned and all end common.
+    #[test]
+    fn hoisted_clamps_fill_the_drawing_lists_buffer() {
+        use crate::host::tests::{issued, replay};
+        use windows::core::Interface;
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let (per, records) = (4usize, 4u32);
+        let bytes = (per * records as usize * 4) as u64;
+        let (title, data) = host.shared_buffer(bytes).unwrap();
+        let (counter, word) = host.shared_buffer(4).unwrap();
+        let key = |r: &super::ID3D12Resource| r.as_raw() as usize;
+        for count in [None, Some(1u32)] {
+            let (clamps, draws) = (host.new_list().unwrap(), host.new_list().unwrap());
+            issued();
+            // SAFETY: our mapped buffers, written before the lists run and
+            // read after they have; live buffers.
+            unsafe {
+                for at in 0..per * records as usize {
+                    data.cast::<u32>().add(at).write_volatile(u32::MAX);
+                }
+                word.cast::<u32>().write_volatile(count.unwrap_or(0));
+                let gpu = title.GetGPUVirtualAddress();
+                let counted = count.map(|_| counter.GetGPUVirtualAddress());
+                let spec = (0, per as u32 * 4, records);
+                let first = super::bound_before(&clamps, &draws, gpu, spec, counted).expect("room");
+                let second = super::bound_before(&clamps, &draws, gpu, spec, counted).expect("room");
+                assert!(first.0 == second.0 && second.1 == first.1 + bytes, "one buffer, in turn");
+                draws.clamp_end(&clamps);
+                assert!(super::bound_before(&clamps, &draws, gpu, spec, counted).is_none(), "the run has ended");
+                clamps.close();
+                draws.close();
+                let run = issued();
+                host.execute(&[&clamps, &draws]);
+                let mut states: std::collections::HashMap<usize, u32> =
+                    [key(&title), key(&counter), key(&first.0)].into_iter().map(|k| (k, 0)).collect();
+                replay(&run, &mut states).unwrap();
+                assert!(run.iter().all(|t| t.0 == key(&first.0)), "only the list's buffer is transitioned");
+                assert_eq!(run.len(), 3, "to unordered access, indirect argument and common");
+                assert!(states.values().all(|&s| s == 0), "all common again");
+                let mut out = std::ptr::null_mut();
+                first.0.Map(0, None, Some(&mut out)).unwrap();
+                let out = out.cast::<u32>();
+                let counts: Vec<u32> = (0..2 * records as usize).map(|i| out.add(i * per).read_volatile()).collect();
+                match count {
+                    None => assert_eq!(counts, [1 << 24, 1 << 24, 0, 0, 0, 0, 0, 0]),
+                    // The words past the count stay as the fresh buffer's.
+                    Some(_) => assert_eq!(counts, [1 << 24, 0, 0, 0, 1 << 24, 0, 0, 0]),
+                }
+                for at in 0..per * records as usize {
+                    assert_eq!(data.cast::<u32>().add(at).read_volatile(), u32::MAX, "the title's copy as written");
+                }
+            }
         }
     }
 

@@ -94,6 +94,18 @@ pub(crate) struct State {
     /// What was set straight onto the host list, for the next segment of
     /// the list ([`State::cut`]).
     fixed: Fixed,
+    /// The run of indirect draws being recorded whose clamps go to the host
+    /// list before (`crate::indirect::hoisting`).
+    hoist: Option<Hoist>,
+}
+
+/// Where the clamps of a run of indirect draws go: `clamps`, the host list
+/// before the one at `into`, still open, as long as that one has `writes`
+/// dispatches and copies (a later one may write the arguments).
+struct Hoist {
+    clamps: std::sync::Arc<HostList>,
+    into: usize,
+    writes: u64,
 }
 
 /// Fixed-function state the title set, as it set it.
@@ -297,8 +309,9 @@ impl State {
         unsafe { list.list.OMSetStencilRef(reference) };
     }
 
-    /// The title list goes on in a fresh host list (a segment after a wait,
-    /// `crate::list`): the state it set is given to `list` again.
+    /// The title list goes on in a fresh host list (a segment after a wait
+    /// or from a run of indirect draws on, `crate::list`): the state it set
+    /// is given to `list` again.
     ///
     /// Replayed: topology, viewports, scissors, blend factor, stencil
     /// reference, render targets and depth (set at once); heaps, root
@@ -335,6 +348,42 @@ impl State {
         }
         if let Some((targets, depth)) = &fixed.targets {
             self.set_targets(list, targets, *depth);
+        }
+    }
+
+    /// Whether an indirect execution of `kind` recorded now would have its
+    /// clamp hoisted: a draw or mesh dispatch that is not dropped before
+    /// its clamp. Draws of rectangles too: no vertices of ours are made
+    /// between indirect draws (they run only where the pipeline's geometry
+    /// shader completes the rectangles, and are clamped either way).
+    pub(crate) fn hoistable(&self, kind: u32) -> bool {
+        kind != INDIRECT_DISPATCH
+            && !crate::pipeline::held_back(self.pipeline as This)
+            && crate::pipeline::host_pipeline(self.pipeline as This).is_some()
+    }
+
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the host list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`,
+    /// the host list before it.
+    pub(crate) fn hoist(&mut self, clamps: std::sync::Arc<HostList>, into: &HostList) {
+        self.hoist = Some(Hoist { clamps, into: std::ptr::from_ref(into) as usize, writes: into.writes() });
+    }
+
+    /// Ends the run whose clamps go to the host list before `list`, if
+    /// any: that list closes, its clamped arguments readable.
+    pub(crate) fn end_hoist(&mut self, list: &HostList) {
+        if let Some(h) = self.hoist.take() {
+            if h.into == std::ptr::from_ref(list) as usize {
+                list.clamp_end(&h.clamps);
+            }
+            h.clamps.close();
         }
     }
 
@@ -1099,6 +1148,7 @@ impl State {
         readable(list, &written, &view, false);
         self.bind_heaps(list, false);
         list.keep(&resource);
+        list.count_write();
         let gpu = visible.gpu(slot);
         // SAFETY: an open list; both slots view the live resource.
         unsafe {
@@ -1168,6 +1218,7 @@ impl State {
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_write();
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -1831,8 +1882,8 @@ impl State {
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
-        const DISPATCH: u32 = 2;
-        const MESH: u32 = 10;
+        const DISPATCH: u32 = INDIRECT_DISPATCH;
+        const MESH: u32 = INDIRECT_MESH;
         #[cfg(feature = "diagnostics")]
         let pipeline = self.pipeline as This;
         #[cfg(feature = "diagnostics")]
@@ -1894,19 +1945,52 @@ impl State {
             why("no host signature");
             return false;
         };
-        args.refresh(list, arguments, len);
+        // The clamp reads the count, so that it stops where the execution
+        // does.
+        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
+        // A draw of a run: clamped in the host list before, which the run's
+        // first draw left open for it (`crate::list`), so that nothing of
+        // ours comes between the draws. That list reads the arguments and
+        // the count, so both are brought up to date with it (the count
+        // with this list too, whose execution reads it).
+        let hoisted = (kind != DISPATCH && self.hoists_into(list))
+            .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
+            .flatten()
+            .and_then(|clamps| {
+                let out = crate::indirect::bound_before(&clamps, list, args.gpu(arguments), (kind, stride, max), counted)?;
+                args.refresh(&clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(&clamps, *at, 4);
+                }
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of indirect kind {kind} max {max} at {arguments:#x}"));
+                Some(out)
+            });
+        let inline = hoisted.is_none();
+        if inline {
+            args.refresh(list, arguments, len);
+        }
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own. It
-        // reads the count, so that it stops where the execution does.
-        let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        let (clamped, clamped_at) = match hoisted {
+            Some(h) => h,
+            None => {
+                // Bounded first: the clamp binds a compute pipeline of its
+                // own.
+                let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
+                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+                // A clamp in the list itself charges the budget after the
+                // clamps hoisted so far: the run ends here, so that those
+                // of later draws do not come before it.
+                list.count_write();
+                (clamped, 0)
+            }
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -1922,7 +2006,9 @@ impl State {
             _ => false,
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if inline {
+                crate::indirect::done(list, &clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -1946,13 +2032,14 @@ impl State {
             )
         });
         // SAFETY: an open list with everything set; the buffers are host
-        // copies the list keeps alive (refresh), the signature is cached.
+        // copies the list keeps alive (refresh) and the list's own, the
+        // signature is cached.
         unsafe {
             list.list.ExecuteIndirect(
                 &signature,
                 max,
                 &clamped,
-                0,
+                clamped_at,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -1966,10 +2053,12 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(list, (&clamped, clamped_at), count, (kind, stride, max), name, always);
             }
         }
-        crate::indirect::done(list, &clamped);
+        if inline {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             self.ambient(list);
@@ -2170,6 +2259,10 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
 /// The console's own primitive topologies.
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
+
+/// Indirect argument kinds (PC numbering) of dispatches and mesh dispatches.
+const INDIRECT_DISPATCH: u32 = 2;
+const INDIRECT_MESH: u32 = 10;
 const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;

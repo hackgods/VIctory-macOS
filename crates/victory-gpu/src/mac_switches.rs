@@ -242,6 +242,52 @@ fn copy_order(value: Option<&str>) -> Option<usize> {
     }
 }
 
+/// How the clamps of indirect draws are recorded (`crate::indirect`):
+/// whether the clamps of a run of indirect draws go to the host list before
+/// the one that draws, and whether a run's clamps are then one dispatch.
+/// Both only with `VICTORY_BATCH_CLAMPS=1`; `hoist` moves the clamps and
+/// leaves each a dispatch of its own (to tell the two steps apart in a
+/// run). Off by default: each clamp is a dispatch of ours just before its
+/// draw, about 4,200 a world frame, each between two draws.
+pub(crate) fn batch_clamps() -> [bool; 2] {
+    static ON: OnceLock<[bool; 2]> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let [hoist, batch] = clamps(std::env::var("VICTORY_BATCH_CLAMPS").ok().as_deref());
+        if hoist {
+            tracing::info!(
+                batch,
+                "VICTORY_BATCH_CLAMPS: the clamps of a run of indirect draws go to the host list before it (batch: as one dispatch a run)"
+            );
+        }
+        [hoist, batch]
+    })
+}
+
+/// `VICTORY_BATCH_CLAMPS`'s rule: hoisted, batched. `1` is both, `hoist`
+/// the first alone; anything else is off.
+fn clamps(value: Option<&str>) -> [bool; 2] {
+    match value.map(str::trim) {
+        Some("1") => [true, true],
+        Some("hoist") => [true, false],
+        _ => [false, false],
+    }
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::clamps;
+
+    #[test]
+    fn the_clamp_switch_is_off_unless_it_is_1_or_hoist() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("batch"), Some("2")] {
+            assert_eq!(clamps(off), [false, false], "{off:?}");
+        }
+        assert_eq!(clamps(Some("1")), [true, true]);
+        assert_eq!(clamps(Some(" 1 ")), [true, true]);
+        assert_eq!(clamps(Some("hoist")), [true, false]);
+    }
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {

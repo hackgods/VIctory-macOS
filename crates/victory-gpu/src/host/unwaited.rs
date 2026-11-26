@@ -57,6 +57,9 @@ use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
 
 use super::*;
 
+/// mac: the next submission prepared while this one runs (`VICTORY_FLIGHTS`).
+pub(crate) mod flights;
+
 /// Whether the title's submissions may return before the host GPU has run
 /// them (`VICTORY_ASYNC_SUBMIT=1`).
 pub(crate) fn on() -> bool {
@@ -122,7 +125,9 @@ pub(crate) fn prewarms() -> bool {
 fn signals() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     on() && *ON.get_or_init(|| {
-        let on = crate::switch::on("VICTORY_ASYNC_SIGNALS") && !all() && idler().is_some();
+        // mac: with flights, also with `VICTORY_ASYNC_SETTLE_ALL=1`.
+        let asked = (crate::switch::on("VICTORY_ASYNC_SIGNALS") && !all()) || flights::on();
+        let on = asked && idler().is_some();
         if on {
             tracing::info!(
                 "VICTORY_ASYNC_SIGNALS: a queue's Signal does not wait for the submission left to the host GPU; \
@@ -188,6 +193,13 @@ struct Left {
     /// Whether one of them runs programs that use title memory, which
     /// write host copies at addresses they compute (`crate::memory`).
     memory: bool,
+    /// mac: with [`flights`] (else empty): title memory its shaders may
+    /// write as its lists declared, and that its work for after lands in
+    /// (address, end); its bottom-of-pipe writes in order (address, the
+    /// value if it is one, bytes); whether it runs an upload list of ours.
+    declared: Vec<(usize, usize)>,
+    values: Vec<(usize, Option<u64>, usize)>,
+    uploads: bool,
     ran: Ran,
 }
 
@@ -257,7 +269,8 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
     }
     // Read after the value: a submission of `queue` cannot be left
     // meanwhile, as its Signal and its submissions come one at a time.
-    if QUEUE.load(Acquire) != queue && !all() {
+    // mac: with flights, every queue's Signal goes behind it (`signal_after`).
+    if QUEUE.load(Acquire) != queue && !(all() && !flights::on()) {
         SPARED[0].fetch_add(1, Relaxed);
         return false;
     }
@@ -273,7 +286,9 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
 /// wait for the queue's work either. False (nothing done) with the switch
 /// off, with nothing of the queue's left, or while it is being finished.
 pub(crate) fn signal_behind(queue: usize, fence: usize, value: u64) -> bool {
-    if !signals() || VALUE.load(Acquire) == 0 || QUEUE.load(Acquire) != queue {
+    // mac: with flights, any queue's (hyphennn 578d459: a fence signalled
+    // while flights are in the air is set behind them).
+    if !signals() || VALUE.load(Acquire) == 0 || (QUEUE.load(Acquire) != queue && !flights::on()) {
         return false;
     }
     crate::fence::keep(fence as crate::object::This);
@@ -325,15 +340,25 @@ pub(crate) fn settle_waits(
     seen: &mut u64,
 ) -> bool {
     if VALUE.load(Acquire) != 0 {
+        let flights = flights::on();
         let owed = match LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(left) => left
-                .writes
-                .iter()
-                .any(|&(at, n)| waits.iter().any(|w| w.reads(at, n))),
+            // mac: with flights, not for a value its writes are known to
+            // leave there: the pump read that already ([`pending_value`]),
+            // and finishing it first would not change what the wait sees.
+            Some(left) => left.writes.iter().any(|&(at, n)| {
+                waits.iter().any(|w| {
+                    w.reads(at, n)
+                        && !(flights
+                            && matches!(
+                                crate::flights::after_writes(&left.values, w.address as usize, usize::from(w.bytes)),
+                                Some(Some(_))
+                            ))
+                })
+            }),
             // Being finished right now: `settle` waits for that.
             None => true,
         };
-        if owed || all() {
+        if owed || (all() && !flights) {
             let next: Vec<&HostList> = next.iter().map(|l| &***l).collect();
             settle_before(By::Wait, &next);
         } else {
@@ -342,6 +367,22 @@ pub(crate) fn settle_waits(
     }
     let now = finished();
     std::mem::replace(seen, now) != now
+}
+
+/// mac: with [`flights`], what the `bytes` at `address` (a held wait's
+/// value) will hold once the submission left is finished, if one of its
+/// bottom-of-pipe writes stores all of them and its value is known (else
+/// `None`: memory says). The wait's work is then prepared beside it, and
+/// goes to the GPU behind it, which is the order the wait asks for
+/// (hyphennn 578d459, `late_met`).
+pub(crate) fn pending_value(address: u64, bytes: u8) -> Option<u64> {
+    if VALUE.load(Acquire) == 0 || !flights::on() {
+        return None;
+    }
+    let left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    let value = crate::flights::after_writes(&left.as_ref()?.values, address as usize, usize::from(bytes))??;
+    flights::MET.fetch_add(1, Relaxed);
+    Some(value)
 }
 
 /// The thread that finishes a submission left to the host GPU when nothing
@@ -397,9 +438,21 @@ fn idle() {
             continue;
         }
         let Some(host) = host() else { return };
+        // A test that needs the submission left to stay left.
+        #[cfg(test)]
+        if tests::IDLE_HELD.load(Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+            continue;
+        }
         // SAFETY: a plain query of our fence.
         if unsafe { host.fence.GetCompletedValue() } >= value {
-            settle(By::Idle);
+            // mac: with flights the lock may be held by the next
+            // submission's preparation, which finishes it itself.
+            if !flights::on() {
+                settle(By::Idle);
+            } else if !host.settle_if_free(value) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             continue;
         }
         if let Some(pause) = crate::descriptor::ahead::pause() {
@@ -524,6 +577,7 @@ pub(super) fn log(frames: f64) {
         );
     }
     crate::descriptor::ahead::log(frames);
+    flights::log(frames);
     if !prewarms() {
         return;
     }
@@ -552,13 +606,37 @@ impl Host {
     /// `next`: the lists that run next, if known ([`Host::prewarm`]).
     pub(super) fn submissions(&self, by: By, next: &[&HostList]) -> std::sync::MutexGuard<'_, u64> {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.settle_held(&mut submitted, by, next);
+        submitted
+    }
+
+    /// [`Host::submissions`]' part under the lock: the submission left, if
+    /// any, is finished (its next lists' copies brought up to date first
+    /// with the prewarm).
+    fn settle_held(&self, submitted: &mut u64, by: By, next: &[&HostList]) {
         if VALUE.load(Acquire) != 0 {
             if !next.is_empty() && prewarms() {
                 self.prewarm(next);
             }
-            self.finish_left(&mut submitted, by);
+            self.finish_left(submitted, by);
         }
-        submitted
+    }
+
+    /// mac: our thread's finish with [`flights`]: only if nothing holds the
+    /// submission lock and the submission left is still the one with fence
+    /// value `value` (which the GPU has run). Whether the lock was had.
+    fn settle_if_free(&self, value: u64) -> bool {
+        let mut submitted = match self.submitted.try_lock() {
+            Ok(submitted) => submitted,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return false,
+        };
+        if VALUE.load(Acquire) == value {
+            self.finish_left(&mut submitted, By::Idle);
+        }
+        drop(submitted);
+        take_done().into_iter().for_each(crate::list::recycle);
+        true
     }
 
     /// Runs the title's own lists (a queue's piece, `crate::queue`), and
@@ -593,6 +671,7 @@ impl Host {
         mark: Option<&Mark>,
         (title_queue, title): (usize, &[std::sync::Arc<HostList>]),
         ran: Ran,
+        uploads: bool,
     ) {
         *submitted += 1;
         let started = Instant::now();
@@ -646,13 +725,34 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
-        let memory = prewarms()
+        let memory = (prewarms() || flights::on())
             && title.iter().any(|l| {
                 l.deferred()
                     .copies
                     .iter()
                     .any(|s| matches!(s, Step::Memory(_)))
             });
+        // mac: what flights need to know of it (`flights::Footprint`).
+        let (mut declared, mut values) = (Vec::new(), Vec::new());
+        if flights::on() {
+            for l in title {
+                let deferred = l.deferred();
+                for step in &deferred.copies {
+                    if let &Step::GpuWrite(_, at, n, _, _) = step {
+                        declared.push((at, at + n));
+                    }
+                }
+                declared.extend(deferred.lands.iter().map(|&(at, n)| (at, at + n)));
+                declared.extend(deferred.texture_backs.iter().map(|b| b.lands()));
+                values.extend(deferred.writes.iter().map(|&(at, what, n)| {
+                    let value = match what {
+                        crate::queue::Written::Value(v) => Some(v),
+                        _ => None,
+                    };
+                    (at, value, n)
+                }));
+            }
+        }
         *LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Left {
             value: *submitted,
             signalled: signalled.is_ok(),
@@ -661,6 +761,9 @@ impl Host {
             writes,
             signals: Vec::new(),
             memory,
+            declared,
+            values,
+            uploads,
             ran,
         });
         QUEUE.store(title_queue, Release);
@@ -894,11 +997,12 @@ impl Host {
 
     /// Waits for the submission left to the host GPU and finishes it, as
     /// [`Host::run`] does one it waited for. Under the submission lock.
-    fn finish_left(&self, submitted: &mut u64, by: By) {
+    /// How long it waited for the GPU.
+    fn finish_left(&self, submitted: &mut u64, by: By) -> Duration {
         let Some(left) = LEFT.lock().unwrap_or_else(|e| e.into_inner()).take() else {
             // None is being finished either: that is done under our lock.
             VALUE.store(0, Release);
-            return;
+            return Duration::ZERO;
         };
         let _holding = Holding::enter();
         let Left {
@@ -910,8 +1014,10 @@ impl Host {
             mut ran,
             ..
         } = left;
+        let mut waited = Duration::ZERO;
         if signalled && !stood {
             ran.gpu = self.wait_left(value, crate::descriptor::ahead::on());
+            waited = ran.gpu;
             WAITED_US[by as usize].fetch_add(ran.gpu.as_micros() as u64, Relaxed);
             SUBMISSION_US[1].fetch_add(ran.gpu.as_micros() as u64, Relaxed);
         }
@@ -946,6 +1052,7 @@ impl Host {
         FINISHED.fetch_add(1, AcqRel);
         // Last: until now a thread that asks ([`settle`]) waits for our lock.
         VALUE.store(0, Release);
+        waited
     }
 }
 
@@ -956,6 +1063,114 @@ mod tests {
     /// Turns the switch on for the tests here, whatever the environment.
     pub(super) static FORCED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    /// Our thread leaves the submission left alone while set.
+    pub(super) static IDLE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// mac: both switches on (`VICTORY_ASYNC_SUBMIT`, `VICTORY_FLIGHTS`),
+    /// and our thread held off, until dropped.
+    struct Flights;
+
+    impl Flights {
+        fn on() -> Flights {
+            FORCED.store(true, Relaxed);
+            flights::FORCED.store(true, Relaxed);
+            IDLE_HELD.store(true, Relaxed);
+            Flights
+        }
+    }
+
+    impl Drop for Flights {
+        fn drop(&mut self) {
+            IDLE_HELD.store(false, Relaxed);
+            flights::FORCED.store(false, Relaxed);
+            FORCED.store(false, Relaxed);
+        }
+    }
+
+    /// Finishes left by flights so far (every [`flights::Why`]).
+    fn finished_beside() -> u64 {
+        flights::finished_beside()
+    }
+
+    /// mac: with flights, the title's next submission is prepared while
+    /// the one left runs, and that one is finished before the next goes to
+    /// the host GPU: its work for after, then its bottom-of-pipe write,
+    /// come before the next one's, and its pending value is read from it
+    /// until then.
+    #[test]
+    fn with_flights_the_one_left_is_finished_before_the_next_runs() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let flights = Flights::on();
+        settle(By::Signal);
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let word = Box::new(AtomicU64::new(0));
+        let at = word.as_ptr() as u64;
+        let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+        for (i, list) in lists.iter().enumerate() {
+            let log = order.clone();
+            let word_at = word.as_ptr() as usize;
+            list.defer_after(move || {
+                // SAFETY: the test's word, alive until the end.
+                let seen = unsafe { (*(word_at as *const AtomicU64)).load(Acquire) };
+                log.lock().unwrap().push((i, seen));
+            });
+            list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(5 + i as u64), 8);
+            list.close();
+        }
+        let before = finished_beside();
+        let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        // Left (unless a diagnostics build captures): its value is known
+        // before it is in memory.
+        if VALUE.load(Acquire) != 0 {
+            assert_eq!(pending_value(at, 8), Some(5));
+            assert_eq!(pending_value(at, 4), Some(5));
+            assert_eq!(pending_value(at + 8, 8), None);
+        }
+        back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        settle(By::Signal);
+        drop(flights);
+        assert_eq!(
+            *order.lock().unwrap(),
+            [(0, 0), (1, 5)],
+            "the first's work for after ran first, and its write was there before the second's"
+        );
+        assert_eq!(word.load(Acquire), 6, "the second's write is the last");
+        assert_eq!(pending_value(at, 8), None, "nothing is left");
+        // (A diagnostics build that captures waits for every submission.)
+        #[cfg(not(feature = "diagnostics"))]
+        assert!(finished_beside() > before, "the first was finished beside the second");
+        let _ = before;
+        drop(back);
+        drop(take_done());
+    }
+
+    /// mac: with flights, a step of the next submission that could see
+    /// what the one left owes (here a step of ours) finishes it first.
+    #[test]
+    fn with_flights_a_step_of_ours_waits_for_the_one_left() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let flights = Flights::on();
+        settle(By::Signal);
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+        let log = order.clone();
+        lists[0].defer_after(move || log.lock().unwrap().push("the first has run"));
+        let log = order.clone();
+        lists[1].defer_host(move || log.lock().unwrap().push("the second's step"));
+        lists.iter().for_each(|l| l.close());
+        let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        settle(By::Signal);
+        drop(flights);
+        assert_eq!(*order.lock().unwrap(), ["the first has run", "the second's step"]);
+        drop(back);
+        drop(take_done());
+    }
 
     /// A title submission left to the host GPU owes its bottom-of-pipe
     /// write until something waits for it; then the write is there, the

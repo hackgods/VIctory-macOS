@@ -54,6 +54,9 @@ pub mod dxgi;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+// mac: plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod flights;
 pub mod frame;
 mod hold;
 #[cfg(windows)]

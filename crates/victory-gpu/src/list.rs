@@ -1076,6 +1076,7 @@ pub(crate) fn read_back(list: &crate::host::HostList, dst: &CopyLocation, at: [u
         )
     };
     let (data, title) = (data as usize, title as usize);
+    list.note_landing(title, len as usize);
     list.defer_after(move || {
         for &(at, n) in &rows {
             let (at, n) = (at as usize, n as usize);

@@ -3589,6 +3589,10 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
+    /// The microseconds its refreshes added to the frame line's copy time
+    /// (tests).
+    #[cfg(test)]
+    counted_us: u64,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -3683,6 +3687,10 @@ impl Batch {
             type RefreshOut = Vec<(usize, usize, usize, u64)>;
             let results: Vec<Mutex<RefreshOut>> =
                 (0..work.len()).map(|_| Mutex::default()).collect();
+            // The frame line's copy time is the time the preparing spent
+            // here, not the workers' times added up (four of them made a
+            // frame's 37 ms of refreshes read as 110-140 ms, "3 GB/s").
+            let started = std::time::Instant::now();
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
                 let mut out = Vec::new();
@@ -3694,17 +3702,23 @@ impl Batch {
                 }
                 *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
             });
+            let wall = started.elapsed().as_micros() as u64;
+            PREPARING[0].fetch_add(wall, Ordering::Relaxed);
+            #[cfg(test)]
+            {
+                self.counted_us += wall;
+            }
             for ((shadow, _), done) in work.into_iter().zip(results) {
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
                 let (start, len) = shadow.range();
-                for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                for (from, to, copied, _us) in done.into_inner().unwrap_or_else(|e| e.into_inner())
+                {
                     #[cfg(feature = "diagnostics")]
                     {
-                        counted.range(from, to - from, us, 0);
+                        counted.range(from, to - from, _us, 0);
                         self.summary
                             .record(from as u64, (to - from) as u64, shadow.gpu(from as u64));
                     }
-                    PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                     total += copied;
                     let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
@@ -5301,6 +5315,32 @@ mod batch {
         crate::shadow::unregister(p, p as u64);
         drop(copy);
         crate::watch::tests::free(p);
+    }
+
+    /// A batch whose copies run on the workers counts the time it took,
+    /// not the workers' times added up, as the frame line's copy time: four
+    /// copies copied side by side count about one copy's time.
+    #[test]
+    fn a_parallel_batch_counts_its_own_time() {
+        if !crate::shadow::parallel_copies_enabled() {
+            return;
+        }
+        // Plain memory is copied whole at each refresh: 4 MiB a copy.
+        let copies: Vec<(usize, Arc<Shadow>)> = (0..4).filter_map(|_| plain(64)).collect();
+        if copies.len() < 4 {
+            copies.into_iter().for_each(|(p, c)| done(p, Some(c)));
+            return; // no host GPU here
+        }
+        let mut batch = Batch::default();
+        let started = std::time::Instant::now();
+        for (p, copy) in &copies {
+            batch.add(copy, *p, 64 * PAGE);
+        }
+        assert_eq!(batch.flush(), 4 * 64 * PAGE);
+        let wall = started.elapsed().as_micros() as u64;
+        let counted = batch.counted_us;
+        assert!(counted <= wall, "counted {counted} us in {wall} us");
+        copies.into_iter().for_each(|(p, c)| done(p, Some(c)));
     }
 
     /// Fills `len` bytes of title memory at `at`.

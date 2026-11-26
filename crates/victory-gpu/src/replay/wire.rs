@@ -374,12 +374,16 @@ wire_enum! {
         31 Indirect { signature: u32, most: u32, args: u32, at: u64, count: u32, count_at: u64 },
         32 WriteImmediate { all: Vec<(Va, u32, i32)> },
         33 DepthBounds { min: f32, max: f32 },
+        /// `ClearUnorderedAccessViewUint`, or `...Float` (`float`: `values`
+        /// are the bits of four floats): the view in slot `slot` of the
+        /// shader-visible heap `heap`, and the same view by what it holds.
+        34 ClearUnordered { heap: u32, slot: u32, view: Slot, res: u32, values: [u32; 4], float: bool, rects: Vec<[i32; 4]> },
     }
 }
 
 /// The highest kind number of [`Cmd`].
 #[cfg(test)]
-const LAST_CMD: u8 = 33;
+const LAST_CMD: u8 = 34;
 
 impl Cmd {
     /// The commands of a list's bytes.
@@ -404,6 +408,7 @@ impl Cmd {
                     | Cmd::ResolveRegion { .. }
                     | Cmd::ClearDepth { .. }
                     | Cmd::ClearTarget { .. }
+                    | Cmd::ClearUnordered { .. }
                     | Cmd::Discard { .. }
                     | Cmd::ResolveQuery { .. }
                     | Cmd::WriteImmediate { .. }
@@ -830,6 +835,15 @@ pub(crate) mod tests {
             Cmd::DepthBounds {
                 min: 0.25,
                 max: 0.75,
+            },
+            Cmd::ClearUnordered {
+                heap: 1,
+                slot: 2,
+                view: view(),
+                res: 3,
+                values: [4, 5, 6, 7],
+                float: true,
+                rects: vec![[0, 1, 2, 3]],
             },
         ]
     }

@@ -1253,6 +1253,14 @@ fn list_table(t: &mut [usize; hook::SLOTS]) {
         t,
         ID3D12GraphicsCommandList_Vtbl.ClearRenderTargetView = clear_target
     );
+    set!(
+        t,
+        ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewUint = clear_unordered_uint
+    );
+    set!(
+        t,
+        ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat = clear_unordered_float
+    );
     set!(t, ID3D12GraphicsCommandList_Vtbl.DiscardResource = discard);
     set!(t, ID3D12GraphicsCommandList_Vtbl.BeginQuery = begin_query);
     set!(t, ID3D12GraphicsCommandList_Vtbl.EndQuery = end_query);
@@ -1286,8 +1294,6 @@ fn list_rest(t: &mut [usize; hook::SLOTS]) -> &'static [(usize, &'static str)] {
         ID3D12GraphicsCommandList_Vtbl.CopyTiles,
         ID3D12GraphicsCommandList_Vtbl.ExecuteBundle,
         ID3D12GraphicsCommandList_Vtbl.SOSetTargets,
-        ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewUint,
-        ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat,
         ID3D12GraphicsCommandList_Vtbl.SetPredication,
         ID3D12GraphicsCommandList1_Vtbl.AtomicCopyBufferUINT,
         ID3D12GraphicsCommandList1_Vtbl.AtomicCopyBufferUINT64,
@@ -2799,6 +2805,79 @@ unsafe extern "system" fn clear_target(
             view: r.view(view.ptr),
             color: color.cast::<[f32; 4]>().read(),
             rects: rects(n, all),
+        });
+    }
+}
+
+/// A clear through an unordered-access view: the view as the list's heap
+/// has it (`gpu`) and as the CPU handle `cpu` names it, of `res`.
+fn clear_unordered(
+    r: &Recorder,
+    gpu: u64,
+    cpu: usize,
+    res: Ptr,
+    values: [u32; 4],
+    float: bool,
+    rects: Vec<[i32; 4]>,
+) -> Cmd {
+    let (heap, slot) = match read(&r.descriptors).gpu(gpu) {
+        Some((h, i)) => (h.id, i),
+        None => (NONE, 0),
+    };
+    if heap == NONE {
+        r.problem("an unordered-access clear through a view in no heap seen made");
+    }
+    Cmd::ClearUnordered {
+        heap,
+        slot,
+        view: r.view(cpu),
+        res: r.resource(res),
+        values,
+        float,
+        rects,
+    }
+}
+
+unsafe extern "system" fn clear_unordered_uint(
+    this: Ptr,
+    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    res: Ptr,
+    values: *const u32,
+    n: u32,
+    all: *const RECT,
+) {
+    // SAFETY: as above; `values` are four words.
+    unsafe {
+        own!(
+            this,
+            ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewUint
+        )(this, gpu, cpu, res, values, n, all);
+        note(this, |r| {
+            let values = values.cast::<[u32; 4]>().read_unaligned();
+            clear_unordered(r, gpu.ptr, cpu.ptr, res, values, false, rects(n, all))
+        });
+    }
+}
+
+unsafe extern "system" fn clear_unordered_float(
+    this: Ptr,
+    gpu: D3D12_GPU_DESCRIPTOR_HANDLE,
+    cpu: D3D12_CPU_DESCRIPTOR_HANDLE,
+    res: Ptr,
+    values: *const f32,
+    n: u32,
+    all: *const RECT,
+) {
+    // SAFETY: as above; `values` are four floats, kept as their bits.
+    unsafe {
+        own!(
+            this,
+            ID3D12GraphicsCommandList_Vtbl.ClearUnorderedAccessViewFloat
+        )(this, gpu, cpu, res, values, n, all);
+        note(this, |r| {
+            let values = values.cast::<[u32; 4]>().read_unaligned();
+            clear_unordered(r, gpu.ptr, cpu.ptr, res, values, true, rects(n, all))
         });
     }
 }

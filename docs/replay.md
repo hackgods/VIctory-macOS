@@ -189,7 +189,7 @@ only the pages the frame changes are put back, read from the capture again.
 
 - Not recorded, but named in the notes when the host layer uses them:
   reserved (tiled) resources, bundles, ray tracing, render passes, enhanced
-  barriers, predication, stream output, `ClearUnorderedAccessView`, shading
+  barriers, predication, stream output, shading
   rate, creation methods other than `CreateCommittedResource`,
   `CreateCommittedResource3`, `CreatePlacedResource` and
   `CreatePlacedResource2`.

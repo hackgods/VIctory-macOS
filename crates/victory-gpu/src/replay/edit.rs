@@ -264,7 +264,10 @@ pub fn kind(c: &Cmd, dispatches: &HashSet<u32>, mesh: &HashSet<u32>, bound: u32)
         Cmd::Indirect { .. } => "indirect draws",
         Cmd::DispatchMesh { .. } => "mesh draws",
         Cmd::Draw { .. } | Cmd::DrawIndexed { .. } => "draws",
-        Cmd::ClearDepth { .. } | Cmd::ClearTarget { .. } | Cmd::Discard { .. } => "clears",
+        Cmd::ClearDepth { .. }
+        | Cmd::ClearTarget { .. }
+        | Cmd::ClearUnordered { .. }
+        | Cmd::Discard { .. } => "clears",
         Cmd::Resolve { .. } | Cmd::ResolveRegion { .. } => "resolves",
         Cmd::CopyBuffer { .. } => "copies of buffers",
         Cmd::CopyTexture {

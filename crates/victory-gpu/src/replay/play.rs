@@ -1748,8 +1748,9 @@ impl Player {
         if let Some(first) = self.versions.first() {
             self.write_live(first);
         }
-        // Render target and depth views.
-        let mut views: [HashSet<Slot>; 2] = Default::default();
+        // Render target and depth views, and the views unordered-access
+        // clears name by a CPU handle.
+        let mut views: [HashSet<Slot>; 3] = Default::default();
         for c in self.commands.iter().flatten() {
             match c {
                 Cmd::Targets { colors, depth } => {
@@ -1758,6 +1759,7 @@ impl Player {
                 }
                 Cmd::ClearTarget { view, .. } => _ = views[0].insert(*view),
                 Cmd::ClearDepth { view, .. } => _ = views[1].insert(*view),
+                Cmd::ClearUnordered { view, .. } => _ = views[2].insert(*view),
                 _ => {}
             }
         }
@@ -1768,6 +1770,7 @@ impl Player {
             let kind = [
                 D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
                 D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             ][i];
             let d = D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: kind,
@@ -1781,7 +1784,9 @@ impl Player {
                 let mut at = heap.GetCPUDescriptorHandleForHeapStart();
                 for s in all {
                     let res = self.objects.get(&s.res).map(|o| &o.res);
-                    if i == 0 {
+                    if i == 2 {
+                        self.view(s, at, false);
+                    } else if i == 0 {
                         let d = s
                             .desc
                             .as_ptr()
@@ -3411,6 +3416,32 @@ impl Player {
                     let rects = (!rects.is_empty()).then_some(&rects[..]);
                     if self.objects.contains_key(&v.res) {
                         l.ClearRenderTargetView(view(v), color, rects);
+                    }
+                }
+                Cmd::ClearUnordered {
+                    heap: id,
+                    slot,
+                    view: v,
+                    res: cleared,
+                    values,
+                    float,
+                    rects,
+                } => {
+                    let rects: Vec<RECT> = rects.iter().map(|r| to_rect(*r)).collect();
+                    // Both handles name a view of the live resource, the
+                    // first in the heap the list has bound.
+                    if let (Some((h, step)), Some(r), Some(cpu)) =
+                        (heap(id), res(*cleared), self.targets.get(v))
+                    {
+                        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: h.gpu + u64::from(*slot) * step,
+                        };
+                        if *float {
+                            let values = values.map(f32::from_bits);
+                            l.ClearUnorderedAccessViewFloat(gpu, *cpu, r, &values, &rects);
+                        } else {
+                            l.ClearUnorderedAccessViewUint(gpu, *cpu, r, values, &rects);
+                        }
                     }
                 }
                 Cmd::Discard {

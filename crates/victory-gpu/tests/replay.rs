@@ -36,7 +36,7 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     // submission ran, `Host::mark`: one list, closed once).
     assert!(notes.contains("frame 9 (world frame 5)"), "{notes}");
     assert!(notes.contains("3 submissions, 5 lists"), "{notes}");
-    for bad in ["not recorded", "not in the capture", "not whole", "lost its hooks", "not seen made"] {
+    for bad in ["not recorded", "not in the capture", "not whole", "lost its hooks", "not seen made", "no heap seen made"] {
         assert!(!notes.contains(bad), "{bad}: {notes}");
     }
     assert!(std::fs::read(capture.join("frame-0.png")).unwrap().starts_with(b"\x89PNG"));
@@ -140,8 +140,9 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
         }
     }
 
-    // Without the draws' pipeline: the cleared target alone, and the report
-    // says what was left out.
+    // Without the draws' pipeline: the cleared target alone (its clear, and
+    // the two rectangles cleared through its unordered-access view), and
+    // the report says what was left out.
     let skipped = Options {
         skip_shaders: vec!["replay test: draw".into()],
         loops: 1,
@@ -152,7 +153,12 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     assert!(report.picture.is_some_and(|p| !p.1));
     assert!(report.notes.iter().any(|n| n == "--skip-shader left out 3 commands"), "{:?}", report.notes);
     let cleared = picture(&mut player);
-    assert!(cleared.chunks(4).all(|t| t == &cleared[..4]), "one colour");
+    let colours: std::collections::HashSet<&[u8]> = cleared.chunks(4).collect();
+    assert_eq!(colours.len(), 3, "the three clears' colours");
+    let texel = |x: usize, y: usize| &cleared[(y * SIZE as usize + x) * 4..][..4];
+    assert_ne!(texel(4, 4), texel(4, 40), "the strip cleared through the unordered-access view");
+    assert_ne!(texel(SIZE as usize - 4, 8), texel(4, 4), "the corner cleared over it");
+    assert_ne!(texel(SIZE as usize - 4, 20), texel(4, 40), "and below it");
     assert_eq!(results(&mut player), made.results, "the passes still ran");
 
     // Both, turn by turn; then the frame as it was, again.

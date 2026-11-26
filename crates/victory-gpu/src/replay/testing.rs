@@ -10,6 +10,9 @@
 //! - a colour and a depth target, cleared and drawn to in three submissions
 //!   of four lists, each draw behind or in front of the others: one plain,
 //!   one with indices, one with its arguments read from a buffer;
+//! - two rectangles of the colour target cleared through an unordered-access
+//!   view of it, one in the first submission and one in the last (as the
+//!   host layer clears for a title's `ClearUnorderedAccessView`);
 //! - a buffer the CPU writes anew before every submission, read by a
 //!   compute pass that writes another, which the draws read;
 //! - a view slot whose view is replaced between two submissions, and one
@@ -172,6 +175,9 @@ struct Program {
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     views: ID3D12DescriptorHeap,
     step: usize,
+    /// The colour target's unordered-access view by a CPU handle, for its
+    /// clears (the same view is in slot [`CLEARED`] of `views`).
+    clears: ID3D12DescriptorHeap,
     draw_root: ID3D12RootSignature,
     draw: ID3D12PipelineState,
     compute_root: ID3D12RootSignature,
@@ -190,6 +196,9 @@ enum How {
     /// With its arguments from the inputs' buffer.
     Indirect,
 }
+
+/// The slot of `views` with the colour target's unordered-access view.
+const CLEARED: usize = 5;
 
 /// Where the inputs' buffer holds a draw's arguments, and six indices.
 const ARGUMENTS: usize = 1024;
@@ -240,8 +249,15 @@ impl Program {
             made.ok_or_else(windows::core::Error::empty)
         };
         let rgba = DXGI_FORMAT_R8G8B8A8_UNORM;
+        // A target shaders may write too: it is also cleared through an
+        // unordered-access view.
         let target = committed(
-            &texture(SIZE, 1, rgba, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+            &texture(
+                SIZE,
+                1,
+                rgba,
+                D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ),
             D3D12_RESOURCE_STATE_COMMON,
         )?;
         crate::host::name(&target, || TARGET.into());
@@ -354,6 +370,30 @@ impl Program {
         let step = unsafe {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
         } as usize;
+        // The target's unordered-access view, by a CPU handle in a heap
+        // shaders do not see and in a slot of the heap they do: a clear
+        // through it takes both.
+        // SAFETY: plain creation; slots of live heaps and a live texture.
+        let clears: ID3D12DescriptorHeap = unsafe {
+            let clears: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })?;
+            let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: rgba,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                ..Default::default()
+            };
+            let mut visible = views.GetCPUDescriptorHandleForHeapStart();
+            visible.ptr += CLEARED * step;
+            for at in [clears.GetCPUDescriptorHandleForHeapStart(), visible] {
+                device.CreateUnorderedAccessView(&target, None::<&ID3D12Resource>, Some(&desc), at);
+            }
+            clears
+        };
         let draw_params = [
             Param::Constants {
                 register: 0,
@@ -529,6 +569,7 @@ impl Program {
             footprint,
             views,
             step,
+            clears,
             draw_root,
             draw,
             compute_root,
@@ -945,6 +986,29 @@ impl Program {
         }
     }
 
+    /// Records a clear of the rectangle `rect` of the colour target to
+    /// `colour` through its unordered-access view; the target is a render
+    /// target before and after.
+    fn clear_unordered(&self, l: &ID3D12GraphicsCommandList, colour: [f32; 4], rect: RECT) {
+        let (target, unordered) = (
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        // SAFETY: an open list; live objects; both handles hold the view.
+        unsafe {
+            l.SetDescriptorHeaps(&[Some(self.views.clone())]);
+            l.ResourceBarrier(&[transition(&self.target, target, unordered)]);
+            l.ClearUnorderedAccessViewFloat(
+                self.table(CLEARED),
+                self.clears.GetCPUDescriptorHandleForHeapStart(),
+                &self.target,
+                &colour,
+                &[rect],
+            );
+            l.ResourceBarrier(&[transition(&self.target, unordered, target)]);
+        }
+    }
+
     /// One frame: three submissions, then the present.
     fn frame(&self, number: u64, drawn: u64) {
         let Some(host) = host() else { return };
@@ -970,6 +1034,15 @@ impl Program {
                 None,
             );
         }
+        // A strip along the top, cleared through the unordered-access
+        // view: under what is drawn where that reaches it.
+        let strip = RECT {
+            left: 0,
+            top: 0,
+            right: SIZE as i32,
+            bottom: 12,
+        };
+        self.clear_unordered(&a.list, [0.9, 0.2, 0.1, 1.0], strip);
         self.pass(&a.list, 5);
         let white = [1.0, 1.0, 1.0, 1.0];
         self.rectangle(&a.list, [-0.9, -0.9, 1.2, 1.2], white, 0.6, 2, How::Plain);
@@ -994,6 +1067,15 @@ impl Program {
         self.pass(&d.list, 1);
         let green = [0.7, 1.0, 0.5, 1.0];
         self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], green, 0.5, 2, How::Indirect);
+        // A corner cleared the same way over everything drawn, part of it
+        // over the strip.
+        let corner = RECT {
+            left: SIZE as i32 - 20,
+            top: 4,
+            right: SIZE as i32,
+            bottom: 28,
+        };
+        self.clear_unordered(&d.list, [0.1, 0.8, 0.9, 1.0], corner);
         // SAFETY: an open list; live objects.
         unsafe {
             let l = &d.list;

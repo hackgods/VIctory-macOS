@@ -962,6 +962,8 @@ mod alloc_tests {
     /// and freed; a smaller one is not.
     #[test]
     fn only_blocks_of_their_own_mapping_are_counted() {
+        // The test that samples big blocks makes some too.
+        let _one = super::SEQUENTIAL.lock().unwrap_or_else(|e| e.into_inner());
         let layout = |size: usize| Layout::from_size_align(size, 16).unwrap();
         let before = big_counts();
         // SAFETY: each block is freed with the layout it was made with.

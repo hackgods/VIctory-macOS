@@ -26,7 +26,11 @@
 //!   does after the queue's work before it: what that work owes title
 //!   memory goes where the pages still are;
 //! - [`Host::quiet`], which waits for the GPU alone ([`Host::stand`]): the
-//!   rest is left to the next of the above, as its caller holds locks.
+//!   rest is left to the next of the above, as its caller holds locks;
+//! - failing all of those, a thread of ours ([`idle`]) once the GPU has
+//!   run it: the title may read memory for a bottom-of-pipe write (or for
+//!   what its shaders wrote) without calling us, as it may on the console,
+//!   where the GPU writes it with nobody waiting.
 //!
 //! At most one submission is left so, and the submission lock is taken by
 //! nobody without one of these, so everything that says "the last
@@ -95,9 +99,11 @@ pub(crate) enum By {
     Mapping,
     /// A view heap being made (the wait for the GPU alone).
     Quiet,
+    /// Nothing: our thread, once the host GPU had run it.
+    Idle,
 }
 
-const WAYS: usize = 7;
+const WAYS: usize = 8;
 
 /// A submission given to the host GPU and not waited for.
 struct Left {
@@ -163,6 +169,44 @@ pub(crate) fn settle_since(by: By, seen: &mut u64) -> bool {
     std::mem::replace(seen, now) != now
 }
 
+/// The thread that finishes a submission left to the host GPU when nothing
+/// else has by the time the GPU has run it; `None` if it could not be made
+/// (then only the callers of [`settle`] and the submission lock finish it).
+fn idler() -> Option<&'static std::thread::Thread> {
+    static IDLER: OnceLock<Option<std::thread::Thread>> = OnceLock::new();
+    IDLER
+        .get_or_init(|| {
+            std::thread::Builder::new()
+                .name("victory unwaited".into())
+                .spawn(idle)
+                .map(|made| made.thread().clone())
+                .inspect_err(|e| tracing::warn!(error = %e, "no thread to finish host submissions nothing waits for"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// [`idler`]'s work: sleeps while no submission is left; while one is,
+/// looks at the host fence every millisecond and finishes the submission
+/// once the GPU has run it.
+fn idle() {
+    loop {
+        let value = VALUE.load(Acquire);
+        if value == 0 {
+            // Woken by `Host::leave`, after it set the value.
+            std::thread::park();
+            continue;
+        }
+        let Some(host) = host() else { return };
+        // SAFETY: a plain query of our fence.
+        if unsafe { host.fence.GetCompletedValue() } >= value {
+            settle(By::Idle);
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// The frame line of submissions left to the host GPU (`frames` since the
 /// last one).
 pub(super) fn log(frames: f64) {
@@ -175,7 +219,8 @@ pub(super) fn log(frames: f64) {
         std::array::from_fn(|i| WAITED_US[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
         "unwaited submissions: {left:.1}/frame left to the host GPU; finished by (the title's next submission, \
-         one of ours, a queue's signal, a held queue's wait, the present, a page mapping, a view heap being made): \
+         one of ours, a queue's signal, a held queue's wait, the present, a page mapping, a view heap being made, \
+         nothing but our thread once it had run): \
          {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the host GPU (the frame line's GPU time is their sum, \
          with our own submissions' waits)"
     );
@@ -261,6 +306,9 @@ impl Host {
             ran,
         });
         VALUE.store(*submitted, Release);
+        if let Some(idler) = idler() {
+            idler.unpark();
+        }
     }
 
     /// Waits until the host fence reaches `value`: how long. As

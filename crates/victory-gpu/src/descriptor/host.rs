@@ -5464,6 +5464,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             Translated {
                 host: hs,
                 used: native.used,
+                threads: None,
             },
         );
         let Some(hp) = HostPipeline::new(&[shader], None, |_, _| {}) else {

@@ -272,17 +272,19 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let umax = rounds && options.atomic_umax;
     let uav_level0 = options.uav_size_level0;
     let no_literal = options.host_wave32 && options.disable_literal_halves;
-    if !locks && !bias && !narrow && !no_literal && !uav_level0 {
+    let limits = options.thread_limits;
+    if !locks && !bias && !narrow && !no_literal && !uav_level0 && !limits {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
+    static BUILDS: [OnceLock<[u8; 32]>; 256] = [const { OnceLock::new() }; 256];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(rounds) << 3
         | usize::from(umax) << 4
         | usize::from(no_literal) << 5
-        | usize::from(uav_level0) << 6;
+        | usize::from(uav_level0) << 6
+        | usize::from(limits) << 7;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -307,6 +309,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         if no_literal {
             h.update(b"literal halves disabled");
         }
+        if limits {
+            h.update(b"thread limits");
+        }
         *h.finalize().as_bytes()
     })
 }
@@ -328,13 +333,24 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         disable_literal_halves: literal_halves_disabled(),
         per_vertex_center: false,
         uav_size_level0: uav_size_level0(),
+        // Only for the pipelines a dispatch counted in threads needs it
+        // for (`crate::pipeline::thread_limited`).
+        thread_limits: false,
     }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let mut options = runtime_options();
+    host_shader_with(container, runtime_options())
+}
+
+/// [`host_shader`] made as `options` say (cached under their own key).
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+) -> (Result<HostShader, String>, bool) {
+    let mut options = options;
     // One program at a time, if the switch lists hashes.
     options.uav_size_level0 = uav_size_level0_for(container);
     let translate =

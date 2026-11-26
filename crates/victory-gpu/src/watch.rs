@@ -609,6 +609,23 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     })
 }
 
+/// Whether `protect_noting` asks about runs of pages at once
+/// (`VICTORY_WATCH_RUNS=1`, off by default).
+fn watch_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WATCH_RUNS"))
+}
+
+/// Whether all of `[at, at + len)` lies in one write-watched pool (one
+/// lookup: the watch answers for a range only when one watched allocation
+/// holds all of it).
+fn write_watched_range(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::GetWriteWatch;
+    let (mut found, mut count, mut granularity) = (0usize, 1usize, 0u32);
+    // SAFETY: room for one answer; no reset, so nothing changes.
+    unsafe { GetWriteWatch(0, at as *const _, len, (&raw mut found).cast(), &mut count, &mut granularity) == 0 }
+}
+
 /// Whether the page holding `at` is in a write-watched pool (one lookup).
 fn write_watched(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
@@ -974,9 +991,19 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
     // the title's write faults wait for; what the answer depends on changes
     // only when the runtime maps or unmaps the memory (`VICTORY_VETTED_PAGES`).
     let vetted = vetted_pages();
+    // Where the run of consecutive pages each page starts ends: a pool is
+    // asked about once for the run (`VICTORY_WATCH_RUNS`).
+    let mut run_ends = vec![0; pages.len()];
+    for i in (0..pages.len()).rev() {
+        run_ends[i] = match pages.get(i + 1) {
+            Some(&next) if next == pages[i] + 1 => run_ends[i + 1],
+            _ => pages[i] + 1,
+        };
+    }
     let (pages, ends): (Vec<usize>, Vec<usize>) = pages
         .into_iter()
-        .filter_map(|p| {
+        .zip(run_ends)
+        .filter_map(|(p, run_end)| {
             if g.protected.contains(&p) {
                 return Some((p, usize::MAX));
             }
@@ -984,7 +1011,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
                 TIMES[4].fetch_add(1, Ordering::Relaxed);
                 return Some((p, end));
             }
-            allowed.region(p).map(|end| (p, end))
+            allowed.region(p, run_end).map(|end| (p, end))
         })
         .unzip();
     let mut i = 0;
@@ -1042,7 +1069,9 @@ struct RuntimeRegions {
 impl RuntimeRegions {
     /// If `page` is the runtime's GPU memory, the page its region is known
     /// to end before (`usize::MAX` for a pool, whose end is not asked).
-    fn region(&mut self, page: usize) -> Option<usize> {
+    /// `run_end`: where the run of consecutive pages asked about from `page`
+    /// on ends.
+    fn region(&mut self, page: usize, run_end: usize) -> Option<usize> {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
         };
@@ -1050,6 +1079,15 @@ impl RuntimeRegions {
             && (a..b).contains(&page)
         {
             return yes.then_some(b);
+        }
+        // mac: one lookup for the whole run when one pool holds all of it
+        // (`VICTORY_WATCH_RUNS=1`): the profile of 27 November counted 9.7 ms
+        // a frame of `NtGetWriteWatch`, 94 % of it here, page by page, under
+        // the guard lock. The range question answers as the page ones do
+        // (`runtime_pages` asks it so).
+        if watch_runs() && run_end > page + 1 && write_watched_range(page * PAGE, (run_end - page) * PAGE) {
+            self.last = Some((page, run_end, true));
+            return Some(usize::MAX);
         }
         // A pool's write watch answers with one lookup. `VirtualQuery` walks
         // Wine's page table to the region's end, under the guard lock that

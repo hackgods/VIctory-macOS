@@ -353,6 +353,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
             victory_gpu::unalias_region(address as usize);
+            let _going = victory_gpu::title_memory_unmapping(address as usize, 0);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -1111,7 +1112,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        let going = victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -1122,6 +1123,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
+        drop(going);
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1199,6 +1201,38 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own `VirtualFree`: the GPU side's guards let go of the memory
+/// first, and keep it unguarded until it is gone
+/// (`victory_gpu::title_memory_unmapping`). Once free, the address may be
+/// other memory's at once, which a guard noted of the old memory would
+/// leave unwatched.
+extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u32) -> BOOL {
+    const MEM_COALESCE_PLACEHOLDERS: u32 = 1;
+    // Splitting and joining placeholders changes nothing they show.
+    let going = (kind & (MEM_PRESERVE_PLACEHOLDER | MEM_COALESCE_PLACEHOLDERS) == 0).then(|| {
+        // A release takes the whole allocation; its size argument is 0.
+        let len = if kind & MEM_RELEASE != 0 { 0 } else { size };
+        victory_gpu::title_memory_unmapping(address as usize, len)
+    });
+    // SAFETY: the title's own arguments.
+    let freed = unsafe { VirtualFree(address, size, kind) };
+    drop(going);
+    freed
+}
+
+/// [`title_virtual_free`] for the title's imports of `VirtualFree`, which
+/// the rest of the system's DLLs serve as they are.
+pub(crate) fn virtual_free_module() -> HleModule {
+    HleModule {
+        name: "xmem-virtual-free",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+        exports: vec![crate::HleExport {
+            name: "VirtualFree",
+            address: title_virtual_free as *const () as usize,
+        }],
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
@@ -1224,6 +1258,36 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The title's imports of `VirtualFree`, however it names their DLL,
+    /// reach [`title_virtual_free`], which frees as the system does and
+    /// passes placeholder splits through.
+    #[test]
+    fn the_titles_virtual_free_is_ours() {
+        for dll in [
+            "kernel32.dll",
+            "KERNELBASE.dll",
+            "api-ms-win-core-memory-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                crate::registry::lookup(dll, "VirtualFree"),
+                Some(title_virtual_free as *const () as usize),
+                "{dll}"
+            );
+        }
+        // SAFETY: a fresh reservation of ours, freed through the export.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!p.is_null());
+        assert_ne!(title_virtual_free(p, 0, MEM_RELEASE), 0);
+        assert_eq!(title_virtual_free(p, 0, MEM_RELEASE), 0, "freed already");
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

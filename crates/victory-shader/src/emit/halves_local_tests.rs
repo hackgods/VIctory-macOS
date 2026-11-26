@@ -353,7 +353,7 @@ fn outcome(words: &[u32], lds_bytes: u32, local: bool) -> String {
 
 /// The programs that read across the halves, each with the refusal it gets
 /// without the setting.
-fn across() -> [(&'static str, Vec<u32>, &'static str); 5] {
+pub(super) fn across() -> [(&'static str, Vec<u32>, &'static str); 5] {
     [
         (
             "a lane mask read as data",

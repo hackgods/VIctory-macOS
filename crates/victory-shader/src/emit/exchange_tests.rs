@@ -1,9 +1,10 @@
-//! Lane reads across the two 32-lane halves handed over through group-shared
+//! Reads across the two 32-lane halves handed over through group-shared
 //! memory (`lower::exchange`, `Options::halves_exchange`;
-//! `notes/ray-tracing-plan.md`). The translation tests and the model of the
-//! hand-over run on any host. The GPU test (Windows) runs the programs in
-//! halves with the setting on every hardware adapter and compares with the
-//! console's values.
+//! `notes/ray-tracing-plan.md`): lane reads, lane masks read as data and
+//! integer reductions. The translation tests and the model of the hand-over
+//! run on any host. The GPU test (Windows) runs the programs in halves with
+//! the setting on every hardware adapter and compares with the console's
+//! values.
 //!
 //! The programs have the shape of the prefix sums in the title's ray-tracing
 //! structure builder (f6eb6498409ca974 and four more): each half sums its own
@@ -13,7 +14,7 @@
 use super::halves_local_tests::{
     PROLOGUE, S_ENDPGM, V16_IS_32_TIMES_V0, k, native, sop1, store, v,
 };
-use super::halves_local_tests::{vop2, vop3};
+use super::halves_local_tests::{across, vop2, vop3};
 use super::lower::{self, HalvesLocal, Mac};
 use crate::{gfx10, io, ir, resource, structure};
 
@@ -312,6 +313,74 @@ fn the_setting_acts_only_in_halves_and_within_shared_memory() {
     assert!(full.contains(REFUSAL), "{full}");
 }
 
+/// A lane mask read as data, a wave sum and a wave prefix sum, each where
+/// every lane runs, translate with the setting, each with one hand-over of
+/// a dword per half: the same translation with half-local reads or
+/// without. A first-lane read is not handed over and stays refused.
+#[test]
+fn ballots_and_integer_reductions_are_handed_over_per_half() {
+    for (what, words, refusal) in across() {
+        let off = halves(&words, false, Mac::default())
+            .err()
+            .unwrap_or_else(|| panic!("{what}: translated without the setting"))
+            .to_string();
+        assert!(off.contains(refusal), "{what}: {off}");
+        let on = halves(&words, false, exchange());
+        if what == "a first-lane read" {
+            let why = on.err().expect("refused").to_string();
+            assert!(why.contains(refusal), "{what}: {why}");
+            continue;
+        }
+        let on = on.unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!((on.wave_size, on.exchanges), (Some(32), 1), "{what}");
+        let with_local = halves(&words, true, exchange()).expect("handed over");
+        assert_eq!(with_local.dxil, on.dxil, "{what}");
+        let local = halves(&words, true, Mac::default()).expect("half-local");
+        assert_ne!(local.dxil, on.dxil, "{what}");
+        // A host of 64-lane waves answers by itself.
+        let whole = |mac| {
+            lowered(&words, 64, 0, false, false, mac)
+                .expect("one wave64")
+                .dxil
+        };
+        assert_eq!(whole(exchange()), whole(Mac::default()), "{what}");
+        // A group that ends in a lower half (96 threads) translates too.
+        let cut = lowered(&words, 96, 0, true, false, exchange());
+        assert_eq!(cut.unwrap_or_else(|e| panic!("{what}: {e}")).exchanges, 1);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut on.dxil.clone())
+                .unwrap_or_else(|e| panic!("{what}: DXIL validation failed: {e}"));
+        }
+    }
+}
+
+/// A lane read, a mask read as data and another lane read: the two lane
+/// reads use the two sets of slots in turn whatever is handed over per half
+/// between them (that exchange has slots of its own and is not counted in
+/// the turn).
+#[test]
+fn lane_reads_take_turns_whatever_is_handed_over_between() {
+    let mut w = PROLOGUE.to_vec();
+    w.push(V16_IS_32_TIMES_V0);
+    w.push(vop2(2, V_ADD_NC_U32, v(0), 0)); // v_add_nc_u32 v2, v0, v0
+    w.extend(readlane(12, 0, 40));
+    w.extend([
+        0x7D82_009D, // v_cmp_lt_u32 vcc, 29, v0
+        0x7E06_026A, // v_mov_b32 v3, vcc_lo
+    ]);
+    w.extend(readlane(13, 2, 31));
+    w.extend([v_mov_s(4, 12), v_mov_s(5, 13)]);
+    w.extend(store(4, 0));
+    w.extend(store(3, 4));
+    w.extend(store(5, 8));
+    w.push(S_ENDPGM);
+    let l = halves(&w, false, exchange()).expect("handed over");
+    assert_eq!((l.exchanges, l.lane_exchanges), (3, 2));
+}
+
 // ---- A model of the hand-over ----
 //
 // A group of host waves, each a unit that runs its lanes in step. A program
@@ -409,6 +478,8 @@ fn two_sets_in_turn_give_the_consoles_values_in_every_order() {
     assert!(one_set.len() > 1, "one set is enough?");
     // One exchange alone needs no second set.
     assert_eq!(results(2, 2, &[3], 1), vec![console(4, &[3])]);
+    // Nor do exchanges with slots of their own (a half's answer).
+    assert_eq!(results(2, 2, &reads, 4), vec![console(4, &reads)]);
 }
 
 /// The same with a group of two console waves in four host waves, and with
@@ -548,6 +619,34 @@ mod gpu {
             1,
             &want,
         ));
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// A half's answer handed over: the mask of `29 < l` is the console's
+    /// two dwords in every lane; the sum of the thread ids is 2,016 in both
+    /// halves; the prefix sum counts from lane 0 in the upper half too. In
+    /// a group of 96 threads the second console wave has a lower half only:
+    /// its sum is that half's (64 to 95: 2,544), its mask has no high bits.
+    #[test]
+    fn both_halves_get_the_consoles_mask_and_reductions_on_every_gpu() {
+        let lanes = |n: u32, f: &dyn Fn(u32) -> Vec<u32>| (0..n).flat_map(f).collect::<Vec<u32>>();
+        let [mask, _, _, sum, prefix] = across().map(|p| p.1);
+        let mut failed = Vec::new();
+        let want = lanes(64, &|_| vec![0xC000_0000, u32::MAX]);
+        failed.extend(differences("mask", &mask, 64, 2, &want));
+        failed.extend(differences("sum", &sum, 64, 1, &[2016; 64]));
+        let want = lanes(64, &|l| vec![(0..l).sum()]);
+        failed.extend(differences("prefix sum", &prefix, 64, 1, &want));
+        let want = lanes(96, &|l| vec![if l < 64 { 2016 } else { 2544 }]);
+        failed.extend(differences("sum, a wave cut short", &sum, 96, 1, &want));
+        let want = lanes(96, &|l| {
+            if l < 64 {
+                vec![0xC000_0000, u32::MAX]
+            } else {
+                vec![u32::MAX, 0]
+            }
+        });
+        failed.extend(differences("mask, a wave cut short", &mask, 96, 2, &want));
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }

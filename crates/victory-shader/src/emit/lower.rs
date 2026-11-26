@@ -101,9 +101,12 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
-    /// Exchanges across the halves (`exchange`).
+    /// Exchanges across the halves (`exchange`), and those of them that
+    /// hand over lane values.
     #[cfg(test)]
     pub exchanges: u32,
+    #[cfg(test)]
+    pub lane_exchanges: u32,
     /// The `WaveSize` the program declares.
     #[cfg(test)]
     pub wave_size: Option<u32>,
@@ -1430,7 +1433,13 @@ impl<'a> Lower<'a> {
         {
             return Err("a wave reduction in a mesh shader");
         }
-        self.same_half(ACROSS)?;
+        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        // In halves: the halves' results handed over (`exchange`, integer
+        // operations), or refused, or the half's own.
+        let exact = !float && self.exchange_halves_in(self.cur_ir);
+        if !exact {
+            self.same_half(ACROSS)?;
+        }
         let c = self.cur;
         let &m = self
             .x
@@ -1443,7 +1452,6 @@ impl<'a> Lower<'a> {
         let id = self.s.m.i32(ident);
         let x = self.s.m.select(c, on, x, id);
         self.s.flags |= flags::WAVE_OPS;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
         let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
         let arg = if float { self.as_float(x) } else { x };
         let ty = if float { f32t } else { i32t };
@@ -1495,6 +1503,17 @@ impl<'a> Lower<'a> {
                 )
             }
         };
+        if exact {
+            // A prefix sum also needs the lower half's total.
+            let total = prefix.map(|_| {
+                let (k, u) = (self.s.m.i8(0), self.s.m.i8(1));
+                self.s
+                    .op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[x, k, u])
+            });
+            return self
+                .exchanged_reduction(op, r, total, ident)
+                .ok_or("a wave reduction's operation");
+        }
         Ok(if float { self.as_int(r) } else { r })
     }
 
@@ -1648,6 +1667,8 @@ impl<'a> Lower<'a> {
             split_barriers: self.split_barriers.len(),
             #[cfg(test)]
             exchanges: self.exchange.made,
+            #[cfg(test)]
+            lane_exchanges: self.exchange.lanes,
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -2134,7 +2155,12 @@ impl<'a> Lower<'a> {
                     Some(&b) if b == self.cur_ir => self.cur,
                     Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
                 };
-                self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                // In halves: both halves' bits handed over (`exchange`), or
+                // refused, or the half's own.
+                let exact = self.exchange_halves_in(self.def_block.get(&lo).map_or(0, |&b| b));
+                if !exact {
+                    self.same_half("a lane mask read as data (wave64 on a 32-lane host)")?;
+                }
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
@@ -2148,7 +2174,11 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
-                let xy = self.half_ballot(at, xy);
+                let xy = if exact {
+                    self.exchanged_ballot(at, xy.0)
+                } else {
+                    self.half_ballot(at, xy)
+                };
                 self.ballots.insert(lo, xy);
                 xy
             }

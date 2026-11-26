@@ -4839,7 +4839,15 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(c, Term::Br(head));
         let iu = self.s.m.undef(i32t);
         let (zero, one) = (k(self, 0), k(self, 1));
-        let fence = k(self, 2 | 8);
+        // The global unordered-access fence, with the group's where the
+        // stage has groups: DXIL validation refuses mode 10 in a pixel
+        // shader (found by evan-kolberg, #240).
+        let fence_mode = if matches!(self.x.native.stage, HwStage::Cs | HwStage::Ms) {
+            2 | 8
+        } else {
+            2
+        };
+        let fence = k(self, fence_mode);
 
         // Head: lane `i`'s turn.
         let i = self.s.m.phi(head, i32t);

@@ -2751,13 +2751,9 @@ pub(crate) mod tests {
             (writer, start as usize + 9, 15),
             (overlap, start as usize + 10, 10),
         ];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(
+            crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some()
+        );
         list.close();
         host.execute(&[&list]);
         assert_eq!(
@@ -2795,13 +2791,9 @@ pub(crate) mod tests {
         unsafe { std::ptr::copy_nonoverlapping(first_bytes.as_ptr(), first_data, 4) };
         let list = host.new_list().unwrap();
         let writes = [(first.clone(), start as usize + 2, 4)];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(
+            crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some()
+        );
         list.close();
         host.execute(&[&list]);
         assert_eq!(widened.read_host(4), [0x0201_0000, 0x0000_0403, 0, 1]);
@@ -2819,10 +2811,99 @@ pub(crate) mod tests {
             (second, start as usize + 6, 4),
         ];
         let ready = std::collections::HashSet::from([widened.buffer.as_raw() as usize]);
-        assert!(crate::widened::sync(&list, &writes, 1, &ready).is_some());
+        assert!(crate::widened::sync(&list, &writes[..1], &writes[1..], &ready).is_some());
         list.close();
         host.execute(&[&list]);
         assert_eq!(widened.read_host(4), [0x0201_0000, 0x0605_0403, 0x0000_0807, 1]);
+    }
+
+    /// A shadow of `len` bytes at title address `start`, on a buffer of its
+    /// own (no title memory behind it).
+    fn loose_shadow(start: u64, len: u64) -> Arc<Shadow> {
+        let (buffer, data) = host().unwrap().shared_buffer(len).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Shadow::new(buffer, data, gpu, start, len)
+    }
+
+    /// The world's lists keep tens of thousands of widened writes and meet
+    /// hundreds of barriers a frame: each barrier takes the writes since the
+    /// last one into the list's history without copying the history (it
+    /// made a 2 MB copy and grew it, ~55 times a frame), and the buffers stay
+    /// with the list from barrier to barrier and from one use to the next,
+    /// so a list used again the same way grows none of them.
+    #[test]
+    fn widened_writes_keep_their_buffers_across_barriers_and_uses() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        // A widened view (so barriers widen), and a copy UAVs write that it
+        // does not overlap (no widening work, only the bookkeeping).
+        let parent = loose_shadow(0x1000, 48);
+        let _widened = parent.widened(0x1000, 48, 1).expect("a widened view");
+        let written = loose_shadow(0x10_0000, 0x1000);
+        let list = host.new_list().unwrap();
+        const WRITES: usize = 20_000;
+        let mut kept = None;
+        for round in 0..2 {
+            let mut pointers = Vec::new();
+            for barrier in 1..=3 {
+                for i in 0..WRITES {
+                    list.mark_widened_write(&written, 0x10_0000 + (i * 8) % 0x1000, 8);
+                }
+                list.sync_widened();
+                let (history, at, writes, waiting) = list.widened_state();
+                assert_eq!(
+                    history.len(),
+                    barrier * WRITES,
+                    "every write in the history"
+                );
+                assert!(!waiting, "nothing left for the next barrier");
+                pointers.push((at, writes));
+            }
+            // The writes' buffer serves every barrier.
+            assert!(
+                pointers.iter().all(|p| p.1 == pointers[0].1),
+                "round {round}"
+            );
+            if let Some(kept) = kept {
+                assert!(
+                    pointers.iter().all(|&p| p == kept),
+                    "the second use grows nothing"
+                );
+            }
+            kept = Some(pointers[2]);
+            list.close();
+            list.reset();
+        }
+    }
+
+    /// A heap named by several heap-writing draws before one barrier counts
+    /// at its last place, once: of two equal writes the later decides what
+    /// a widened view takes, and each takes the copies as they are at the
+    /// barrier.
+    #[test]
+    fn a_heap_written_twice_before_a_barrier_is_expanded_once_at_its_last_place() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        let written = loose_shadow(0x20_0000, 0x1000);
+        let viewed = Arc::new(crate::bindless::Viewed::default());
+        viewed.add_unordered(&written, 0x20_0000, 0x100);
+        viewed.add_unordered(&written, 0x20_0800, 0x100);
+        let list = host.new_list().unwrap();
+        list.mark_widened_heap(&viewed);
+        list.mark_widened_write(&written, 0x20_0400, 16);
+        list.mark_widened_heap(&viewed);
+        list.sync_widened();
+        let (history, ..) = list.widened_state();
+        assert_eq!(
+            history,
+            [(0x20_0400, 16), (0x20_0000, 0x100), (0x20_0800, 0x100)]
+        );
+        list.close();
     }
 
     /// An element-aligned shadow that starts after the widened view cannot
@@ -2851,13 +2932,9 @@ pub(crate) mod tests {
         unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), later_data, 12) };
         let list = host.new_list().unwrap();
         let writes = [(later, start as usize + 12, 12)];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(
+            crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some()
+        );
         list.close();
         host.execute(&[&list]);
         assert_eq!(

@@ -256,6 +256,18 @@ pub fn run(
             Err(why) => println!("request slice  not applied: {why}"),
         }
     }
+    // macOS port: the longest step the title's clamped timers take in a
+    // frame, made longer (victory_loader::time_step); off unless asked for.
+    if let Some(seconds) =
+        victory_loader::time_step::wanted(std::env::var(victory_loader::time_step::SWITCH).ok().as_deref())
+    {
+        match victory_loader::time_step::patch(image.base() as u64, seconds) {
+            Ok(step) => println!(
+                "time step      on: the title's clamped timers step up to {step} s a frame (the title's 1/15 s; asked for {seconds})"
+            ),
+            Err(why) => println!("time step      not applied: {why}"),
+        }
+    }
     // macOS port: map pieces nobody asks for any more are put out when the
     // title's pool of buildings fills up (victory_loader::map_evict); off
     // unless asked for.

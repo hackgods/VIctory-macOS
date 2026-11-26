@@ -30,6 +30,7 @@ pub mod masked;
 pub mod pool_watch;
 pub mod probe_guard;
 pub mod srl_slice;
+pub mod time_step;
 pub mod wide;
 #[cfg(windows)]
 mod patch;

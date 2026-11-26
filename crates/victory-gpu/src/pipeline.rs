@@ -281,9 +281,12 @@ fn link_mesh_outputs() -> bool {
 pub(crate) fn merge_mesh_rows() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| {
-        // On, reordered, under D3DMetal, whose limit this is for; `=0`
-        // switches it off.
-        let default = if crate::shader_cache::under_wine() { 3 } else { 0 };
+        // On under D3DMetal, whose limit this is for, at level 7: the
+        // measured smallest order, and a pair still over the limit clips in
+        // its pixel shader (not exact; the ground materials that were
+        // no-ops draw, run 26 November 14:54). `=6` is the exact part alone,
+        // `=3` the reorder before the measured rule, `=0` off.
+        let default = if crate::shader_cache::under_wine() { 7 } else { 0 };
         std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 7).unwrap_or(default)
     })
 }

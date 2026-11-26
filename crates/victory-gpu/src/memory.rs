@@ -203,6 +203,8 @@ struct Shared {
     pairs: HashMap<usize, u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The missed regions' count it gives blocks to ([`missed_regions`]).
+    regions: usize,
     layout: Arc<Layout>,
     /// The table's working buffers, kept between rewrites (grown as
     /// needed, never shrunk): the copies' order, the level-1 index, each
@@ -462,6 +464,7 @@ impl Shared {
             null,
             pairs: HashMap::new(),
             generation: u64::MAX,
+            regions: 0,
             layout: Arc::default(),
             scratch: pagetable::Scratch::default(),
         })
@@ -510,7 +513,8 @@ impl Shared {
             Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
             Err(_) => pagetable::Outputs::default(),
         };
-        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        let regions = missed_regions();
+        let built = self.scratch.build_with_regions(&ranges, &slots, self.null, &regions, &mut out);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
@@ -520,6 +524,7 @@ impl Shared {
             ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
         }
         self.generation = now;
+        self.regions = regions.len();
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -550,7 +555,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
+        if s.generation != now || s.regions != missed_regions_count() {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -569,6 +574,32 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 }
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
+/// The 256 MiB regions with no copy shaders read (level-1 indices), at
+/// most [`MISSED_REGIONS_MAX`]: the page tables give each a block of
+/// entries that name no copy, which read as missing as the null block
+/// does, so that the next miss there names its page, not the region.
+static MISSED_REGIONS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const MISSED_REGIONS_MAX: usize = 64;
+static MISSED_REGIONS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn missed_regions() -> Vec<usize> {
+    MISSED_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn missed_regions_count() -> usize {
+    MISSED_REGIONS_COUNT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Shaders read 256 MiB region `l1` (a level-1 index), which no copy and
+/// so no block has.
+fn note_missed_region(l1: usize) {
+    let mut regions = MISSED_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if l1 < LEVEL1 && regions.len() < MISSED_REGIONS_MAX && !regions.contains(&l1) {
+        regions.push(l1);
+        MISSED_REGIONS_COUNT.store(regions.len(), std::sync::atomic::Ordering::Release);
+    }
+}
+
 fn has_missed(marks: &[u32], l: &Layout) -> bool {
     for (w, &mark) in marks.iter().enumerate() {
         let mut bits = mark;
@@ -643,6 +674,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    note_missed_region(entry);
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
@@ -720,6 +752,20 @@ mod tests {
         let ours = vec![0u8; 1 << 16];
         assert!(memory_kind(ours.as_ptr() as u64).starts_with("(committed private"));
         assert!(memory_kind(0x7ff0_0000_0000).starts_with("(free"));
+    }
+
+    /// A region missed is noted once, and the count the page tables compare
+    /// moves with it; past the index or the cap nothing is noted.
+    #[test]
+    fn missed_regions_are_noted_once() {
+        let before = missed_regions_count();
+        note_missed_region(LEVEL1 - 7);
+        note_missed_region(LEVEL1 - 7);
+        note_missed_region(LEVEL1);
+        assert!(missed_regions().contains(&(LEVEL1 - 7)));
+        assert!(!missed_regions().contains(&LEVEL1));
+        assert!(missed_regions_count() <= before + 1);
+        assert!(missed_regions_count() <= MISSED_REGIONS_MAX);
     }
 
     /// Writes of lists using title memory are held back from a frame with a

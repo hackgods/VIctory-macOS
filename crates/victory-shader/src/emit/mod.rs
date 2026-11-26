@@ -1431,6 +1431,108 @@ mod tests {
         assert!(conflict.to_string().contains("barycentrics read directly"));
     }
 
+    /// A pixel program that reads only its barycentrics (the I and J
+    /// registers, no attribute: hair strands, the bloom filter of #448)
+    /// reads `SV_Barycentrics`, and its pipeline is made and drawn: on the
+    /// host GPU and on WARP, each texel holds the weights of the second and
+    /// third vertex at its centre. Nothing refuses such a pipeline for the
+    /// `SFI0` barycentrics bit it sets (Ahmet-Dedeler/VIctory ba66e786
+    /// stopped a check of that bit from refusing them).
+    #[test]
+    #[cfg(windows)]
+    fn barycentrics_only_pixel_shaders_draw_their_weights() {
+        use super::host::{Draw, Host};
+        let _one = super::valu_tests::ONE_AT_A_TIME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let isg1 = rows(&[], true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let words = [
+            0x7E06_0300u32, // v_mov_b32 v3, v0 (I)
+            0x7E08_0301,    // v_mov_b32 v4, v1 (J)
+            0x7E0A_0280,    // v_mov_b32 v5, 0.0
+            0x7E0C_02F2,    // v_mov_b32 v6, 1.0
+            0xF800_180F,
+            0x0605_0403, // exp mrt0, v3, v4, v5, v6 done vm
+            0xBF81_0000,
+        ];
+        // Perspective barycentrics at the pixel's centre.
+        let ps = emit_pixel(&words, vec![], 1 << 1, &isg1, &osg1).unwrap();
+        let features = Container::parse(&ps.dxil)
+            .unwrap()
+            .part(FourCC::SFI0)
+            .map(|p| u64::from_le_bytes(p.data.try_into().unwrap()));
+        assert_ne!(features.unwrap() & (1 << 17), 0, "Barycentrics feature bit");
+        // A vertex shader passing its position on.
+        let mut s = Shader::new(false);
+        let b = s.entry;
+        let position = |kind, name: &str| SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xF,
+            half: false,
+        };
+        for col in 0..4 {
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), s.m.undef(s.t.i32)];
+            let v = s.op(b, "loadInput.f32", Attr::ReadNone, s.t.f32, 4, &args);
+            let args = [s.m.i32(0), s.m.i32(0), s.m.i8(col), v];
+            s.op(b, "storeOutput.f32", Attr::NoUnwind, s.t.void, 5, &args);
+        }
+        s.inputs = vec![position(0, "POSITION")];
+        s.outputs = vec![position(3, "SV_Position")];
+        s.m.terminate(b, super::bitcode::Term::Ret);
+        let vs = s.finish();
+        // A triangle over the whole target: a point's weights of the second
+        // and third vertex are (x + 1) / 4 and (y + 1) / 4.
+        let vertices = [
+            [-1.0f32, -1.0, 0.5, 1.0],
+            [3.0, -1.0, 0.5, 1.0],
+            [-1.0, 3.0, 0.5, 1.0],
+        ]
+        .concat();
+        let size = 8u32;
+        let mut ran = 0;
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no {label} device; skipped");
+                continue;
+            };
+            let root = host.root_signature_for(&[]).unwrap();
+            let pso = host
+                .pipeline_with(&root, &vs, &ps.dxil)
+                .unwrap_or_else(|e| panic!("{label}: pipeline: {e}"));
+            let draw = Draw {
+                roots: Vec::new(),
+                textures: &[],
+                samplers: &[],
+                vertices: &vertices,
+                stride: 16,
+                size: (size, size),
+                mesh_groups: 0,
+            };
+            let texels = host
+                .draw(&root, &pso, &draw)
+                .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+            for (i, t) in (0u32..).zip(&texels) {
+                let centre = |n: u32| (2 * n + 1) as f32 / size as f32;
+                let (x, y) = (centre(i % size) - 1.0, 1.0 - centre(i / size));
+                let expected = [(x + 1.0) / 4.0, (y + 1.0) / 4.0, 0.0, 1.0];
+                let near = t.iter().zip(expected).all(|(a, b)| (a - b).abs() < 1e-5);
+                assert!(near, "{label}: pixel {i}: {t:?}, expected {expected:?}");
+            }
+            ran += 1;
+        }
+        if ran == 0 {
+            eprintln!("no device; skipped");
+        }
+    }
+
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose
     /// output signature has SV_StencilRef, and the feature bit

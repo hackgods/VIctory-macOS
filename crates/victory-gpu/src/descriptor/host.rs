@@ -1110,6 +1110,11 @@ impl HostHeap {
                 (index, record, view)
             })
             .collect();
+        // Nothing to make (a page of empty or verified slots): neither the
+        // slot lock nor `VIEWS`, which title threads writing views wait on.
+        if entries.is_empty() {
+            return;
+        }
         let mut again = Vec::new();
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2799,6 +2804,45 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(1), "made from the record copied again");
+    }
+
+    /// A heap sync of slots holding nothing made takes no lock: it does not
+    /// wait for a title thread holding the slot lock (writing a view).
+    #[test]
+    fn a_heap_sync_of_empty_slots_does_not_wait_for_the_slot_lock() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let host = title_heap.host().expect("a host view heap");
+        let held = host.made.lock().unwrap();
+        let heap = heap as usize;
+        let (done, synced) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let h = crate::descriptor::heap(heap as crate::object::This);
+            // No record was ever written: every slot is empty.
+            h.host().unwrap().sync_slots(0, 4, start, 32);
+            let _ = done.send(());
+        });
+        let waited = synced
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err();
+        drop(held);
+        assert!(!waited, "the sync of empty slots waited for the slot lock");
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

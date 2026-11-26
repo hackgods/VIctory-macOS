@@ -126,7 +126,7 @@ impl Access {
 
 /// Blocks every lane runs exactly once: no cycle through them, on every
 /// path from the entry to an end (as [`split_wave_barriers`] has them).
-pub(super) fn once(p: &Program) -> Vec<bool> {
+pub(crate) fn once(p: &Program) -> Vec<bool> {
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
     let reach = |from: usize, start: bool, avoid: Option<usize>| {

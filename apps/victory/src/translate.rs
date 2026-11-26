@@ -171,6 +171,9 @@ struct Checks {
     /// Lane reads across the halves are handed over through group-shared
     /// memory where every lane runs (`VICTORY_HALVES_EXCHANGE=1`, as `run`).
     exchange: bool,
+    /// With `exchange`: every lane walks the skips around a hand-over
+    /// (`VICTORY_HALVES_WALK=1`, as `run`).
+    walk: bool,
 }
 
 pub fn run(
@@ -223,6 +226,10 @@ pub fn run(
     if exchange {
         println!("halves       hand lane reads over through shared memory where every lane runs (VICTORY_HALVES_EXCHANGE=1)");
     }
+    let walk = victory_gpu::shader_cache::halves_walk();
+    if walk {
+        println!("halves       walk the skips around a hand-over, where that is exact (VICTORY_HALVES_WALK=1)");
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -268,6 +275,7 @@ pub fn run(
                                 halves_local,
                                 lds_order,
                                 exchange,
+                                walk,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -634,6 +642,7 @@ fn translate(
                         halves_shared_lds: checks.halves_local[1],
                         lds_order: checks.lds_order,
                         halves_exchange: checks.exchange,
+                        halves_walk: checks.walk,
                         ..Default::default()
                     };
                     let _ = emit::uav_size_queries();

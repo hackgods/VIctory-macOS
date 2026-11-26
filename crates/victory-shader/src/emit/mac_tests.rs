@@ -127,6 +127,7 @@ const EARLY: Mac = Mac {
     lds_order: false,
     exchange: false,
     uav_level0: false,
+    walk: false,
 };
 
 /// The rule by itself: bit 12, and nothing that D3D's flag would change.
@@ -278,6 +279,7 @@ const WRITERS: Mac = Mac {
     lds_order: false,
     exchange: false,
     uav_level0: false,
+    walk: false,
 };
 
 /// `image_atomic_<op> v[vdata..], v[vaddr:vaddr+1], s[srsrc:srsrc+7]` on a

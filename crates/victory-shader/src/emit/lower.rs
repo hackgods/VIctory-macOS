@@ -27,9 +27,11 @@ mod halves;
 pub(crate) mod lds_order;
 mod mac;
 mod mesh;
+mod together;
 pub(crate) use mesh::{KeptOutputs, plan_merge};
 pub(crate) use halves::Local as HalvesLocal;
 pub(crate) use mac::Mac;
+pub(crate) use exchange::wanted as exchanges_wanted;
 #[cfg(test)]
 pub(crate) use f64_sum::count_f64_high;
 #[cfg(test)]

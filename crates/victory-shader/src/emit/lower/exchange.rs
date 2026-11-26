@@ -25,7 +25,10 @@
 //! Where: only in a block every lane runs exactly once
 //! ([`lds_order::once`]), where a group barrier is legal and where every
 //! thread of the group stores before any loads. A read anywhere else is left
-//! to the halves' other rules.
+//! to the halves' other rules. With [`Mac::walk`] a half's answer is also
+//! handed over in a block the group runs together, every thread once or
+//! none ([`super::together`]), and `emit::walk` makes more blocks ones every
+//! lane runs by leaving out the skips around them.
 //!
 //! What is handed over:
 //!
@@ -109,11 +112,32 @@ use super::*;
 /// D3D12's limit on a compute shader's thread-group shared memory, in bytes.
 const SHARED_BYTES: u32 = 32768;
 
+thread_local! {
+    /// While [`wanted`] runs a lowering: the IR blocks where it asked for an
+    /// exchange and not every lane runs the block exactly once.
+    static WANTED: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `lowering` (of one program, on this thread) and returns, with what
+/// it returns, the IR blocks where it asked for an exchange that could not
+/// be made because only some lanes run the block, or run it more than once:
+/// the places `emit::walk` opens to every lane.
+pub(crate) fn wanted<T>(lowering: impl FnOnce() -> T) -> (T, Vec<usize>) {
+    WANTED.with(|w| *w.borrow_mut() = Some(Vec::new()));
+    let made = lowering();
+    let blocks = WANTED.with(|w| w.borrow_mut().take()).unwrap_or_default();
+    (made, blocks)
+}
+
 /// The exchanges of one program.
 #[derive(Default)]
 pub(super) struct State {
     /// Blocks every lane runs exactly once, when first asked.
     once: Option<Vec<bool>>,
+    /// Blocks a thread group runs together ([`together`]), when first
+    /// asked.
+    together: Option<Vec<bool>>,
     /// The slots: two sets of one dword per thread of the group (rounded
     /// up to whole console waves), group-shared.
     slots: Option<V>,
@@ -151,9 +175,14 @@ impl Lower<'_> {
     /// program in halves that is asked to exchange.
     fn exchange_in(&mut self, b: usize) -> bool {
         let p = self.x.p;
-        self.halves
-            && self.x.mac.exchange
-            && self.exchange.once.get_or_insert_with(|| lds_order::once(p))[b]
+        if !(self.halves && self.x.mac.exchange) {
+            return false;
+        }
+        let once = self.exchange.once.get_or_insert_with(|| lds_order::once(p))[b];
+        if !once {
+            WANTED.with(|w| w.borrow_mut().as_mut().map(|blocks| blocks.push(b)));
+        }
+        once
     }
 
     /// The group barrier in block `at`.
@@ -240,12 +269,30 @@ impl Lower<'_> {
 
     /// Whether a half's answer made in IR block `b` can be handed over
     /// ([`Lower::exchanged_halves`]): the block is one every lane runs once
-    /// and the slots fit. Takes the slots.
+    /// (or, with [`Mac::walk`], one the group runs together) and the slots
+    /// fit. Takes the slots.
     pub(super) fn exchange_halves_in(&mut self, b: usize) -> bool {
         match self.exchange_slots() {
-            Some(per_set) => self.exchange_in(b) && self.exchange_takes(per_set / 8),
+            Some(per_set) => {
+                (self.exchange_together(b) || self.exchange_in(b))
+                    && self.exchange_takes(per_set / 8)
+            }
             None => false,
         }
+    }
+
+    /// Whether IR block `b` is one a thread group runs together (every
+    /// thread once, or none: [`together`]), in a program in halves asked to
+    /// exchange there too ([`Mac::walk`]). A half's answer has slots of its
+    /// own, so the module notes' 5 holds for it there as in a block every
+    /// lane runs: the group's threads all store, meet and load, or none
+    /// does.
+    fn exchange_together(&mut self, b: usize) -> bool {
+        let x = self.x;
+        self.halves
+            && x.mac.exchange
+            && x.mac.walk
+            && self.exchange.together.get_or_insert_with(|| together::blocks(x))[b]
     }
 
     /// `x`, a dword every lane of a host wave holds alike (the half's

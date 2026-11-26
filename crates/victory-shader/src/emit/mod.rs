@@ -266,6 +266,9 @@ pub mod validator;
 mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
+mod walk;
+#[cfg(test)]
+mod walk_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
@@ -479,6 +482,13 @@ pub struct Options {
     /// writable view has one level, so it is the same query. The shader
     /// cache keys on it.
     pub uav_size_level0: bool,
+    /// With [`Options::halves_exchange`]: a program whose hand-overs sit
+    /// in code only some lanes run (behind an early-out, inside `if`
+    /// bodies) is translated with those skips left out, every lane walking
+    /// the skipped code with its EXEC bit clear, if all its reads across
+    /// the halves are then handed over (`walk`). Exact, or the program
+    /// stays as it was. The shader cache keys on it.
+    pub halves_walk: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -823,6 +833,22 @@ fn emit_pruned(
     options: Options,
     keep: Option<&lower::KeptOutputs>,
 ) -> Result<HostShader, ShaderError> {
+    // Mac (`Options::halves_walk`): the program with its hand-overs opened
+    // to every lane, where that makes it exact.
+    if keep.is_none()
+        && let Some(exact) = walk::exact(input, options)
+    {
+        return Ok(exact);
+    }
+    emit_form(input, options, keep)
+}
+
+/// [`emit_pruned`] of the program as `input` has it.
+fn emit_form(
+    input: &EmitInput<'_>,
+    options: Options,
+    keep: Option<&lower::KeptOutputs>,
+) -> Result<HostShader, ShaderError> {
     let EmitInput {
         c,
         native,
@@ -916,6 +942,7 @@ fn emit_pruned(
             lds_order: options.lds_order,
             exchange: options.halves_exchange,
             uav_level0: options.uav_size_level0,
+            walk: options.halves_walk,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

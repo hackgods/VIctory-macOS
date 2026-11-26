@@ -132,6 +132,12 @@ pub(crate) struct Mac {
     /// it (`notes/uav-size.md`; first seen in its shadow min/max program,
     /// `07f451a14b13fecb`).
     pub uav_level0: bool,
+    /// With [`Mac::exchange`]: a half's answer is also handed over in a
+    /// block that a thread group runs together, under branches every
+    /// thread of the group takes the same way ([`super::together`]). Set
+    /// for the programs `emit::walk` opens to every lane
+    /// (`emit::Options::halves_walk`).
+    pub walk: bool,
 }
 
 thread_local! {

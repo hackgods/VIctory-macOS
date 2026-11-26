@@ -175,6 +175,13 @@ pub fn halves_exchange() -> bool {
     crate::mac_switches::exchange()
 }
 
+/// Whether, with that, every lane walks the skips around a hand-over
+/// (`victory_shader::emit::Options::halves_walk`, `VICTORY_HALVES_WALK=1`;
+/// the rule is in `mac_switches`).
+pub fn halves_walk() -> bool {
+    crate::mac_switches::walk()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -270,6 +277,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         lds_order: crate::mac_switches::lds_order(),
         halves_exchange: crate::mac_switches::exchange(),
         uav_size_level0: crate::mac_switches::uav_size_level0(),
+        halves_walk: crate::mac_switches::walk(),
     }
 }
 
@@ -304,6 +312,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         options.lds_order,
         options.halves_exchange,
         options.uav_size_level0,
+        options.halves_walk,
     );
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

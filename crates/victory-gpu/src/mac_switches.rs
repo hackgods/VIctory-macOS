@@ -169,6 +169,30 @@ fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
     }
 }
 
+/// Whether a console wave64 program whose hand-overs across the halves
+/// sit in code only some lanes run is translated with those skips left
+/// out, every lane walking the skipped code with its EXEC bit clear
+/// (`victory_shader::emit::walk`, `victory_shader::emit::Options::halves_walk`;
+/// `notes/ray-tracing-plan.md`, "Tiled sun-shadow programs"): only with
+/// `VICTORY_HALVES_WALK=1`, and only together with
+/// `VICTORY_HALVES_EXCHANGE=1` (alone it changes nothing, and is then left
+/// out of the cache key too). Exact where it applies; a program it does
+/// not make exact is translated as without it.
+pub(crate) fn walk() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_WALK").ok().as_deref(), false);
+        if on && exchange() {
+            tracing::info!(
+                "VICTORY_HALVES_WALK=1: every lane walks the skips around a hand-over across 32-lane halves, where that makes the program exact"
+            );
+        } else if on {
+            tracing::warn!("VICTORY_HALVES_WALK=1 does nothing without VICTORY_HALVES_EXCHANGE=1");
+        }
+        on && exchange()
+    })
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -207,8 +231,15 @@ pub(crate) fn key(
     lds_order: bool,
     exchange: bool,
     uav_size_level0: bool,
+    walk: bool,
 ) -> [u8; 32] {
-    if !early_depth && lock_writers == [false; 2] && !lds_order && !exchange && !uav_size_level0 {
+    if !early_depth
+        && lock_writers == [false; 2]
+        && !lds_order
+        && !exchange
+        && !uav_size_level0
+        && !walk
+    {
         return *build;
     }
     let mut h = blake3::Hasher::new();
@@ -230,6 +261,9 @@ pub(crate) fn key(
     }
     if uav_size_level0 {
         h.update(b"uav size level 0");
+    }
+    if walk {
+        h.update(b"halves walk");
     }
     *h.finalize().as_bytes()
 }
@@ -300,11 +334,15 @@ mod tests {
     /// the key without them; early depth alone is what it was before the
     /// lock settings came, the three of them without the LDS order what
     /// they were before it came, and all four without the exchange what
-    /// they were before that came.
+    /// they were before that came; and every key without the walk is what
+    /// it was before the walk came.
     #[test]
     fn each_combination_of_settings_has_cache_entries_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(key(&build, false, [false, false], false, false, false), build);
+        assert_eq!(
+            key(&build, false, [false, false], false, false, false, false),
+            build
+        );
         let of = |build: &[u8; 32], n: u8| {
             key(
                 build,
@@ -313,22 +351,34 @@ mod tests {
                 n & 8 != 0,
                 n & 16 != 0,
                 n & 32 != 0,
+                n & 64 != 0,
             )
         };
         let mut keys = std::collections::HashSet::new();
-        for n in 0..64u8 {
+        for n in 0..128u8 {
             let k = of(&build, n);
             assert_eq!(k, of(&build, n));
             keys.insert(k);
             // Over another build (other settings, another translator).
             assert!(n == 0 || k != of(&[8u8; 32], n));
         }
-        assert_eq!(keys.len(), 64);
+        assert_eq!(keys.len(), 128);
+        // The exchange and the level-0 size query, as before the walk.
+        let mut two = blake3::Hasher::new();
+        two.update(&build);
+        two.update(b"halves exchange");
+        two.update(b"uav size level 0");
+        assert_eq!(of(&build, 48), *two.finalize().as_bytes());
+        two = blake3::Hasher::new();
+        two.update(&build);
+        two.update(b"halves exchange");
+        two.update(b"halves walk");
+        assert_eq!(of(&build, 80), *two.finalize().as_bytes());
         let mut early = blake3::Hasher::new();
         early.update(&build);
         early.update(b"early depth");
         assert_eq!(
-            key(&build, true, [false, false], false, false, false),
+            key(&build, true, [false, false], false, false, false, false),
             *early.finalize().as_bytes()
         );
         let mut four = blake3::Hasher::new();

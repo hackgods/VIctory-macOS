@@ -24,6 +24,7 @@ const ORDER: Mac = Mac {
     lds_order: true,
     exchange: false,
     uav_level0: false,
+    walk: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

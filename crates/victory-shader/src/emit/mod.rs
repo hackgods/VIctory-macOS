@@ -679,8 +679,11 @@ pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, 
 /// elements one element in both stages, 2 makes every row a whole `float4`,
 /// 3 is 1 with the rows in the order that wastes least (`lower::plan_merge`),
 /// 4 is 3 with the rows of clip and cull distances last, 5 is 4 with the
-/// three-component rows first and the `float4` rows last; then the size is not checked here, as Metal counts
-/// it its own way (the caller logs what was made).
+/// three-component rows first and the `float4` rows last, 6 is the order
+/// that is smallest by the measured rule (`mesh_size`), with elements the
+/// pixel shader reads with a gap declared as their read parts; then the
+/// size is not checked here (the caller logs what was made, with Metal's
+/// count).
 pub fn translate_linked(
     mesh: &[u8],
     pixel: Option<&[u8]>,
@@ -735,7 +738,7 @@ pub fn translate_linked(
             Some(part) => signature(part.data)?,
             None => Vec::new(),
         };
-        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge >= 4, merge == 5);
+        lower::plan_merge(&mut reads, &outputs, merge == 2, merge >= 3, merge >= 4, merge == 5, merge == 6);
     }
     let linked_ms = emit_mesh(&reads)?;
     let linked_ps = emit_pruned(&ps_in, options, Some(&reads))?;
@@ -3086,6 +3089,169 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
                 assert!(
                     texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
+                    "{label}: unexpected pixel {:?}",
+                    texels.first()
+                );
+            }
+        }
+    }
+
+    /// macOS port, level 6 of a linked pair end to end: the pixel shader
+    /// reads `TEXCOORD15` at x, z and w, so both stages declare it as two
+    /// parts in its register, x and zw, and `TEXCOORD0` (read at x) as one
+    /// component; the vertex is 32 bytes by Metal's count where the whole
+    /// elements were 48. Exports and reads reach their parts: the pair
+    /// draws the mesh shader's values on hardware and WARP.
+    #[test]
+    fn linked_pair_declares_an_element_read_with_a_gap_as_its_parts() {
+        let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 128);
+        let mc = Container::parse(&ms_bytes).unwrap();
+        let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+        let mst = structure::structure(&mp).unwrap();
+        let mres = resource::track(&mp, &ms_native.layout, ms_native.stage, Some(&mst)).unwrap();
+        let mio = io::raise(&mp, &ms_native).unwrap();
+        let ms_in = EmitInput { c: &mc, native: &ms_native, p: &mp, st: &mst, io: &mio, res: &mres };
+        let p1 = |vdst: u32, attr: u32, ch: u32| 0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8);
+        let p2 = |vdst: u32, attr: u32, ch: u32| 0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8);
+        let ps_words = [
+            p1(2, 0, 0),
+            p2(2, 0, 0), // v2 = TEXCOORD0.x (1.0)
+            p1(3, 15, 0),
+            p2(3, 15, 0), // v3 = TEXCOORD15.x (0.0)
+            p1(4, 15, 2),
+            p2(4, 15, 2), // v4 = TEXCOORD15.z (0.25)
+            p1(5, 15, 3),
+            p2(5, 15, 3), // v5 = TEXCOORD15.w (1.0)
+            0xF800_180F,
+            0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let ps_inputs: Vec<crate::native::PsInput> = (0..16u8)
+            .map(|k| crate::native::PsInput {
+                usage: crate::native::Usage::Generic,
+                row: k + 1,
+                mask: 0xF,
+                attr: k,
+                flat: false,
+                fp16: false,
+                pack2: false,
+                row2: 0,
+            })
+            .collect();
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps { inputs: ps_inputs, input_addr: 1 << 1, db_shader_control: 0, patches: vec![] },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let element = |name: &str, kind: u8, index: u32, row: u32| SigElement {
+            name: name.into(),
+            index,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let mut ps_sig = vec![element("SV_Position", 3, 0, 0)];
+        ps_sig.extend((0..16).map(|k| element("TEXCOORD", 0, k, k + 1)));
+        let isg1 = container::signature(&ps_sig, true);
+        let osg1 = rows(&[("SV_Target", 16, false)], false);
+        let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let pc = Container::parse(&ps_bytes).unwrap();
+        let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
+        let pst = structure::structure(&pp).unwrap();
+        let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
+        let pio = io::raise(&pp, &ps_native).unwrap();
+        let ps_in = EmitInput { c: &pc, native: &ps_native, p: &pp, st: &pst, io: &pio, res: &pres };
+        let full_ps = emit_pruned(&ps_in, Options::default(), None).unwrap();
+        // As `translate_linked` plans level 6.
+        let mut reads = pixel_input_reads(&full_ps.dxil).unwrap();
+        assert_eq!(reads.get(&("TEXCOORD".into(), 15)), Some(&0b1101));
+        let outputs = signature(mc.part(FourCC::OSG1).unwrap().data).unwrap();
+        lower::plan_merge(&mut reads, &outputs, false, true, true, false, true);
+        let linked_ms = emit_pruned(&ms_in, Options::default(), Some(&reads)).unwrap();
+        let linked_ps = emit_pruned(&ps_in, Options::default(), Some(&reads)).unwrap();
+        let declared = |dxil: &[u8], part| -> Vec<(String, u32, Option<u32>, u8, u8)> {
+            let c = Container::parse(dxil).unwrap();
+            let els = signature(c.part(part).unwrap().data).unwrap();
+            els.iter().filter(|e| e.kind == 0).map(|e| (e.name.clone(), e.index, e.row, e.col, e.cols)).collect()
+        };
+        let mesh = declared(&linked_ms.dxil, FourCC::OSG1);
+        assert_eq!(
+            mesh,
+            vec![
+                ("TEXCOORD".to_string(), 0, Some(1), 0, 1),
+                ("VPART".to_string(), 64, Some(16), 0, 1),
+                ("VPART".to_string(), 66, Some(16), 2, 2),
+            ]
+        );
+        assert_eq!(declared(&linked_ps.dxil, FourCC::ISG1), mesh);
+        let o = mesh_outputs(&linked_ms.dxil).unwrap();
+        assert_eq!((o.vertex_components, o.vertex_bytes), (8, 32));
+        #[cfg(windows)]
+        {
+            if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+                v.validate(&mut linked_ms.dxil.clone()).unwrap();
+                v.validate(&mut linked_ps.dxil.clone()).unwrap();
+            }
+            use super::host::{Draw, Host, Root};
+            use windows::Win32::Graphics::Direct3D12::{
+                D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
+                D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
+                D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            for (label, warp) in [("hardware", false), ("warp", true)] {
+                let Ok(host) = Host::new(warp) else {
+                    eprintln!("no SM 6.6 {label} device; skipped");
+                    continue;
+                };
+                let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+                // SAFETY: the query writes the structure of the given size.
+                let queried = unsafe {
+                    host.device.CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS7,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                };
+                if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+                    eprintln!("no mesh shaders on the {label} device; skipped");
+                    continue;
+                }
+                let root = host
+                    .root_signature_for(&[
+                        (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
+                        (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
+                    ])
+                    .unwrap();
+                let pso = host
+                    .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
+                    .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
+                let texels = host
+                    .draw(
+                        &root,
+                        &pso,
+                        &Draw {
+                            roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
+                            textures: &[],
+                            samplers: &[],
+                            vertices: &[],
+                            stride: 0,
+                            size: (16, 16),
+                            mesh_groups: 1,
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
+                assert!(
+                    texels.iter().all(|t| *t == [1.0, 0.0, 0.25, 1.0]),
                     "{label}: unexpected pixel {:?}",
                     texels.first()
                 );

@@ -286,6 +286,13 @@ pub(crate) const MEASURED: &[(&str, u32, u32)] = &[
     ("f3@0 P@1 f3@2 f3@3 f3@4 f3@5 f3@6 f3@7 f3@8 f2@10.2 u1@11 f4@12 f4@13 f4@14 f4@15 f4@16 f4@17 C1@18", 260, 0),
     ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f4@8 f4@9 f4@10 f4@11 f4@12 f3@13 f1@14.3 u1@15 C1@16", 252, 0),
     ("P@0 f3@1 f1@2.3 u1@3 f4@4 f4@5 f4@6 f4@7 f4@8 f4@9 f4@10 f4@11 f4@12 f4@13 f4@14 f4@15 C1@16", 260, 0),
+    ("# the two ground-material shapes as VICTORY_MERGE_MESH_ROWS=6 makes them (`lower::mesh`'s test): the first fits exactly", 0, 0),
+    ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f2@6 f2@7 f1@7.3 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 C4@17", 256, 0),
+    ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 C4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 f2@17 f1@17.3", 260, 0),
+    ("# the second with its four clip distances as an ordinary element (the 16 bytes go)", 0, 0),
+    ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 f2@17 f1@17.3", 252, 0),
+    ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f2@8 f2@9 f1@9.3 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f3@17", 252, 0),
+    ("P C3 C1 f4", 80, 0),
 ];
 
 #[cfg(test)]

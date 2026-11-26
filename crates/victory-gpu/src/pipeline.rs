@@ -271,7 +271,9 @@ fn link_mesh_outputs() -> bool {
 /// gets each output row that holds several elements as one element (1), or
 /// every row as a whole `float4` (2), or as 1 with the rows reordered (3), or
 /// as 3 with the clip and cull distances in the last registers (4, a test),
-/// or as 4 with the three-component rows first, `float4` rows last (5, a test);
+/// or as 4 with the three-component rows first, `float4` rows last (5, a test),
+/// or in the order that is smallest by the measured rule, with components
+/// the pixel shader never reads left out of the elements around them (6);
 /// see `victory_shader::emit::translate_linked`.
 #[cfg(windows)]
 pub(crate) fn merge_mesh_rows() -> u8 {
@@ -280,7 +282,7 @@ pub(crate) fn merge_mesh_rows() -> u8 {
         // On, reordered, under D3DMetal, whose limit this is for; `=0`
         // switches it off.
         let default = if crate::shader_cache::under_wine() { 3 } else { 0 };
-        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 5).unwrap_or(default)
+        std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 6).unwrap_or(default)
     })
 }
 

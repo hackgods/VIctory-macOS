@@ -1,6 +1,7 @@
 //! Mesh shader output signatures, counts and lane indices.
 
 use super::{Attr, HashMap, Lower, SigElement, V, Why, pred};
+use crate::emit::mesh_size;
 use crate::emit::shader::Mesh;
 
 /// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
@@ -41,6 +42,13 @@ const MERGE_KEY: &str = "\u{0}merge-row";
 const ORDER_KEY: &str = "\u{0}host-row";
 /// The semantic of a merged row; its index is the row.
 const MERGED_NAME: &str = "VROW";
+/// The reserved [`KeptOutputs`] key under which a linked translation carries
+/// the columns of a row the pixel shader reads, where an element of the row
+/// spans a column it does not read ([`split_rows`]); the value is the mask.
+const SPLIT_KEY: &str = "\u{0}split-row";
+/// The semantic of a part of a split element; its index is four times the
+/// row plus the part's first column.
+const PART_NAME: &str = "VPART";
 
 /// macOS port (Metal's 32 KiB mesh output limit): marks in `keep` the rows
 /// of `outputs` that hold two or more arbitrary elements once pruned, all of
@@ -65,6 +73,14 @@ const MERGED_NAME: &str = "VROW";
 /// rows last: after that 4-byte slot `float4` rows cost Metal padding that
 /// rows of three do not (measured with Metal itself, notes/mesh-size.md,
 /// "Correction, 26 November afternoon").
+///
+/// The three paragraphs above are the reasons those levels were made
+/// for; measured, they are wrong (`emit::mesh_size` has the rule). With
+/// `fitted` the plan follows the measured rule instead: an element the pixel
+/// shader reads with a gap is declared as its read parts ([`split_rows`]),
+/// which drops 4 bytes for each component nothing reads, and the rows,
+/// those of distances alone among them, take the order in which the rule's
+/// size of a vertex is smallest ([`fitted_order`]).
 pub(crate) fn plan_merge(
     keep: &mut KeptOutputs,
     outputs: &[SigElement],
@@ -72,6 +88,7 @@ pub(crate) fn plan_merge(
     reorder: bool,
     distances_last: bool,
     xyz_first: bool,
+    fitted: bool,
 ) {
     let mut pruned = outputs.to_vec();
     prune_signature(&mut pruned, keep);
@@ -117,6 +134,42 @@ pub(crate) fn plan_merge(
         registers.extend(&dists);
         rows.extend(dists.iter().map(|&r| (r, 0)));
         registers.sort_unstable();
+        if fitted {
+            // The columns each row's elements are read at; a row with an
+            // element that spans more is declared in parts.
+            let mut read: HashMap<u32, u8> = HashMap::new();
+            for e in outputs.iter().filter(|e| e.kind == 0) {
+                let Some(r) = e.row else { continue };
+                let used = keep.get(&(e.name.to_ascii_uppercase(), e.index)).copied().unwrap_or(0);
+                *read.entry(r).or_insert(0) |= used & (((1u8 << e.cols) - 1) << e.col);
+            }
+            for e in pruned.iter().filter(|e| e.kind == 0) {
+                let Some(r) = e.row else { continue };
+                let span = ((1u8 << e.cols) - 1) << e.col;
+                let mask = read.get(&r).copied().unwrap_or(0);
+                if mask & span != span && mask & span != 0 {
+                    keep.insert((SPLIT_KEY.to_string(), r), mask);
+                }
+            }
+            split_rows(&mut pruned, keep);
+            // The members of a vertex after the position, as D3DMetal lays
+            // them out: the signature's order, which is the registers'.
+            // The rows that move take the registers of the rows that move;
+            // every other row stays where it is.
+            let members = |r: u32| -> Vec<u8> {
+                pruned.iter().filter(|e| e.row == Some(r) && e.kind != 3).map(|e| e.cols).collect()
+            };
+            let mut all: Vec<u32> = pruned.iter().filter(|e| e.kind != 3).filter_map(|e| e.row).collect();
+            all.sort_unstable();
+            all.dedup();
+            let free: Vec<Vec<u8>> = rows.iter().map(|&(r, _)| members(r)).collect();
+            let slots: Vec<Option<Vec<u8>>> =
+                all.iter().map(|r| (!registers.contains(r)).then(|| members(*r))).collect();
+            let order = fitted_order(mesh_size::fixed_bytes(&pruned), &slots, &free);
+            if order.len() == rows.len() {
+                rows = order.into_iter().map(|i| rows[i]).collect();
+            }
+        }
         for (&(r, _), register) in rows.iter().zip(registers) {
             keep.insert((ORDER_KEY.to_string(), r), register as u8);
         }
@@ -181,6 +234,7 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
         e.usage = usage;
         at += 1;
     }
+    split_rows(elements, keep);
     // The signature lists the elements that move in the order of their host
     // registers, in the places those elements had.
     let slots: Vec<usize> = (0..elements.len())
@@ -191,6 +245,144 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     for (i, e) in slots.into_iter().zip(moved) {
         elements[i] = e;
     }
+}
+
+/// Declares each arbitrary element of a row [`plan_merge`] marked for it as
+/// its parts: one element for each run of columns the pixel shader reads,
+/// named by the row and the run's first column, in the element's place and
+/// register. D3DMetal sizes a vertex by its elements' components
+/// (`emit::mesh_size`), so a component between two read ones costs 4 bytes
+/// only while its element spans it. Both stages of a pair declare the same
+/// parts; exports and reads find their channel by row and column as before,
+/// and an export to a column no part holds is dropped as one to a pruned
+/// element is.
+fn split_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    let mut at = 0;
+    while at < elements.len() {
+        let e = &elements[at];
+        let mask = match (e.kind, e.row) {
+            (0, Some(r)) => keep.get(&(SPLIT_KEY.to_string(), r)).copied(),
+            _ => None,
+        };
+        let span = ((1u8 << e.cols) - 1) << e.col;
+        let Some(mask) = mask.map(|m| m & span).filter(|&m| m != span && m != 0) else {
+            at += 1;
+            continue;
+        };
+        let e = elements.remove(at);
+        let mut col = e.col;
+        while col < e.col + e.cols {
+            if mask >> col & 1 == 0 {
+                col += 1;
+                continue;
+            }
+            let cols = (mask >> col).trailing_ones() as u8;
+            let mut part = e.clone();
+            part.name = PART_NAME.to_string();
+            part.index = 4 * e.row.expect("a row") + u32::from(col);
+            part.col = col;
+            part.cols = cols;
+            part.usage = (e.usage >> (col - e.col)) & ((1 << cols) - 1);
+            elements.insert(at, part);
+            at += 1;
+            col += cols;
+        }
+    }
+}
+
+/// The order of the rows that may move in which a vertex is smallest by the
+/// measured rule (`emit::mesh_size`): indices into `free`, each row its
+/// elements' components in the signature's order. `slots` are a vertex's
+/// rows after the position in register order: `None` takes the next of the
+/// rows that move, the others stay and hold these elements. `start` is
+/// what the rule puts before them. Among equal orders the one that keeps
+/// the given order of `free` longest is taken, so the result is the same
+/// wherever it is computed.
+fn fitted_order(start: u32, slots: &[Option<Vec<u8>>], free: &[Vec<u8>]) -> Vec<usize> {
+    // The rows that move, by shape: which is placed matters, not which row.
+    let mut shapes: Vec<&Vec<u8>> = Vec::new();
+    for f in free {
+        if !shapes.contains(&f) {
+            shapes.push(f);
+        }
+    }
+    let mut left: Vec<u8> = shapes.iter().map(|s| free.iter().filter(|f| f == s).count() as u8).collect();
+    // Bytes from an offset to the end of a row placed there. Alignments
+    // are 4, 8, 12 and 16, so only the offset modulo 48 matters.
+    let place = |at: u32, row: &[u8]| row.iter().fold(at, |at, &cols| mesh_size::after(at, cols)) - at;
+    // The fewest bytes the slots from `slot` on take, from this offset.
+    fn least(
+        slot: usize,
+        at: u32,
+        left: &mut Vec<u8>,
+        slots: &[Option<Vec<u8>>],
+        shapes: &[&Vec<u8>],
+        place: &dyn Fn(u32, &[u8]) -> u32,
+        memo: &mut HashMap<(usize, u32, Vec<u8>), u32>,
+    ) -> u32 {
+        let Some(here) = slots.get(slot) else { return 0 };
+        let key = (slot, at % 48, left.clone());
+        if let Some(&known) = memo.get(&key) {
+            return known;
+        }
+        let best = match here {
+            Some(row) => {
+                let n = place(at % 48, row);
+                n + least(slot + 1, at + n, left, slots, shapes, place, memo)
+            }
+            None => {
+                let mut best = u32::MAX;
+                for i in 0..shapes.len() {
+                    if left[i] == 0 {
+                        continue;
+                    }
+                    left[i] -= 1;
+                    let n = place(at % 48, shapes[i]);
+                    best = best.min(n + least(slot + 1, at + n, left, slots, shapes, place, memo));
+                    left[i] += 1;
+                }
+                best
+            }
+        };
+        memo.insert(key, best);
+        best
+    }
+    let mut memo = HashMap::new();
+    let mut order = Vec::with_capacity(free.len());
+    let mut taken = vec![false; free.len()];
+    let mut at = start;
+    for (slot, here) in slots.iter().enumerate() {
+        let row = match here {
+            Some(row) => row,
+            None => {
+                let goal = least(slot, at, &mut left, slots, &shapes, &place, &mut memo);
+                // The first shape, in the given order, that reaches it.
+                let mut found = None;
+                for i in 0..shapes.len() {
+                    if left[i] == 0 {
+                        continue;
+                    }
+                    left[i] -= 1;
+                    let n = place(at % 48, shapes[i]);
+                    let rest = least(slot + 1, at + n, &mut left, slots, &shapes, &place, &mut memo);
+                    if n + rest == goal {
+                        found = Some(i);
+                        break;
+                    }
+                    left[i] += 1;
+                }
+                let Some(shape) = found else { break };
+                let row = (0..free.len())
+                    .find(|&i| !taken[i] && &free[i] == shapes[shape])
+                    .expect("a row of the shape counted");
+                taken[row] = true;
+                order.push(row);
+                &free[row]
+            }
+        };
+        at += place(at % 48, row);
+    }
+    order
 }
 
 impl Lower<'_> {
@@ -290,7 +482,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, false, false, false);
+        plan_merge(&mut keep, &outputs, false, false, false, false, false);
         let mut mesh = outputs.clone();
         merge_rows(&mut mesh, &keep);
         let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -316,7 +508,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, true, false, false, false);
+        plan_merge(&mut keep, &outputs, true, false, false, false, false);
         let mut wide = outputs.clone();
         merge_rows(&mut wide, &keep);
         assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
@@ -338,7 +530,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, true, false, false);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false);
         let finish = |mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>, u8)> {
             merge_rows(&mut els, &keep);
             renumber_rows(&mut els, &keep);
@@ -385,7 +577,7 @@ mod tests {
             els.iter().map(|e| (e.name.clone(), e.row)).collect()
         };
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, true, false);
+        plan_merge(&mut keep, &outputs, false, true, true, false, false);
         let mesh = shape(&keep, outputs.clone());
         let row = |name: &str, r: u32| (name.to_string(), Some(r));
         assert_eq!(
@@ -416,7 +608,7 @@ mod tests {
         assert_eq!(shape(&keep, pixel), mesh[1..]);
         // Level 3 leaves the clip distance at its register.
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, false, false);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false);
         assert_eq!(shape(&keep, outputs.clone())[1], row("SV_ClipDistance", 1));
     }
 
@@ -438,7 +630,7 @@ mod tests {
             for e in outputs.iter().filter(|e| e.kind == 0) {
                 keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
             }
-            plan_merge(&mut keep, outputs, false, true, true, xyz_first);
+            plan_merge(&mut keep, outputs, false, true, true, xyz_first, false);
             keep
         };
         let shape = |keep: &KeptOutputs, mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>)> {
@@ -467,5 +659,156 @@ mod tests {
         let keep = plan(&plain, true);
         assert_eq!(shape(&keep, plain.clone()), shape(&plan(&plain, false), plain.clone()));
         assert_eq!(shape(&keep, plain.clone())[1], el("TEXCOORD", 0, 2));
+    }
+    /// The rows of a ground-material shape of 18 registers that Metal
+    /// refused at levels 3, 4 and 5: the position, four clip distances, and
+    /// 16 rows of arbitrary elements (three and two elements in rows 5 and
+    /// 7). The pixel shader reads all but the third component of row 15
+    /// and, with `seven` false, the fourth of row 7.
+    fn ground_shape(seven: bool) -> (Vec<SigElement>, KeptOutputs) {
+        let mut outputs = vec![
+            element("SV_Position", 0, 3, 9, 0, 0, 4),
+            element("SV_ClipDistance", 0, 6, 9, 1, 0, 4),
+        ];
+        // (row, column, components) of each arbitrary element.
+        let mut shape: Vec<(u32, u8, u8)> = vec![(2, 0, 4), (3, 0, 4), (4, 0, 4), (5, 0, 1), (5, 1, 2), (5, 3, 1), (6, 0, 4), (7, 0, 3), (7, 3, 1)];
+        shape.extend((8..14).map(|r| (r, 0, 3)));
+        shape.extend([(14, 0, 2), (15, 0, 4), (16, 0, 3), (17, 0, 3)]);
+        let mut keep = KeptOutputs::new();
+        for (n, (row, col, cols)) in shape.into_iter().enumerate() {
+            let e = element("TEXCOORD", n as u32, 0, 9, row, col, cols);
+            let read = match (row, col) {
+                (15, _) => 0xB,
+                (7, 3) if !seven => 0,
+                _ => e.mask_for_test(),
+            };
+            if read != 0 {
+                keep.insert((e.name.clone(), e.index), read);
+            }
+            outputs.push(e);
+        }
+        (outputs, keep)
+    }
+
+    impl SigElement {
+        fn mask_for_test(&self) -> u8 {
+            ((1u8 << self.cols) - 1) << self.col
+        }
+    }
+
+    /// Level 6 on the two ground shapes: the element read at x, y and w is
+    /// declared as two parts in its register, the rows take the order in
+    /// which the measured rule's vertex is smallest, and the pixel shader,
+    /// which lists its inputs in another order, declares the same. The
+    /// first shape then fits Metal's 256 bytes a vertex exactly (the probe
+    /// measured this very signature: `mesh_size::MEASURED`); the second
+    /// is 260 and cannot fit: the position, the 16 bytes clip distances
+    /// add, the distances and its 53 read components are 260 bytes with
+    /// nothing wasted.
+    #[test]
+    fn fitted_rows_follow_the_measured_rule() {
+        use crate::emit::mesh_probe_tests::line;
+        let finish = |keep: &KeptOutputs, mut els: Vec<SigElement>| -> Vec<SigElement> {
+            prune_signature(&mut els, keep);
+            merge_rows(&mut els, keep);
+            renumber_rows(&mut els, keep);
+            els
+        };
+        let plan = |seven: bool, level: u8| {
+            let (outputs, mut keep) = ground_shape(seven);
+            plan_merge(&mut keep, &outputs, false, true, level >= 4, level == 5, level == 6);
+            let mesh = finish(&keep, outputs.clone());
+            (outputs, keep, mesh)
+        };
+        // As the game measured them at levels 3, 4 and 5.
+        for (seven, sizes) in [(false, [264, 272, 272]), (true, [272, 272, 272])] {
+            for (level, size) in (3..).zip(sizes) {
+                assert_eq!(mesh_size::struct_bytes(&plan(seven, level).2), size, "level {level}");
+            }
+        }
+        let (outputs, keep, mesh) = plan(false, 6);
+        assert_eq!(line(&mesh), FITTED, "the signature the probe measured");
+        assert_eq!(mesh_size::struct_bytes(&mesh), 256);
+        // The parts: x and y, and w, in one register.
+        let parts: Vec<(u32, u8, u8, Option<u32>)> =
+            mesh.iter().filter(|e| e.name == PART_NAME).map(|e| (e.index, e.col, e.cols, e.row)).collect();
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert_eq!((parts[0].0, parts[0].1, parts[0].2), (60, 0, 2));
+        assert_eq!((parts[1].0, parts[1].1, parts[1].2), (63, 3, 1));
+        assert_eq!(parts[0].3, parts[1].3);
+        // Every register from 0 to 17 once, but for the parts' twice.
+        let mut registers: Vec<u32> = mesh.iter().filter_map(|e| e.row).collect();
+        registers.sort_unstable();
+        registers.dedup();
+        assert_eq!(registers, (0..18).collect::<Vec<u32>>());
+        // The pixel shader: its inputs backwards, without the position.
+        let pixel: Vec<SigElement> = outputs[1..].iter().rev().cloned().collect();
+        let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
+            els.iter().map(|e| (e.name.clone(), e.index, e.row, e.col, e.cols)).collect()
+        };
+        assert_eq!(shape(&finish(&keep, pixel)), shape(&mesh[1..]));
+        // The second shape: smaller than at any level before, not enough.
+        let (_, _, mesh) = plan(true, 6);
+        assert_eq!(line(&mesh), UNFITTED, "the signature the probe measured");
+        assert_eq!(mesh_size::struct_bytes(&mesh), 260);
+    }
+
+    /// The first ground shape as level 6 makes it, in the probe's notation.
+    const FITTED: &str =
+        "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f2@6 f2@7 f1@7.3 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 C4@17";
+    /// The second.
+    const UNFITTED: &str =
+        "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 C4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 f2@17 f1@17.3";
+
+    /// The order found is the smallest of all orders, rows that stay are
+    /// left in their slots, and equal rows keep their order.
+    #[test]
+    fn the_fitted_order_is_the_smallest() {
+        let size = |start: u32, slots: &[Option<Vec<u8>>], free: &[Vec<u8>], order: &[usize]| {
+            let mut next = order.iter();
+            slots.iter().fold(start, |at, slot| {
+                let row = slot.as_ref().unwrap_or_else(|| &free[*next.next().expect("a row for each slot")]);
+                row.iter().fold(at, |at, &cols| mesh_size::after(at, cols))
+            })
+        };
+        // Every order of up to seven rows, by Heap's algorithm.
+        fn orders(n: usize) -> Vec<Vec<usize>> {
+            fn go(k: usize, a: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+                if k <= 1 {
+                    out.push(a.clone());
+                    return;
+                }
+                for i in 0..k {
+                    go(k - 1, a, out);
+                    a.swap(if k % 2 == 0 { i } else { 0 }, k - 1);
+                }
+            }
+            let mut out = Vec::new();
+            go(n, &mut (0..n).collect(), &mut out);
+            out
+        }
+        let cases: [(u32, Vec<Option<Vec<u8>>>, Vec<Vec<u8>>); 5] = [
+            (16, vec![None; 4], vec![vec![4], vec![3], vec![3], vec![2]]),
+            (32, vec![None; 7], vec![vec![4], vec![4], vec![3], vec![3], vec![3], vec![2, 1], vec![2]]),
+            (32, vec![None, None, Some(vec![1, 1]), None, None, None], vec![vec![4], vec![3], vec![3], vec![1], vec![2]]),
+            (16, vec![Some(vec![3]), None, None, None], vec![vec![4], vec![4], vec![1]]),
+            (0, vec![None; 6], vec![vec![3], vec![4], vec![1], vec![2], vec![3], vec![4]]),
+        ];
+        for (start, slots, free) in cases {
+            let order = fitted_order(start, &slots, &free);
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..free.len()).collect::<Vec<usize>>(), "{order:?}");
+            let least = orders(free.len()).iter().map(|o| size(start, &slots, &free, o)).min().expect("an order");
+            assert_eq!(size(start, &slots, &free, &order), least, "{start} {slots:?} {free:?}: {order:?}");
+            // Equal rows in their given order.
+            for (i, a) in order.iter().enumerate() {
+                for b in &order[i + 1..] {
+                    assert!(free[*a] != free[*b] || a < b, "{order:?}");
+                }
+            }
+        }
+        // Rows that already waste nothing stay as they are given.
+        assert_eq!(fitted_order(16, &[None, None, None], &[vec![4], vec![4], vec![2]]), vec![0, 1, 2]);
     }
 }

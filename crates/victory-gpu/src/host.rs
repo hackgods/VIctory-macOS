@@ -3800,13 +3800,15 @@ impl Meter {
             let [records, counted] =
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
             let root_views = crate::draw::take_root_view_slots() as f64 / report_frames;
+            let clamps = crate::indirect::take_dispatches() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
                  GPU; {back_ms:.1} copying back {back_mb:.1} MB), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
-                 max records {records:.0}/frame ({counted:.0} under a count)",
+                 max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
+                 dispatches/frame",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

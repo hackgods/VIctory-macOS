@@ -319,8 +319,17 @@ fn bound_with(
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
+    DISPATCHES.fetch_add(1, Ordering::Relaxed);
     Some(out)
 }
+
+/// Dispatches of ours recorded for clamps since the last call (the frame
+/// line): one before every indirect execution, each ending the host's
+/// render pass where it stands between two draws.
+pub(crate) fn take_dispatches() -> u64 {
+    DISPATCHES.swap(0, Ordering::Relaxed)
+}
+static DISPATCHES: AtomicU64 = AtomicU64::new(0);
 
 /// Records the clamps were asked to walk (the maximum of each execution)
 /// since the last call, and the part of them under a count buffer, where

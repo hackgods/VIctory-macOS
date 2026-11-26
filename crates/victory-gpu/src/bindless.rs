@@ -378,6 +378,17 @@ pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
     }
 }
 
+/// The buffer range (title address, bytes) of the view currently in
+/// `index`, changed or not (diagnostics: what a table draw reads there).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn slot_range(viewed: &Viewed, index: u32) -> Option<(usize, usize)> {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    match inner.slots.get(&index) {
+        Some(Seen::Buffer(_, address, len, _)) => Some((*address as usize, *len as usize)),
+        _ => None,
+    }
+}
+
 /// Per submission: the buffer range of the view currently in `index`. A
 /// table draw may have been recorded with another view in that slot.
 pub(crate) fn refresh_slot(

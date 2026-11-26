@@ -162,9 +162,83 @@ impl fmt::Display for RefreshSummary {
     }
 }
 
+/// The small buffer ranges (constant buffers and other views of at most
+/// [`SMALL_READ`] bytes) that the commands of a submission read through
+/// their tables, in the order its steps name them, to tell when a title
+/// copy later in the same submission writes one (`crate::host`,
+/// `Batch::rewritten`; diagnostics).
+#[cfg(any(feature = "diagnostics", test))]
+#[derive(Default)]
+pub(crate) struct SmallReads(Vec<(usize, usize)>);
+
+/// The longest range [`SmallReads`] keeps.
+#[cfg(any(feature = "diagnostics", test))]
+pub(crate) const SMALL_READ: usize = 256;
+
+#[cfg(any(feature = "diagnostics", test))]
+impl SmallReads {
+    /// A command reads `[at, at + len)`.
+    pub(crate) fn read(&mut self, at: usize, len: usize) {
+        let range = (at, at.saturating_add(len));
+        // Kept short: a world submission names tens of thousands, most of
+        // them the ranges just named.
+        if len == 0 || len > SMALL_READ || self.0.len() >= 16384 || self.0.iter().rev().take(64).any(|r| *r == range) {
+            return;
+        }
+        self.0.push(range);
+    }
+
+    /// What a copy into `[at, at + len)` writes of the ranges read so far:
+    /// each part as (from, to), and how many of the ranges hold it.
+    pub(crate) fn written(&self, at: usize, len: usize) -> Vec<(usize, usize, usize)> {
+        let end = at.saturating_add(len);
+        let mut out: Vec<(usize, usize, usize)> = Vec::new();
+        for &(from, to) in &self.0 {
+            let (a, b) = (from.max(at), to.min(end));
+            if a >= b {
+                continue;
+            }
+            match out.iter_mut().find(|o| (o.0, o.1) == (a, b)) {
+                Some(o) => o.2 += 1,
+                None => out.push((a, b, 1)),
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{REFRESH_TOP, Ranges, RefreshSummary};
+    use super::{REFRESH_TOP, Ranges, RefreshSummary, SMALL_READ, SmallReads};
+
+    /// A copy writes the small ranges read before it where they overlap,
+    /// counted per range; long ranges and ranges read after it are not its.
+    #[test]
+    fn a_copy_writes_the_small_ranges_read_before_it() {
+        let mut reads = SmallReads::default();
+        assert!(reads.written(0x1000, 0x100).is_empty());
+        reads.read(0x1fe0, 32);
+        reads.read(0x1fe0, 32);
+        reads.read(0x1cd0, 48);
+        reads.read(0x1fe0, 32);
+        reads.read(0x4000, SMALL_READ + 1);
+        reads.read(0x5000, 0);
+        // The same range named three times is kept once.
+        assert_eq!(reads.written(0x1fe0, 32), vec![(0x1fe0, 0x2000, 1)]);
+        assert_eq!(reads.written(0x1ff0, 0x100), vec![(0x1ff0, 0x2000, 1)]);
+        assert_eq!(
+            reads.written(0x1000, 0x1000),
+            vec![(0x1fe0, 0x2000, 1), (0x1cd0, 0x1d00, 1)]
+        );
+        assert!(reads.written(0x2000, 0x1000).is_empty());
+        assert!(reads.written(0x4000, 0x200).is_empty());
+        // Two views of different lengths at one address are two ranges.
+        reads.read(0x1fe0, 16);
+        assert_eq!(
+            reads.written(0x1fe0, 16),
+            vec![(0x1fe0, 0x1ff0, 2)]
+        );
+    }
 
     /// Synthetic ranges arrive out of order: totals cover all of them, while
     /// the formatted largest are bounded and ties have a stable order.

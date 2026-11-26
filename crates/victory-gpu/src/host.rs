@@ -2791,6 +2791,11 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    // An experiment may leave the copy out (diagnostics).
+                    #[cfg(feature = "diagnostics")]
+                    if batch.rewritten(dst, src, len) {
+                        continue;
+                    }
                     batch.title_copied(dst, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     len
@@ -2810,10 +2815,16 @@ impl HostList {
                         add(C::Refreshes, 1);
                         add(C::RefreshBytes, *len as u64);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    batch.reads.read(*address, *len);
                     batch.add(shadow, *address, *len);
                     continue;
                 }
                 Step::Slot(viewed, index) => {
+                    #[cfg(feature = "diagnostics")]
+                    if let Some((address, len)) = crate::bindless::slot_range(viewed, *index) {
+                        batch.reads.read(address, len);
+                    }
                     crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
@@ -2885,6 +2896,10 @@ struct Batch {
     /// bounded diagnostics line. No range contents or view attribution.
     #[cfg(feature = "diagnostics")]
     summary: crate::ranges::RefreshSummary,
+    /// The small ranges the submission's commands read through tables so
+    /// far ([`Batch::rewritten`]).
+    #[cfg(feature = "diagnostics")]
+    reads: crate::ranges::SmallReads,
     /// Where each copy in `current` sits in memory, by copy: a title copy
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
@@ -2997,6 +3012,69 @@ impl Batch {
             }
         }
         total
+    }
+
+    /// Diagnostics, before a title copy of `len` bytes from `src` to `dst`
+    /// (a list's `CopyBufferRegion`, buffer `CopyResource` or
+    /// `CopyMemoryToMemoryX`): logs it when it changes a small range that a
+    /// command earlier in the same submission reads through a table. On
+    /// the console a list's copies and draws run in their order, so that
+    /// command reads the old bytes; here every step of a submission is
+    /// done before its first GPU command, so it runs with the new ones
+    /// (the title's TAA passes then work on a quarter of the screen,
+    /// `notes/uav-size.md`). The first 32 such copies of a run and those
+    /// of listed capture frames; `VICTORY_COPY_ORDER=0` turns it off.
+    ///
+    /// Returns whether the copy is to be left out: with
+    /// `VICTORY_COPY_ORDER=keep`, an experiment, when all it writes is one
+    /// such range. Then the commands before it run with the bytes the
+    /// title gave them, and those after it too (wrongly: they wanted the
+    /// new ones): it shows what the earlier ones do with their own bytes.
+    #[cfg(feature = "diagnostics")]
+    fn rewritten(&self, dst: usize, src: usize, len: usize) -> bool {
+        static LOGGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        // Off, or on and whether such a copy is left out.
+        static MODE: OnceLock<Option<bool>> = OnceLock::new();
+        let Some(keep) = *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_ORDER").as_deref() {
+            Ok("0") => None,
+            Ok("keep") => {
+                tracing::info!("VICTORY_COPY_ORDER=keep: a title copy that only changes a small range read earlier in its submission is not made (experiment)");
+                Some(true)
+            }
+            _ => Some(false),
+        }) else {
+            return false;
+        };
+        let mut left_out = false;
+        for (from, to, views) in self.reads.written(dst, len) {
+            // Both ranges read as the copy reads them (an unmapped page
+            // reads as zeros); the same bytes change nothing.
+            let n = (to - from).min(64);
+            let (mut old, mut new) = ([0u8; 64], [0u8; 64]);
+            copy_mapped(old.as_mut_ptr(), from as *const u8, n, false);
+            copy_mapped(new.as_mut_ptr(), (src + (from - dst)) as *const u8, n, false);
+            if old[..n] == new[..n] {
+                continue;
+            }
+            left_out |= keep && (from, to) == (dst, dst.saturating_add(len));
+            let k = LOGGED.fetch_add(1, Ordering::Relaxed);
+            if k >= 32 && !crate::capture::listed(crate::queue::presented() + 1) {
+                continue;
+            }
+            let floats = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+            };
+            tracing::info!(
+                target: "victory_gpu::trace",
+                "copy order: a title copy changes {:#x}+{}, which commands earlier in this submission read through a table ({views} view ranges): {:?} becomes {:?}; {}",
+                from,
+                to - from,
+                floats(&old[..n]),
+                floats(&new[..n]),
+                if left_out { "left out (VICTORY_COPY_ORDER=keep)" } else { "they run with the new bytes" }
+            );
+        }
+        left_out
     }
 
     /// Logs one compact line for the submission, if it refreshed title memory.

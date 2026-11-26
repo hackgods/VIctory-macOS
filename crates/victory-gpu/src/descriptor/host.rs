@@ -880,8 +880,20 @@ impl HostHeap {
         if !candidates.is_empty() {
             let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
             let mut current = Vec::with_capacity(records.len());
+            #[cfg(feature = "diagnostics")]
+            let asking =
+                crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncViewsNs);
             views_current_into(&records, &mut current);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
+            #[cfg(feature = "diagnostics")]
+            let waited = crate::watch::TimedNs(
+                std::time::Instant::now(),
+                crate::copystat::C::SyncSlotLockNs,
+            );
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             for (&(i, [_, view, generation]), is_current) in candidates.iter().zip(current) {
                 let changed = match made.get(i as usize) {
                     Some(&m) if is_current => m != (u64::from(generation) << 32 | u64::from(view)),
@@ -1094,6 +1106,9 @@ impl HostHeap {
     /// wrote again meanwhile is left to `mirror`; views are unpinned after
     /// the lock, whose holders their release may need.
     fn mirror_synced(&self, slots: &[u32], at: impl Fn(u32) -> u64) {
+        #[cfg(feature = "diagnostics")]
+        let preparing =
+            crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncPrepareNs);
         let entries: Vec<(u32, [u32; 3], Option<ViewPin>)> = slots
             .iter()
             .filter(|&&index| index < self.count)
@@ -1110,6 +1125,8 @@ impl HostHeap {
                 (index, record, view)
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(preparing);
         // Nothing to make (a page of empty or verified slots): neither the
         // slot lock nor `VIEWS`, which title threads writing views wait on.
         if entries.is_empty() {
@@ -1128,7 +1145,12 @@ impl HostHeap {
             // Whether each view is still current, as `mirror` asks under the lock.
             let records: Vec<[u32; 3]> = entries.iter().map(|&(_, record, _)| record).collect();
             let mut current = Vec::with_capacity(records.len());
+            #[cfg(feature = "diagnostics")]
+            let asking =
+                crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncViewsNs);
             views_current_into(&records, &mut current);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
             for ((index, record, view), current) in entries.iter().zip(current) {
                 let index = *index;
                 // SAFETY: as above.

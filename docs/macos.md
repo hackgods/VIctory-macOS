@@ -202,3 +202,23 @@ So every submission now ends with a small list that copies the submission's numb
 ## The clwb write-back loops
 
 The title has eight loops that write cache lines back with `clwb`, which faults under Rosetta and costs an exception each time (#135). Under Rosetta, the same check that decides fault tracking, `victory` turns the `clwb` of each loop into a NOP when it loads the image. It patches only when it finds exactly eight loops and logs the number it found otherwise. `VICTORY_NOP_CLWB=0` leaves the loops alone and `VICTORY_NOP_CLWB=1` patches them where Rosetta is not detected.
+
+## An ambient light in place of ray-traced indirect light
+
+`VICTORY_AMBIENT=1` turns on a stand-in from Belobug's fork (`victory-gpu/src/ambient.rs`). It is off by default, and off it changes nothing. The game lights what the sun does not reach with probes it fills by tracing rays. Right after the game's program that resolves those probes (`CS_ScreenProbes_TemporalResolve_*`), a compute pass of VIctory's own replaces that program's output with an ambient light: the same everywhere in a frame, darker in creases and under objects (worked out from the depth image). By default its level and colour follow the sky dome the game draws for its reflections. After the game's last reflection pass (`CS_UpdateHistory`), a second pass of the same shader holds reflections to half of that light.
+
+VIctory logs one line at start when the switch is on, one line for each program it found by name, and one line the first time each part runs (`ambient light: the first image it writes`, `ambient light follows the sky dome`, `reflections held to the ambient light`). `no ambient light: ...` says why a pass did not run.
+
+| Variable | Effect |
+| --- | --- |
+| `VICTORY_AMBIENT=1` | Turns the stand-in on. Unset, empty, `0` and `off` leave the game's own output. |
+| `VICTORY_AMBIENT_SKY=off` or `gain,least,power` | `off` keeps a constant level. Otherwise the level is `gain * mean^power + least` of the sky dome's mean (0.36, 0.05, 0.4). |
+| `VICTORY_AMBIENT_LEVEL=<level>` | The constant level (0.6), used while the light does not follow the sky. |
+| `VICTORY_AMBIENT_TINT=r,g,b` | The constant light's colour (1, 0.98, 0.94). |
+| `VICTORY_AMBIENT_SHADE=s,r,n,t` | The shading: strength (1; 0 for none), radius in metres (0.6), near plane (0.1), tangent of half the vertical field of view (0.45). |
+| `VICTORY_AMBIENT_REFLECT=<part>` | The most a reflection may hold, as a part of the light (0.5). 0 leaves reflections alone. |
+| `VICTORY_AMBIENT_FILE=<file>` | Diagnostics builds: the file is read twice a second, to tune a running game. `gain least [power] [s r n t]` follows the sky; `level r g b [s r n t [part [least]]]` sets a constant light. |
+
+In the fork `VICTORY_AMBIENT` is the level and the stand-in is on unless it says `off`. Here it is a switch, and the level has its own variable.
+
+The pass is compiled at run time, so under Wine its shader keeps to what Wine's compiler takes ("Run-time HLSL and textures under Wine and D3DMetal" above): its root signature is built in code, and the image sizes are constants, because Wine's compiler has no `GetDimensions` on unordered views (`RWTexture2D`): the fork's shader stops there with `E5005: Method 'GetDimensions' is not defined on type 'RWTexture2D<uint>'`. It finds the game's programs by the names in their shader containers and the images by fixed places in their tables, so it only fits this game's shader build. It changes no shader translation and no cached pipeline: turning it on or off leaves both caches warm.

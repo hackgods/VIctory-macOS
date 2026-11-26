@@ -335,6 +335,47 @@ pub(crate) fn start_line(
     )
 }
 
+/// What `VICTORY_AMBIENT_FILE`'s text sets in a running game.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum FromFile {
+    /// Two, three, six or seven numbers: gain, least, a power if their
+    /// count is odd (0.4 otherwise), then the shading's four.
+    Follow { follow: [f32; 3], shade: Option<[f32; 4]> },
+    /// `level r g b`, then the shading's four, then the part reflections
+    /// are held to, then the least they hold (0 if left out).
+    Constant { level: f32, tint: [f32; 3], shade: Option<[f32; 4]>, reflections: Option<[f32; 2]> },
+}
+
+/// Reads the numbers of `VICTORY_AMBIENT_FILE`'s text; `None` if they are
+/// too few.
+pub(crate) fn from_file(text: &str) -> Option<FromFile> {
+    let read: Vec<f32> = text.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    if let [gain, least, ref rest @ ..] = read[..]
+        && matches!(rest.len(), 0 | 1 | 4 | 5)
+    {
+        let (power, rest) = match rest.len() % 2 {
+            1 => (rest[0], &rest[1..]),
+            _ => (0.4, rest),
+        };
+        let shade = match rest[..] {
+            [s, r, n, t] => Some([s, r, n, t]),
+            _ => None,
+        };
+        return Some(FromFile::Follow { follow: [gain, least, power], shade });
+    }
+    let [level, r, g, b, ref rest @ ..] = read[..] else {
+        return None;
+    };
+    let (shade, reflections) = match rest[..] {
+        [s, r, n, t, ref last @ ..] => (
+            Some([s, r, n, t]),
+            last.first().map(|k| [k.max(0.0), last.get(1).map_or(0.0, |f| f.max(0.0))]),
+        ),
+        _ => (None, None),
+    };
+    Some(FromFile::Constant { level: level.max(0.0), tint: [r, g, b], shade, reflections })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +505,52 @@ mod tests {
         assert!(
             plain.contains("a constant ambient light of level 1.4, not shaded; reflections left alone"),
             "{plain}"
+        );
+    }
+
+    /// The file's numbers: two, three, six or seven follow the sky; four or
+    /// more of another count set a constant light.
+    #[test]
+    fn the_file_sets_what_its_count_of_numbers_says() {
+        assert_eq!(from_file(""), None);
+        assert_eq!(from_file("0.5"), None);
+        assert_eq!(
+            from_file("0.4 0.02"),
+            Some(FromFile::Follow { follow: [0.4, 0.02, 0.4], shade: None })
+        );
+        assert_eq!(
+            from_file("0.4 0.02 0.5\n"),
+            Some(FromFile::Follow { follow: [0.4, 0.02, 0.5], shade: None })
+        );
+        assert_eq!(
+            from_file("0.4 0.02 1 0.6 0.1 0.45"),
+            Some(FromFile::Follow { follow: [0.4, 0.02, 0.4], shade: Some([1.0, 0.6, 0.1, 0.45]) })
+        );
+        assert_eq!(
+            from_file("0.4 0.02 0.5 1 0.6 0.1 0.45"),
+            Some(FromFile::Follow { follow: [0.4, 0.02, 0.5], shade: Some([1.0, 0.6, 0.1, 0.45]) })
+        );
+        assert_eq!(
+            from_file("0.3 1 0.9 0.8"),
+            Some(FromFile::Constant { level: 0.3, tint: [1.0, 0.9, 0.8], shade: None, reflections: None })
+        );
+        assert_eq!(
+            from_file("-1 1 1 1 0 0.6 0.1 0.45 0.7 -3"),
+            Some(FromFile::Constant {
+                level: 0.0,
+                tint: [1.0, 1.0, 1.0],
+                shade: Some([0.0, 0.6, 0.1, 0.45]),
+                reflections: Some([0.7, 0.0]),
+            })
+        );
+        assert_eq!(
+            from_file("0.3 1 1 1 1 0.6 0.1 0.45 0.7"),
+            Some(FromFile::Constant {
+                level: 0.3,
+                tint: [1.0, 1.0, 1.0],
+                shade: Some([1.0, 0.6, 0.1, 0.45]),
+                reflections: Some([0.7, 0.0]),
+            })
         );
     }
 }

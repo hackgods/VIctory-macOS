@@ -105,15 +105,23 @@ fn level() -> f32 {
 }
 
 /// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
-/// gives.
+/// gives. With `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds) the file's
+/// `level r g b` is read again twice a second, to tune both by eye in a
+/// running game.
 fn tint() -> [f32; 3] {
+    if let Some((_, tint)) = *LIVE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return tint;
+    }
     static SET: OnceLock<[f32; 3]> = OnceLock::new();
     *SET.get_or_init(|| set::tint(var("VICTORY_AMBIENT_TINT").as_deref()))
 }
 
+/// The level and colour last read from `VICTORY_AMBIENT_FILE`, if any.
+static LIVE: Mutex<Option<(f32, [f32; 3])>> = Mutex::new(None);
+
 /// The most a reflection may hold, as a part of the ambient light's level:
 /// `VICTORY_AMBIENT_REFLECT=<part>` (0.5 by default; 0 leaves the title's
-/// reflections alone).
+/// reflections alone); a ninth number in the file sets it in a running game.
 ///
 /// Without rays the reflections are the sky's, unoccluded, wherever a
 /// surface is glossy: indoors a wooden floor, a counter and glass tops wore
@@ -124,9 +132,20 @@ fn tint() -> [f32; 3] {
 /// lighting programs read that image next.
 /// shortcut: stands in for what the title's traced reflections would see.
 fn keep() -> f32 {
+    if let Some(live) = *KEEP.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
 }
+
+static KEEP: Mutex<Option<f32>> = Mutex::new(None);
+
+/// The least a reflection holds, as a part of the light around: a tenth
+/// number in the file (0, the default, leaves dark reflections dark).
+/// shortcut: without rays, what should mirror the sky (still water) sees
+/// nothing and is black; this gives it a part of the ambient light instead.
+static LEAST: Mutex<f32> = Mutex::new(0.0);
 
 /// The sky dome the title's sky program (`set::SKY`) last drew into: the
 /// host copy, held, since the title's object may go at any time.
@@ -161,7 +180,8 @@ pub(crate) fn sky_drawn(image: usize) {
 /// at dawn; one level for all hours either drowned the title's own shadows
 /// or left what the sun does not reach black. On unless
 /// `VICTORY_AMBIENT_SKY=off`, which keeps the constant; `gain,least,power`
-/// sets it.
+/// sets it; a file of two or three numbers, or six or seven with the
+/// shading's, does so in a running game.
 /// shortcut: the sky's mean stands in for the light the title's traced
 /// probes would gather; indoors it is the sky's too.
 ///
@@ -170,16 +190,85 @@ pub(crate) fn sky_drawn(image: usize) {
 /// the sky's mean goes from 0.001 at night to several units by day, the
 /// levels that look right only from 0.07 to 1.4.
 fn follow() -> Option<[f32; 3]> {
+    if let Some(live) = *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
     static SET: OnceLock<Option<[f32; 3]>> = OnceLock::new();
     *SET.get_or_init(|| set::follow(var("VICTORY_AMBIENT_SKY").as_deref()))
 }
 
+static FOLLOW: Mutex<Option<Option<[f32; 3]>>> = Mutex::new(None);
+
 /// How much less of the light reaches creases and corners, worked out from
 /// the depth image alone (`set::shade`, `VICTORY_AMBIENT_SHADE=s,r,n,t`).
+/// The file's values after its first four replace them.
 /// shortcut: stands in for the occlusion the title's traced probes carry.
 fn shade() -> [f32; 4] {
+    if let Some(live) = *SHADE.lock().unwrap_or_else(|e| e.into_inner()) {
+        return live;
+    }
     static SET: OnceLock<[f32; 4]> = OnceLock::new();
     *SET.get_or_init(|| set::shade(var("VICTORY_AMBIENT_SHADE").as_deref()))
+}
+
+static SHADE: Mutex<Option<[f32; 4]>> = Mutex::new(None);
+
+/// The level from `VICTORY_AMBIENT_FILE`, if it gave one; starts the thread
+/// that reads the file (diagnostics builds).
+fn live_level() -> Option<f32> {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else { return };
+        let _ = std::thread::Builder::new().name("victory-ambient".into()).spawn(move || {
+            loop {
+                // Not `read_to_string`: it asks for the file's metadata,
+                // which can hang a thread under Wine (`crate::read_file`).
+                let text = crate::read_file(std::path::Path::new(&file)).unwrap_or_default();
+                read_live(&String::from_utf8_lossy(&text));
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    });
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+}
+
+/// Takes what the file's text sets (`set::from_file`).
+fn read_live(text: &str) {
+    match set::from_file(text) {
+        Some(set::FromFile::Follow { follow, shade }) => {
+            if shade.is_some() {
+                *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = shade;
+            }
+            let new = Some(Some(follow));
+            let mut live = FOLLOW.lock().unwrap_or_else(|e| e.into_inner());
+            if *live != new {
+                let [gain, least, power] = follow;
+                tracing::info!(gain, least, power, "ambient light follows the sky, set from the file");
+                *live = new;
+            }
+        }
+        Some(set::FromFile::Constant { level, tint, shade, reflections }) => {
+            *FOLLOW.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+            if shade.is_some() {
+                *SHADE.lock().unwrap_or_else(|e| e.into_inner()) = shade;
+            }
+            if let Some([keep, least]) = reflections {
+                *KEEP.lock().unwrap_or_else(|e| e.into_inner()) = Some(keep);
+                *LEAST.lock().unwrap_or_else(|e| e.into_inner()) = least;
+            }
+            let new = Some((level, tint));
+            let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if *live != new {
+                let [r, g, b] = tint;
+                tracing::info!(level, r, g, b, "ambient light set from the file");
+                *live = new;
+            }
+        }
+        None => {}
+    }
 }
 
 /// Views, used in turn: more than the passes of every list in flight.
@@ -313,7 +402,7 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         });
         return false;
     }
-    let level = level();
+    let level = live_level().unwrap_or_else(level);
     static FIRST: std::sync::Once = std::sync::Once::new();
     FIRST.call_once(|| {
         tracing::info!(
@@ -376,7 +465,7 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         shade,
         follow: sky.as_ref().map_or([0.0, 0.0, 1.0], |s| s.1),
         held,
-        floor: 0.0,
+        floor: *LEAST.lock().unwrap_or_else(|e| e.into_inner()),
         size: [d.Width as u32, d.Height],
         sky: sky.as_ref().map_or([0, 0], |s| s.2),
     });

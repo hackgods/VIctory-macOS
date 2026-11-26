@@ -1112,8 +1112,56 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    note_remap(first, last);
     remapped(&mut guards(), first, last);
     crate::shadow::forget_range(at, len);
+}
+
+/// Title memory the runtime reported mapped, unmapped or freed, pages
+/// `[first, last)`, in order: how many so far, and the last
+/// [`REMAPS_KEPT`] with their numbers. `crate::memory` asks whether a page
+/// it finds with nothing mapped after a list ran can have had memory while
+/// the list ran ([`remapped_since`]).
+static REMAPS: Mutex<Remaps> = Mutex::new((0, std::collections::VecDeque::new()));
+
+/// [`REMAPS`]: the count, and (number, first page, last page) of the last.
+type Remaps = (u64, std::collections::VecDeque<(u64, usize, usize)>);
+const REMAPS_KEPT: usize = 4096;
+
+fn note_remap(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let mut remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    remaps.0 += 1;
+    let n = remaps.0;
+    if remaps.1.len() == REMAPS_KEPT {
+        remaps.1.pop_front();
+    }
+    remaps.1.push_back((n, first, last));
+}
+
+/// The number of the last reported mapping change ([`remapped_since`]).
+pub(crate) fn remap_epoch() -> u64 {
+    REMAPS.lock().unwrap_or_else(|e| e.into_inner()).0
+}
+
+/// Whether a mapping change the runtime reported after `epoch` (from
+/// [`remap_epoch`]) touched page `page` (a page number), or may have: one
+/// no longer kept counts.
+pub(crate) fn remapped_since(epoch: u64, page: usize) -> bool {
+    let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if remaps.0 == epoch {
+        return false;
+    }
+    let oldest = remaps.1.front().map_or(u64::MAX, |&(n, _, _)| n);
+    oldest > epoch + 1
+        || remaps
+            .1
+            .iter()
+            .rev()
+            .take_while(|&&(n, _, _)| n > epoch)
+            .any(|&(_, first, last)| (first..last).contains(&page))
 }
 
 /// Before title memory `[at, at + len)` is unmapped or freed (`len` 0: the
@@ -1129,11 +1177,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// around its unmappings and the title's frees, and a tracker taking the
 /// pages meanwhile leaves them changed, as during a kernel write.
 pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
-    if !fault_tracking() || at == 0 {
+    if at == 0 {
         return Writing { first: 0, last: 0 };
     }
     let len = if len == 0 { allocation_len(at) } else { len };
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    note_remap(first, last);
+    if !fault_tracking() {
+        return Writing { first: 0, last: 0 };
+    }
     let mut g = guards();
     g.busy.push((first, last));
     remapped(&mut g, first, last);
@@ -2168,6 +2220,20 @@ pub(crate) mod tests {
         assert!(t.changed(page / PAGE), "and its writes are seen");
         drop(t);
         free(p);
+    }
+
+    /// A page counts as remapped since a count when a reported change
+    /// after it touched the page; one before it, or elsewhere, does not.
+    #[test]
+    fn remaps_since_a_count_name_their_pages() {
+        let top = usize::MAX / PAGE - 64;
+        let before = remap_epoch();
+        title_memory_remapped(top * PAGE, PAGE);
+        let after = remap_epoch();
+        assert!(after > before);
+        assert!(remapped_since(before, top));
+        assert!(!remapped_since(after, top), "nothing since");
+        assert!(!remapped_since(before, top + 7), "another page");
     }
 
     /// With length 0, the whole allocation at the address goes (as

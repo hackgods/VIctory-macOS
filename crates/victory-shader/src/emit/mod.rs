@@ -222,6 +222,8 @@ mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
 #[cfg(test)]
+mod f64_tests;
+#[cfg(test)]
 mod halves_local_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;

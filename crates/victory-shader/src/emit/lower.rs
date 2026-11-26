@@ -105,6 +105,11 @@ pub(crate) struct Lowered {
     /// Whether the module contains the 32-lane half mask (`!31`).
     #[cfg(test)]
     pub has_half_wave_mask: bool,
+    /// The first dword of each written raw buffer store where the
+    /// translation made it from constants alone
+    /// ([`Module::constant_call_args`](super::bitcode::Module)).
+    #[cfg(test)]
+    pub stored_constants: Vec<Option<u32>>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -1617,6 +1622,11 @@ impl<'a> Lower<'a> {
             uses_lane_index: self.s.m.has_function("dx.op.waveGetLaneIndex"),
             #[cfg(test)]
             has_half_wave_mask: self.s.m.has_i32_const(!31),
+            #[cfg(test)]
+            stored_constants: self
+                .s
+                .m
+                .constant_call_args("dx.op.rawBufferStore.i32", 4),
             dxil: {
                 if let Some(keep) = self.keep {
                     mesh::renumber_rows(&mut self.s.inputs, keep);

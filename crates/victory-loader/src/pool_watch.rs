@@ -10,6 +10,25 @@
 //! many interiors wait in the list of the interiors' per-frame step. It
 //! reads the title's memory and changes nothing.
 //!
+//! More lines say where and for whom:
+//! - `buildings by place`: the buildings in use counted by 500 m square of
+//!   the map (an entity's position is at +0x70: x, y and z as floats, and in
+//!   the fourth dword two signed words that count 32 m in x and in y, as the
+//!   title's own conversion at +0x4dc3790 reads them). Squares are named by
+//!   their centre in km. This tells buildings of places the camera has left
+//!   from too many at the place it is at.
+//! - `interiors`: the interiors by state (0 none to 4 switched on) and, for
+//!   those wanted with their entities, by the module that wants them most
+//!   (14 bytes at +0xb2, one a module: 1 off, 4 with entities, 0x10 all).
+//! - `focus`, once a second: the place of the entity the interiors measure
+//!   their distance from (pointer at +0xab56e38, read in 1,788 places of
+//!   the code: most likely the player, not checked) with the buildings in
+//!   use, to follow the cuts of a sequence between the five-second lines.
+//! - `map pieces`: the pieces of map the title's store (+0xa024230) has
+//!   loaded, with their entities, by the same squares. The store's capacity
+//!   field (+0x44) is a guess from the layout of the title's other pools;
+//!   if the line makes no sense, that guess is wrong.
+//!
 //! That step (RVA 0x16cd4d0) was first read as the step of the whole map
 //! and paced by `VICTORY_MAPDATA_STEPS`; it is the state machine of the
 //! interiors only (its pools are made under the names "InteriorProxy" and
@@ -43,6 +62,28 @@ const WAITING: u32 = 0x076d_5098;
 /// whose low 17 bits are all set while the entry is in use.
 const BUILDINGS: u32 = 0x0a9e_c938;
 const OBJECTS: u32 = 0x0abb_e2e8;
+/// The pool of interiors (0x150 bytes each): the 14 wanted levels at +0xb2,
+/// the state at +0xc1.
+const INTERIORS: u32 = 0x09e5_76c8;
+const INTERIOR_WANTED: usize = 0xb2;
+const MODULES: usize = 14;
+/// The store of map pieces: its slots at +0x38, a slot's size at +0x40, the
+/// number of slots at +0x44 (a guess), a bit per slot in use at +0x60. A
+/// slot starts with the pointer to its loaded contents, which has its
+/// entities' pointers at +0x8 and their number at +0x10.
+const STORE: u32 = 0x0a02_4230;
+/// Pointer to the entity the interiors' distance check measures from.
+const FOCUS: u32 = 0x0ab5_6e38;
+/// An entity's position, and the side of the squares the title counts in
+/// the position's fourth dword.
+const POSITION: usize = 0x70;
+const SECTOR: f32 = 32.0;
+/// The side of a square of the log's lines, and the map's reach: a
+/// position further out than this is not one.
+const SQUARE: f32 = 500.0;
+const REACH: f32 = 16_000.0;
+/// Squares named in a line.
+const NAMED: usize = 8;
 /// A walk of the waiting list stops here: the list is read without the
 /// title's lock, so a node freed under us can lead anywhere.
 const WALK_LIMIT: u32 = 1 << 16;
@@ -65,6 +106,112 @@ pub struct Pool {
 fn pool_from(header: &[u8; 0x28]) -> Pool {
     let dword = |at: usize| u32::from_le_bytes(header[at..at + 4].try_into().unwrap());
     Pool { capacity: dword(0xc), used: dword(0x10), freed: dword(0x24) }
+}
+
+/// The x and y of the map, in metres, of an entity's 16 position bytes;
+/// `None` if they are not a place on the map.
+fn place_of(position: &[u8; 16]) -> Option<(f32, f32)> {
+    let float = |at: usize| f32::from_le_bytes(position[at..at + 4].try_into().unwrap());
+    let word = |at: usize| f32::from(i16::from_le_bytes(position[at..at + 2].try_into().unwrap()));
+    let (x, y) = (float(0) + SECTOR * word(12), float(4) + SECTOR * word(14));
+    (x.abs() <= REACH && y.abs() <= REACH && float(8).abs() <= REACH).then_some((x, y))
+}
+
+/// The once-a-second line.
+fn focus_line(focus: Option<(f32, f32)>, buildings: Option<Pool>) -> String {
+    let focus = match focus {
+        Some((x, y)) => format!("{:.2},{:.2} km", x / 1000.0, y / 1000.0),
+        None => "none".to_owned(),
+    };
+    match buildings {
+        Some(p) => format!("focus {focus}; buildings {} ({} freed so far)", p.used, p.freed),
+        None => format!("focus {focus}"),
+    }
+}
+
+/// Counts by 500 m square.
+#[derive(Default)]
+struct Places {
+    /// Per square: entries, and whatever they carry (a piece's entities).
+    squares: std::collections::HashMap<(i32, i32), (u32, u32)>,
+    /// Entries with no place on the map.
+    nowhere: u32,
+}
+
+impl Places {
+    fn add(&mut self, place: Option<(f32, f32)>, carried: u32) {
+        match place {
+            Some((x, y)) => {
+                let square = ((x / SQUARE).floor() as i32, (y / SQUARE).floor() as i32);
+                let at = self.squares.entry(square).or_default();
+                *at = (at.0 + 1, at.1.saturating_add(carried));
+            }
+            None => self.nowhere += 1,
+        }
+    }
+
+    /// The fullest squares by their centre in km, "x,y n" (or "x,y n/carried"),
+    /// then what is left.
+    fn text(&self, carried: bool) -> String {
+        let mut squares: Vec<_> = self.squares.iter().collect();
+        squares.sort_by_key(|&(&square, &(n, c))| (std::cmp::Reverse(if carried { c } else { n }), square));
+        let km = |i: i32| (i as f32 + 0.5) * SQUARE / 1000.0;
+        let mut out: Vec<String> = squares
+            .iter()
+            .take(NAMED)
+            .map(|&(&(x, y), &(n, c))| {
+                if carried { format!("{:.2},{:.2} {n}/{c}", km(x), km(y)) } else { format!("{:.2},{:.2} {n}", km(x), km(y)) }
+            })
+            .collect();
+        if squares.len() > NAMED {
+            let rest = squares[NAMED..].iter().fold((0u32, 0u32), |a, &(_, &(n, c))| (a.0 + n, a.1.saturating_add(c)));
+            let rest = if carried { format!("{}/{}", rest.0, rest.1) } else { rest.0.to_string() };
+            out.push(format!("{} more squares {rest}", squares.len() - NAMED));
+        }
+        if self.nowhere != 0 {
+            out.push(format!("nowhere {}", self.nowhere));
+        }
+        if out.is_empty() { "none".to_owned() } else { out.join("; ") }
+    }
+}
+
+/// The interiors by state, and those wanted with their entities by module.
+#[derive(Default, Debug, PartialEq, Eq)]
+struct Interiors {
+    states: [u32; 5],
+    odd_state: u32,
+    wanted_by: [u32; MODULES],
+}
+
+impl Interiors {
+    /// One interior's 16 bytes from +0xb2: the wanted levels, then at +0xc1
+    /// its state.
+    fn add(&mut self, bytes: &[u8; 16]) {
+        match self.states.get_mut(usize::from(bytes[15])) {
+            Some(n) => *n += 1,
+            None => self.odd_state += 1,
+        }
+        // As the title's step does: the highest level wins, the first module
+        // that has it. 4 and up means "with its entities".
+        let wanted = &bytes[..MODULES];
+        let most = wanted.iter().copied().max().unwrap_or(0);
+        if (4..=0x10).contains(&most)
+            && let Some(module) = wanted.iter().position(|&level| level == most)
+        {
+            self.wanted_by[module] += 1;
+        }
+    }
+
+    fn text(&self) -> String {
+        let [a, b, c, d, e] = self.states;
+        let by: Vec<String> =
+            self.wanted_by.iter().enumerate().filter(|&(_, &n)| n != 0).map(|(m, n)| format!("{m}:{n}")).collect();
+        let odd = if self.odd_state != 0 { format!(" (other {})", self.odd_state) } else { String::new() };
+        format!(
+            "interiors: in state 0/1/2/3/4 {a}/{b}/{c}/{d}/{e}{odd}, wanted with entities by module {}",
+            if by.is_empty() { "none".to_owned() } else { by.join(" ") }
+        )
+    }
 }
 
 /// The log line.
@@ -96,22 +243,29 @@ fn known(base: u64) -> bool {
     }
 }
 
-/// Reads of the title's memory that cannot fault: a page is asked about
-/// before it is read, and the answer for the last page is kept.
+/// Reads of the title's memory that do not fault on a wild pointer: an
+/// address is asked about before it is read, and the last few answers (whole
+/// runs of readable pages) are kept until [`Reader::forget`].
 #[cfg(windows)]
 #[derive(Default)]
 struct Reader {
-    page: Option<usize>,
+    /// Runs of committed, readable pages, `start..end`.
+    runs: [(usize, usize); 16],
+    next: usize,
 }
 
 #[cfg(windows)]
 impl Reader {
+    /// Forgets the answers: the title maps and unmaps memory as it runs.
+    fn forget(&mut self) {
+        *self = Self::default();
+    }
+
     fn readable(&mut self, address: usize) -> bool {
         use windows_sys::Win32::System::Memory::{
             MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
         };
-        let page = address & !0xfff;
-        if self.page == Some(page) {
+        if self.runs.iter().any(|&(start, end)| (start..end).contains(&address)) {
             return true;
         }
         // SAFETY: a zeroed MEMORY_BASIC_INFORMATION is valid.
@@ -122,7 +276,11 @@ impl Reader {
             && info.State == MEM_COMMIT
             && info.Protect & PAGE_GUARD == 0
             && info.Protect & 0xff != PAGE_NOACCESS;
-        self.page = ok.then_some(page);
+        if ok {
+            let start = info.BaseAddress as usize;
+            self.runs[self.next] = (start, start.saturating_add(info.RegionSize));
+            self.next = (self.next + 1) % self.runs.len();
+        }
         ok
     }
 
@@ -142,6 +300,80 @@ impl Reader {
     fn pool(&mut self, at: usize) -> Option<Pool> {
         let header = self.pointer(at)?;
         self.bytes::<0x28>(header).map(|h| pool_from(&h))
+    }
+
+    fn dword(&mut self, address: usize) -> Option<u32> {
+        self.bytes::<4>(address).map(u32::from_le_bytes)
+    }
+
+    /// The entries in use of the pool whose pointer is at `at`: each one's
+    /// address goes to `each`. `None` if the pool is not there.
+    fn in_use(&mut self, at: usize, mut each: impl FnMut(&mut Self, usize)) -> Option<()> {
+        let header = self.pointer(at)?;
+        let h = self.bytes::<0x38>(header)?;
+        let pointer = |at: usize| usize::from_le_bytes(h[at..at + 8].try_into().unwrap());
+        let dword = |at: usize| u32::from_le_bytes(h[at..at + 4].try_into().unwrap());
+        let (storage, size, capacity, flags, mask) = (pointer(0), dword(8), dword(0xc), pointer(0x28), dword(0x30));
+        if storage == 0 || flags == 0 || capacity > 1 << 22 {
+            return None;
+        }
+        for i in 0..capacity as usize {
+            // As the title tests it: in use while every bit of the mask is set.
+            if self.dword(flags + 4 * i).is_some_and(|f| !f & mask == 0) {
+                each(self, storage + i * size as usize);
+            }
+        }
+        Some(())
+    }
+
+    /// The buildings (or objects) in use by place.
+    fn places(&mut self, at: usize) -> Option<Places> {
+        let mut places = Places::default();
+        self.in_use(at, |reader, entity| {
+            places.add(reader.bytes::<16>(entity + POSITION).as_ref().and_then(place_of), 0);
+        })?;
+        Some(places)
+    }
+
+    fn interiors(&mut self, at: usize) -> Option<Interiors> {
+        let mut interiors = Interiors::default();
+        self.in_use(at, |reader, interior| {
+            if let Some(bytes) = reader.bytes::<16>(interior + INTERIOR_WANTED) {
+                interiors.add(&bytes);
+            }
+        })?;
+        Some(interiors)
+    }
+
+    /// The store's loaded pieces by the place of their first entity, each
+    /// carrying its number of entities; with them the slots in use.
+    fn pieces(&mut self, store: usize) -> Option<(u32, Places)> {
+        let (slots, size, capacity, bits) = (
+            self.pointer(store + 0x38)?,
+            self.dword(store + 0x40)? as usize,
+            self.dword(store + 0x44)? as usize,
+            self.pointer(store + 0x60)?,
+        );
+        if slots == 0 || bits == 0 || !(8..=0x1000).contains(&size) || capacity > 1 << 22 {
+            return None;
+        }
+        let (mut used, mut places) = (0, Places::default());
+        for i in 0..capacity {
+            if !self.bytes::<1>(bits + i / 8).is_some_and(|b| b[0] >> (i % 8) & 1 == 1) {
+                continue;
+            }
+            used += 1;
+            let Some(contents) = self.pointer(slots + i * size).filter(|&c| c != 0) else { continue };
+            let (Some(entities), Some(n)) = (self.pointer(contents + 0x8), self.dword(contents + 0x10)) else {
+                continue;
+            };
+            // Entities the title left out are null: the first that is there.
+            let first = (0..n.min(16) as usize)
+                .find_map(|k| self.pointer(entities + 8 * k).filter(|&e| e != 0));
+            let place = first.and_then(|e| self.bytes::<16>(e + POSITION)).as_ref().and_then(place_of);
+            places.add(place, n.min(1 << 20));
+        }
+        Some((used, places))
     }
 
     /// Nodes in the waiting list, and whether the walk was cut short.
@@ -172,13 +404,47 @@ pub fn watch(base: u64) -> Result<(), &'static str> {
         .name("victory pool watch".into())
         .spawn(move || {
             let mut reader = Reader::default();
+            let mut second = 0u64;
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                reader.page = None;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                second += 1;
+                reader.forget();
                 let buildings = reader.pool(base + BUILDINGS as usize);
+                let focus = reader
+                    .pointer(base + FOCUS as usize)
+                    .and_then(|entity| reader.bytes::<16>(entity + POSITION))
+                    .as_ref()
+                    .and_then(place_of);
+                tracing::info!("{}", focus_line(focus, buildings));
+                if !second.is_multiple_of(5) {
+                    continue;
+                }
                 let objects = reader.pool(base + OBJECTS as usize);
                 let waiting = reader.waiting(base + WAITING as usize);
                 tracing::info!("{}", line(buildings, objects, waiting));
+                let text = |places: Option<Places>| places.map_or("unknown".to_owned(), |p| p.text(false));
+                tracing::info!(
+                    "buildings by place (500 m squares, centre in km, count): {}",
+                    text(reader.places(base + BUILDINGS as usize))
+                );
+                tracing::info!("objects by place: {}", text(reader.places(base + OBJECTS as usize)));
+                match reader.interiors(base + INTERIORS as usize) {
+                    Some(interiors) => tracing::info!("{}", interiors.text()),
+                    None => tracing::info!("interiors: unknown"),
+                }
+                // The store's dwords from +0x40 go along: the slot size, then
+                // the guessed capacity and its neighbours, to check the guess.
+                let fields = reader
+                    .bytes::<0x14>(base + STORE as usize + 0x40)
+                    .map(|b| b.chunks(4).map(|d| u32::from_le_bytes(d.try_into().unwrap()).to_string()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                match reader.pieces(base + STORE as usize) {
+                    Some((used, places)) => tracing::info!(
+                        "map pieces: {used} slots in use (store +0x40.. {fields}); loaded by place (pieces/entities): {}",
+                        places.text(true)
+                    ),
+                    None => tracing::info!("map pieces: the store is not as read (store +0x40.. {fields})"),
+                }
             }
         })
         .map(|_| ())
@@ -214,6 +480,98 @@ mod tests {
         // The free list's head: an empty list (0x1fffe) after 5821 frees.
         header[0x20..0x28].copy_from_slice(&0x16bd_0001_fffeu64.to_le_bytes());
         assert_eq!(pool_from(&header), Pool { used: 22_196, capacity: 22_500, freed: 5821 });
+    }
+
+    fn position(x: f32, y: f32, z: f32, sx: i16, sy: i16) -> [u8; 16] {
+        let mut p = [0u8; 16];
+        p[0..4].copy_from_slice(&x.to_le_bytes());
+        p[4..8].copy_from_slice(&y.to_le_bytes());
+        p[8..12].copy_from_slice(&z.to_le_bytes());
+        p[12..14].copy_from_slice(&sx.to_le_bytes());
+        p[14..16].copy_from_slice(&sy.to_le_bytes());
+        p
+    }
+
+    #[test]
+    fn a_position_is_its_floats_plus_32_m_squares() {
+        // The waterfront of the crash logs, about -488, -5413.
+        assert_eq!(place_of(&position(24.0, 27.0, 3.0, -16, -170)), Some((-488.0, -5413.0)));
+        assert_eq!(place_of(&position(5.0, 6.0, 0.0, 0, 0)), Some((5.0, 6.0)));
+        assert_eq!(place_of(&position(f32::NAN, 0.0, 0.0, 0, 0)), None);
+        assert_eq!(place_of(&position(0.0, 0.0, 0.0, 1000, 0)), None, "32 km out is not on the map");
+        assert_eq!(place_of(&position(0.0, 0.0, 1.0e9, 0, 0)), None);
+    }
+
+    #[test]
+    fn the_focus_line_is_in_km() {
+        let pool = Pool { used: 10_853, capacity: 22_500, freed: 4361 };
+        assert_eq!(
+            focus_line(Some((-488.4, -5413.8)), Some(pool)),
+            "focus -0.49,-5.41 km; buildings 10853 (4361 freed so far)"
+        );
+        assert_eq!(focus_line(None, None), "focus none");
+    }
+
+    #[test]
+    fn places_name_the_fullest_squares_first() {
+        let mut places = Places::default();
+        for _ in 0..3 {
+            places.add(Some((-488.0, -5413.0)), 0);
+        }
+        places.add(Some((737.0, 6523.0)), 0);
+        places.add(None, 0);
+        assert_eq!(places.text(false), "-0.25,-5.25 3; 0.75,6.75 1; nowhere 1");
+        assert_eq!(Places::default().text(false), "none");
+
+        let mut pieces = Places::default();
+        pieces.add(Some((10.0, 10.0)), 5);
+        pieces.add(Some((20.0, 20.0)), 7);
+        pieces.add(Some((-10.0, 10.0)), 100);
+        assert_eq!(pieces.text(true), "-0.25,0.25 1/100; 0.25,0.25 2/12");
+
+        let mut many = Places::default();
+        for i in 0..(NAMED as i32 + 2) {
+            for _ in 0..=i {
+                many.add(Some((i as f32 * SQUARE + 1.0, 1.0)), 0);
+            }
+        }
+        assert!(many.text(false).starts_with("4.75,0.25 10; 4.25,0.25 9; "));
+        assert!(many.text(false).ends_with("; 2 more squares 3"));
+    }
+
+    #[test]
+    fn interiors_count_by_state_and_by_the_module_that_wants_most() {
+        let mut interiors = Interiors::default();
+        let mut off = [1u8; 16];
+        off[14] = 0;
+        off[15] = 0;
+        interiors.add(&off);
+        let mut on = off;
+        on[5] = 0x10;
+        on[9] = 0x10;
+        on[2] = 4;
+        on[15] = 4;
+        interiors.add(&on);
+        let mut partly = off;
+        partly[6] = 4;
+        partly[15] = 2;
+        interiors.add(&partly);
+        let mut shell = off;
+        shell[3] = 2;
+        shell[15] = 1;
+        interiors.add(&shell);
+        let mut odd = off;
+        odd[15] = 9;
+        interiors.add(&odd);
+        assert_eq!(interiors.states, [1, 1, 1, 0, 1]);
+        assert_eq!(interiors.odd_state, 1);
+        assert_eq!(interiors.wanted_by[5], 1, "the first module with the highest level");
+        assert_eq!(interiors.wanted_by[6], 1);
+        assert_eq!(interiors.wanted_by.iter().sum::<u32>(), 2);
+        assert_eq!(
+            interiors.text(),
+            "interiors: in state 0/1/2/3/4 1/1/1/0/1 (other 1), wanted with entities by module 5:1 6:1"
+        );
     }
 
     #[test]

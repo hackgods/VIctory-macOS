@@ -997,6 +997,11 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// The budget this list's indirect executions charge instead of its
+    /// own: that of the host list before it, where the title list was cut
+    /// only for a run of indirect draws ([`HostList::continue_budget`]).
+    /// The buffer, its host address and where it is mapped.
+    budget_from: Mutex<Option<(ID3D12Resource, u64, usize)>>,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
@@ -1375,6 +1380,7 @@ impl Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                budget_from: Mutex::new(None),
                 arguments: Mutex::new(None),
                 writes: Default::default(),
                 hoisted: Mutex::default(),
@@ -2301,6 +2307,7 @@ impl HostList {
             (scratch.current, scratch.used) = (0, 0);
         }
         self.writes.store(0, Ordering::Relaxed);
+        self.own_budget();
         {
             let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
             (hoisted.used, hoisted.at, hoisted.readable) = (0, 0, false);
@@ -2820,6 +2827,9 @@ impl HostList {
     /// The host address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        if let Some((_, gpu, _)) = self.budget_from.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return Some(*gpu);
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -2838,6 +2848,53 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// From here on this list's indirect executions charge the budget
+    /// `before` charges, and do not zero it: `before` is the host list just
+    /// before it in a title list that was cut between them only for a run
+    /// of indirect draws (`crate::list`, hoisted clamps). The executions of
+    /// both then share one budget, charged in the title's order, as they do
+    /// in the one host list they are recorded in without that cut; so the
+    /// records past the budget are the same ones with and without it.
+    /// (A host submission's zeroing is done before its first list runs, and
+    /// the two run in order: in one submission, or `before` in an earlier
+    /// one.) The buffer lives as long as either list names it.
+    pub(crate) fn continue_budget(&self, before: &HostList) {
+        let Some(gpu) = before.budget() else { return };
+        let theirs = before.budget_from.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let from = theirs.or_else(|| {
+            let (buffer, data) = before.budget.get()?.as_ref()?;
+            Some((buffer.clone(), gpu, *data))
+        });
+        *self.budget_from.lock().unwrap_or_else(|e| e.into_inner()) = from;
+    }
+
+    /// The list's indirect executions charge its own budget (again).
+    pub(crate) fn own_budget(&self) {
+        *self.budget_from.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The work charged so far to the budget the list's indirect executions
+    /// charge, as its word is now (read when the list is not running).
+    #[cfg(test)]
+    pub(crate) fn budget_spent(&self) -> u32 {
+        let from = self.budget_from.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map(|b| b.2);
+        let at = from.or_else(|| self.budget.get().and_then(|b| b.as_ref()).map(|b| b.1)).unwrap_or(0);
+        // SAFETY: a mapped word of a live buffer.
+        if at == 0 { 0 } else { unsafe { (at as *const u32).read_volatile() } }
+    }
+
+    /// A command of this list reads `[address, address + len)` of title
+    /// buffers through the host list before it (the hoisted clamp of an
+    /// indirect draw, whose refresh that list holds): noted like this
+    /// list's own reads ([`HostList::defer_refresh`]), so that a title copy
+    /// into them recorded here keeps its order with the draw
+    /// (`VICTORY_COPY_ORDER=split`).
+    pub(crate) fn note_hoisted_read(&self, address: usize, len: usize) {
+        if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+            self.deferred().reads.insert(address, address.saturating_add(len), 0);
+        }
     }
 
     /// The list's argument buffer, at least `bytes` long, common between

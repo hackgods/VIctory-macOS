@@ -1959,6 +1959,7 @@ impl State {
             .and_then(|clamps| {
                 let out = crate::indirect::bound_before(&clamps, list, args.gpu(arguments), (kind, stride, max), counted)?;
                 args.refresh(&clamps, arguments, len);
+                list.note_hoisted_read(arguments as usize, len.min(args.left(arguments)) as usize);
                 if let Some((s, at)) = &counter {
                     s.refresh(&clamps, *at, 4);
                 }

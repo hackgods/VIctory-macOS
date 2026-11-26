@@ -240,6 +240,8 @@ fn start_run(this: This, state: &mut crate::draw::State) {
     let Some(next) = next_segment(this) else { return };
     HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.cut(next);
+    // One budget on both sides of this cut, as without it.
+    next.continue_budget(&clamps);
     state.hoist(clamps, next);
 }
 
@@ -318,6 +320,8 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
             next.defer_wait(wait);
             return;
         }
+        // (What follows a wait has a budget of its own, as in a new list.)
+        current.own_budget();
         current.defer_wait(wait);
     }
     #[cfg(not(windows))]
@@ -2259,7 +2263,9 @@ mod tests {
     /// draw of a run cuts the title list, the host list before staying open
     /// for the run's clamps; draws of the same run add no cut until
     /// something may have written arguments, and a wait ends the run. The
-    /// host lists run in order, and a reset starts from one again.
+    /// host list after such a cut goes on with the budget of the one
+    /// before; after a wait it has its own. The host lists run in order,
+    /// and a reset starts from one again.
     #[cfg(windows)]
     #[test]
     fn indirect_draws_cut_lists_for_hoisted_clamps() {
@@ -2286,6 +2292,7 @@ mod tests {
             assert_eq!(segments(list).len(), 2);
             let draws = host_list(list).unwrap();
             assert!(state.lock().unwrap().hoists_into(draws));
+            assert_eq!(draws.budget(), segments(list)[0].budget(), "one budget across the cut");
             start();
             assert_eq!(segments(list).len(), 2, "the same run");
             draws.count_write();
@@ -2297,6 +2304,7 @@ mod tests {
             wait64(list, 0x1000, 0, 0, 0);
             assert!(!state.lock().unwrap().hoists_into(host_list(list).unwrap()));
             assert_eq!(segments(list).len(), 3);
+            assert_ne!(host_list(list).unwrap().budget(), segments(list)[1].budget(), "a budget of its own after a wait");
             start();
             assert_eq!(segments(list).len(), 4);
             assert_eq!(close(list), S_OK);
@@ -2305,6 +2313,60 @@ mod tests {
             drop(all);
             assert_eq!(reset(list, allocator, null), S_OK);
             assert_eq!(segments(list).len(), 1);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// With `VICTORY_COPY_ORDER=split`, the arguments of an indirect draw
+    /// whose clamp is hoisted are read by the list before the one that
+    /// draws; they are noted in the drawing list too, so a title copy into
+    /// them recorded there cuts it as it does without hoisting. The cut
+    /// ends the run (its list of clamps closes) and the part after the copy
+    /// has a budget of its own, as without hoisting.
+    #[cfg(windows)]
+    #[test]
+    fn a_copy_into_the_arguments_of_a_hoisted_draw_cuts_the_list() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let null = std::ptr::null();
+        let (target, source) = (title_buffer(4096), title_buffer(256));
+        let at = crate::resource::buffer_bytes(target).unwrap().0 as u64;
+        let from = crate::resource::buffer_bytes(source).unwrap().0 as u64;
+        let copy = crate::shadow::find(at, 4096).expect("the buffer's host copy");
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: our list.
+        let state = unsafe { &(*list.cast::<List>()).state };
+        start_run(list, &mut state.lock().unwrap());
+        let hosts = segments(list);
+        assert_eq!(hosts.len(), 2);
+        // An indirect draw with 16 bytes of arguments at 0x100, as
+        // `State::execute_indirect` records it with its clamp hoisted.
+        let gpu = copy.gpu(at + 0x100);
+        let clamped = crate::indirect::bound_before(&hosts[0], &hosts[1], gpu, (0, 16, 1), None);
+        assert!(clamped.is_some());
+        copy.refresh(&hosts[0], at + 0x100, 16);
+        hosts[1].note_hoisted_read(at as usize + 0x100, 16);
+        // A copy elsewhere stays in the drawing list; one into the
+        // arguments cuts it.
+        copy_memory(list, at + 0x200, from, 32, 0);
+        assert_eq!(segments(list).len(), 2);
+        assert!(!state.lock().unwrap().hoists_into(&hosts[1]), "a copy ends the run");
+        copy_memory(list, at + 0x108, from, 4, 0);
+        let hosts = segments(list);
+        assert_eq!(hosts.len(), 3);
+        assert!(hosts[2].after_copy());
+        assert_eq!(hosts[1].budget(), hosts[0].budget());
+        assert_ne!(hosts[2].budget(), hosts[0].budget(), "a budget of its own after the copy");
+        assert_eq!(close(list), S_OK);
+        // Every part is closed and runs, the clamps before their draw.
+        for part in crate::host::copy_order_parts(hosts) {
+            host.execute(&part.iter().map(|s| &**s).collect::<Vec<_>>());
         }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);

@@ -730,6 +730,81 @@ mod tests {
         }
     }
 
+    /// A title list cut for runs of indirect draws charges one budget in
+    /// the title's order, as the one host list it would be without the cuts
+    /// does: a dispatch clamped in the first list, a draw of two garbage
+    /// records and one of small records hoisted into it, a dispatch clamped
+    /// in the second list and a small draw hoisted into that. The dispatch
+    /// and the first garbage record run and take the budget; everything
+    /// after runs empty, in the lists after the cuts too. With a budget for
+    /// each list (`chained` off: lists cut at a wait) the second list's
+    /// executions run.
+    #[test]
+    fn a_list_cut_for_a_run_goes_on_with_the_budget_before_it() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let words = |b: &super::ID3D12Resource, at: u64, n: usize| -> Vec<u32> {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a mapped buffer of ours, read once its lists have run.
+            unsafe {
+                b.Map(0, None, Some(&mut data)).unwrap();
+                (0..n).map(|i| data.cast::<u8>().add(at as usize).cast::<u32>().add(i * 4).read_volatile()).collect()
+            }
+        };
+        let (title, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: our mapped buffer, written before the lists run.
+        let gpu = unsafe {
+            // A dispatch of 4 groups at 0; two garbage draws at 16; two
+            // small draws at 48.
+            let w = data.cast::<u32>();
+            for (i, v) in [4, 1, 1, 0].into_iter().chain([u32::MAX; 8]).chain([3, 1, 0, 0, 3, 1, 0, 0]).enumerate() {
+                w.add(i).write_volatile(v);
+            }
+            title.GetGPUVirtualAddress()
+        };
+        for chained in [true, false] {
+            let lists = [host.new_list().unwrap(), host.new_list().unwrap(), host.new_list().unwrap()];
+            if chained {
+                lists[1].continue_budget(&lists[0]);
+                lists[2].continue_budget(&lists[1]);
+            }
+            let a = super::bound(&lists[0], gpu, (2, 12, 1), None).unwrap();
+            super::done(&lists[0], &a);
+            let garbage = super::bound_before(&lists[0], &lists[1], gpu + 16, (0, 16, 2), None).unwrap();
+            let small = super::bound_before(&lists[0], &lists[1], gpu + 48, (0, 16, 2), None).unwrap();
+            lists[1].clamp_end(&lists[0]);
+            lists[0].close();
+            let b = super::bound(&lists[1], gpu, (2, 12, 1), None).unwrap();
+            super::done(&lists[1], &b);
+            let last = super::bound_before(&lists[1], &lists[2], gpu + 48, (0, 16, 2), None).unwrap();
+            lists[2].clamp_end(&lists[1]);
+            lists[1].close();
+            lists[2].close();
+            host.execute(&[&lists[0], &lists[1], &lists[2]]);
+            assert_eq!(words(&a, 0, 1), [4], "the dispatch before the run");
+            assert_eq!(words(&garbage.0, garbage.1, 2), [1 << 24, 0], "the budget ends in the first draw");
+            assert_eq!(words(&small.0, small.1, 2), [0, 0], "the draw after it runs empty");
+            if chained {
+                assert_eq!(words(&b, 0, 1), [0], "and the dispatch after the cut");
+                assert_eq!(words(&last.0, last.1, 2), [0, 0], "and the draw of the next run");
+                assert_eq!(lists[2].budget_spent(), 1 << 27);
+                assert_eq!(lists[0].budget_spent(), 1 << 27, "one budget");
+            } else {
+                assert_eq!(words(&b, 0, 1), [4], "a budget of its own");
+                assert_eq!(words(&last.0, last.1, 2), [3, 3]);
+                assert_eq!(lists[1].budget_spent(), 4 * 64 + 6);
+            }
+            // A list reset has its own budget again.
+            lists[2].reset();
+            let again = super::bound(&lists[2], gpu, (2, 12, 1), None).unwrap();
+            super::done(&lists[2], &again);
+            lists[2].close();
+            host.execute(&[&lists[2]]);
+            assert_eq!((words(&again, 0, 1), lists[2].budget_spent()), (vec![4], 4 * 64));
+        }
+    }
+
     /// The budget is the list's: a second execution of the same records
     /// finds it spent, and they all run empty.
     #[test]

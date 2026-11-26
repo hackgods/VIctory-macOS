@@ -25,9 +25,23 @@
 //!   the code: most likely the player, not checked) with the buildings in
 //!   use, to follow the cuts of a sequence between the five-second lines.
 //! - `map pieces`: the pieces of map the title's store (+0xa024230) has
-//!   loaded, with their entities, by the same squares. The store's capacity
-//!   field (+0x44) is a guess from the layout of the title's other pools;
-//!   if the line makes no sense, that guess is wrong.
+//!   loaded, with their entities, by the same squares (capacity at +0x44;
+//!   the run of 12:34 showed 187,000 slots of 48 bytes, which fits).
+//! - `map pieces near`, `mid`, `far` (within 1 km of the focus, within 3 km,
+//!   further) and `nowhere`: the loaded pieces by what the title's own
+//!   "remove if nobody needs it" (+0x23cac30) looks at. A group is written
+//!   `b<box> i<flags> r<refs> d<dependents> pieces/entities`:
+//!   - box: the piece's word in the box streamer's table (pointer at store
+//!     +0xe0), low 9 bits. Any of 0x79 set means a search still asks for the
+//!     piece; with 0x80 set the piece is switched by script and 0x100 says on.
+//!   - flags, refs, dependents: from the piece's streaming record (the
+//!     engine at +0x764b240 keeps 28-byte records in 503 buckets): the byte
+//!     at +0x19 (bit 0 is "do not delete"), the words at +0xc and +0xe
+//!     added, the word at +0x14. `i--` if there is no record.
+//!
+//!   Pieces far from the focus that still have a search bit are held by
+//!   whoever sets that bit; with no bit and no "do not delete" they are free
+//!   to go and something does not remove them.
 //!
 //! That step (RVA 0x16cd4d0) was first read as the step of the whole map
 //! and paced by `VICTORY_MAPDATA_STEPS`; it is the state machine of the
@@ -74,6 +88,18 @@ const MODULES: usize = 14;
 const STORE: u32 = 0x0a02_4230;
 /// Pointer to the entity the interiors' distance check measures from.
 const FOCUS: u32 = 0x0ab5_6e38;
+/// The streaming engine (pointer): 503 buckets of 0xa0 bytes; a bucket's
+/// records (28 bytes, the object's number in the low 28 bits of the first
+/// dword) are counted at +0x24 and start at the pointer at +0x28, both
+/// shifted by 16 bytes times the dword at the engine's +0x14.
+const ENGINE: u32 = 0x0764_b240;
+const BUCKETS: usize = 503;
+const RECORD: usize = 0x1c;
+/// A piece is near the focus within this, far beyond the second.
+const NEAR: f32 = 1000.0;
+const FAR: f32 = 3000.0;
+/// Groups named in a class of pieces.
+const GROUPS: usize = 6;
 /// An entity's position, and the side of the squares the title counts in
 /// the position's fourth dword.
 const POSITION: usize = 0x70;
@@ -172,6 +198,58 @@ impl Places {
             out.push(format!("nowhere {}", self.nowhere));
         }
         if out.is_empty() { "none".to_owned() } else { out.join("; ") }
+    }
+}
+
+/// What the title's "remove if nobody needs it" looks at for one piece:
+/// the box streamer's word (low 9 bits), the streaming record's flags byte
+/// (`None` without a record), its two reference words added, its dependents.
+type Need = (u16, Option<u8>, u32, u16);
+
+/// The class of a piece by its distance from the focus: near, mid, far,
+/// nowhere (no place, or no focus to measure from).
+fn class_of(place: Option<(f32, f32)>, focus: Option<(f32, f32)>) -> usize {
+    match (place, focus) {
+        (Some((x, y)), Some((fx, fy))) => match (x - fx).hypot(y - fy) {
+            d if d < NEAR => 0,
+            d if d < FAR => 1,
+            _ => 2,
+        },
+        _ => 3,
+    }
+}
+const CLASSES: [&str; 4] = ["near", "mid", "far", "nowhere"];
+
+/// The pieces of one class by need, each with its entities.
+#[derive(Default)]
+struct Needs {
+    groups: std::collections::HashMap<Need, (u32, u32)>,
+}
+
+impl Needs {
+    fn add(&mut self, need: Need, entities: u32) {
+        let at = self.groups.entry(need).or_default();
+        *at = (at.0 + 1, at.1.saturating_add(entities));
+    }
+
+    /// The total, then the groups with the most entities.
+    fn text(&self) -> String {
+        let total = self.groups.values().fold((0u32, 0u32), |a, &(n, e)| (a.0 + n, a.1.saturating_add(e)));
+        let mut groups: Vec<_> = self.groups.iter().collect();
+        groups.sort_by_key(|&(&need, &(n, e))| (std::cmp::Reverse(e), std::cmp::Reverse(n), need));
+        let mut out: Vec<String> = groups
+            .iter()
+            .take(GROUPS)
+            .map(|&(&(b, i, r, d), &(n, e))| {
+                let i = i.map_or("--".to_owned(), |i| format!("{i:02x}"));
+                format!("b{b:03x} i{i} r{r} d{d} {n}/{e}")
+            })
+            .collect();
+        if groups.len() > GROUPS {
+            let rest = groups[GROUPS..].iter().fold((0u32, 0u32), |a, &(_, &(n, e))| (a.0 + n, a.1.saturating_add(e)));
+            out.push(format!("{} more groups {}/{}", groups.len() - GROUPS, rest.0, rest.1));
+        }
+        format!("{}/{}: {}", total.0, total.1, if out.is_empty() { "none".to_owned() } else { out.join("; ") })
     }
 }
 
@@ -345,9 +423,22 @@ impl Reader {
         Some(interiors)
     }
 
-    /// The store's loaded pieces by the place of their first entity, each
-    /// carrying its number of entities; with them the slots in use.
-    fn pieces(&mut self, store: usize) -> Option<(u32, Places)> {
+    /// The streaming record of the object numbered `object`.
+    fn record(&mut self, engine: usize, object: u32) -> Option<[u8; RECORD]> {
+        let shift = self.dword(engine + 0x14).filter(|&s| s < 8)? as usize;
+        let bucket = engine + (object as usize % BUCKETS) * 0xa0 + shift * 0x10;
+        let (n, records) = (self.dword(bucket + 0x24)? as usize, self.pointer(bucket + 0x28)?);
+        (0..n.min(1 << 14)).find_map(|k| {
+            let at = records + k * RECORD;
+            (self.dword(at)? & 0x0fff_ffff == object).then(|| self.bytes::<RECORD>(at))?
+        })
+    }
+
+    /// The store's loaded pieces: the slots in use, the pieces by the place
+    /// of their first entity (each carrying its number of entities), and
+    /// the pieces by need in the four classes of distance from `focus`.
+    fn pieces(&mut self, base: usize, focus: Option<(f32, f32)>) -> Option<(u32, Places, [Needs; 4])> {
+        let store = base + STORE as usize;
         let (slots, size, capacity, bits) = (
             self.pointer(store + 0x38)?,
             self.dword(store + 0x40)? as usize,
@@ -357,7 +448,14 @@ impl Reader {
         if slots == 0 || bits == 0 || !(8..=0x1000).contains(&size) || capacity > 1 << 22 {
             return None;
         }
-        let (mut used, mut places) = (0, Places::default());
+        // For the needs: the store's first object number, the box
+        // streamer's word per slot, the engine. Without them the needs say so.
+        let (first_object, box_words, engine) = (
+            self.dword(store + 0x8).unwrap_or(0),
+            self.pointer(store + 0xe0).unwrap_or(0),
+            self.pointer(base + ENGINE as usize).unwrap_or(0),
+        );
+        let (mut used, mut places, mut needs) = (0, Places::default(), <[Needs; 4]>::default());
         for i in 0..capacity {
             if !self.bytes::<1>(bits + i / 8).is_some_and(|b| b[0] >> (i % 8) & 1 == 1) {
                 continue;
@@ -367,13 +465,22 @@ impl Reader {
             let (Some(entities), Some(n)) = (self.pointer(contents + 0x8), self.dword(contents + 0x10)) else {
                 continue;
             };
+            let n = n.min(1 << 20);
             // Entities the title left out are null: the first that is there.
             let first = (0..n.min(16) as usize)
                 .find_map(|k| self.pointer(entities + 8 * k).filter(|&e| e != 0));
             let place = first.and_then(|e| self.bytes::<16>(e + POSITION)).as_ref().and_then(place_of);
-            places.add(place, n.min(1 << 20));
+            places.add(place, n);
+            let box_word = self.bytes::<2>(box_words + 2 * i).map_or(0xffff, u16::from_le_bytes);
+            let record = self.record(engine, first_object.wrapping_add(i as u32));
+            let word = |r: &[u8; RECORD], at: usize| u16::from_le_bytes(r[at..at + 2].try_into().unwrap());
+            let need: Need = match record.as_ref() {
+                Some(r) => (box_word & 0x1ff, Some(r[0x19]), u32::from(word(r, 0xc)) + u32::from(word(r, 0xe)), word(r, 0x14)),
+                None => (box_word & 0x1ff, None, 0, 0),
+            };
+            needs[class_of(place, focus)].add(need, n);
         }
-        Some((used, places))
+        Some((used, places, needs))
     }
 
     /// Nodes in the waiting list, and whether the walk was cut short.
@@ -438,11 +545,16 @@ pub fn watch(base: u64) -> Result<(), &'static str> {
                     .bytes::<0x14>(base + STORE as usize + 0x40)
                     .map(|b| b.chunks(4).map(|d| u32::from_le_bytes(d.try_into().unwrap()).to_string()).collect::<Vec<_>>().join(" "))
                     .unwrap_or_default();
-                match reader.pieces(base + STORE as usize) {
-                    Some((used, places)) => tracing::info!(
-                        "map pieces: {used} slots in use (store +0x40.. {fields}); loaded by place (pieces/entities): {}",
-                        places.text(true)
-                    ),
+                match reader.pieces(base, focus) {
+                    Some((used, places, needs)) => {
+                        tracing::info!(
+                            "map pieces: {used} slots in use (store +0x40.. {fields}); loaded by place (pieces/entities): {}",
+                            places.text(true)
+                        );
+                        for (class, needs) in CLASSES.iter().zip(&needs) {
+                            tracing::info!("map pieces {class} (box, flags, refs, dependents, pieces/entities) {}", needs.text());
+                        }
+                    }
                     None => tracing::info!("map pieces: the store is not as read (store +0x40.. {fields})"),
                 }
             }
@@ -500,6 +612,37 @@ mod tests {
         assert_eq!(place_of(&position(f32::NAN, 0.0, 0.0, 0, 0)), None);
         assert_eq!(place_of(&position(0.0, 0.0, 0.0, 1000, 0)), None, "32 km out is not on the map");
         assert_eq!(place_of(&position(0.0, 0.0, 1.0e9, 0, 0)), None);
+    }
+
+    #[test]
+    fn pieces_are_classed_by_their_distance_from_the_focus() {
+        let focus = Some((0.0, 0.0));
+        assert_eq!(class_of(Some((600.0, 700.0)), focus), 0);
+        assert_eq!(class_of(Some((-1000.0, 100.0)), focus), 1);
+        assert_eq!(class_of(Some((2999.0, 0.0)), focus), 1);
+        assert_eq!(class_of(Some((3000.0, 1.0)), focus), 2);
+        assert_eq!(class_of(None, focus), 3);
+        assert_eq!(class_of(Some((1.0, 1.0)), None), 3);
+        assert_eq!(CLASSES[2], "far");
+    }
+
+    #[test]
+    fn needs_name_the_groups_with_the_most_entities_first() {
+        let mut needs = Needs::default();
+        needs.add((0x008, Some(0x01), 1, 0), 20);
+        needs.add((0x008, Some(0x01), 1, 0), 30);
+        needs.add((0x000, Some(0x00), 2, 1), 400);
+        needs.add((0x180, None, 0, 0), 1);
+        assert_eq!(
+            needs.text(),
+            "4/451: b000 i00 r2 d1 1/400; b008 i01 r1 d0 2/50; b180 i-- r0 d0 1/1"
+        );
+        assert_eq!(Needs::default().text(), "0/0: none");
+        for k in 0..(GROUPS as u16 + 3) {
+            needs.add((k, Some(0), 0, 0), 1000 + u32::from(k));
+        }
+        assert!(needs.text().starts_with("13/9487: b008 i00 r0 d0 1/1008; b007 i00 r0 d0 1/1007; "));
+        assert!(needs.text().ends_with("; 6 more groups 7/3454"), "{}", needs.text());
     }
 
     #[test]

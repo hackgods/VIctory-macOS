@@ -391,6 +391,9 @@ fn from_bytes(bytes: &[u8]) -> windows::core::Result<Clamp> {
             },
             ..Default::default()
         })?;
+        // By the name the one-thread form gets from `compute::pipeline`:
+        // what a frame replay knows the clamp by (`--skip-clamps`).
+        crate::host::name(&pso, || "victory: clamp".to_owned());
         Ok(Clamp { root, pso, words: false })
     }
 }

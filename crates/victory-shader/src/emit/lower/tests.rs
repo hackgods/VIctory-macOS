@@ -1,13 +1,38 @@
 //! Tests of the lowering (`super`). In a file of their own so that
 //! `lower.rs` stays under the asset policy's file size limit (512 KiB).
 
-use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower, packed_half};
+use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower, packed_half};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
+/// A program's constant table starts after its instructions, unless a
+/// load at a fixed offset reads below that.
+#[test]
+fn the_code_table_starts_after_the_instructions() {
+    // s_nop 0, s_endpgm, then 1,000 dwords of constants.
+    let mut words = vec![0xBF80_0000, S_ENDPGM];
+    words.extend(0..1000u32);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, false, 256).unwrap();
+    let at = |offset: u32, dynamic: bool| resource::Address {
+        param: resource::CODE,
+        offset,
+        dynamic: dynamic.then_some(ir::Value(0)),
+    };
+    let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+    // A load at a computed offset from the code's start: the table is
+    // the constants only, not the whole program.
+    assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+    assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+    // A load at a fixed offset inside the instructions keeps the start.
+    assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+    // Loads past the instructions only: from the lowest of them.
+    assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+}
 
 /// Whether a synthetic compute program translates with these input registers.
 fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
@@ -116,7 +141,7 @@ fn root(root: RootType, user_data: u8, slot: u8) -> RootParam {
 /// Lowers a one-thread compute program that copies four root constants
 /// (s0..s3) into v1..v4, runs `body`, and stores v0 to a raw buffer from a
 /// descriptor table, so the vector instructions in `body` have an effect.
-fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+fn lower_valu(body: &[u32]) -> Result<Lowered, crate::ShaderError> {
     let mut words = vec![
         0xBE85_0380, // s_mov_b32 s5, 0
         0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
@@ -149,7 +174,37 @@ fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         vec![constants, root(RootType::Table, 4, 1)],
         vec![buffer],
     )
-    .map(|_| ())
+}
+
+fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
+    lower_valu(body).map(|_| ())
+}
+
+#[test]
+fn vop3_conversion_modifiers_affect_the_lowering() {
+    for (op, first, second, modifier) in [
+        (0x0Au32, 1 << 15, 0, "clamp"),
+        (0x0B, 1 << 8, 0, "abs"),
+        (0x0B, 0, 1 << 29, "neg"),
+    ] {
+        let vop1 = lower_valu(&[0x7E00_0000 | op << 9 | 0x101])
+            .unwrap()
+            .dxil;
+        let vop3 = |first: u32, second: u32| {
+            lower_valu(&[
+                0xD400_0000 | (0x180 + op) << 16 | first,
+                0x101 | second,
+            ])
+            .unwrap()
+            .dxil
+        };
+        assert_eq!(vop1, vop3(0, 0), "VOP1/VOP3 control for op {op:#x}");
+        assert_ne!(
+            vop1,
+            vop3(first, second),
+            "VOP3 {modifier} was dropped for op {op:#x}"
+        );
+    }
 }
 
 #[test]
@@ -877,6 +932,74 @@ fn a_scalar_result_needs_no_exec() {
 }
 
 #[test]
+fn guarded_or_modified_v_mov_b32_is_not_folded_as_constant() {
+    let group_ids_xy = 3 << 7;
+    let refusal = |code: &[u32]| match lowers(code, group_ids_xy) {
+        Ok(()) => None,
+        Err(crate::ShaderError::Unsupported { what, .. }) => Some(what),
+        Err(error) => panic!("{error}"),
+    };
+    let direct = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 -> end
+        0xBE84_0380, // s_mov_b32 s4, 0
+        S_ENDPGM,
+    ];
+    assert!(refusal(&direct).is_some());
+
+    // Guarded `v_mov_b32 v1, 0`: inactive lanes (v0 != 0) preserve v1 = -1,
+    // so they pass the compare after the join and read s6 (`s_memtime`).
+    let mut guarded = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+        0x7E02_0280, // v_mov_b32 v1, 0 (guarded)
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+        0xBF86_0003, // s_cbranch_vccz -> end
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 -> end
+        0xBE84_0380, // s_mov_b32 s4, 0
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&guarded), refusal(&direct));
+    // Without the EXEC guard, `v_mov_b32 v1, 0` writes every lane and s6 is dead.
+    guarded[3] = 0xBF80_0000; // s_nop 0
+    guarded[5] = 0xBF80_0000; // s_nop 0
+    lowers(&guarded, group_ids_xy).expect("unguarded v_mov_b32 still folds");
+
+    // VOP3 `v_mov_b32_e64 v1, -(1.0)`: neg modifier flips 1.0f to -1.0f,
+    // matching the compare after the join so s6 is live.
+    let mut negated = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0xD581_0001,
+        0x2000_00F2, // v_mov_b32_e64 v1, -(1.0)
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7E02_02F3, // v_mov_b32 v1, -1.0
+        0x7D84_02F3, // join: v_cmp_eq_u32 vcc_lo, -1.0, v1
+        0xBF86_0003, // s_cbranch_vccz -> end
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 -> end
+        0xBE84_0380, // s_mov_b32 s4, 0
+        S_ENDPGM,
+    ];
+    assert_eq!(refusal(&negated), refusal(&direct));
+    // Clearing the neg bit yields unmodified 1.0f (!= -1.0f), so s6 is dead.
+    negated[3] = 0x0000_00F2; // v_mov_b32_e64 v1, 1.0
+    lowers(&negated, group_ids_xy).expect("unmodified v_mov_b32_e64 still folds");
+}
+
+#[test]
 fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
     let refusal = |code: &[u32]| match lowers(code, 1 << 7) {
         Ok(()) => None,
@@ -923,6 +1046,43 @@ fn a_missing_value_on_a_path_no_lane_takes_is_dead() {
         S_ENDPGM,
     ];
     assert_eq!(refusal(&kept), None);
+}
+
+#[test]
+fn a_guarded_scalar_write_kills_a_stale_sgpr() {
+    // s6 holds a missing value (timestamp) where s0 == 0 and 5 where
+    // s0 != 0; the flag in v1 skips the first read on the s0 == 0 path.
+    // After that, inside a guarded region (EXEC narrowed without a
+    // branch), `v_readfirstlane_b32` overwrites s6 unconditionally before
+    // s6 is read again.
+    let mut words = [
+        0xF490_0180,
+        0,           // s_memtime s[6:7]
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xBF06_8000, // s_cmp_eq_u32 s0, 0 (s0 = group id X)
+        0xBF85_0002, // s_cbranch_scc1 -> join
+        0xBE86_0385, // s_mov_b32 s6, 5
+        0x7E02_02C1, // v_mov_b32 v1, -1
+        0x7D84_02C1, // join: v_cmp_eq_u32 vcc_lo, -1, v1
+        0xBF86_0003, // s_cbranch_vccz -> after
+        0xBF07_8006, // s_cmp_lg_u32 s6, 0
+        0xBF85_0001, // s_cbranch_scc1 -> after
+        0xBE84_0380, // s_mov_b32 s4, 0
+        0x7DA4_0080, // after: v_cmpx_eq_u32 exec_lo, 0, v0 (narrows EXEC)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0 (guarded, writes SGPR)
+        0x7DA4_0006, // v_cmpx_eq_u32 exec_lo, s6, v0 (reads new s6)
+        0xBEFE_03C1, // s_mov_b32 exec_lo, -1
+        S_ENDPGM,
+    ];
+    let group_ids_xy = 3 << 7;
+    lowers(&words, group_ids_xy).expect("guarded v_readfirstlane overwrites stale s6");
+    // Without the overwrite, the guarded compare reads the stale s6.
+    let mut no_kill = words;
+    no_kill[13] = 0xBF80_0000; // s_nop 0
+    assert!(lowers(&no_kill, group_ids_xy).is_err());
+    // With the flag set on both paths, the earlier read sees the stale s6.
+    words[2] = 0x7E02_02C1; // v_mov_b32 v1, -1
+    assert!(lowers(&words, group_ids_xy).is_err());
 }
 
 #[test]
@@ -1065,6 +1225,88 @@ fn packed_halves_fill_parameters_first_fit() {
     for a in [1, 3, 4] {
         assert_eq!(param(a), "- - - - - - - -");
     }
+}
+
+#[test]
+fn ds_bpermute_wave64_preserves_32_lane_half() {
+    // Without reading v0 (`thread_id`), only the wave64 half-wave base
+    // (`lane_index & !31`) introduces `dx.op.waveGetLaneIndex`.
+    let words = [
+        0x7E02_02FF,
+        0x0000_0104, // v_mov_b32 v1, 0x104
+        0x7E04_0285, // v_mov_b32 v2, 5
+        0xDACC_000C,
+        0x0300_0201, // ds_bpermute_b32 v3, v1, v2 offset:12
+        0x7E00_0503, // v_readfirstlane_b32 s0, v3
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    for wave64 in [false, true] {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [if wave64 { 64 } else { 32 }, 1, 1],
+            }),
+            code: code.clone(),
+        };
+        let p = ir::build(&native.code, wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let mut lowered = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
+            host_wave32: false,
+            view_marks: false,
+        })
+        .unwrap();
+        assert!(lowered.wave_ops);
+        assert_eq!(lowered.uses_lane_index, wave64, "wave64={wave64}");
+        assert_eq!(lowered.has_half_wave_mask, wave64, "wave64={wave64}");
+        #[cfg(windows)]
+        if let Ok(mut v) = crate::emit::validator::Validator::load(
+            crate::emit::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut lowered.dxil).unwrap();
+        }
+    }
+}
+
+#[test]
+fn ds_bpermute_refuses_gds() {
+    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+    let words = [
+        0x7E02_0285,           // v_mov_b32 v1, 5
+        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
+        2 << 24 | 1 << 8,
+        0x7E00_0502, // v_readfirstlane_b32 s0, v2
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        lowers(&words, 0),
+        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+    ));
 }
 
 // ---- one console wave split across host waves ----

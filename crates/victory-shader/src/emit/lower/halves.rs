@@ -127,17 +127,6 @@ impl Lower<'_> {
     pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
         if self.halves { Err(what) } else { Ok(()) }
     }
-
-    /// The lane mask `ds_bpermute_b32` takes its source lane modulo: in
-    /// halves the host wave, which is the half the console permutes within;
-    /// else the console wave, as before.
-    pub(super) fn permute_lanes(&self) -> u32 {
-        if self.halves {
-            HALF - 1
-        } else {
-            self.wave() - 1
-        }
-    }
 }
 
 /// Why a first-lane read stops in halves: the console's first lane may be

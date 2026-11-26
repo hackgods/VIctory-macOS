@@ -1233,12 +1233,39 @@ pub(crate) fn free_atomic_locks() -> usize {
 }
 
 /// Clears the lock words in `words`, a bitmap buffer's dwords, leaving the
-/// written pages and read marks before them. Returns how many were taken.
+/// written pages and read marks before them and the give-up count after
+/// them. Returns how many were taken.
 fn free_locks(words: &mut [u32]) -> usize {
-    let locks = &mut words[(victory_shader::emit::ATOMIC_LOCKS_AT / 4) as usize..];
+    let first = (victory_shader::emit::ATOMIC_LOCKS_AT / 4) as usize;
+    let locks = &mut words[first..first + victory_shader::emit::ATOMIC_LOCKS as usize];
     let taken = locks.iter().filter(|&&w| w != 0).count();
     locks.fill(0);
     taken
+}
+
+/// After a submission: how many lanes gave up waiting for a 64-bit
+/// atomic's lock since the last call and went on without it, so that their
+/// updates may be lost (`victory_shader::emit`, "Atomic locks"; #240). The
+/// counts are cleared.
+pub(crate) fn take_gave_up() -> u64 {
+    let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+    BITMAPS
+        .iter()
+        .filter_map(|b| b.get()?.as_ref())
+        .map(|b| {
+            // SAFETY: the mapped buffer of `dwords` dwords; the GPU is done
+            // with it (one submission runs at a time, and none runs now).
+            let words = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, dwords) };
+            take_count(words)
+        })
+        .sum()
+}
+
+/// Takes the give-up count from `words`, a bitmap buffer's dwords.
+fn take_count(words: &mut [u32]) -> u64 {
+    u64::from(std::mem::take(
+        &mut words[(victory_shader::emit::ATOMIC_LOCKS_GAVE_UP_AT / 4) as usize],
+    ))
 }
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
@@ -2151,11 +2178,13 @@ pub(crate) mod tests {
 
     /// After a submission the host GPU ended, every lock word of the
     /// emulated 64-bit atomics is free again, and the written pages and read
-    /// marks before them stay as they were (#240).
+    /// marks before them and the give-up count after them stay as they were
+    /// (#240). The count is taken once.
     #[test]
     fn freeing_atomic_locks_keeps_pages_and_read_marks() {
         let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
         let first = (victory_shader::emit::ATOMIC_LOCKS_AT / 4) as usize;
+        let end = first + victory_shader::emit::ATOMIC_LOCKS as usize;
         let mut words = vec![0xA5A5_A5A5u32; dwords];
         assert_eq!(
             free_locks(&mut words),
@@ -2166,10 +2195,13 @@ pub(crate) mod tests {
             words[..first].iter().all(|&w| w == 0xA5A5_A5A5),
             "pages and read marks kept"
         );
-        assert!(words[first..].iter().all(|&w| w == 0), "every lock free");
+        assert!(words[first..end].iter().all(|&w| w == 0), "every lock free");
+        assert_eq!(words[end..], [0xA5A5_A5A5], "the give-up count kept");
         words[first + 7] = 1;
         assert_eq!(free_locks(&mut words), 1, "one lock left taken");
         assert_eq!(free_locks(&mut words), 0, "none the second time");
+        assert_eq!(take_count(&mut words), 0xA5A5_A5A5, "the give-up count");
+        assert_eq!(take_count(&mut words), 0, "taken once");
     }
 
     /// The title writes a constant under a range an earlier list of the

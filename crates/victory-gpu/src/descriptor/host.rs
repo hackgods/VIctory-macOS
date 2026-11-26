@@ -18,6 +18,48 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+/// What a heap sync of a page works in ([`HostHeap::sync_slots_bytes`]),
+/// kept by each thread for its next page: the slots to make again, those
+/// to check under the locks, their records and whether each is current,
+/// the views pinned for the make, and the slots left to `mirror`.
+#[derive(Default)]
+struct Scratch {
+    stale: Vec<u32>,
+    candidates: Vec<(u32, [u32; 3])>,
+    records: Vec<[u32; 3]>,
+    current: Vec<bool>,
+    entries: Vec<(u32, [u32; 3], Option<ViewPin>)>,
+    again: Vec<u32>,
+}
+
+impl Scratch {
+    const fn new() -> Self {
+        Self {
+            stale: Vec::new(),
+            candidates: Vec::new(),
+            records: Vec::new(),
+            current: Vec::new(),
+            entries: Vec::new(),
+            again: Vec::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.stale.clear();
+        self.candidates.clear();
+        self.records.clear();
+        self.current.clear();
+        self.entries.clear();
+        self.again.clear();
+    }
+}
+
+thread_local! {
+    /// The thread's [`Scratch`], taken for a page (a nested sync, were there
+    /// one, takes an empty one).
+    static SYNC_SCRATCH: std::cell::Cell<Scratch> = const { std::cell::Cell::new(Scratch::new()) };
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -836,8 +878,14 @@ impl HostHeap {
             .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
-        let mut stale: Vec<u32> = Vec::new();
-        let mut candidates: Vec<(u32, [u32; 3])> = Vec::new();
+        let mut scratch = SYNC_SCRATCH.take();
+        let Scratch {
+            stale,
+            candidates,
+            records,
+            current,
+            ..
+        } = &mut scratch;
 
         for i in first..last {
             let addr = at(i);
@@ -878,11 +926,10 @@ impl HostHeap {
         let checking =
             crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncCheckNs);
         if !candidates.is_empty() {
-            let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
-            let mut current = Vec::with_capacity(records.len());
-            views_current_into(&records, &mut current);
+            records.extend(candidates.iter().map(|&(_, r)| r));
+            views_current_into(records, current);
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            for (&(i, [_, view, generation]), is_current) in candidates.iter().zip(current) {
+            for (&(i, [_, view, generation]), &is_current) in candidates.iter().zip(&*current) {
                 let changed = match made.get(i as usize) {
                     Some(&m) if is_current => m != (u64::from(generation) << 32 | u64::from(view)),
                     Some(&m) => m != 0,
@@ -901,7 +948,9 @@ impl HostHeap {
             crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncMakeNs);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::SyncMade, stale.len() as u64);
-        self.mirror_synced(&stale, at);
+        self.mirror_synced(&mut scratch, at);
+        scratch.clear();
+        SYNC_SCRATCH.set(scratch);
         #[cfg(feature = "diagnostics")]
         drop(making);
 
@@ -1093,43 +1142,47 @@ impl HostHeap {
     /// prepared first, without the lock, as `mirror` does; a slot the title
     /// wrote again meanwhile is left to `mirror`; views are unpinned after
     /// the lock, whose holders their release may need.
-    fn mirror_synced(&self, slots: &[u32], at: impl Fn(u32) -> u64) {
-        let entries: Vec<(u32, [u32; 3], Option<ViewPin>)> = slots
-            .iter()
-            .filter(|&&index| index < self.count)
-            .map(|&index| {
-                // SAFETY: a descriptor slot in title memory the caller found mapped.
-                let record = unsafe { (at(index) as *const [u32; 3]).read_unaligned() };
-                let [tag, i, generation] = record;
-                let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
-                if let Some(view) = &view
-                    && !is_placed_texture(view)
-                {
-                    prepare(view);
-                }
-                (index, record, view)
-            })
-            .collect();
+    ///
+    /// The slots are `scratch.stale`; the scratch's other vectors are the
+    /// thread's own, reused from page to page: fresh ones a page made one
+    /// thread's sync slower than main's lock a slot (`bench::heap_sync_bench`).
+    fn mirror_synced(&self, scratch: &mut Scratch, at: impl Fn(u32) -> u64) {
+        let Scratch {
+            stale,
+            entries,
+            again,
+            ..
+        } = scratch;
+        for &index in stale.iter().filter(|&&index| index < self.count) {
+            // SAFETY: a descriptor slot in title memory the caller found mapped.
+            let record = unsafe { (at(index) as *const [u32; 3]).read_unaligned() };
+            let [tag, i, generation] = record;
+            let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+            if let Some(view) = &view
+                && !is_placed_texture(view)
+            {
+                prepare(view);
+            }
+            entries.push((index, record, view));
+        }
         // Nothing to make (a page of empty or verified slots): neither the
         // slot lock nor `VIEWS`, which title threads writing views wait on.
         if entries.is_empty() {
             return;
         }
-        let mut again = Vec::new();
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            // Whether each view is still current, as `mirror` asks under the lock.
-            let records: Vec<[u32; 3]> = entries.iter().map(|&(_, record, _)| record).collect();
-            let mut current = Vec::with_capacity(records.len());
-            views_current_into(&records, &mut current);
-            for ((index, record, view), current) in entries.iter().zip(current) {
+            // A pinned view is current, as `mirror` finds it: only a
+            // resource's release makes its views stale, and the pin holds
+            // the resource (views of no resource never go stale).
+            for (index, record, view) in entries.iter() {
                 let index = *index;
                 // SAFETY: as above.
                 if unsafe { (at(index) as *const [u32; 3]).read_unaligned() } != *record {
                     again.push(index);
                     continue;
                 }
-                match view.as_deref().filter(|_| current) {
+                match view.as_deref() {
                     None => self.unmake_locked(&mut made, index),
                     Some(view) => {
                         let [_, i, generation] = *record;
@@ -1141,8 +1194,9 @@ impl HostHeap {
                 }
             }
         }
-        drop(entries);
-        for index in again {
+        // Unpinned after the lock, whose holders their release may need.
+        entries.clear();
+        for &index in again.iter() {
             self.mirror(index, at(index), false);
         }
     }

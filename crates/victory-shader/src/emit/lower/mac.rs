@@ -124,9 +124,13 @@ pub(crate) struct Mac {
     pub exchange: bool,
     /// A size query on a writable image (`getDimensions`) asks for level 0
     /// instead of an undefined level (`emit::Options::uav_size_level0`).
-    /// D3DMetal answered the undefined one wrongly in the title's shadow
-    /// min/max program (`07f451a14b13fecb`: sample coordinates fit a width
-    /// and height of 65,536; `notes/PLAN.md`, 26 November 15:15).
+    /// D3DMetal answers the undefined one with 0 x 0 and level 0 with the
+    /// size of the view's level (measured, `uav_size_tests`). The console
+    /// compiler's code adds 1 to the descriptor's "size - 1" fields, so a
+    /// size of 0 reads as 65,536 x 65,536: the title's 35 programs that
+    /// compute with such a size divide by it or test coordinates against
+    /// it (`notes/uav-size.md`; first seen in its shadow min/max program,
+    /// `07f451a14b13fecb`).
     pub uav_level0: bool,
 }
 

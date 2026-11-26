@@ -31,9 +31,11 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     assert_eq!(capture, dir.path().join("capture-1"));
     let notes = std::fs::read_to_string(capture.join("notes.txt")).unwrap();
     println!("{notes}");
-    // The frame asked for, whole, with nothing left out.
+    // The frame asked for, whole, with nothing left out: its four lists
+    // and the host's own that ends every submission (its mark that the
+    // submission ran, `Host::mark`: one list, closed once).
     assert!(notes.contains("frame 9 (world frame 5)"), "{notes}");
-    assert!(notes.contains("3 submissions, 4 lists"), "{notes}");
+    assert!(notes.contains("3 submissions, 5 lists"), "{notes}");
     for bad in ["not recorded", "not in the capture", "not whole", "lost its hooks", "not seen made"] {
         assert!(!notes.contains(bad), "{bad}: {notes}");
     }
@@ -48,7 +50,7 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     let frame = player.frame();
     assert_eq!((frame.number, frame.world, frame.partial), (9, 4, false));
     assert_eq!(frame.submits.len(), 3);
-    assert_eq!(frame.submits.iter().map(|s| s.lists.len()).collect::<Vec<_>>(), [1, 2, 1]);
+    assert_eq!(frame.submits.iter().map(|s| s.lists.len()).collect::<Vec<_>>(), [2, 3, 2]);
     // The view made before the second submission and the one replaced
     // before the third, and what the CPU wrote before each.
     assert_eq!(frame.submits.iter().map(|s| s.views.len()).collect::<Vec<_>>(), [0, 1, 1]);
@@ -177,7 +179,7 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
         lines
     };
     assert!(listing.iter().any(|l| l.contains("replay test: draw")), "pipelines are named");
-    assert!(listing.iter().any(|l| l.starts_with("list 3 of submission 2")));
+    assert!(listing.iter().any(|l| l.starts_with("list 5 of submission 2")));
     let shaders = dir.path().join("empty");
     std::fs::create_dir(&shaders).unwrap();
     let with = play::replay(

@@ -284,6 +284,20 @@ pub(crate) fn sync_heaps() {
     }
 }
 
+/// Whether [`sync_heaps`] would find pages to read: a shader-visible heap
+/// with its host heap holds pages written since its last sync. Takes no
+/// tracker's lock; a write racing the answer is found by the next asking.
+#[cfg(windows)]
+pub(crate) fn heaps_written() -> bool {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    heaps.iter().any(|&(_, _, at)| {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        matches!(heap.host.get(), Some(Some(_)))
+            && heap.written.as_ref().is_some_and(|w| !w.clean())
+    })
+}
+
 /// Makes the views of slots `slots` that were left null (textures the title
 /// placed itself, textures given up) in every shader-visible view heap, now
 /// that shaders read them (`crate::shadow::take_reads`), and stamps what

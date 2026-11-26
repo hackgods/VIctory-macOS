@@ -245,6 +245,8 @@ pub use container::sign as sign_container;
 pub use rect::{rectangle_gs, right_angle};
 #[cfg(all(test, windows))]
 mod memory_tests;
+#[cfg(test)]
+mod mesh_probe_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;

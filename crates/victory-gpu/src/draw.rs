@@ -2918,9 +2918,48 @@ void main() {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
-        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
-        let (src, outs) = (buffer(4096), [buffer(256), buffer(256)]);
+        let src = buffer(4096);
         let at = crate::resource::buffer_bytes(src).unwrap().0 as u64 + 0x100;
+        dispatches_around_a_copy(host, at);
+    }
+
+    /// [`a_copy_keeps_its_order_with_an_earlier_lists_dispatch_when_the_piece_is_split`]
+    /// with the 16 dwords in aliased title memory (`VICTORY_ALIAS_BUFFERS`,
+    /// `crate::alias`): the GPU reads the title's memory itself, so only when
+    /// the copy is made decides what each dispatch reads. As one submission
+    /// both read the new values, as with a host copy; split, the copy is made
+    /// once the first part has run on the GPU, and the first reads the old
+    /// ones: the cut needs no host copy.
+    #[test]
+    fn a_copy_into_aliased_memory_keeps_its_order_when_the_piece_is_split() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let page = crate::watch::PAGE;
+        // SAFETY: a fresh allocation of our own.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let aliased = crate::alias::alias_region(base, page, false);
+        // Under Rosetta (Wine with D3DMetal) the remap works: the test runs.
+        assert!(aliased || !crate::watch::rosetta(), "no alias under Rosetta");
+        if aliased {
+            let aliased = crate::shadow::find(base as u64, 4).expect("the aliased region");
+            assert!(aliased.is_aliased());
+            drop(aliased);
+            dispatches_around_a_copy(host, base as u64 + 0x100);
+            assert!(crate::alias::unalias_region(base));
+        }
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Two host lists: the first reads the 16 dwords 64 bytes apart at `at`
+    /// into one output, the second copies new values over them and reads
+    /// them into another; run as one submission, then split.
+    fn dispatches_around_a_copy(host: &crate::host::Host, at: u64) {
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let outs = [buffer(256), buffer(256)];
         let out_bytes = outs.map(|o| crate::resource::buffer_bytes(o).unwrap().0 as u64);
         let null = std::ptr::null();
         let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];

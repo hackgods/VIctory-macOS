@@ -30,6 +30,9 @@ mod ambient_set;
 mod alias;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
+mod alias_plan;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
 mod batch;
 #[cfg(windows)]
 mod bindless;
@@ -127,7 +130,10 @@ pub mod heap_reports {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]
-pub use alias::{alias_region, enabled as alias_buffers, unalias_region};
+pub use alias::{
+    alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
+    uncommitted as alias_uncommitted,
+};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]

@@ -155,6 +155,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // Zero-copy buffers (`VICTORY_ALIAS_BUFFERS`): what of a commit at a
+    // given address was not committed before it.
+    let aliasing = victory_gpu::alias_buffers();
+    let before = (aliasing && !base.is_null() && kind & MEM_COMMIT != 0)
+        .then(|| victory_gpu::alias_uncommitted(base as usize, size));
     let mut at = allocate(&mut parameter);
     // A 32-bit request that found no room below 4 GiB: the guards there
     // make way for it.
@@ -175,16 +180,14 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
-    if !at.is_null()
-        && victory_gpu::alias_buffers()
-        && kind & MEM_COMMIT != 0
-        && kind & MEM_RESERVE_PLACEHOLDER == 0
-        && protect == PAGE_READWRITE
-        && (at as usize).is_multiple_of(PAGE)
-        && size >= PAGE
-        && size.is_multiple_of(PAGE)
-    {
-        victory_gpu::alias_region(at as usize, size, false);
+    if !at.is_null() && aliasing {
+        let eligible = kind & MEM_COMMIT != 0
+            && kind & MEM_RESERVE_PLACEHOLDER == 0
+            && protect == PAGE_READWRITE
+            && (at as usize).is_multiple_of(PAGE)
+            && size >= PAGE
+            && size.is_multiple_of(PAGE);
+        victory_gpu::alias_committed(at as usize, size, base.is_null(), eligible, before.as_deref());
     }
     if base.is_null() {
         tracing::debug!(
@@ -352,7 +355,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            victory_gpu::unalias_region(address as usize);
+            if victory_gpu::alias_buffers() {
+                victory_gpu::unalias_region(address as usize);
+            }
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }

@@ -1987,6 +1987,8 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
+            // Its first title copy opens a list the copy-order split cut.
+            batch.cut = list.after_copy();
             self.poll_beside(&mut submitted, &mut beside);
             if beside.as_ref().is_some_and(unwaited::flights::Beside::running) {
                 let mut gate = |step: &Step| self.beside_step(&mut submitted, &mut beside, step);
@@ -2018,6 +2020,7 @@ impl Host {
             }
         }
         batch.flush();
+        batch.count_zero_copy();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
         // mac: one submission on the host GPU at a time.
@@ -3416,8 +3419,8 @@ impl HostList {
         self.deferred().after_copy = true;
     }
 
-    /// Whether [`HostList::starts_after_copy`] was called since the reset.
-    #[cfg(test)]
+    /// Whether [`HostList::starts_after_copy`] was called since the reset
+    /// (also counted for `VICTORY_ALIAS_BUFFERS`'s frame line).
     pub(crate) fn after_copy(&self) -> bool {
         self.deferred().after_copy
     }
@@ -3871,6 +3874,7 @@ impl HostList {
                         continue;
                     }
                     batch.title_copied(dst, len);
+                    crate::alias::title_copy(dst, len, std::mem::take(&mut batch.cut));
                     if matches!(step, Step::Move(..)) {
                         move_mapped(dst as *mut u8, src as *const u8, len);
                     } else {
@@ -4047,6 +4051,15 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
+    /// Aliased memory asked for (`crate::alias`), by copy: never copied,
+    /// counted once per submission for the frame line.
+    zero_copy: std::collections::HashMap<usize, crate::ranges::Ranges>,
+    /// Host copies refreshed with bytes copied, and those bytes (counted with
+    /// `zero_copy`).
+    copied: (usize, usize),
+    /// The list being prepared starts after a copy-order cut and has not
+    /// made a title copy yet (`crate::alias::title_copy`).
+    cut: bool,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -4071,12 +4084,16 @@ fn refresh(shadow: &crate::shadow::Shadow, address: usize, len: usize, early: bo
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        // Title memory that is the copy's own: nothing to copy, ever.
+        if shadow.is_aliased() && len > 0 {
+            self.zero_copy.entry(key).or_default().insert(address, end, JOIN);
+        }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
             return;
         }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
         let empty = crate::ranges::Ranges::default();
@@ -4170,6 +4187,7 @@ impl Batch {
             for ((shadow, _), done) in work.into_iter().zip(results) {
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
                 let (start, len) = shadow.range();
+                let before = total;
                 for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4191,12 +4209,17 @@ impl Batch {
                     };
                     have.insert(from, to, 0);
                 }
+                if total > before {
+                    self.copied.0 += 1;
+                    self.copied.1 += total - before;
+                }
             }
             return total;
         }
         for (shadow, ranges) in work {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
+            let before = total;
             for (from, to) in ranges.iter() {
                 let started = std::time::Instant::now();
                 let copied = refresh(&shadow, from, to - from, self.early);
@@ -4224,8 +4247,31 @@ impl Batch {
                 };
                 have.insert(from, to, 0);
             }
+            if total > before {
+                self.copied.0 += 1;
+                self.copied.1 += total - before;
+            }
         }
         total
+    }
+
+    /// At the end of the submission's preparing, with `VICTORY_ALIAS_BUFFERS`:
+    /// what it asked of aliased memory and copied into host copies, for the
+    /// frame line.
+    fn count_zero_copy(&mut self) {
+        if !crate::alias::enabled() {
+            return;
+        }
+        let (mut ranges, mut bytes) = (0, 0);
+        for asked in self.zero_copy.values() {
+            for (from, to) in asked.iter() {
+                ranges += 1;
+                bytes += to - from;
+            }
+        }
+        crate::alias::asked(self.zero_copy.len(), ranges, bytes, self.copied.0, self.copied.1);
+        self.zero_copy.clear();
+        self.copied = (0, 0);
     }
 
     /// Diagnostics, before a title copy of `len` bytes from `src` to `dst`
@@ -4913,6 +4959,9 @@ impl Meter {
             let [back_ms, back_mb] = [0, 1].map(|i| {
                 COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / report_frames
             });
+            // With `VICTORY_ALIAS_BUFFERS` only (else empty): the same frames'
+            // zero-copy and copy paths.
+            let zero_copy = crate::alias::frame_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -4931,7 +4980,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
                  dispatches/frame ({hoisted:.0} clamps in the list before their draw's, \
-                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches)",
+                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches){zero_copy}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

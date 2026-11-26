@@ -154,6 +154,23 @@ pub fn run(
             Err(why) => println!("lookup guard   not applied: {why}"),
         }
     }
+    // macOS port: the title's per-frame map data step runs as often a second
+    // as on a console (victory_loader::mapdata_pace); off unless asked for.
+    let mapdata_steps = victory_loader::mapdata_pace::steps_wanted(
+        std::env::var(victory_loader::mapdata_pace::STEPS_SWITCH).ok().as_deref(),
+    );
+    let mapdata_paced = mapdata_steps.is_some_and(|most| {
+        match victory_loader::mapdata_pace::pace(image.base() as u64, most) {
+            Ok(()) => {
+                println!("map data pace  on: the step at +0x16cd4d0 runs up to {most} times a frame, 30 a second");
+                true
+            }
+            Err(why) => {
+                println!("map data pace  not applied: {why}");
+                false
+            }
+        }
+    });
     // macOS port: on a Series S the title's upscaler choice returns its own
     // upscaler (type 6), not FSR 4, whose passes show nothing here
     // (victory_loader::upscaler_patch); `VICTORY_UPSCALER_PATCH=0` leaves it.
@@ -264,11 +281,13 @@ pub fn run(
         victory_loader::probe_guard::watch();
     }
     // macOS port: the title's map data pools and waiting list in the log
-    // (victory_loader::mapdata_pace); off unless asked for.
-    if victory_loader::mapdata_pace::watch_wanted(
-        std::env::var(victory_loader::mapdata_pace::WATCH_SWITCH).ok().as_deref(),
-    ) {
-        match victory_loader::mapdata_pace::watch(image.base() as u64) {
+    // (victory_loader::mapdata_pace), asked for or with the pacing.
+    if mapdata_paced
+        || victory_loader::mapdata_pace::watch_wanted(
+            std::env::var(victory_loader::mapdata_pace::WATCH_SWITCH).ok().as_deref(),
+        )
+    {
+        match victory_loader::mapdata_pace::watch(image.base() as u64, true) {
             Ok(()) => println!("map data watch on: pools and waiting slots are logged every 5 s"),
             Err(why) => println!("map data watch not started: {why}"),
         }

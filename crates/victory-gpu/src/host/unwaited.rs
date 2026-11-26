@@ -42,11 +42,13 @@
 //! leaves its host list to us (`crate::list::restart`), as for a list a
 //! queue holds.
 //!
-//! Left out of the fork's change: refreshing the next submission's buffer
-//! copies while the one before runs. There `Shadow::update` goes around the
-//! ranges a running submission's shaders write; here it copies under them
-//! and into their snapshot, which is right only once that submission has
-//! been copied back (`crate::shadow::Shadow::update_tracked`).
+//! The fork also refreshes the next submission's buffer copies while the
+//! one before runs. There `Shadow::update` goes around the ranges a running
+//! submission's shaders write; here it copies under them and into their
+//! snapshot, which is right only once that submission has been copied back
+//! (`crate::shadow::Shadow::update_tracked`). So only the copies the
+//! running submission cannot write are refreshed early, and only with
+//! `VICTORY_ASYNC_PREWARM=1` ([`Host::prewarm`]).
 
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
@@ -87,6 +89,24 @@ fn all() -> bool {
             );
         }
         all
+    })
+}
+
+/// Whether, while a submission left to the host GPU still runs and the
+/// lists that run next are known, their buffer copies are brought up to
+/// date ([`Host::prewarm`]; `VICTORY_ASYNC_PREWARM=1`, off by default, and
+/// nothing without `VICTORY_ASYNC_SUBMIT=1`).
+pub(crate) fn prewarms() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    on() && *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_ASYNC_PREWARM");
+        if on {
+            tracing::info!(
+                "VICTORY_ASYNC_PREWARM: while the host GPU runs a submission left to it, the buffer copies \
+                 of the lists that run next are brought up to date, but for those it may write"
+            );
+        }
+        on
     })
 }
 
@@ -138,6 +158,9 @@ struct Left {
     lists: Vec<std::sync::Arc<HostList>>,
     /// Where their bottom-of-pipe writes go (address, bytes).
     writes: Vec<(u64, u64)>,
+    /// Whether one of them runs programs that use title memory, which
+    /// write host copies at addresses they compute (`crate::memory`).
+    memory: bool,
     ran: Ran,
 }
 
@@ -183,11 +206,16 @@ pub(crate) fn finished() -> u64 {
 /// for it and does what it owes. Whether there was one. Nothing on a thread
 /// that holds the submission lock (inside a submission none is left).
 pub(crate) fn settle(by: By) -> bool {
+    settle_before(by, &[])
+}
+
+/// [`settle`], when the lists that run next are known (`next`, else none).
+fn settle_before(by: By, next: &[&HostList]) -> bool {
     if VALUE.load(Acquire) == 0 || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
         return false;
     }
     let Some(host) = host() else { return false };
-    drop(host.submissions(by));
+    drop(host.submissions(by, next));
     take_done().into_iter().for_each(crate::list::recycle);
     true
 }
@@ -210,7 +238,8 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
 }
 
 /// For a queue's head whose `waits` do not all hold: [`settle`], if the
-/// submission left owes a bottom-of-pipe write where one of them reads.
+/// submission left owes a bottom-of-pipe write where one of them reads
+/// (`next`: the lists that run once the waits hold, if asked for).
 /// Whether any submission left was finished since `seen` ([`finished`],
 /// brought up to date), by this call or by another thread: the waits are
 /// then to be looked at again.
@@ -219,7 +248,11 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
 /// shaders write, a read-back) is not seen here: its head is held until
 /// the submission is finished by something else ([`idle`] at the latest),
 /// and runs at the queues' next look (their timer's, within 2 ms).
-pub(crate) fn settle_waits(waits: &[crate::hold::ValueWait], seen: &mut u64) -> bool {
+pub(crate) fn settle_waits(
+    waits: &[crate::hold::ValueWait],
+    next: &[&std::sync::Arc<HostList>],
+    seen: &mut u64,
+) -> bool {
     if VALUE.load(Acquire) != 0 {
         let owed = match LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(left) => left
@@ -230,7 +263,8 @@ pub(crate) fn settle_waits(waits: &[crate::hold::ValueWait], seen: &mut u64) -> 
             None => true,
         };
         if owed || all() {
-            settle(By::Wait);
+            let next: Vec<&HostList> = next.iter().map(|l| &***l).collect();
+            settle_before(By::Wait, &next);
         } else {
             SPARED[1].fetch_add(1, Relaxed);
         }
@@ -277,6 +311,79 @@ fn idle() {
     }
 }
 
+/// Since the last frame line, of [`Host::prewarm`]: times it had a
+/// running submission and lists to look at; of those, times it did nothing
+/// as a running list uses title memory, and times the GPU finished first;
+/// copies brought up to date and their bytes; copies left alone as the
+/// running submission may write them, and as their memory is not tracked;
+/// microseconds.
+static EARLY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// The copies that took pages early, held until the submission that ran
+/// meanwhile is finished (`crate::shadow::forget_early`).
+static EARLY_HELD: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+
+/// What [`Host::prewarm`] gathers: the ranges of each copy to bring up to
+/// date (ranges less than [`JOIN`] apart as one, as a submission's own
+/// refreshes), and the copies left alone.
+#[derive(Default)]
+struct Early {
+    wanted: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    /// Where each copy is in `wanted`, by copy.
+    index: std::collections::HashMap<usize, usize>,
+    /// Copies the running lists' heaps view for unordered access.
+    written: std::collections::HashSet<usize>,
+    /// Title memory whose copies hold shader writes kept from it: where
+    /// each stretch starts and ends, in order, none touching the next.
+    kept: Vec<(usize, usize)>,
+    /// Copies decided against, and how many: as the running submission may
+    /// write them, as their memory is not tracked.
+    left: std::collections::HashSet<usize>,
+    alone: [u64; 2],
+}
+
+impl Early {
+    fn add(&mut self, copy: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Nothing to copy, as for a submission's own refreshes.
+        if len == 0 || copy.clean() {
+            return;
+        }
+        let key = std::sync::Arc::as_ptr(copy) as usize;
+        if self.left.contains(&key) {
+            return;
+        }
+        let i = match self.index.get(&key) {
+            Some(&i) => i,
+            None => {
+                let (start, bytes) = copy.range();
+                let (start, end) = (start as usize, (start + bytes) as usize);
+                let why = if copy.dirty_bit().is_none() {
+                    Some(1)
+                } else if !copy.idle()
+                    || self.written.contains(&key)
+                    || self
+                        .kept
+                        .get(self.kept.partition_point(|&(_, e)| e <= start))
+                        .is_some_and(|&(s, _)| s < end)
+                {
+                    Some(0)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    self.left.insert(key);
+                    self.alone[why] += 1;
+                    return;
+                }
+                self.wanted.push((copy.clone(), Default::default()));
+                self.index.insert(key, self.wanted.len() - 1);
+                self.wanted.len() - 1
+            }
+        };
+        self.wanted[i].1.insert(address, address + len, JOIN);
+    }
+}
+
 /// The frame line of submissions left to the host GPU (`frames` since the
 /// last one).
 pub(super) fn log(frames: f64) {
@@ -298,14 +405,38 @@ pub(super) fn log(frames: f64) {
          the giving, and our own submissions' waits); {spared:.1?} per frame went on without finishing it \
          (Signals of other queues, waits it owed no write to)"
     );
+    if !prewarms() {
+        return;
+    }
+    let early: [f64; 8] = std::array::from_fn(|i| EARLY[i].swap(0, Relaxed) as f64 / frames);
+    let marked = crate::shadow::EARLY_MARKED.swap(0, Relaxed) as f64 / frames;
+    tracing::info!(
+        "prewarm: {:.1} ms/frame of the next lists' preparation done while the host GPU ran, in {:.1} goes/frame \
+         ({:.1} of them did nothing: a running list uses title memory; {:.1} stopped as the GPU finished first): \
+         {:.0} buffer copies/frame brought up to date early ({:.2} MB/frame), {:.0} left alone as the running \
+         submission may write them and {:.0} as their memory is not tracked; {marked:.1} pages/frame taken early \
+         were marked as written by the running shaders all the same (the title's bytes kept; 0 if the rule holds)",
+        early[7] / 1000.0,
+        early[0],
+        early[1],
+        early[2],
+        early[3],
+        early[4] / 1e6,
+        early[5],
+        early[6],
+    );
 }
 
 impl Host {
     /// The submission lock, once the submission left to the host GPU (if
     /// any) is finished: the holder prepares or submits with none running.
-    pub(super) fn submissions(&self, by: By) -> std::sync::MutexGuard<'_, u64> {
+    /// `next`: the lists that run next, if known ([`Host::prewarm`]).
+    pub(super) fn submissions(&self, by: By, next: &[&HostList]) -> std::sync::MutexGuard<'_, u64> {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         if VALUE.load(Acquire) != 0 {
+            if !next.is_empty() && prewarms() {
+                self.prewarm(next);
+            }
             self.finish_left(&mut submitted, by);
         }
         submitted
@@ -389,12 +520,20 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        let memory = prewarms()
+            && title.iter().any(|l| {
+                l.deferred()
+                    .copies
+                    .iter()
+                    .any(|s| matches!(s, Step::Memory(_)))
+            });
         *LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Left {
             value: *submitted,
             signalled: signalled.is_ok(),
             stood: false,
             lists: title.to_vec(),
             writes,
+            memory,
             ran,
         });
         QUEUE.store(title_queue, Release);
@@ -454,6 +593,141 @@ impl Host {
         }
     }
 
+    /// While the submission left to the host GPU still runs: brings up to
+    /// date the buffer copies `next` (the lists that run next) will ask
+    /// for, as their own preparation does after it (their refresh steps,
+    /// and what their heaps' views and title-memory tables reach), so that
+    /// preparation finds them done. Under the submission lock, before the
+    /// submission left is finished; stops when the GPU has run it.
+    ///
+    /// A copy is left alone, for the lists' own preparation, if the running
+    /// submission may write it or its early refresh could differ from the
+    /// one after it:
+    ///
+    /// - a list submitted declared that its shaders write it (a range
+    ///   pending or a snapshot kept, [`Shadow::idle`]): title memory there
+    ///   is older than the copy until the copy-back;
+    /// - a heap the running lists take views from views it for unordered
+    ///   access: their shaders may write it with no list declaring it;
+    /// - every copy, if a running list uses title memory: its programs
+    ///   write copies at addresses they compute;
+    /// - it holds shader writes kept out of title memory until the frame's
+    ///   end (`crate::memory::kept`): a refresh drops them from the pages
+    ///   the title wrote, and the running lists may read them;
+    /// - its memory is not tracked: it is copied whole at each use, and
+    ///   would only be copied twice.
+    ///
+    /// The others take the pages the title wrote since they last took them.
+    /// What the running submission reads of them it read from pages its
+    /// own preparation took; a page the title writes after that, while the
+    /// GPU reads it, is a race on the console too, where the GPU reads
+    /// title memory itself. A page taken early that the running shaders
+    /// marked as written all the same is counted and keeps the title's
+    /// bytes ([`Shadow::update_early`]).
+    ///
+    /// Not done early: steps that write title memory or the list's upload
+    /// memory (their order with the running submission's copy-back counts),
+    /// the texture uploads (the running submission's upload list and
+    /// staging buffers are reused by the next), the heaps' descriptor sync
+    /// and the title-memory tables (the running shaders read both).
+    fn prewarm(&self, next: &[&HostList]) {
+        let left = {
+            let left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(left) = left.as_ref().filter(|l| l.signalled && !l.stood) else {
+                return;
+            };
+            (left.value, left.memory, left.ran.heaps.clone())
+        };
+        let (value, memory, heaps) = left;
+        // SAFETY: a plain query of our fence.
+        let ran = || unsafe { self.fence.GetCompletedValue() } >= value;
+        if ran() {
+            return;
+        }
+        let started = Instant::now();
+        let _holding = Holding::enter();
+        EARLY[0].fetch_add(1, Relaxed);
+        if memory {
+            EARLY[1].fetch_add(1, Relaxed);
+            return;
+        }
+        let mut early = Early::default();
+        for heap in &heaps {
+            crate::bindless::written(heap, |copy| {
+                early.written.insert(std::sync::Arc::as_ptr(copy) as usize);
+            });
+        }
+        // In order and joined, to be searched once per copy.
+        let mut kept = crate::memory::kept();
+        kept.sort_unstable();
+        for (at, n) in kept {
+            match early.kept.last_mut() {
+                Some((_, end)) if at <= *end => *end = (*end).max(at + n),
+                _ => early.kept.push((at, at + n)),
+            }
+        }
+        let mut cut = false;
+        for list in next {
+            if ran() {
+                cut = true;
+                break;
+            }
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(copy, address, len) => early.add(copy, *address, *len),
+                    Step::Slot(viewed, index) => {
+                        crate::bindless::refresh_slot(viewed, *index, |c, a, l| early.add(c, a, l))
+                    }
+                    Step::Heap(viewed) => {
+                        crate::bindless::refresh(viewed, |c, a, l| early.add(c, a, l))
+                    }
+                    &Step::Memory(heap) => crate::memory::due(heap, |c, a, l| early.add(c, a, l)),
+                    _ => {}
+                }
+            }
+        }
+        let (mut copies, mut bytes) = (0, 0);
+        let mut held = Vec::with_capacity(early.wanted.len());
+        // The fence is asked at most every 200 microseconds.
+        let mut asked = Instant::now();
+        for (copy, ranges) in early.wanted {
+            if cut {
+                break;
+            }
+            if asked.elapsed() >= Duration::from_micros(200) {
+                asked = Instant::now();
+                if ran() {
+                    cut = true;
+                    break;
+                }
+            }
+            let mut taken = Some(0);
+            for (from, to) in ranges.iter() {
+                taken = taken.and_then(|n| Some(n + copy.update_early(from, to - from)?));
+            }
+            match taken {
+                Some(n) => {
+                    copies += 1;
+                    bytes += n as u64;
+                    held.push(copy);
+                }
+                None => early.alone[0] += 1,
+            }
+        }
+        // Held until the submission is finished: the pages they took are
+        // noted by their addresses.
+        EARLY_HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(held);
+        EARLY[2].fetch_add(u64::from(cut), Relaxed);
+        EARLY[3].fetch_add(copies, Relaxed);
+        EARLY[4].fetch_add(bytes, Relaxed);
+        EARLY[5].fetch_add(early.alone[0], Relaxed);
+        EARLY[6].fetch_add(early.alone[1], Relaxed);
+        EARLY[7].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    }
+
     /// Waits for the submission left to the host GPU and finishes it, as
     /// [`Host::run`] does one it waited for. Under the submission lock.
     fn finish_left(&self, submitted: &mut u64, by: By) {
@@ -493,6 +767,9 @@ impl Host {
             let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
             self.finish(None, &runs, ran);
         }
+        // What copies took early while it ran is as anything else now.
+        crate::shadow::forget_early();
+        EARLY_HELD.lock().unwrap_or_else(|e| e.into_inner()).clear();
         DONE.lock().unwrap_or_else(|e| e.into_inner()).extend(lists);
         FINISHED.fetch_add(1, AcqRel);
         // Last: until now a thread that asks ([`settle`]) waits for our lock.
@@ -537,7 +814,7 @@ mod tests {
         }
         assert_eq!(std::sync::Arc::strong_count(&list), 1, "the list came back");
         // Under the lock nothing is left, and the last submission ran.
-        let submitted = host.submissions(By::Ours);
+        let submitted = host.submissions(By::Ours, &[]);
         assert_eq!(VALUE.load(Acquire), 0);
         if let Some(mark) = host.mark() {
             assert!(

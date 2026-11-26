@@ -128,8 +128,12 @@ pub(crate) struct World<'a, S> {
     /// and not waited for still owes its bottom-of-pipe writes), which may
     /// be what a segment's waits are for: whether anything was finished
     /// since they were tested. Always `false` where `run` runs every piece
-    /// to completion.
-    pub(crate) owed: &'a mut dyn FnMut(&[ValueWait]) -> bool,
+    /// to completion. With `ahead`, it is also given what runs next if the
+    /// waits come to hold: the queue's piece so far, the segment, and the
+    /// segments right behind it that wait for nothing (else nothing).
+    pub(crate) owed: &'a mut dyn FnMut(&[ValueWait], &[&S]) -> bool,
+    /// Whether `owed` wants to know what runs next.
+    pub(crate) ahead: bool,
 }
 
 impl<S> Held<S> {
@@ -151,9 +155,10 @@ impl<S> Held<S> {
             for (queue, items) in &mut self.queues {
                 let mut piece = Vec::new();
                 loop {
-                    let ready = match items.front_mut() {
+                    let mut behind = items.iter_mut();
+                    let ready = match behind.next() {
                         None => false,
-                        Some((Item::Segment(_, waits), since, fresh)) => {
+                        Some((Item::Segment(head, waits), since, fresh)) => {
                             let mut ok = true;
                             for wait in waits.iter() {
                                 match wait.holds(w.read) {
@@ -165,8 +170,19 @@ impl<S> Held<S> {
                             // What they wait for may be owed by a piece not
                             // waited for: that is finished first, and they
                             // are looked at again.
-                            if !ok && (w.owed)(waits.as_slice()) {
-                                ok = waits.iter().all(|wait| wait.holds(w.read) != Some(false));
+                            if !ok {
+                                let next: Vec<&S> = if w.ahead {
+                                    let after = behind.map_while(|(item, ..)| match item {
+                                        Item::Segment(s, none) if none.is_empty() => Some(&*s),
+                                        _ => None,
+                                    });
+                                    piece.iter().chain([&*head]).chain(after).collect()
+                                } else {
+                                    Vec::new()
+                                };
+                                if (w.owed)(waits.as_slice(), &next) {
+                                    ok = waits.iter().all(|wait| wait.holds(w.read) != Some(false));
+                                }
                             }
                             if !ok {
                                 *fresh = false;
@@ -279,6 +295,8 @@ mod tests {
         /// Pieces are not waited for: their writes are owed until finished.
         unwaited: bool,
         owed: Vec<(u64, u64)>,
+        /// What each head whose waits did not hold was told runs next.
+        next: Vec<Vec<&'static str>>,
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
@@ -301,8 +319,9 @@ mod tests {
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
         };
-        let mut owed = |_: &[ValueWait]| {
+        let mut owed = |_: &[ValueWait], next: &[&&'static str]| {
             let mut f = fake.borrow_mut();
+            f.next.push(next.iter().map(|s| **s).collect());
             let owed = std::mem::take(&mut f.owed);
             for &(a, v) in &owed {
                 f.memory.insert(a, v);
@@ -317,7 +336,7 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed, ahead: true })
     }
 
     #[test]
@@ -403,6 +422,32 @@ mod tests {
         let p = pump(&mut held, &fake);
         assert_eq!(fake.borrow().log, ["q1: draw", "finished", "q2: depth"]);
         assert_eq!(p.waited.len(), 1);
+    }
+
+    /// A head whose wait does not hold is told what runs with it once it
+    /// does: the piece gathered before it, itself, and the segments behind
+    /// it up to the next one that waits.
+    #[test]
+    fn a_held_head_knows_what_runs_next() {
+        let fake = RefCell::new(Fake::default());
+        let mut held = Held::default();
+        held.push(2, Item::Segment("a", vec![]));
+        held.push(2, Item::Segment("b", vec![ge(0x100, 1)]));
+        held.push(2, Item::Segment("c", vec![]));
+        held.push(2, Item::Segment("d", vec![ge(0x200, 1)]));
+        held.push(2, Item::Segment("e", vec![]));
+        pump(&mut held, &fake);
+        // Asked twice: with the piece before it, and again once that ran.
+        assert_eq!(fake.borrow().next, [vec!["a", "b", "c"], vec!["b", "c"]]);
+        assert_eq!(fake.borrow().log, ["q2: a"]);
+        // Held again with nothing gathered before it; a Signal ends the run.
+        let mut held = Held::default();
+        held.push(3, Item::Segment("f", vec![ge(0x100, 1)]));
+        held.push(3, Item::Signal(5, 1));
+        held.push(3, Item::Segment("g", vec![]));
+        fake.borrow_mut().next.clear();
+        pump(&mut held, &fake);
+        assert_eq!(fake.borrow().next, [["f"]]);
     }
 
     #[test]

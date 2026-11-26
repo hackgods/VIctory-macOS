@@ -1488,7 +1488,9 @@ impl Host {
         // The one before, if the host GPU was not waited for, is finished
         // first.
         let by = if title.is_some() { unwaited::By::Next } else { unwaited::By::Ours };
-        let mut submitted = self.submissions(by);
+        // (The title's lists are next: their buffer copies may be brought
+        // up to date while it still runs, `unwaited::Host::prewarm`.)
+        let mut submitted = self.submissions(by, if title.is_some() { runs } else { &[] });
         let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]

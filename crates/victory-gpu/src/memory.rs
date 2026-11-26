@@ -588,6 +588,26 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     }
 }
 
+/// [`prepare`]'s copies for a refresh ahead of the list's submission
+/// (`crate::host::unwaited`): those the page table of heap `key` named when
+/// it was last brought up to date. The table itself is left as it is: a
+/// submission still running may read it.
+pub(crate) fn due(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let l = layout(key);
+    for (c, bit) in l.copies.iter().zip(&l.bits) {
+        if !crate::watch::clean_bit(*bit) {
+            let (start, len) = c.range();
+            add(c, start as usize, len as usize);
+        }
+    }
+}
+
+/// The title memory whose host copies hold shader writes kept from it
+/// until the frame's end ([`drop_withheld`]): a refresh there drops them.
+pub(crate) fn kept() -> Vec<(usize, usize)> {
+    DROPPED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
 fn has_missed(marks: &[u32], l: &Layout) -> bool {
     for (w, &mark) in marks.iter().enumerate() {

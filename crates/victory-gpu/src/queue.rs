@@ -228,9 +228,9 @@ fn pump(held: &mut Holding, why: Why) {
     // A wait may be for a bottom-of-pipe write of a submission the host
     // GPU was left with: that one is finished before a head is held.
     let mut seen = unwaited::finished();
-    let mut owed = |waits: &[crate::hold::ValueWait]| {
+    let mut owed = |waits: &[crate::hold::ValueWait], next: &[&std::sync::Arc<crate::host::HostList>]| {
         let at = std::time::Instant::now();
-        let finished = unwaited::settle_waits(waits, &mut seen);
+        let finished = unwaited::settle_waits(waits, next, &mut seen);
         if finished {
             ran.set(ran.get() + at.elapsed());
         }
@@ -242,6 +242,7 @@ fn pump(held: &mut Holding, why: Why) {
         run: &mut run,
         signal: &mut signal,
         owed: &mut owed,
+        ahead: unwaited::prewarms(),
     });
     let ran = ran.get();
     if pumped.segments > 0 || pumped.unknown > 0 {

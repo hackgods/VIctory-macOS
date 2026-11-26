@@ -34,6 +34,7 @@ pub(crate) use mac::Mac;
 pub(crate) use f64_sum::count_f64_high;
 #[cfg(test)]
 pub(crate) use mac::early_depth as early_depth_rule;
+pub(crate) use mac::take_uav_size_queries;
 use mesh::prune_signature;
 
 type Why = &'static str;
@@ -4674,6 +4675,16 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        if image.is_some() && uav {
+            // Width, height and depth: descriptor dwords 1, 2 and 4.
+            let sizes: Vec<Value> = (0..count)
+                .filter(|k| matches!(k.wrapping_sub(u32::from(first)), 1 | 2 | 4))
+                .filter_map(|k| inst.write(Reg::S(code + k as u8)))
+                .collect();
+            if mac::read_as_numbers(self.x.p, &sizes) {
+                mac::note_uav_size_query(false);
+            }
+        }
         let mip = if image.is_some() && (!uav || self.x.mac.uav_level0) {
             self.s.m.i32(0)
         } else {
@@ -9427,6 +9438,9 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
+            if uav {
+                mac::note_uav_size_query(true);
+            }
             let mip = if uav && self.x.mac.uav_level0 {
                 self.s.m.i32(0)
             } else if uav {

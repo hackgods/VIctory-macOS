@@ -40,9 +40,9 @@ const fn store(vdata: u8, offset: u32) -> [u32; 2] {
 /// `image_get_resinfo` gives for the image at table dword 0 (at level 0),
 /// then dwords 1 and 2 of its descriptor read as numbers (width - 1 in
 /// dword 1 bits 30-31 and dword 2 bits 0-13, height - 1 in dword 2 bits
-/// 14-29). With `writes` the program stores to the image (texel 0, 0),
-/// else it loads from it.
-fn size_queries(writes: bool) -> Vec<u32> {
+/// 14-29), or without `numbers` two zeros. With `writes` the program stores
+/// to the image (texel 0, 0), else it loads from it.
+fn size_queries(writes: bool, numbers: bool) -> Vec<u32> {
     let mut w = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -62,7 +62,11 @@ fn size_queries(writes: bool) -> Vec<u32> {
     } else {
         w.extend(image(0x00, 0xF, 8, 1)); // image_load v[8:11], v[1:2]
     }
-    w.extend([v_mov(6, 9), v_mov(7, 10)]);
+    if numbers {
+        w.extend([v_mov(6, 9), v_mov(7, 10)]);
+    } else {
+        w.extend([v_mov(6, 128), v_mov(7, 128)]);
+    }
     for (k, r) in (4..8).enumerate() {
         w.extend(store(r, 4 * k as u32));
     }
@@ -78,7 +82,7 @@ fn descriptor_size(d1: u32, d2: u32) -> (u32, u32) {
 
 /// One table in `s0`: the image at dword 0, the raw buffer the threads
 /// store to at dword 8. A wave32 program of 32 threads.
-fn native(writes: bool) -> NativeProgram {
+fn native(writes: bool, numbers: bool) -> NativeProgram {
     let range = |kind, table_offset_dwords, dwords| UsedResource {
         kind,
         root: RootType::Table,
@@ -111,7 +115,7 @@ fn native(writes: bool) -> NativeProgram {
             rsrc2: 1 << 1,
             threads: [32, 1, 1],
         }),
-        code: size_queries(writes)
+        code: size_queries(writes, numbers)
             .iter()
             .flat_map(|w| w.to_le_bytes())
             .collect(),
@@ -119,7 +123,11 @@ fn native(writes: bool) -> NativeProgram {
 }
 
 fn lowered(writes: bool, level0: bool) -> lower::Lowered {
-    let native = native(writes);
+    lowered_with(writes, true, level0)
+}
+
+fn lowered_with(writes: bool, numbers: bool, level0: bool) -> lower::Lowered {
+    let native = native(writes, numbers);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
@@ -155,6 +163,23 @@ fn lowered(writes: bool, level0: bool) -> lower::Lowered {
 fn the_setting_changes_only_queries_on_writable_images() {
     assert_ne!(lowered(true, false).dxil, lowered(true, true).dxil);
     assert_eq!(lowered(false, false).dxil, lowered(false, true).dxil);
+}
+
+/// What `translate --list` reports: a query per path for a writable image
+/// whose size the program uses, with the setting or without; none for a
+/// read-only image; and none from the descriptor of a writable image that
+/// the program only writes through (its dwords are loaded all the same).
+#[test]
+fn size_queries_on_writable_images_are_counted_where_the_size_is_used() {
+    let _ = lower::take_uav_size_queries();
+    for level0 in [false, true] {
+        lowered(true, level0);
+        assert_eq!(lower::take_uav_size_queries(), [1, 1]);
+    }
+    lowered(false, false);
+    assert_eq!(lower::take_uav_size_queries(), [0, 0]);
+    lowered_with(true, false, false);
+    assert_eq!(lower::take_uav_size_queries(), [0, 1]);
 }
 
 #[cfg(windows)]

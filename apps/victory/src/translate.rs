@@ -69,6 +69,10 @@ struct Tally {
     ms_emitted: usize,
     ms_validated: usize,
     ms_pipelines: usize,
+    /// Programs that ask a writable image for its size: from its
+    /// descriptor's dwords only, by a query only, both ways (mac,
+    /// `emit::uav_size_queries`).
+    uav_sizes: [usize; 3],
     /// Reason → programs stopped by it, and the first one.
     failed: BTreeMap<String, (usize, String)>,
     /// With `--list`: one line per program and outcome.
@@ -132,6 +136,9 @@ impl Tally {
         self.ms_pipelines += other.ms_pipelines;
         for (k, n) in other.exports {
             *self.exports.entry(k).or_default() += n;
+        }
+        for (a, b) in self.uav_sizes.iter_mut().zip(other.uav_sizes) {
+            *a += b;
         }
         self.lines.extend(other.lines);
         for (reason, (n, example)) in other.failed {
@@ -330,6 +337,14 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    if t.uav_sizes != [0; 3] {
+        let [descriptor, query, both] = t.uav_sizes;
+        println!(
+            "sizes        of writable images asked by {} programs: {descriptor} from descriptors, \
+             {query} by query, {both} both ways (--list names them)",
+            descriptor + query + both
+        );
+    }
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -621,9 +636,33 @@ fn translate(
                         halves_exchange: checks.exchange,
                         ..Default::default()
                     };
-                    match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {
+                    let _ = emit::uav_size_queries();
+                    let emitted = emit::emit_with(&container, &p, &program, &s, &i, &r, marks);
+                    let sizes = emit::uav_size_queries();
+                    match emitted {
                         Ok(shader) => {
                             *counter(t, p.stage, 1) += 1;
+                            // The other source of sizes: descriptors the
+                            // program reads only as numbers, which the host
+                            // fills in (`HostShader::view_addresses`).
+                            if t.list && shader.view_addresses {
+                                t.lines.push(format!(
+                                    "{}  descriptors read only as numbers (the host's view table)",
+                                    label()
+                                ));
+                            }
+                            if sizes != [0; 2] {
+                                let k = usize::from(sizes[1] != 0) * (1 + usize::from(sizes[0] != 0));
+                                t.uav_sizes[k] += 1;
+                                if t.list {
+                                    t.lines.push(format!(
+                                        "{}  sizes of writable images: {} from descriptors, {} by query",
+                                        label(),
+                                        sizes[0],
+                                        sizes[1]
+                                    ));
+                                }
+                            }
                             check(shader, t, checks, label);
                         }
                         Err(ShaderError::Unsupported { offset, what }) => t

@@ -130,6 +130,67 @@ pub(crate) struct Mac {
     pub uav_level0: bool,
 }
 
+thread_local! {
+    /// Size queries on writable images in the translations this thread
+    /// made since [`take_uav_size_queries`]: from a descriptor's dwords,
+    /// by `image_get_resinfo`.
+    static UAV_SIZE_QUERIES: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+/// Counts a size query on a writable image whose answer the program
+/// uses, whatever [`Mac::uav_level0`] says (for `translate --list`, which
+/// names the title's programs that have one; `notes/uav-size.md`).
+pub(super) fn note_uav_size_query(resinfo: bool) {
+    UAV_SIZE_QUERIES.with(|q| {
+        let mut n = q.get();
+        n[usize::from(resinfo)] += 1;
+        q.set(n);
+    });
+}
+
+/// Whether `p` reads one of `values` as a number: in an instruction that
+/// does not take it as part of a descriptor (an image's or a buffer's
+/// resource, a sampler, the base of a scalar buffer load), directly or
+/// through phis. A descriptor's dwords are loaded together; only a program
+/// that computes with the size dwords asks for the size.
+pub(super) fn read_as_numbers(p: &Program, values: &[Value]) -> bool {
+    let mut set: HashSet<Value> = values.iter().copied().collect();
+    loop {
+        let before = set.len();
+        for phi in p.blocks.iter().flat_map(|b| &b.phis) {
+            if phi.args.iter().any(|a| set.contains(a)) {
+                set.insert(phi.value);
+            }
+        }
+        if set.len() == before {
+            break;
+        }
+    }
+    let within = |o: &Operand, reg: Reg| match (*o, reg) {
+        (Operand::Scalar { code, dwords }, Reg::S(r)) => (code..code + dwords).contains(&r),
+        _ => false,
+    };
+    p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+        i.reads.iter().any(|&(reg, v)| {
+            set.contains(&v)
+                && !match &i.fields {
+                    Fields::Image { rsrc, sampler, .. } => {
+                        within(rsrc, reg) || sampler.as_ref().is_some_and(|s| within(s, reg))
+                    }
+                    Fields::Buffer { rsrc, .. } => within(rsrc, reg),
+                    Fields::Smem { base, .. } => within(base, reg),
+                    _ => false,
+                }
+        })
+    })
+}
+
+/// The counts since the last call, and zeroes them: queries from a
+/// descriptor's dwords, queries by `image_get_resinfo`.
+pub(crate) fn take_uav_size_queries() -> [u32; 2] {
+    UAV_SIZE_QUERIES.with(|q| q.replace([0; 2]))
+}
+
 /// `DB_SHADER_CONTROL`: the program exports depth (`Z_EXPORT_ENABLE`).
 const Z_EXPORT: u32 = 1 << 0;
 /// The program exports a stencil test value or a stencil operation value.

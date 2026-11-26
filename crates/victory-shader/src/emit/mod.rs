@@ -787,6 +787,13 @@ pub fn emit(
     emit_with(c, native, p, st, io, res, Options::default())
 }
 
+/// Size queries on writable images in the translations this thread made
+/// since the last call: from a descriptor's dwords, by `image_get_resinfo`
+/// (`Options::uav_size_level0` changes what they ask; mac).
+pub fn uav_size_queries() -> [u32; 2] {
+    lower::take_uav_size_queries()
+}
+
 /// [`emit`] made as `options` say.
 pub fn emit_with(
     c: &Container,

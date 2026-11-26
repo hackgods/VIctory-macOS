@@ -1311,6 +1311,10 @@ impl<'a> Lower<'a> {
             Shape::K(k) => return Ok(self.s.m.i32(k)),
             Shape::Value(v) => return self.i32_of(v),
             Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
+            // The fork lowers this sum with DXIL doubles
+            // (avatarmanz b17b69fd, 61e5f79a), which the Mac line's host
+            // does not have; left out.
+            Shape::ActiveF64(..) => return Err("a whole-wave sum of 64-bit floats"),
             Shape::Masked(src, mask, ident) => {
                 let c = self.cur;
                 let &m = self

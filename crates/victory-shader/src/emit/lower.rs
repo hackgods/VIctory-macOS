@@ -4966,10 +4966,15 @@ impl<'a> Lower<'a> {
             args.extend([nlo, nhi, nlo, nhi, l.s.m.i8(0xF)]);
             l.s.op(b, "textureStore.i32", Attr::NoUnwind, void, 67, &args);
             l.s.op(b, "barrier", Attr::NoDuplicate, void, 80, &[fence]);
-            // Frees it only if taken: an `and` with all ones changes nothing.
-            let (and, all) = (l.s.m.i32(1), l.s.m.i32(u32::MAX));
-            let keep = l.s.m.select(b, won, zero, all);
-            l.atomic_bin_op(b, &[locks, and, lock, iu, iu, keep]);
+            // One add either way: a lane that took the lock frees it (it
+            // holds 1, so all ones brings it to 0), and a lane that gave up
+            // counts itself at `ATOMIC_LOCKS_GAVE_UP_AT` instead.
+            let add = l.s.m.i32(0);
+            let count = l.s.m.i32(super::ATOMIC_LOCKS_GAVE_UP_AT);
+            let at = l.s.m.select(b, won, lock, count);
+            let all = l.s.m.i32(u32::MAX);
+            let by = l.s.m.select(b, won, all, one);
+            l.atomic_bin_op(b, &[locks, add, at, iu, iu, by]);
             (lo, hi)
         };
 
@@ -5069,8 +5074,8 @@ impl<'a> Lower<'a> {
         let turn = self.s.m.cmp(head, pred::EQ, me, i);
         self.s.m.terminate(head, Term::CondBr(turn, spin, latch));
 
-        // Spin, bounded by the stage (past it, on without the lock; see
-        // `atomic_lock_spins`).
+        // Spin, bounded by the stage (`atomic_lock_spins`): past the bound a
+        // lane goes on without the lock, and its step counts it.
         let got = self.s.op(
             spin,
             "atomicCompareExchange.i32",

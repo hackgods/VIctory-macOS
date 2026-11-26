@@ -2289,6 +2289,9 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

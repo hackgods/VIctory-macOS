@@ -4,6 +4,7 @@
 //! alone, in release, with `--ignored --nocapture --test-threads=1`.
 
 use super::*;
+use crate::backend::HostGpu;
 
 #[test]
 #[ignore = "times widened bookkeeping at barriers on host lists"]

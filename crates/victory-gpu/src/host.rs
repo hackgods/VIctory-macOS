@@ -1378,6 +1378,33 @@ fn last_heap_events(events: &[WidenedEvent]) -> std::collections::HashMap<usize,
         .collect()
 }
 
+/// A list's widened events since its last barrier, and the writes taken
+/// from them that no barrier widened yet (heap events expanded). Both are
+/// emptied, not made again, from barrier to barrier and from one use of the
+/// list to the next: a heap event expands to every UAV range of the heap,
+/// tens of thousands in the world.
+#[derive(Default)]
+struct WidenedPending {
+    events: Vec<WidenedEvent>,
+    writes: Vec<WidenedWrite>,
+}
+
+/// Room for widened writes a list keeps when it closes at least, in writes
+/// (24 bytes each), so that small lists never give theirs back.
+const WIDENED_KEEP_MIN: usize = 1 << 12;
+
+/// Empties a list's widened write buffer at its close, keeping the room for
+/// its next use (the world's lists need about the same each frame) but not
+/// more than twice what this use needed, `used`: a peak is not kept for
+/// good.
+fn empty_widened<T>(v: &mut Vec<T>, used: usize) {
+    v.clear();
+    let keep = used.max(WIDENED_KEEP_MIN).next_power_of_two();
+    if v.capacity() > 2 * keep {
+        v.shrink_to(keep);
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -1411,7 +1438,7 @@ pub(crate) struct HostList {
     /// Shadow ranges written through UAVs: the history late views may need,
     /// and ordered events written since the last barrier.
     widened_writes: Mutex<Vec<WidenedWrite>>,
-    widened_pending: Mutex<Vec<WidenedEvent>>,
+    widened_pending: Mutex<WidenedPending>,
     /// Exact source shadows whose buffers widening commands read. Their COM
     /// objects alone do not keep an arena slice out of the reuse pool.
     widened_sources: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>>,
@@ -3033,7 +3060,13 @@ impl HostList {
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut pending = self
+            .widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.events.clear();
+        pending.writes.clear();
+        drop(pending);
         self.widened_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3302,6 +3335,7 @@ impl HostList {
         self.widened_pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .events
             .push(WidenedEvent::Write((shadow.clone(), address, len)));
     }
 
@@ -3314,6 +3348,7 @@ impl HostList {
         self.widened_pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .events
             .push(WidenedEvent::Heap(heap.clone()));
     }
 
@@ -3328,61 +3363,74 @@ impl HostList {
     /// After the title's buffer/UAV barrier, widen the shadow ranges written
     /// before it so later SRVs in this submission see the UAV output.
     pub(crate) fn sync_widened(&self) {
-        let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
-        let events = std::mem::take(&mut *pending);
+        let mut pending = self
+            .widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let WidenedPending { events, writes } = &mut *pending;
+        // A heap event becomes the UAV ranges the heap's views reach now.
         // Every event of a heap expands to the same ranges (read now), and
         // the last one's copies come after, so over, the earlier ones'.
-        let last = last_heap_events(&events);
-        let mut expanded = Vec::new();
-        for (index, event) in events.into_iter().enumerate() {
+        let last = last_heap_events(events);
+        for (i, event) in events.drain(..).enumerate() {
             match event {
-                WidenedEvent::Write(write) => expanded.push(WidenedEvent::Write(write)),
+                WidenedEvent::Write(write) => writes.push(write),
                 WidenedEvent::Heap(heap) => {
-                    if last.get(&(std::sync::Arc::as_ptr(&heap) as usize)) == Some(&index) {
-                        expanded.extend(
-                            crate::bindless::widened_writes(&heap)
-                                .into_iter()
-                                .map(WidenedEvent::Write),
-                        );
+                    if last.get(&(std::sync::Arc::as_ptr(&heap) as usize)) == Some(&i) {
+                        crate::bindless::widened_writes_into(&heap, writes);
                     }
                 }
             }
         }
-        *pending = expanded;
-        let sampled: Vec<_> = pending
-            .iter()
-            .map(|event| match event {
-                WidenedEvent::Write(write) => write.clone(),
-                WidenedEvent::Heap(_) => unreachable!("heap events expanded above"),
-            })
-            .collect();
         if !crate::shadow::WIDENED_ANY.load(Ordering::Acquire) {
-            self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
-            pending.clear();
+            self.widened_writes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(writes);
             return;
         }
-        let ready = self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if sampled.is_empty()
-            && crate::shadow::widened_all().iter().all(|view| {
-                ready.contains(&(view.buffer.as_raw() as usize))
-            })
+        let mut ready = self.widened_ready.lock().unwrap_or_else(|e| e.into_inner());
+        if writes.is_empty()
+            && crate::shadow::widened_all()
+                .iter()
+                .all(|view| ready.contains(&(view.buffer.as_raw() as usize)))
         {
             return;
         }
-        let history = self.widened_writes.lock().unwrap_or_else(|e| e.into_inner());
-        let synced = history.len();
-        let mut writes = history.clone();
-        writes.extend(sampled.iter().cloned());
-        drop(history);
-        if writes.is_empty() {
+        let mut history = self
+            .widened_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if history.is_empty() && writes.is_empty() {
             return;
         }
-        let Some(views) = crate::widened::sync(self, &writes, synced, &ready) else {
+        // Writes a failed widening leaves stay for the next barrier.
+        let Some(views) = crate::widened::sync(self, &history, writes, &ready) else {
             return;
         };
-        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
-        pending.clear();
-        self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).extend(views);
+        history.append(writes);
+        ready.extend(views);
+    }
+
+    /// The widened history (address, bytes per write), where the history
+    /// and the buffer of writes not widened yet are, and whether anything
+    /// waits for a barrier (tests).
+    #[cfg(test)]
+    pub(crate) fn widened_state(&self) -> (Vec<(usize, usize)>, *const u8, *const u8, bool) {
+        let history = self
+            .widened_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let pending = self
+            .widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        (
+            history.iter().map(|&(_, at, len)| (at, len)).collect(),
+            history.as_ptr().cast(),
+            pending.writes.as_ptr().cast(),
+            !pending.events.is_empty() || !pending.writes.is_empty(),
+        )
     }
 
     /// Moves widened buffers into the unordered state for widening copies.
@@ -3418,8 +3466,20 @@ impl HostList {
     /// Returns widened buffers to common so the CPU can refresh them before
     /// the next submission.
     fn widen_close(&self) {
-        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        let mut history = self
+            .widened_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let used = history.len();
+        empty_widened(&mut history, used);
+        drop(history);
+        let mut pending = self
+            .widened_pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.events.clear();
+        empty_widened(&mut pending.writes, used);
+        drop(pending);
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let states = std::mem::take(&mut *self.widened_states.lock().unwrap_or_else(|e| e.into_inner()));
         for (_, (buffer, before)) in states {

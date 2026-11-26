@@ -256,6 +256,8 @@ mod image_store_tests;
 mod lower;
 #[cfg(test)]
 mod mark_tests;
+#[cfg(test)]
+mod mesh_index_tests;
 mod deltas;
 mod rect;
 pub use container::sign as sign_container;
@@ -382,6 +384,20 @@ pub struct HostShader {
     /// `u`[`VIEW_WRITES`] in [`MEMORY_SPACE`] (module notes, "Write
     /// marks").
     pub view_marks: bool,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`, or a format
+    /// load whose every use reads one half as f16), in order. On the console
+    /// each channel's 16 bits move as they are through a 16-bit float view
+    /// and through a 16-bit integer one alike. The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -994,6 +1010,7 @@ fn emit_pruned(
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     })
 }
 
@@ -1645,6 +1662,7 @@ mod tests {
             heap: false,
             heap_writes: false,
             view_marks: false,
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1663,6 +1681,7 @@ mod tests {
                 heap: false,
                 heap_writes: false,
                 view_marks: false,
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

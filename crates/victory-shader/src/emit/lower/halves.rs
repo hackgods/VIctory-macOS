@@ -303,9 +303,11 @@ impl Lower<'_> {
     ) -> Result<V, Why> {
         use super::super::wave::Op;
         let c = self.cur;
-        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
+        // AddH's half results are accumulated in f32, then rounded to f16 by
+        // the caller, just like the single-wave lowering.
+        let float = matches!(op, Op::AddF | Op::AddH | Op::MinF | Op::MaxF);
         let bits = if float { self.as_int(total) } else { total };
-        let missing = self.s.m.i32(ident);
+        let missing = self.s.m.i32(if op == Op::AddH { 0 } else { ident });
         let (lo, hi) = self.exchange_halves(bits, missing, c)?;
         let (lo, hi) = if float {
             (self.as_float(lo), self.as_float(hi))
@@ -324,7 +326,7 @@ impl Lower<'_> {
             l.s.m.select(c, less, lo, hi)
         };
         Ok(match op {
-            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
+            Op::AddU | Op::AddF | Op::AddH => self.s.m.bin(c, Bin::Add, lo, hi),
             Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
             Op::And => self.s.m.bin(c, Bin::And, lo, hi),
             Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
@@ -335,7 +337,6 @@ impl Lower<'_> {
             // FMin, FMax: as the host's own wave minimum and maximum.
             Op::MinF => self.binary(36, lo, hi),
             Op::MaxF => self.binary(35, lo, hi),
-            Op::AddH => return Err("a 16-bit wave reduction over both 32-lane halves"),
         })
     }
 }
@@ -379,12 +380,35 @@ pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may diff
 /// it that do not post-dominate it, which only the lanes taking one side may
 /// run (the branch's own block among them where a cycle leads back to it).
 /// None with an indirect exit.
-pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
+///
+/// Lowering caps an unconditional back edge — a `Jump` to a block at or
+/// before the jump, by reverse postorder — with an early return at the loop
+/// iteration limit: the latch leaves the program there too. That generated
+/// exit is block `n` here, a terminal exit just like a `Ret`, so a closed
+/// loop with a capped back edge does not look like it has no way out (which
+/// would make everything post-dominate its branches).
+pub(super) fn branch_regions(p: &Program, st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     let n = st.exits.len();
-    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Reverse postorder ranks, as lowering numbers them.
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; n];
+    for (r, &b) in order.iter().enumerate() {
+        rpo[b] = r;
+    }
+    let capped = |b: usize| {
+        matches!(st.exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b])
+    };
+    // Block `n` is the virtual exit of every capped latch.
+    let m = n + 1;
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); m];
     for (b, e) in st.exits.iter().enumerate() {
         match *e {
-            LaneExit::Jump(t) => succ[b].push(t),
+            LaneExit::Jump(t) => {
+                succ[b].push(t);
+                if capped(b) {
+                    succ[b].push(n);
+                }
+            }
             LaneExit::Branch {
                 taken, not_taken, ..
             } => {
@@ -396,9 +420,9 @@ pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>>
         }
     }
     // Post-dominators, as bitsets (a virtual exit after every end).
-    let words = n.div_ceil(64);
+    let words = m.div_ceil(64);
     let full = vec![u64::MAX; words];
-    let mut pdom: Vec<Vec<u64>> = (0..n)
+    let mut pdom: Vec<Vec<u64>> = (0..m)
         .map(|b| {
             if succ[b].is_empty() {
                 let mut v = vec![0; words];
@@ -412,7 +436,7 @@ pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>>
     let mut changed = true;
     while changed {
         changed = false;
-        for b in (0..n).rev() {
+        for b in (0..m).rev() {
             if succ[b].is_empty() {
                 continue;
             }
@@ -434,7 +458,7 @@ pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>>
         if !matches!(e, LaneExit::Branch { .. }) {
             continue;
         }
-        let mut seen = vec![false; n];
+        let mut seen = vec![false; m];
         let mut stack: Vec<usize> = succ[d].clone();
         while let Some(b) = stack.pop() {
             // The branch's own block is in its region if a cycle leads back
@@ -445,7 +469,7 @@ pub(super) fn branch_regions(st: &Structured) -> Option<Vec<(usize, Vec<bool>)>>
             seen[b] = true;
             stack.extend(succ[b].iter().copied());
         }
-        regions.push((d, seen));
+        regions.push((d, seen[..n].to_vec()));
     }
     Some(regions)
 }
@@ -558,7 +582,7 @@ fn wave_tid(x: &Parts) -> Option<Value> {
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     let wave_tid = wave_tid(x);
-    let regions = branch_regions(st);
+    let regions = branch_regions(p, st);
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
     let per_lane = |v: Value| x.res.waterfall.reads.contains(&v);
     // Scalar SSA values the same in every lane of a console wave, proven the

@@ -853,6 +853,9 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+// Also built for tests, which run where `host` cannot.
+#[cfg(any(windows, test))]
+mod schedule;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 
@@ -938,7 +941,7 @@ impl Prebuild {
         // thousands of them would bury the pre-build's own report.
         let quiet = tracing::Dispatch::none();
         let made = tracing::dispatcher::with_default(&quiet, || {
-            host::HostPipeline::new(&self.shaders, self.graphics.as_deref())
+            host::HostPipeline::new(&self.shaders, self.graphics.as_deref(), |_, _| {})
         });
         #[cfg(feature = "diagnostics")]
         make::log_built(&key);

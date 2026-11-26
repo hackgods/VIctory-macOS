@@ -478,7 +478,7 @@ const _: () = assert!(size_of::<RtvRecord>() <= 112);
 impl RtvRecord {
     /// All the view it records is made from: records with equal keys have
     /// equal views (of the same host texture).
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub(crate) fn key(&self) -> (usize, [u32; 7]) {
         let mut words = [self.described; 7];
         words[1..].copy_from_slice(&self.desc);
@@ -527,9 +527,44 @@ impl RtvRecord {
     }
 }
 
-/// Device method: records the view at `handle` (descriptor memory).
-pub(crate) extern "system" fn create_rtv(
-    _: This,
+#[cfg(windows)]
+const _: () = {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_RENDER_TARGET_VIEW_DESC,
+        D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    };
+    assert!(size_of::<D3D12_RENDER_TARGET_VIEW_DESC>() == 24);
+    assert!(std::mem::offset_of!(D3D12_RENDER_TARGET_VIEW_DESC, Anonymous) == 8);
+    assert!(size_of::<D3D12_DEPTH_STENCIL_VIEW_DESC>() == 24);
+    assert!(std::mem::offset_of!(D3D12_DEPTH_STENCIL_VIEW_DESC, Anonymous) == 12);
+    assert!(size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>() == 40);
+    assert!(std::mem::offset_of!(D3D12_SHADER_RESOURCE_VIEW_DESC, Anonymous) == 16);
+    assert!(size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>() == 40);
+    assert!(std::mem::offset_of!(D3D12_UNORDERED_ACCESS_VIEW_DESC, Anonymous) == 8);
+};
+
+/// Zeroes the union tail words an RTV or DSV dimension does not use so
+/// uninitialized caller stack bytes do not cause false target-cache misses.
+/// Unknown dimensions and dimension 0 keep every word unchanged.
+fn sanitize_target_words(words: &mut [u32; 6], depth: bool) {
+    let (start, used) = if depth {
+        // D3D12_DSV_DIMENSION: 1D, 1D array, 2D, 2D array, 2D MS, 2D MS array.
+        const USED: [usize; 7] = [0, 1, 3, 1, 3, 0, 2];
+        (3, USED.get(words[1] as usize).copied())
+    } else {
+        // D3D12_RTV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 3, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(words[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| words[1] != 0) {
+        words[start + used..6].fill(0);
+    }
+}
+
+fn write_target_record(
+    tag: u32,
+    depth: bool,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
@@ -537,30 +572,38 @@ pub(crate) extern "system" fn create_rtv(
     if handle == 0 {
         return;
     }
-    // SAFETY: the title passes a description or null.
-    let described = unsafe { desc.as_ref() };
+    let desc_words = words(desc).map(|mut w| {
+        sanitize_target_words(&mut w, depth);
+        w
+    });
     let record = RtvRecord {
-        tag: RTV_TAG,
-        described: u32::from(described.is_some()),
+        tag,
+        described: u32::from(desc_words.is_some()),
         resource,
-        desc: described.copied().unwrap_or_default(),
+        desc: desc_words.unwrap_or_default(),
     };
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
 }
 
-/// Device method: a depth view, recorded as render target views are.
-pub(crate) extern "system" fn create_dsv(
-    this: This,
+/// Device method: records the view at `handle` (descriptor memory).
+pub(crate) extern "system" fn create_rtv(
+    _: This,
     resource: This,
     desc: *const [u32; 6],
     handle: u64,
 ) {
-    create_rtv(this, resource, desc, handle);
-    if handle != 0 {
-        // SAFETY: just written by `create_rtv`.
-        unsafe { (handle as *mut u32).write_unaligned(DSV_TAG) };
-    }
+    write_target_record(RTV_TAG, false, resource, desc, handle);
+}
+
+/// Device method: a depth view, recorded as render target views are.
+pub(crate) extern "system" fn create_dsv(
+    _: This,
+    resource: This,
+    desc: *const [u32; 6],
+    handle: u64,
+) {
+    write_target_record(DSV_TAG, true, resource, desc, handle);
 }
 const DSV_TAG: u32 = u32::from_le_bytes(*b"vDSV");
 
@@ -591,17 +634,24 @@ pub(crate) enum View {
 /// title releases it, its entries are freed for reuse under a new
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
-/// next.
-/// shortcut: views without a resource object (constant buffers, memory
-/// views, samplers) are kept for the run; they are bounded by the title's
-/// memory and sampler states.
+/// next. Views without a resource object (constant buffers, placed memory
+/// views) are capped oldest-first (`VICTORY_OWNERLESS_VIEWS`) so they cannot
+/// accumulate without bound over a long run.
+#[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
+    /// Live entries in [`index`](Self::index) holding constant buffer views
+    /// (`[0]`) and placed memory views (`[1]`), kept O(1) as entries change.
+    address_entries: [u64; 2],
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// Entries of views that no resource releases (constant buffers and
+    /// placed memory views), oldest first, with the generation each was made
+    /// at: past [`ownerless_cap`] the oldest is freed.
+    ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
 /// Read by every view written and every slot a draw binds, on the
@@ -609,10 +659,26 @@ struct Views {
 /// resource released.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    address_entries: [0, 0],
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    ownerless: std::collections::VecDeque::new(),
 });
+
+/// How many table entries of views without a resource are kept
+/// ([`Views::ownerless`]). Past this cap the oldest entries are freed and
+/// their generation bumped so stale handles read as empty.
+/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (`0`: unlimited).
+fn ownerless_cap() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("VICTORY_OWNERLESS_VIEWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1 << 20)
+    })
+}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -624,6 +690,81 @@ impl View {
             _ => [0, 0],
         }
     }
+}
+
+impl Views {
+    fn count_address(&mut self, view: &View, added: bool) {
+        let kind = match view {
+            View::Constant(..) => 0,
+            View::Placed(..) => 1,
+            _ => return,
+        };
+        let n = &mut self.address_entries[kind];
+        *n = if added { *n + 1 } else { n.saturating_sub(1) };
+    }
+
+    fn free_ownerless(&mut self, i: u32, generation: u32) -> bool {
+        let Some((view, current)) = self.list.get(i as usize).cloned() else {
+            return false;
+        };
+        if current != generation || self.index.get(&view) != Some(&i) {
+            return false;
+        }
+        self.index.remove(&view);
+        self.count_address(&view, false);
+        self.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        self.free.push(i);
+        true
+    }
+
+    /// Inserts or looks up `view`, evicting oldest ownerless entries to keep
+    /// at most `cap` (`0`: unlimited). Returns `(index, generation, evicted)`.
+    fn entry_kept(&mut self, view: View, cap: usize) -> (u32, u32, bool) {
+        if let Some(&i) = self.index.get(&view) {
+            return (i, self.list[i as usize].1, false);
+        }
+        let ownerless =
+            view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
+        let mut evicted = false;
+        if ownerless && cap != 0 {
+            while self.ownerless.len() >= cap {
+                let (old_i, old_gen) = self.ownerless.pop_front().expect("at or over cap");
+                evicted |= self.free_ownerless(old_i, old_gen);
+            }
+        }
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.list[i as usize].0 = view.clone();
+                i
+            }
+            None => {
+                self.list.push((view.clone(), 1));
+                self.list.len() as u32 - 1
+            }
+        };
+        let generation = self.list[i as usize].1;
+        self.count_address(&view, true);
+        for r in view.resources().into_iter().filter(|&r| r != 0) {
+            self.by_resource.entry(r).or_default().push(i);
+        }
+        self.index.insert(view, i);
+        if ownerless && cap != 0 {
+            self.ownerless.push_back((i, generation));
+        }
+        (i, generation, evicted)
+    }
+}
+
+/// O(1) view-table counts for diagnostics: `[slots_total, live, cbv_live, placed_live]`.
+#[cfg(any(all(windows, feature = "diagnostics"), test))]
+pub(crate) fn views_kept() -> [u64; 4] {
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    [
+        views.list.len() as u64,
+        views.index.len() as u64,
+        views.address_entries[0],
+        views.address_entries[1],
+    ]
 }
 
 fn record(handle: u64, view: View) {
@@ -647,27 +788,10 @@ fn record(handle: u64, view: View) {
         return;
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
-    let i = match views.index.get(&view) {
-        Some(&i) => i,
-        None => {
-            let i = match views.free.pop() {
-                Some(i) => {
-                    views.list[i as usize].0 = view.clone();
-                    i
-                }
-                None => {
-                    views.list.push((view.clone(), 1));
-                    views.list.len() as u32 - 1
-                }
-            };
-            for r in view.resources().into_iter().filter(|&r| r != 0) {
-                views.by_resource.entry(r).or_default().push(i);
-            }
-            views.index.insert(view, i);
-            i
-        }
-    };
-    let generation = views.list[i as usize].1;
+    let (i, generation, evicted) = views.entry_kept(view, ownerless_cap());
+    if evicted {
+        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -828,6 +952,61 @@ pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle:
     record(handle, view);
 }
 
+/// Copies only the defined fields of a 56-byte `ResourceDesc`, leaving struct
+/// padding words 1 (after `Dimension`) and 13 (after `Flags`) zeroed so
+/// uninitialized caller stack bytes do not mint duplicate `VIEWS` entries.
+fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
+    if desc.is_null() {
+        return None;
+    }
+    let src = desc.cast::<u32>();
+    let mut fields = [0u32; 14];
+    // SAFETY: the caller supplies a 56-byte `ResourceDesc`, possibly unaligned.
+    // `Dimension` occupies word 0; `Alignment` through `Flags` occupy words 2..13.
+    unsafe {
+        fields[0] = src.read_unaligned();
+        fields[2..13].copy_from_slice(&src.add(2).cast::<[u32; 11]>().read_unaligned());
+    }
+    Some(fields)
+}
+
+/// Zeroes SRV alignment padding (word 3) and the unused tail of the view
+/// union for known non-zero SRV/UAV dimensions so uninitialized caller bytes
+/// do not defeat `VIEWS` deduplication. Unknown dimensions and dimension 0
+/// keep every word unchanged.
+fn sanitize_view_words(words: &mut [u32; 10], unordered: bool) {
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D.
+        const USED: [usize; 9] = [0, 7, 1, 3, 2, 4, 0, 2, 3];
+        (2, USED.get(words[1] as usize).copied())
+    } else {
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
+        // 2D MS array, 3D, cube, cube array, acceleration structure.
+        const USED: [usize; 12] = [0, 5, 3, 5, 4, 6, 0, 2, 3, 3, 5, 2];
+        (4, USED.get(words[1] as usize).copied())
+    };
+    if let Some(used) = used.filter(|_| words[1] != 0) {
+        if !unordered {
+            words[3] = 0;
+        }
+        words[start + used..10].fill(0);
+    }
+}
+
+fn view_words(desc: *const [u32; 10], unordered: bool) -> Option<[u32; 10]> {
+    let mut d = words(desc)?;
+    sanitize_view_words(&mut d, unordered);
+    Some(d)
+}
+
+fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
+    let mut d = words(desc)?;
+    let head: &mut [u32; 10] = (&mut d[..10]).try_into().expect("10-word prefix");
+    sanitize_view_words(head, unordered);
+    Some(d)
+}
+
 /// Device method.
 pub(crate) extern "system" fn create_srv(
     _: This,
@@ -835,7 +1014,7 @@ pub(crate) extern "system" fn create_srv(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    record(handle, View::Shader(resource as usize, words(desc)));
+    record(handle, View::Shader(resource as usize, view_words(desc, false)));
 }
 
 /// Device method.
@@ -846,7 +1025,7 @@ pub(crate) extern "system" fn create_uav(
     desc: *const [u32; 10],
     handle: u64,
 ) {
-    let view = View::Unordered(resource as usize, counter as usize, words(desc));
+    let view = View::Unordered(resource as usize, counter as usize, view_words(desc, true));
     record(handle, view);
 }
 
@@ -859,7 +1038,9 @@ pub(crate) extern "system" fn create_placed_srv(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) =
+        (placed_resource_words(resource), placed_view_words(desc, false))
+    {
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -870,7 +1051,9 @@ pub(crate) extern "system" fn create_placed_uav(
     desc: *const [u32; 16],
     handle: u64,
 ) {
-    if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+    if let (Some(resource), Some(desc)) =
+        (placed_resource_words(resource), placed_view_words(desc, true))
+    {
         record(handle, View::Placed(true, resource, desc));
     }
 }
@@ -1474,5 +1657,372 @@ pub(crate) mod tests {
             release(h);
             assert!(queued, "the descriptor write reached the heap at the reused address");
         }
+    }
+
+    #[test]
+    fn placed_views_ignore_resource_desc_padding() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let view_desc = [0u32; 16];
+        let null = std::ptr::null();
+        let expected = [3, 0, 0, 0, 8, 0, 8, 0x1_0001, 28, 1, 0, 0, 0, 0];
+        for (unordered, create) in [
+            (false, create_placed_srv as extern "system" fn(_, _, _, _)),
+            (true, create_placed_uav),
+        ] {
+            create(null, &expected, &view_desc, handle);
+            let first = slot;
+            let mut padded = expected;
+            padded[1] = 0xaaaa_aaaa;
+            padded[13] = 0xbbbb_bbbb;
+            create(null, &padded, &view_desc, handle);
+            assert_eq!(slot, first, "padding words 1 and 13 must deduplicate");
+            assert_eq!(
+                view(handle).as_deref(),
+                Some(&View::Placed(unordered, expected, view_desc))
+            );
+            let mut other = expected;
+            other[12] = 4; // Flags
+            create(null, &other, &view_desc, handle);
+            assert_ne!(slot, first, "non-padding Flags word must still differentiate");
+        }
+    }
+
+    #[test]
+    fn views_ignore_unused_srv_and_uav_words() {
+        let mut slot = [0u32; 8];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+        let resource = [1, 0, 0, 0, 0x4000, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+
+        // Every known SRV dimension (1..=11): word 3 and words[4+used..10] are zeroed.
+        let srv_used: [(u32, usize); 11] = [
+            (1, 5),
+            (2, 3),
+            (3, 5),
+            (4, 4),
+            (5, 6),
+            (6, 0),
+            (7, 2),
+            (8, 3),
+            (9, 3),
+            (10, 5),
+            (11, 2),
+        ];
+        for (dim, used) in srv_used {
+            let mut clean = [0u32; 16];
+            clean[0] = 28;
+            clean[1] = dim;
+            clean[2] = 0x1688;
+            for k in 0..used {
+                clean[4 + k] = 10 + k as u32;
+            }
+            clean[10] = 0x1000 + dim;
+            clean[11] = 0x6;
+            let mut noisy = clean;
+            noisy[3] = 0xdead_beef;
+            for w in &mut noisy[4 + used..10] {
+                *w = 0xfeed_face;
+            }
+
+            create_placed_srv(null, &resource, &clean, handle);
+            let first = slot;
+            create_placed_srv(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "placed SRV dim {dim} unused words");
+            assert_eq!(
+                view(handle).as_deref(),
+                Some(&View::Placed(false, resource, clean))
+            );
+
+            let clean10: [u32; 10] = clean[..10].try_into().unwrap();
+            let noisy10: [u32; 10] = noisy[..10].try_into().unwrap();
+            create_srv(null, null, &clean10, handle);
+            let first_srv = slot;
+            create_srv(null, null, &noisy10, handle);
+            assert_eq!(slot, first_srv, "resource SRV dim {dim} unused words");
+            assert_eq!(view(handle).as_deref(), Some(&View::Shader(0, Some(clean10))));
+
+            if used > 0 {
+                let mut diff = clean10;
+                diff[4 + used - 1] += 1;
+                create_srv(null, null, &diff, handle);
+                assert_ne!(slot, first_srv, "SRV dim {dim} last used word must count");
+            }
+        }
+
+        // Every known UAV dimension (1..=8): words[2+used..10] are zeroed.
+        let uav_used: [(u32, usize); 8] = [
+            (1, 7),
+            (2, 1),
+            (3, 3),
+            (4, 2),
+            (5, 4),
+            (6, 0),
+            (7, 2),
+            (8, 3),
+        ];
+        for (dim, used) in uav_used {
+            let mut clean = [0u32; 16];
+            clean[0] = 28;
+            clean[1] = dim;
+            for k in 0..used {
+                clean[2 + k] = 20 + k as u32;
+            }
+            clean[10] = 0x2000 + dim;
+            clean[11] = 0x6;
+            let mut noisy = clean;
+            for w in &mut noisy[2 + used..10] {
+                *w = 0xbadc_0ffe;
+            }
+
+            create_placed_uav(null, &resource, &clean, handle);
+            let first = slot;
+            create_placed_uav(null, &resource, &noisy, handle);
+            assert_eq!(slot, first, "placed UAV dim {dim} unused words");
+            assert_eq!(
+                view(handle).as_deref(),
+                Some(&View::Placed(true, resource, clean))
+            );
+
+            let clean10: [u32; 10] = clean[..10].try_into().unwrap();
+            let noisy10: [u32; 10] = noisy[..10].try_into().unwrap();
+            create_uav(null, null, null, &clean10, handle);
+            let first_uav = slot;
+            create_uav(null, null, null, &noisy10, handle);
+            assert_eq!(slot, first_uav, "resource UAV dim {dim} unused words");
+            assert_eq!(
+                view(handle).as_deref(),
+                Some(&View::Unordered(0, 0, Some(clean10)))
+            );
+
+            if used > 0 {
+                let mut diff = clean10;
+                diff[2 + used - 1] += 1;
+                create_uav(null, null, null, &diff, handle);
+                assert_ne!(slot, first_uav, "UAV dim {dim} last used word must count");
+            }
+        }
+
+        // Dimension 0 and unknown dimensions preserve every word untouched.
+        for (unordered, dim) in [(false, 0u32), (false, 99), (true, 0), (true, 99)] {
+            let raw = [28, dim, 0x1688, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77];
+            let mut out = raw;
+            sanitize_view_words(&mut out, unordered);
+            assert_eq!(out, raw, "unknown/zero dim {dim} (uav={unordered}) preserved");
+        }
+    }
+
+    #[test]
+    fn ownerless_entries_are_capped() {
+        let mut views = Views::default();
+        let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
+        let live_counts = |v: &Views| {
+            let count = |f: fn(&View) -> bool| v.index.keys().filter(|k| f(k)).count() as u64;
+            [
+                count(|k| matches!(k, View::Constant(..))),
+                count(|k| matches!(k, View::Placed(..))),
+            ]
+        };
+        let named = |views: &Views, (i, generation): (u32, u32), view: &View| {
+            views
+                .list
+                .get(i as usize)
+                .is_some_and(|(v, g)| *g == generation && v == view)
+        };
+
+        let mut handles = Vec::new();
+        for n in 0..10u32 {
+            let (i, g, evicted) = views.entry_kept(placed(n), 4);
+            assert_eq!(evicted, n >= 4);
+            handles.push((i, g));
+            assert_eq!(views.address_entries, live_counts(&views));
+        }
+        assert_eq!(views.index.len(), 4, "four kept");
+        assert!(views.list.len() <= 4, "entries reused in place: {}", views.list.len());
+        for (n, &h) in handles.iter().enumerate().take(6) {
+            assert!(!named(&views, h, &placed(n as u32)), "entry {n} stale");
+        }
+        for (n, &h) in handles.iter().enumerate().skip(6) {
+            assert!(named(&views, h, &placed(n as u32)), "entry {n} kept");
+        }
+        // Re-recording a live entry reuses it without evicting.
+        assert_eq!(views.entry_kept(placed(9), 4), (handles[9].0, handles[9].1, false));
+        // A resource-owned view is never evicted by ownerless churn.
+        let shader = View::Shader(0x1234, None);
+        let (si, sg, evicted) = views.entry_kept(shader.clone(), 4);
+        assert!(!evicted);
+        for n in 10..40 {
+            views.entry_kept(placed(n), 4);
+        }
+        views.entry_kept(View::Constant(0x5678, 256), 4);
+        assert!(named(&views, (si, sg), &shader));
+        assert_eq!(views.index.len(), 5, "1 resource view + 4 ownerless");
+        assert_eq!(views.address_entries, [1, 3]);
+        assert_eq!(views.address_entries, live_counts(&views));
+        // Cap 1 keeps only the latest ownerless view.
+        let mut single = Views::default();
+        let (a_i, a_g, _) = single.entry_kept(View::Constant(0x1000, 64), 1);
+        let (b_i, b_g, evicted) = single.entry_kept(View::Constant(0x2000, 64), 1);
+        assert!(evicted);
+        assert!(!named(&single, (a_i, a_g), &View::Constant(0x1000, 64)));
+        assert!(named(&single, (b_i, b_g), &View::Constant(0x2000, 64)));
+        assert_eq!(single.address_entries, [1, 0]);
+        // Cap 0 keeps all entries without growing `ownerless`.
+        let ownerless_before = views.ownerless.len();
+        for n in 40..60 {
+            let (_, _, evicted) = views.entry_kept(placed(n), 0);
+            assert!(!evicted);
+        }
+        assert_eq!(views.index.len(), 5 + 20);
+        assert_eq!(views.ownerless.len(), ownerless_before);
+        assert_eq!(views.address_entries, live_counts(&views));
+        let _ = views_kept();
+    }
+
+    #[test]
+    fn rtv_and_dsv_records_ignore_unused_union_words() {
+        let mut slot = [0u64; 16];
+        let handle = slot.as_mut_ptr() as u64;
+        let null = std::ptr::null();
+
+        // RTV dims 1..=8: union starts at word 2.
+        for (dim, used) in [
+            (1u32, 3usize),
+            (2, 1),
+            (3, 3),
+            (4, 2),
+            (5, 4),
+            (6, 0),
+            (7, 2),
+            (8, 3),
+        ] {
+            let mut clean = [28, dim, 0, 0, 0, 0];
+            for k in 0..used {
+                clean[2 + k] = 1 + k as u32;
+            }
+            let mut noisy = clean;
+            for w in &mut noisy[2 + used..6] {
+                *w = 0xdead_beef;
+            }
+            create_rtv(null, null, &clean, handle);
+            let k_clean = rtv_record(handle).unwrap().key();
+            create_rtv(null, null, &noisy, handle);
+            let k_noisy = rtv_record(handle).unwrap().key();
+            assert_eq!(k_noisy, k_clean, "RTV dim {dim} unused tail");
+            if used > 0 {
+                let mut diff = clean;
+                diff[2 + used - 1] += 1;
+                create_rtv(null, null, &diff, handle);
+                assert_ne!(rtv_record(handle).unwrap().key(), k_clean, "RTV dim {dim} used word");
+            }
+        }
+
+        // DSV dims 1..=6: Flags at word 2, union starts at word 3.
+        for (dim, used) in [(1u32, 1usize), (2, 3), (3, 1), (4, 3), (5, 0), (6, 2)] {
+            let mut clean = [40, dim, 1, 0, 0, 0];
+            for k in 0..used {
+                clean[3 + k] = 5 + k as u32;
+            }
+            let mut noisy = clean;
+            for w in &mut noisy[3 + used..6] {
+                *w = 0xfeed_face;
+            }
+            create_dsv(null, null, &clean, handle);
+            let k_clean = dsv_record(handle).unwrap().key();
+            create_dsv(null, null, &noisy, handle);
+            let k_noisy = dsv_record(handle).unwrap().key();
+            assert_eq!(k_noisy, k_clean, "DSV dim {dim} unused tail");
+            if used > 0 {
+                let mut diff = clean;
+                diff[3 + used - 1] += 1;
+                create_dsv(null, null, &diff, handle);
+                assert_ne!(dsv_record(handle).unwrap().key(), k_clean, "DSV dim {dim} used word");
+            }
+            // DSV Flags (word 2) must always be preserved.
+            let mut flags_diff = clean;
+            flags_diff[2] ^= 2;
+            create_dsv(null, null, &flags_diff, handle);
+            assert_ne!(dsv_record(handle).unwrap().key(), k_clean, "DSV dim {dim} Flags");
+        }
+
+        // Unknown / zero dimensions keep every word; null desc records zeroed words.
+        for (depth, dim) in [(false, 0u32), (false, 99), (true, 0), (true, 99)] {
+            let raw = [28, dim, 1, 2, 3, 4];
+            let mut out = raw;
+            sanitize_target_words(&mut out, depth);
+            assert_eq!(out, raw);
+        }
+        create_rtv(null, null, std::ptr::null(), handle);
+        assert_eq!(rtv_record(handle).unwrap().key(), (0, [0; 7]));
+        create_dsv(null, null, std::ptr::null(), handle);
+        assert_eq!(dsv_record(handle).unwrap().key(), (0, [0; 7]));
+    }
+
+    /// A table made afresh for a draw holds the descriptors its shader
+    /// moves halves through (`HostShader::half_views`), also past the range
+    /// starts its used-resource entries give: with one entry for a range
+    /// from dword 0 and a 16-bit float buffer view at dword 8, the table
+    /// takes two dynamic slots, so the next allocation does not land on the
+    /// view's.
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        let (first, second) = (title.start, title.start + 32);
+        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &words, second);
+        assert!(view(second).as_deref().and_then(host::half_view).is_some());
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let made = state.tables(&list, &[range], &[(1, 8)], true);
+        let [(1, offset)] = made[..] else {
+            panic!("one fresh table for root parameter 1, not {made:?}");
+        };
+        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        let next = host_heap.dynamic(1).expect("a dynamic slot");
+        host_heap.release(next, 1);
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert_eq!(
+            next,
+            offset / 32 + 2,
+            "the next allocation took the table's second slot"
+        );
     }
 }

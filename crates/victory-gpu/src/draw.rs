@@ -753,7 +753,7 @@ impl State {
                     .host()
                     .and_then(|h| h.view_addresses());
             }
-            let made = self.tables(list, &t.used, compute);
+            let made = self.tables(list, &t.used, &t.host.half_views, compute);
             // A depth copy of ours made readable a texture the tables hold
             // (`crate::twin`), with a compute pipeline: this one's again
             // (root arguments are set below).
@@ -1324,9 +1324,53 @@ impl State {
     ///
     /// Within a list, the same table holding the same descriptors is made
     /// once.
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> Vec<(u8, u32)> {
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a channel
+    /// as unsigned integers (`HostShader::half_views`). A table with a 16-bit
+    /// float or signed buffer view at one of them is made afresh as well,
+    /// with that view in the unsigned format of the same layout
+    /// (`descriptor::host::half_view`): the title's own slot keeps the
+    /// title's format for shaders that read it as floats.
+    pub(crate) fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        half: &[(u8, u32)],
+        compute: bool,
+    ) -> Vec<(u8, u32)> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = Vec::new();
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and the
+        // title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            let view = crate::descriptor::view(table + u64::from(at) * 4)?;
+            crate::descriptor::host::half_view(&view)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
+        }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA) are made afresh too: the
         // title's slots there have no host slot of their own.
@@ -1371,19 +1415,31 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its first).
             let n = entries
                 .iter()
                 .map(|u| u.table_offset_dwords / 8 + 1)
+                .chain(
+                    half.iter()
+                        .filter(|&&(s, _)| s == slot)
+                        .map(|&(_, at)| at / 8 + 1),
+                )
                 .max()
                 .unwrap_or(1);
             // The table and what its entries hold (record words).
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
+                n.hash(&mut h);
                 for k in 0..n {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    // Another table than the same slots made for a shader
+                    // that reads them in the title's formats.
+                    half.contains(&(slot, k * 8)).hash(&mut h);
                 }
                 (table, h.finish())
             };
@@ -1417,7 +1473,10 @@ impl State {
                 let view = crate::descriptor::view(table + u64::from(k) * 32);
                 match view.as_deref() {
                     Some(view) => {
-                        host.make_at(index, view);
+                        match halved(self, slot, k * 8) {
+                            Some(twin) => host.make_at(index, &twin),
+                            None => host.make_at(index, view),
+                        }
                         if let Some(u) = used {
                             readable(list, u, view, true);
                         }
@@ -3356,7 +3415,7 @@ void main() { dst.Store4(0, asuint(src[0])); }
         state.set_table(true, 0, title_heap.start);
         assert!(
             state
-                .tables(&list, &[used(ResourceType::Srv)], true)
+                .tables(&list, &[used(ResourceType::Srv)], &[], true)
                 .is_empty(),
             "an in-place table"
         );
@@ -4259,7 +4318,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 used: used_entries,
             },
         );
-        let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
+        let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("compute host pipeline");
         assert!(hp.marks.is_some());
 
         // 16-bit console depth-stencil texture (`format = 118`) whose twin

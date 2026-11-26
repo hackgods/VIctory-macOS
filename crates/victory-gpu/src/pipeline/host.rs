@@ -389,21 +389,25 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
-/// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
-    static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.contains(&reason) {
-        seen.push(reason);
-        tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
-    }
-    None
-}
-
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        record_refusal: impl Fn(&'static str, Option<i32>),
+    ) -> Option<HostPipeline> {
+        let refuse = |reason: &'static str| {
+            // Record every affected pipeline, including those after the first warning.
+            record_refusal(reason, None);
+            static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&reason) {
+                seen.push(reason);
+                tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
+            }
+            None
+        };
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -414,10 +418,7 @@ impl HostPipeline {
                 .iter()
                 .any(|s| !matches!(s.stage, "vertex" | "pixel" | "mesh"))
         {
-            return refuse(
-                "only vertex, mesh, pixel and compute stages are translated",
-                shaders,
-            );
+            return refuse("only vertex, mesh, pixel and compute stages are translated");
         }
         let mesh = find("mesh");
         let stages = if let Some(cs) = compute {
@@ -426,17 +427,14 @@ impl HostPipeline {
             let first = match (mesh, find("vertex")) {
                 (Some(ms), _) => (ms, D3D12_SHADER_VISIBILITY_MESH),
                 (None, Some(vs)) => (vs, D3D12_SHADER_VISIBILITY_VERTEX),
-                (None, None) => return refuse("no vertex or mesh shader", shaders),
+                (None, None) => return refuse("no vertex or mesh shader"),
             };
             let mut stages = vec![first];
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
         if mesh.is_some() && !host()?.mesh_support().supported() {
-            return refuse(
-                "the host GPU has no mesh shaders (or no shader model 6.6)",
-                shaders,
-            );
+            return refuse("the host GPU has no mesh shaders (or no shader model 6.6)");
         }
         for (s, _) in &stages {
             s.translated()?;
@@ -477,10 +475,7 @@ impl HostPipeline {
                 "mesh outputs over Metal's 32 KiB after linking: pipeline refused \
                  (VICTORY_MESH_OVER_LIMIT=1 makes it)"
             );
-            return refuse(
-                "the mesh shader's outputs take more than the host GPU allows",
-                shaders,
-            );
+            return refuse("the mesh shader's outputs take more than the host GPU allows");
         }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
@@ -500,10 +495,7 @@ impl HostPipeline {
                 .is_some_and(|b: [u8; 4]| u32::from_le_bytes(b) & 0x1040_0000 != 0)
         });
         if atomics64 && !host.heap_atomics64() {
-            return refuse(
-                "the host GPU has no 64-bit atomics on typed heap resources",
-                shaders,
-            );
+            return refuse("the host GPU has no 64-bit atomics on typed heap resources");
         }
 
         let aniso_point_mip_supported = crate::sampler::aniso_point_mip(&host.device);
@@ -637,6 +629,7 @@ impl HostPipeline {
         let (root, root_blob) = match root_signature(&host.device, &params, &samplers, compute.is_some()) {
             Ok(root) => root,
             Err(e) => {
+                record_refusal("root signature refused", Some(e.code().0));
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
                 return None;
             }
@@ -668,6 +661,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    record_refusal("compute pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
                     return None;
@@ -689,7 +683,7 @@ impl HostPipeline {
             });
         }
         let Some(g) = g else {
-            return refuse("graphics state not kept (plain description)", shaders);
+            return refuse("graphics state not kept (plain description)");
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
@@ -698,7 +692,7 @@ impl HostPipeline {
         let ps = stages.get(1).and_then(|(s, _)| s.translated());
         let deltas = ps.is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
         if mesh.is_some() && deltas {
-            return refuse("non-provoking vertex values in a mesh pipeline", shaders);
+            return refuse("non-provoking vertex values in a mesh pipeline");
         }
         if mesh.is_some() {
             let name = super::library::name(
@@ -723,6 +717,7 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
+                    record_refusal("mesh pipeline refused", Some(e.code().0));
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
                     return None;
@@ -751,15 +746,16 @@ impl HostPipeline {
         let vs = stages.first().and_then(|(s, _)| s.translated());
         let gs = match (g.topology.0, vs, ps) {
             (RECTANGLES, ..) if deltas => {
-                return refuse("non-provoking vertex values in a rectangle list", shaders);
+                return refuse("non-provoking vertex values in a rectangle list");
             }
             (_, Some(vs), Some(ps)) if deltas => {
                 if host_topology(g) != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE {
-                    return refuse("non-provoking vertex values of points or lines", shaders);
+                    return refuse("non-provoking vertex values of points or lines");
                 }
                 match victory_shader::emit::vertex_delta_gs(&vs.host.dxil, &ps.host.dxil) {
                     Ok(gs) => gs,
                     Err(e) => {
+                        record_refusal("no vertex value geometry shader", None);
                         tracing::warn!(error = %e, ?shaders, "no vertex value geometry shader");
                         return None;
                     }
@@ -834,6 +830,7 @@ impl HostPipeline {
         let pso = match made {
             Ok(pso) => pso,
             Err(e) => {
+                record_refusal("graphics pipeline refused", Some(e.code().0));
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
                 return None;

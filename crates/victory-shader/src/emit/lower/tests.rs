@@ -1358,6 +1358,15 @@ fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
 
 /// The same program, lowered.
 fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
+    lowered_result(words, lanes, narrow_waves).expect("lower")
+}
+
+/// The same program, lowered, as a result (a refusal is an `Err`).
+fn lowered_result(
+    words: &[u32],
+    lanes: u32,
+    narrow_waves: bool,
+) -> Result<super::Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -1393,7 +1402,6 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         host_wave32: false,
         view_marks: false,
     })
-    .expect("lower")
 }
 
 #[test]
@@ -1580,6 +1588,673 @@ fn a_read_before_divergent_writes_syncs_where_all_lanes_run() {
     w.push(RESTORE_EXEC);
     w.push(S_ENDPGM);
     assert_eq!(barriers_at(&wave64(&w)).unwrap(), []);
+}
+
+/// Lowers a wave64 compute program of `lanes` threads in halves
+/// (`host_wave32`, a host of 32-lane waves): the console wave runs as two
+/// host waves, which pass values between them behind group barriers.
+fn lowered_halves(words: &[u32], lanes: u32) -> Result<Lowered, crate::ShaderError> {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            // Two user-data SGPRs, no LDS.
+            rsrc2: 2 << 1,
+            threads: [lanes, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        host_wave32: true,
+        view_marks: false,
+    })
+}
+
+/// A uniform outer loop (on the scalar `s20`) holding a divergent inner
+/// loop — entered on `vcc`, the lanes with thread id below 40 — whose latch
+/// is an unconditional `s_branch` back to its header: the back edge that
+/// lowering caps with an early return at the loop iteration limit. After
+/// the inner loop, `v_readlane_b32` of console lane 40, which in halves
+/// passes between the 32-lane halves behind group barriers (its result is
+/// only read after the outer loop, so no branch in the loop depends on it).
+fn capped_back_edge_in_a_divergent_loop() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0
+        0xBF87_0001, // s_cbranch_vccnz -> the inner loop
+        0xBF82_0005, // s_branch -> the join
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF06_8315, // s_cmp_eq_u32 s21, 3
+        0xBF85_0001, // s_cbranch_scc1 -> the join
+        0xBF82_FFFC, // s_branch -> the inner loop's header (unconditional back edge)
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        0xBF85_FFF2, // s_cbranch_scc1 -> the outer loop's header
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0 (after the outer loop)
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBF80_0000, // s_nop
+        S_ENDPGM,
+    ]
+}
+
+/// The same outer loop with an inner loop every lane enters together: its
+/// unconditional back edge is capped too, but every lane of the group
+/// leaves the loop through it together, so nothing after it is skipped.
+fn capped_back_edge_in_a_uniform_loop() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF06_8315, // s_cmp_eq_u32 s21, 3
+        0xBF85_0001, // s_cbranch_scc1 -> the join
+        0xBF82_FFFC, // s_branch -> the inner loop's header (unconditional back edge)
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        0xBF85_FFF6, // s_cbranch_scc1 -> the outer loop's header
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0 (after the outer loop)
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBF80_0000, // s_nop
+        S_ENDPGM,
+    ]
+}
+
+/// The divergent inner loop with a conditional back edge instead: the
+/// iteration cap then only ends the loop through its normal exit, no lane
+/// leaves the program early.
+fn conditional_back_edge_in_a_divergent_loop() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0
+        0xBF87_0001, // s_cbranch_vccnz -> the inner loop
+        0xBF82_0004, // s_branch -> the join
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF0A_8315, // s_cmp_lt_u32 s21, 3
+        0xBF85_FFFD, // s_cbranch_scc1 -> the inner loop's header (conditional back edge)
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        0xBF85_FFF3, // s_cbranch_scc1 -> the outer loop's header
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0 (after the outer loop)
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBF80_0000, // s_nop
+        S_ENDPGM,
+    ]
+}
+
+/// The back-edge programs have the back edges their comments say: one
+/// unconditional `s_branch` to a loop header where they say so, and the
+/// words decode to the instructions their comments name.
+#[test]
+fn the_back_edge_programs_are_what_their_comments_say() {
+    let back_edges = |w: &[u32]| {
+        let p = wave64(w);
+        let order = crate::ir::reverse_postorder(&p.blocks);
+        let mut rpo = vec![usize::MAX; p.blocks.len()];
+        for (r, &b) in order.iter().enumerate() {
+            rpo[b] = r;
+        }
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, blk)| match blk.exit {
+                ir::Exit::Jump(t) => rpo[*b] != usize::MAX && rpo[t] <= rpo[*b],
+                _ => false,
+            })
+            .count()
+    };
+    assert_eq!(back_edges(&capped_back_edge_in_a_divergent_loop()), 1);
+    assert_eq!(back_edges(&capped_back_edge_in_a_uniform_loop()), 1);
+    assert_eq!(back_edges(&conditional_back_edge_in_a_divergent_loop()), 0);
+    for w in [
+        capped_back_edge_in_a_divergent_loop(),
+        capped_back_edge_in_a_uniform_loop(),
+        conditional_back_edge_in_a_divergent_loop(),
+    ] {
+        let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "s_mov_b32 s20, 0",
+            "s_add_u32 s21, s21, 1",
+            "v_readlane_b32 s12, v0, 40",
+            "s_cmp_lg_u32 s12, 0",
+            "s_add_u32 s20, s20, 1",
+            "s_cmp_lt_u32 s20, 2",
+            "s_cbranch_scc1",
+            "s_branch",
+            "s_endpgm",
+        ] {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+    let code: Vec<u8> = capped_back_edge_in_a_divergent_loop()
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in ["v_cmp_gt_u32 vcc", "s_cbranch_vccnz", "s_cmp_eq_u32 s21, 3"] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// A half-wave exchange after a divergent loop whose unconditional back
+/// edge lowering caps with an early return: one wave may leave the program
+/// at the cap while another reaches the exchange's group barrier with
+/// missing participants, so the exchange is refused in halves. As one
+/// wave64 there are no halves and it translates.
+#[test]
+fn an_exchange_after_a_divergent_capped_back_edge_is_refused() {
+    let w = capped_back_edge_in_a_divergent_loop();
+    let why = lowered_halves(&w, 64)
+        .err()
+        .expect("refused in halves")
+        .to_string();
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
+    // One wave64: no halves, no exchange, and it translates.
+    let whole = lowered(&w, 64, false);
+    assert_eq!(whole.wave_size, Some(64));
+}
+
+/// The same exchange after a loop whose unconditional back edge is capped
+/// but which every lane of the group runs together: all lanes leave at the
+/// cap together, so the exchange stands in halves.
+#[test]
+fn an_exchange_after_a_uniform_capped_back_edge_translates() {
+    let w = capped_back_edge_in_a_uniform_loop();
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.wave_ops);
+    // The exchange really is there: each half's store between two group
+    // barriers.
+    assert!(l.barriers > 0, "no dx.op.barrier written");
+}
+
+/// The same exchange after a divergent loop whose back edge is conditional:
+/// the cap then ends the loop through its normal exit, so no lane leaves
+/// early and the exchange stands in halves.
+#[test]
+fn an_exchange_after_a_divergent_conditional_back_edge_translates() {
+    let w = conditional_back_edge_in_a_divergent_loop();
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.wave_ops);
+    assert!(l.barriers > 0, "no dx.op.barrier written");
+}
+
+/// A closed loop: its header's conditional back edge branches on `scc` from
+/// comparing the loop-carried `s12` (a divergent condition), and the latch's
+/// unconditional `s_branch` back to the header is the loop's only other
+/// back edge — and the one lowering caps with an early return. Every back
+/// edge to the header shares its iteration counter, so a lane whose compare
+/// holds runs the conditional back edge and drives the shared count up; it
+/// can reach the cap at the latch and leave the program there while another
+/// lane goes on. The latch is still run by every lane of the group (it
+/// post-dominates the branch), so only the shared-counter check can see the
+/// escape: `v_readlane_b32` of console lane 40 in the loop, whose result the
+/// header's branch reads, is refused in halves.
+fn shared_counter_with_a_divergent_conditional_back_edge() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBF82_0000, // s_branch -> the loop header
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0 (the loop-carried exchange's result)
+        0xBF85_FFFE, // s_cbranch_scc1 -> the loop header (conditional back edge)
+        0xBF82_0000, // s_branch -> the exchange
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0xBF82_0000, // s_branch -> the latch
+        0xBF82_FFF9, // s_branch -> the loop header (unconditional latch, capped)
+    ]
+}
+
+/// Blocker 1: the loop above shares one counter between its conditional and
+/// unconditional back edges. The latch is in step, but the header is not
+/// (the divergent branch's region) and the conditional back edge is not
+/// uniform, so a lane may return early at the latch's cap while another
+/// continues — the exchange in the loop is refused in halves.
+#[test]
+fn an_exchange_in_a_loop_whose_counter_a_divergent_back_edge_shares_is_refused() {
+    let w = shared_counter_with_a_divergent_conditional_back_edge();
+    // The words decode to what the comments say: one conditional back edge
+    // to the header on vcc, one unconditional capped one from the latch.
+    let p = wave64(&w);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (r, &b) in order.iter().enumerate() {
+        rpo[b] = r;
+    }
+    let mut unconditional = 0;
+    let mut conditional = 0;
+    for (b, blk) in p.blocks.iter().enumerate() {
+        let back = |t: usize| rpo[b] != usize::MAX && rpo[t] <= rpo[b];
+        match blk.exit {
+            ir::Exit::Jump(t) if back(t) => unconditional += 1,
+            ir::Exit::Branch { taken, not_taken } if back(taken) || back(not_taken) => {
+                conditional += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(unconditional, 1, "one capped unconditional back edge");
+    assert_eq!(conditional, 1, "one conditional back edge to the same header");
+    assert_eq!(
+        p.blocks
+            .iter()
+            .filter(|b| b.insts.iter().any(|i| i.name() == "s_barrier"))
+            .count(),
+        0
+    );
+    let why = lowered_halves(&w, 64)
+        .err()
+        .expect("refused in halves")
+        .to_string();
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
+}
+
+/// A lane-dependent branch into a closed self-loop (its only edge is the
+/// unconditional `s_branch` back to itself, which lowering caps with an
+/// early return) against a sibling path holding `v_readlane_b32` of console
+/// lane 40. The lanes in the self-loop never reach the sibling path — they
+/// leave at the cap — so the exchange there is refused in halves.
+fn closed_self_loop_next_to_a_lane_read() -> Vec<u32> {
+    vec![
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0 (vcc = v0 < 40)
+        0xBF87_0001, // s_cbranch_vccnz -> the self-loop
+        0xBF82_0001, // s_branch -> the sibling path
+        0xBF82_FFFF, // s_branch -> itself: the closed self-loop (capped back edge)
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40
+        0xBF07_800C, // s_cmp_lg_u32 s12, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBF80_0000, // s_nop
+        S_ENDPGM,
+    ]
+}
+
+/// Blocker 2: the closed self-loop has no exit in the console's CFG, but
+/// lowering's early return at its capped back edge is one, so the sibling
+/// path with the lane read does not post-dominate the lane-dependent branch
+/// and is not a reconvergence point — the exchange is refused in halves.
+#[test]
+fn an_exchange_on_the_sibling_of_a_closed_capped_self_loop_is_refused() {
+    let w = closed_self_loop_next_to_a_lane_read();
+    let p = wave64(&w);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (r, &b) in order.iter().enumerate() {
+        rpo[b] = r;
+    }
+    assert_eq!(
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, blk)| match blk.exit {
+                ir::Exit::Jump(t) => rpo[*b] != usize::MAX && rpo[t] <= rpo[*b],
+                _ => false,
+            })
+            .count(),
+        1,
+        "one capped unconditional back edge (the self-loop)"
+    );
+    let why = lowered_halves(&w, 64)
+        .err()
+        .expect("refused in halves")
+        .to_string();
+    assert!(
+        why.contains("a lane read that may cross 32-lane halves"),
+        "{why}"
+    );
+}
+
+/// The closed self-loop of [`closed_self_loop_next_to_a_lane_read`], with
+/// `s_barrier; s_endpgm` on the sibling path instead of the lane read. The
+/// lane read stays in the entry block (its result unused) so that halves
+/// really runs.
+fn closed_self_loop_next_to_an_s_barrier() -> Vec<u32> {
+    vec![
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0 (vcc = v0 < 40)
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40 (unused; activates halves)
+        0xBF87_0001, // s_cbranch_vccnz -> the self-loop (word 6)
+        0xBF82_0001, // s_branch -> the sibling path (word 7)
+        0xBF82_FFFF, // s_branch -> itself: the closed self-loop (capped back edge)
+        0xBF8A_0000, // s_barrier on the sibling path
+        S_ENDPGM,
+    ]
+}
+
+/// Blocker 3: an explicit `s_barrier` on the sibling path of a closed capped
+/// self-loop is refused. The sibling is not reachable from the loop's
+/// header, but the lane-dependent branch leads to the latch, so the escape
+/// at the cap still reaches the sibling — in halves and as one wave64 alike.
+#[test]
+fn an_s_barrier_on_the_sibling_of_a_closed_capped_self_loop_is_refused() {
+    let w = closed_self_loop_next_to_an_s_barrier();
+    // The words decode to what the comments say: one capped back edge (the
+    // self-loop) and the s_barrier on the sibling path.
+    let p = wave64(&w);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (r, &b) in order.iter().enumerate() {
+        rpo[b] = r;
+    }
+    assert_eq!(
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, blk)| match blk.exit {
+                ir::Exit::Jump(t) => rpo[*b] != usize::MAX && rpo[t] <= rpo[*b],
+                _ => false,
+            })
+            .count(),
+        1,
+        "one capped unconditional back edge (the self-loop)"
+    );
+    assert_eq!(
+        p.blocks
+            .iter()
+            .filter(|b| b.insts.iter().any(|i| i.name() == "s_barrier"))
+            .count(),
+        1
+    );
+    for why in [
+        lowered_halves(&w, 64).err().expect("refused in halves"),
+        lowered_result(&w, 64, false)
+            .err()
+            .expect("refused as one wave64"),
+    ] {
+        let why = why.to_string();
+        assert!(
+            why.contains("an s_barrier where a lane may have left the program early"),
+            "{why}"
+        );
+    }
+}
+
+/// The same closed self-loop, but the `s_barrier` sits before the
+/// lane-dependent branch: every lane runs that block once before any lane
+/// can have left at the cap, so the barrier is kept.
+fn an_s_barrier_before_the_branch_of_a_closed_self_loop() -> Vec<u32> {
+    vec![
+        0xBF8A_0000, // s_barrier, before the branch
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40 (unused; activates halves)
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0
+        0xBF87_0001, // s_cbranch_vccnz -> the self-loop (word 7)
+        0xBF82_0001, // s_branch -> the sibling path (word 8)
+        0xBF82_FFFF, // s_branch -> itself: the closed self-loop (capped back edge)
+        S_ENDPGM,    // the sibling path
+    ]
+}
+
+/// An `s_barrier` before the divergent branch that leads to a closed capped
+/// self-loop is not marked escaped: it translates, in halves and as one
+/// wave64 alike.
+#[test]
+fn an_s_barrier_before_the_branch_of_a_closed_capped_self_loop_translates() {
+    let w = an_s_barrier_before_the_branch_of_a_closed_self_loop();
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0, "no dx.op.barrier written in halves");
+    let whole = lowered(&w, 64, false);
+    assert_eq!(whole.wave_size, Some(64));
+    assert!(whole.barriers > 0, "no dx.op.barrier written as one wave64");
+    // The explicit s_barrier is one barrier beyond the same program with an
+    // s_nop in its place.
+    let mut nop = w.clone();
+    nop[0] = 0xBF80_0000; // s_nop instead of the s_barrier
+    let without = lowered_halves(&nop, 64).expect("translated in halves");
+    assert_eq!(
+        l.barriers,
+        without.barriers + 1,
+        "the s_barrier adds exactly one dx.op.barrier"
+    );
+}
+
+/// An earlier divergent branch whose arms reconverge at a join holding an
+/// `s_barrier`, then a later divergent branch into a closed capped self-loop
+/// (its only edge the unconditional `s_branch` back to itself, which
+/// lowering caps with an early return). The lane read stays in the entry
+/// block (its result unused) so that halves really runs.
+fn an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop() -> Vec<u32> {
+    vec![
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40 (unused; activates halves)
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0 (the earlier divergent branch)
+        0xBF87_0001, // s_cbranch_vccnz -> arm A (word 6)
+        0xBF82_0001, // s_branch -> the join (word 7)
+        0xBF80_0000, // s_nop, arm A -> the join (word 7)
+        0xBF8A_0000, // s_barrier at the join (word 7)
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0 (the later divergent branch)
+        0xBF87_0001, // s_cbranch_vccnz -> the self-loop (word 12)
+        0xBF82_0001, // s_branch -> the sibling path (word 13)
+        0xBF82_FFFF, // s_branch -> itself: the closed self-loop (capped back edge)
+        S_ENDPGM,    // the sibling path (word 13)
+    ]
+}
+
+/// An `s_barrier` at the join of an earlier divergent branch, before a later
+/// divergent branch into a closed capped self-loop, is not marked escaped:
+/// every lane runs the join before any lane can have left at the self-loop's
+/// cap, so the escape at the cap must not reach back past the reconvergence
+/// at the join. It translates in halves and as one wave64 alike.
+#[test]
+fn an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop_translates() {
+    let w = an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop();
+    // The words give one capped back edge (the self-loop) and one s_barrier
+    // at the earlier join.
+    let p = wave64(&w);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (r, &b) in order.iter().enumerate() {
+        rpo[b] = r;
+    }
+    assert_eq!(
+        p.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, blk)| match blk.exit {
+                ir::Exit::Jump(t) => rpo[*b] != usize::MAX && rpo[t] <= rpo[*b],
+                _ => false,
+            })
+            .count(),
+        1,
+        "one capped unconditional back edge (the self-loop)"
+    );
+    assert_eq!(
+        p.blocks
+            .iter()
+            .filter(|b| b.insts.iter().any(|i| i.name() == "s_barrier"))
+            .count(),
+        1
+    );
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0, "no dx.op.barrier written in halves");
+    let whole = lowered(&w, 64, false);
+    assert_eq!(whole.wave_size, Some(64));
+    assert!(whole.barriers > 0, "no dx.op.barrier written as one wave64");
+    // The explicit s_barrier is one barrier beyond the same program with an
+    // s_nop at the join.
+    let mut nop = w.clone();
+    nop[7] = 0xBF80_0000; // s_nop instead of the s_barrier at the join
+    let without = lowered_halves(&nop, 64).expect("translated in halves");
+    assert_eq!(
+        l.barriers,
+        without.barriers + 1,
+        "the s_barrier adds exactly one dx.op.barrier"
+    );
+}
+
+/// The same shape with a uniform branch (on `scc` from comparing the
+/// constant `s20`): every lane takes the same arm, so no lane can be at the
+/// sibling's barrier while another left at the cap, and the barrier is
+/// kept.
+fn an_s_barrier_on_the_sibling_behind_a_uniform_branch() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40 (unused; activates halves)
+        0xBF07_8014, // s_cmp_lg_u32 s20, 0 (uniform: s20 is the constant 0)
+        0xBF85_0001, // s_cbranch_scc1 -> the self-loop (word 6)
+        0xBF82_0001, // s_branch -> the sibling path (word 7)
+        0xBF82_FFFF, // s_branch -> itself: the closed self-loop (capped back edge)
+        0xBF8A_0000, // s_barrier on the sibling path
+        S_ENDPGM,
+    ]
+}
+
+/// An `s_barrier` on the sibling path behind a uniform branch is not marked
+/// escaped either: the branch sends every lane the same way.
+#[test]
+fn an_s_barrier_on_the_sibling_behind_a_uniform_branch_translates() {
+    let w = an_s_barrier_on_the_sibling_behind_a_uniform_branch();
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0, "no dx.op.barrier written in halves");
+    let whole = lowered(&w, 64, false);
+    assert_eq!(whole.wave_size, Some(64));
+    assert!(whole.barriers > 0, "no dx.op.barrier written as one wave64");
+    // The explicit s_barrier is one barrier beyond the same program with an
+    // s_nop in its place.
+    let mut nop = w.clone();
+    nop[7] = 0xBF80_0000; // s_nop instead of the s_barrier on the sibling path
+    let without = lowered_halves(&nop, 64).expect("translated in halves");
+    assert_eq!(
+        l.barriers,
+        without.barriers + 1,
+        "the s_barrier adds exactly one dx.op.barrier"
+    );
+}
+
+/// The divergent capped loop of [`capped_back_edge_in_a_divergent_loop`],
+/// with an explicit `s_barrier` at the join instead of the lane read: a lane
+/// may have left the program early at the inner loop's cap, so the barrier
+/// is refused even without any exchange.
+fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
+    vec![
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0x7D88_00FF,
+        40,          // v_cmp_gt_u32 vcc, 40, v0
+        0xBF87_0001, // s_cbranch_vccnz -> the inner loop
+        0xBF82_0005, // s_branch -> the join
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0xBF06_8315, // s_cmp_eq_u32 s21, 3
+        0xBF85_0001, // s_cbranch_scc1 -> the join
+        0xBF82_FFFC, // s_branch -> the inner loop's header (capped back edge)
+        0xBF8A_0000, // s_barrier at the join
+        0xBF80_0000, // s_nop
+        0x8014_8114, // s_add_u32 s20, s20, 1
+        0xBF0A_8214, // s_cmp_lt_u32 s20, 2
+        0xBF85_FFF2, // s_cbranch_scc1 -> the outer loop's header
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xD760_000C,
+        0x0001_5100, // v_readlane_b32 s12, v0, 40 (unused; activates halves)
+        S_ENDPGM,
+    ]
+}
+
+/// Blocker 3: an explicit `s_barrier` at the join after a divergent loop
+/// whose capped back edge may have let a lane leave the program early is
+/// refused, in halves and as one wave64 alike.
+#[test]
+fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
+    let w = a_divergent_capped_loop_then_an_s_barrier_at_the_join();
+    for why in [
+        lowered_halves(&w, 64).err().expect("refused in halves"),
+        lowered_result(&w, 64, false)
+            .err()
+            .expect("refused as one wave64"),
+    ] {
+        let why = why.to_string();
+        assert!(
+            why.contains("an s_barrier where a lane may have left the program early"),
+            "{why}"
+        );
+    }
+}
+
+/// The same `s_barrier` where no lane can have left early — a uniform loop
+/// with a capped back edge, every lane leaving at the cap together — is
+/// kept: the cap analysis does not reject legitimate barriers. The lane
+/// read at the join stays (it is what makes halves run), and the explicit
+/// `s_barrier` goes just before `s_endpgm`.
+#[test]
+fn an_s_barrier_after_a_uniform_capped_loop_translates() {
+    let mut w = capped_back_edge_in_a_uniform_loop();
+    // Keep the v_readlane at the join (word 6), so halves really runs, and
+    // put the explicit s_barrier where the s_nop before s_endpgm was.
+    w[13] = 0xBF8A_0000; // s_barrier
+    let l = lowered_halves(&w, 64).expect("translated in halves");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0, "no dx.op.barrier written in halves");
+    // And as one wave64, where the barrier is the program's own.
+    let whole = lowered(&w, 64, false);
+    assert_eq!(whole.wave_size, Some(64));
+    assert!(
+        whole.barriers > 0,
+        "no dx.op.barrier written as one wave64"
+    );
+    // The explicit s_barrier is one barrier beyond the same program without
+    // it (the fixture itself, whose word 13 is the s_nop).
+    let without = lowered_halves(&capped_back_edge_in_a_uniform_loop(), 64)
+        .expect("translated in halves");
+    assert_eq!(
+        l.barriers,
+        without.barriers + 1,
+        "the s_barrier adds exactly one dx.op.barrier"
+    );
 }
 
 #[test]
@@ -1879,10 +2554,11 @@ fn the_null_pair_is_read_once_in_the_entry_block() {
 
 /// A box32 node's last 48 bytes are read through its first 64 bytes'
 /// page-table lookup, and looked up again only in lanes whose node starts
-/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
-/// the null pair's view in the entry block, then the head's 16 dwords and
-/// the tail's 12 through that lookup, and the second lookup in a block of
-/// its own.
+/// in the last 64 bytes of a page (`raw_load_past`): the null pair's view
+/// in the entry block, the head's lookup in the `ty < 6` block (so sentinel
+/// `INVALID` and unhandled types 6/7 read nothing), then the head's 16
+/// dwords and the tail's 12 through that lookup, and the second lookup in a
+/// block of its own.
 #[test]
 fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     // The descriptor in s[12:15], based at the pointer.
@@ -1905,11 +2581,15 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
     assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
     assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
-    assert_eq!(table[..3], [0; 3], "{table:?}");
+    assert_eq!(table[0], 0, "{table:?}");
+    let head = table[1];
+    assert!(head > 0 && table[2] == head, "{table:?}");
     let again = table[3];
-    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
-    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
-    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+    assert!(again > head && table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    // Excluding the 2 page-table loads in `head`, the 4 head node loads and
+    // 3 non-crossing tail node loads all reuse `head`'s lookup.
+    let through_head = loads.iter().filter(|&&b| b >= head && b < again).count() - 2;
+    assert_eq!(through_head, 4 + 3, "{loads:?} {table:?}");
 }
 
 /// Lowers a wave64 compute program of 64 threads as a host of 32-lane waves

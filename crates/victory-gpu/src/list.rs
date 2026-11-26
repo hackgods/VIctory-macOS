@@ -239,31 +239,81 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
     Some(unsafe { &*next })
 }
 
+/// Restarts a title list's host slots: every slot a queue still holds
+/// (`Arc::strong_count > 1`) is replaced with a fresh list from `make`,
+/// the used slots that are kept are reset with `reset`, and the last old
+/// held list is returned, left to the queue that holds it (so what the
+/// title list owned can wait until it has run). Every replacement is
+/// made before any slot is touched: if one `make` fails, `hosts` is left
+/// exactly as it was and its error is returned, so a held segment keeps
+/// its list and nothing it may still read is dropped early.
+#[cfg(any(windows, test))]
+fn restart_hosts<T, E>(
+    hosts: &mut [std::sync::Arc<T>],
+    used: usize,
+    mut make: impl FnMut() -> Result<std::sync::Arc<T>, E>,
+    mut reset: impl FnMut(&T),
+) -> Result<Option<std::sync::Arc<T>>, E> {
+    // Prepare every replacement first: a failure here mutates nothing.
+    let mut held = Vec::new();
+    for (k, h) in hosts.iter().enumerate() {
+        if std::sync::Arc::strong_count(h) > 1 {
+            held.push((k, make()?));
+        }
+    }
+    // Commit: every replacement exists, so creating one cannot fail from
+    // here on (a native reset failure on an unheld slot still goes
+    // through `host::fail`).
+    let mut left = None;
+    let mut fresh = held.into_iter().peekable();
+    for (k, h) in hosts.iter_mut().enumerate() {
+        if let Some((hk, _)) = fresh.peek()
+            && *hk == k
+        {
+            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+            let (_, fresh) = fresh.next().unwrap_or_else(|| unreachable!("peeked above"));
+            left = Some(std::mem::replace(h, fresh));
+        } else if k <= used {
+            reset(h);
+        }
+    }
+    Ok(left)
+}
+
 /// After the title list's last submission: its host lists start again,
 /// and a host list a queue still holds (`crate::hold`) is left to the
 /// queue and replaced. The last one left so, which should keep what the
-/// title list owned.
+/// title list owned. The replacements are all prepared before the
+/// segment or any slot is touched: if one cannot be made, nothing
+/// changes and the error is returned.
 #[cfg(windows)]
-fn restart(this: This) -> Option<std::sync::Arc<crate::host::HostList>> {
+fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, HRESULT> {
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
-    let used = list.segment.swap(0, std::sync::atomic::Ordering::Relaxed);
+    let used = list.segment.load(std::sync::atomic::Ordering::Relaxed);
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
-    let mut left = None;
-    for (k, h) in hosts.iter_mut().enumerate() {
-        if std::sync::Arc::strong_count(h) > 1 {
-            EARLY_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::debug!(segment = k, "a list reset while a queue still holds part of it: that part keeps its own host list");
+    let left = restart_hosts(
+        &mut hosts,
+        used,
+        || {
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
-            match spare.map(Ok).or_else(|| crate::host::host().map(|host| host.new_list())) {
-                Some(Ok(fresh)) => left = Some(std::mem::replace(h, std::sync::Arc::new(fresh))),
-                _ => continue,
+            if let Some(fresh) = spare {
+                Ok(std::sync::Arc::new(fresh))
+            } else if let Some(host) = crate::host::host() {
+                host.new_list().map(std::sync::Arc::new).map_err(|e| {
+                    tracing::warn!(error = %e, "no replacement host command list");
+                    e.code().0
+                })
+            } else {
+                tracing::warn!("no host command list to replace a held segment");
+                Err(crate::object::E_OUTOFMEMORY)
             }
-        } else if k <= used {
-            h.reset();
-        }
-    }
-    left
+        },
+        crate::host::HostList::reset,
+    )?;
+    list.segment.store(0, std::sync::atomic::Ordering::Relaxed);
+    Ok(left)
 }
 
 /// Host lists [`restart`] left to a queue, back once they ran: the next
@@ -458,13 +508,19 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     if allocator.is_null() {
         return E_INVALIDARG;
     }
-    // A queue may still hold what the list recorded (`restart`, `leave`).
-    // SAFETY: the title passes one of our lists.
-    let uploads = unsafe { &(*this.cast::<List>()).uploads };
-    let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(windows)]
     {
-        let held = restart(this);
+        // The replacements for the held segments are all made before
+        // anything is mutated: on failure the list keeps its slots, its
+        // segment and its upload memory, and the error goes back.
+        let held = match restart(this) {
+            Ok(left) => left,
+            Err(hr) => return hr,
+        };
+        // A queue may still hold what the list recorded (`restart`, `leave`).
+        // SAFETY: the title passes one of our lists.
+        let uploads = unsafe { &(*this.cast::<List>()).uploads };
+        let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
         // SAFETY: the title passes one of our lists.
         let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
@@ -473,10 +529,14 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         leave(held, uploads, old);
     }
     #[cfg(not(windows))]
-    drop(uploads);
+    {
+        // SAFETY: the title passes one of our lists.
+        let uploads = unsafe { &(*this.cast::<List>()).uploads };
+        let uploads = std::mem::take(&mut *uploads.lock().unwrap_or_else(|e| e.into_inner()));
+        drop(uploads);
+        let _ = this;
+    }
     crate::pipeline::bound(pipeline);
-    #[cfg(not(windows))]
-    let _ = this;
     S_OK
 }
 
@@ -2165,5 +2225,229 @@ mod tests {
         assert!(!read_only_transition(&transition(0, NON_PIXEL, COMMON)));
         assert!(!read_only_transition(&transition(2, NON_PIXEL, PIXEL)));
         assert!(!read_only_transition(&UAV_BARRIER));
+    }
+
+    /// List-owned upload/scratch memory (`allocate_upload`) submitted on a held
+    /// queue must stay mapped and GPU-readable across both an immediate list
+    /// `Reset` (while reusing the list for a second distinct upload batch) and
+    /// an immediate `Release`, and then be freed once both batches finish on
+    /// the host GPU.
+    #[cfg(windows)]
+    #[test]
+    fn allocate_upload_survives_early_reset_and_release_while_held_on_gpu() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 2, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 2, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let qdesc = crate::queue::QueueDesc::compute();
+        let mut queue = null;
+        assert_eq!(
+            crate::queue::create(null, &qdesc, &crate::queue::QUEUE_IID, &mut queue),
+            S_OK
+        );
+
+        let (dst1_buf, dst1_cpu) = host.shared_buffer(256).unwrap();
+        let (dst2_buf, dst2_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: newly allocated mapped shared buffers of 256 bytes each.
+        unsafe {
+            std::ptr::write_bytes(dst1_cpu, 0, 256);
+            std::ptr::write_bytes(dst2_cpu, 0, 256);
+        }
+
+        let flag = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let flag_addr = std::ptr::from_ref(&*flag) as u64;
+        const GREATER_EQUAL: u32 = 7;
+
+        // Batch 1: allocate upload memory, write pattern 1, gate on `flag >= 1`,
+        // copy upload shadow -> dst1 on the host GPU, submit (held), then Reset immediately.
+        let p1 = allocate_upload(list, 256, 64);
+        assert!(!p1.is_null() && (p1 as usize).is_multiple_of(64));
+        for i in 0..64u32 {
+            // SAFETY: 256 bytes were allocated at `p1`.
+            unsafe { p1.cast::<u32>().add(i as usize).write_volatile(0xA1B2_0000 + i) };
+        }
+        let s1 = crate::shadow::find(p1 as u64, 256).expect("upload 1 registered in shadow");
+        wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
+        {
+            let h1 = host_list(list).expect("host list for batch 1");
+            s1.refresh(h1, p1 as u64, 256);
+            let off1 = (p1 as u64) - s1.range().0;
+            // SAFETY: open host list, valid buffers of at least 256 bytes.
+            unsafe { h1.list.CopyBufferRegion(&dst1_buf, 0, &s1.buffer, off1, 256) };
+            h1.keep(&dst1_buf);
+        }
+        drop(s1);
+        assert_eq!(close(list), S_OK);
+        crate::queue::submit_one(queue, list);
+
+        // Still held: dst1 must still be zero, and resetting `list` must transfer
+        // upload 1 to the held HostList rather than freeing it.
+        // SAFETY: mapped readback buffer.
+        assert_eq!(unsafe { dst1_cpu.cast::<u32>().read_volatile() }, 0);
+        assert_eq!(reset(list, allocator, null), S_OK);
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_some(),
+            "upload 1 must stay registered and mapped after early Reset while held"
+        );
+
+        // Batch 2: reuse the SAME command list while Batch 1 is still held,
+        // allocate a second distinct upload block, write pattern 2, copy -> dst2,
+        // submit (queued behind Batch 1), then Release the list immediately.
+        let p2 = allocate_upload(list, 256, 64);
+        assert!(!p2.is_null() && p2 != p1 && (p2 as usize).is_multiple_of(64));
+        for i in 0..64u32 {
+            // SAFETY: 256 bytes were allocated at `p2`.
+            unsafe { p2.cast::<u32>().add(i as usize).write_volatile(0xC3D4_0000 + i) };
+        }
+        let s2 = crate::shadow::find(p2 as u64, 256).expect("upload 2 registered in shadow");
+        {
+            let h2 = host_list(list).expect("host list for batch 2");
+            s2.refresh(h2, p2 as u64, 256);
+            let off2 = (p2 as u64) - s2.range().0;
+            // SAFETY: open host list, valid buffers of at least 256 bytes.
+            unsafe { h2.list.CopyBufferRegion(&dst2_buf, 0, &s2.buffer, off2, 256) };
+            h2.keep(&dst2_buf);
+        }
+        drop(s2);
+        assert_eq!(close(list), S_OK);
+        crate::queue::submit_one(queue, list);
+        assert_eq!(release(list), 0);
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_some()
+                && crate::shadow::find(p2 as u64, 256).is_some(),
+            "both uploads must stay registered and mapped after early Reset + Release while held"
+        );
+
+        // Satisfy the wait and pump: both batches run on the live host GPU.
+        flag.store(1, Ordering::Release);
+        crate::queue::pump_held(crate::queue::Why::Submission);
+
+        // SAFETY: GPU execution finished synchronously inside pump_held; dst1_cpu is mapped for 64 u32s.
+        let got1 = unsafe { std::slice::from_raw_parts(dst1_cpu.cast::<u32>(), 64) };
+        // SAFETY: GPU execution finished synchronously inside pump_held; dst2_cpu is mapped for 64 u32s.
+        let got2 = unsafe { std::slice::from_raw_parts(dst2_cpu.cast::<u32>(), 64) };
+        for i in 0..64u32 {
+            assert_eq!(got1[i as usize], 0xA1B2_0000 + i, "batch 1 word {i} corrupted");
+            assert_eq!(got2[i as usize], 0xC3D4_0000 + i, "batch 2 word {i} corrupted");
+        }
+        assert!(
+            crate::shadow::find(p1 as u64, 256).is_none()
+                && crate::shadow::find(p2 as u64, 256).is_none(),
+            "both uploads must be unregistered and freed once held lists finish"
+        );
+
+        assert_eq!(release(queue), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A stand-in host list for `restart_hosts` (tests).
+    struct FakeHost {
+        id: u32,
+        reset: std::sync::atomic::AtomicBool,
+    }
+
+    fn fake_host(id: u32) -> FakeHost {
+        FakeHost {
+            id,
+            reset: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Held slots are replaced with the fresh lists, the used kept slots
+    /// are reset, the rest are left alone, and the last held slot's old
+    /// list comes back for the queue that holds it.
+    #[test]
+    fn restart_replaces_held_slots_and_returns_the_last_held_one() {
+        let mut hosts: Vec<Arc<FakeHost>> = (0..4).map(|id| Arc::new(fake_host(id))).collect();
+        // A queue still holds slots 0 and 2.
+        let held0 = hosts[0].clone();
+        let held2 = hosts[2].clone();
+        let mut next = 100;
+        let left = restart_hosts(
+            &mut hosts,
+            1,
+            || -> Result<Arc<FakeHost>, ()> {
+                let id = next;
+                next += 1;
+                Ok(Arc::new(fake_host(id)))
+            },
+            |h| h.reset.store(true, Ordering::Relaxed),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(Arc::ptr_eq(&left, &held2));
+        assert_eq!(hosts[0].id, 100, "held slot 0 replaced");
+        assert!(hosts[1].reset.load(Ordering::Relaxed), "used, unheld slot 1 reset");
+        assert_eq!(hosts[2].id, 101, "held slot 2 replaced");
+        assert!(!hosts[3].reset.load(Ordering::Relaxed), "past `used`, unheld slot 3 untouched");
+        assert_eq!(hosts[3].id, 3);
+        // Slot 0's old list is gone (only the queue's clone remains); slot
+        // 2's is kept alive by the queue's clone and the returned `left`.
+        assert_eq!(Arc::strong_count(&held0), 1);
+        assert_eq!(Arc::strong_count(&held2), 2);
+    }
+
+    /// If any replacement cannot be made, nothing is mutated: every slot
+    /// keeps its list (a held segment keeps the one the queue will still
+    /// run), no kept slot is reset, and the error comes back — so the
+    /// caller drops no upload memory while a held segment can read it.
+    #[test]
+    fn restart_failure_leaves_every_slot_untouched() {
+        let mut hosts: Vec<Arc<FakeHost>> = (0..3).map(|id| Arc::new(fake_host(id))).collect();
+        // Slot identity, snapshotted without holding any of the lists.
+        let original: Vec<std::sync::Weak<FakeHost>> = hosts.iter().map(Arc::downgrade).collect();
+        // A queue still holds slots 0 and 2; slot 1 is unheld.
+        let held0 = hosts[0].clone();
+        let held2 = hosts[2].clone();
+        assert_eq!(
+            hosts.iter().map(Arc::strong_count).collect::<Vec<_>>(),
+            [2, 1, 2],
+            "slot 0 held, slot 1 unheld, slot 2 held"
+        );
+        let mut calls = 0;
+        let result = restart_hosts(
+            &mut hosts,
+            2,
+            || -> Result<Arc<FakeHost>, ()> {
+                calls += 1;
+                // The second held slot's (slot 2's) replacement fails.
+                if calls < 2 {
+                    Ok(Arc::new(fake_host(100 + calls)))
+                } else {
+                    Err(())
+                }
+            },
+            |h| h.reset.store(true, Ordering::Relaxed),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 2, "every held slot's replacement was attempted first");
+        assert!(
+            hosts
+                .iter()
+                .zip(&original)
+                .all(|(a, b)| b.upgrade().is_some_and(|o| Arc::ptr_eq(a, &o))),
+            "no slot was mutated, not even the one whose replacement was made"
+        );
+        assert!(
+            !hosts.iter().any(|h| h.reset.load(Ordering::Relaxed)),
+            "no kept slot was reset"
+        );
+        assert!(
+            !hosts[1].reset.load(Ordering::Relaxed),
+            "the unheld slot 1 is not reset on failure"
+        );
+        assert!(Arc::ptr_eq(&hosts[0], &held0) && Arc::ptr_eq(&hosts[2], &held2));
     }
 }

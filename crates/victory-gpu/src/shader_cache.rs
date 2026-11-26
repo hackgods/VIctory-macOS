@@ -167,6 +167,14 @@ pub fn halves_lds_order() -> bool {
     crate::mac_switches::lds_order()
 }
 
+/// Whether lane reads across 32-lane halves are handed over through
+/// group-shared memory where every lane runs
+/// (`victory_shader::emit::Options::halves_exchange`,
+/// `VICTORY_HALVES_EXCHANGE=1`; the rule is in `mac_switches`).
+pub fn halves_exchange() -> bool {
+    crate::mac_switches::exchange()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -260,6 +268,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_lock_helpers: lock_writers[0],
         atomic_lock_keys: lock_writers[1],
         lds_order: crate::mac_switches::lds_order(),
+        halves_exchange: crate::mac_switches::exchange(),
     }
 }
 
@@ -290,6 +299,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         options.early_depth,
         [options.atomic_lock_helpers, options.atomic_lock_keys],
         options.lds_order,
+        options.halves_exchange,
     );
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

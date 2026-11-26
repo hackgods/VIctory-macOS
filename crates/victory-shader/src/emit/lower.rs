@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
+mod exchange;
 mod f64_sum;
 mod halves;
 pub(crate) mod lds_order;
@@ -100,6 +101,9 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
+    /// Exchanges across the halves (`exchange`).
+    #[cfg(test)]
+    pub exchanges: u32,
     /// The `WaveSize` the program declares.
     #[cfg(test)]
     pub wave_size: Option<u32>,
@@ -327,6 +331,8 @@ struct Lower<'a> {
     halves_refused: Option<Why>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// Reads across the halves handed over through shared memory.
+    exchange: exchange::State,
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
@@ -872,6 +878,7 @@ impl<'a> Lower<'a> {
             halves,
             halves_refused,
             relabelled: None,
+            exchange: Default::default(),
             alike: if halves {
                 halves::lane_uniform(x)
             } else {
@@ -1639,6 +1646,8 @@ impl<'a> Lower<'a> {
             },
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            exchanges: self.exchange.made,
             #[cfg(test)]
             wave_size: self.s.wave_size,
             #[cfg(test)]
@@ -7148,6 +7157,9 @@ impl<'a> Lower<'a> {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
+                    if let Some(r) = self.exchanged_lane(a, lane) {
+                        return int(self, r);
+                    }
                     self.same_half(
                         "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
                     )?;

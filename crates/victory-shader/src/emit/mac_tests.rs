@@ -125,6 +125,7 @@ const EARLY: Mac = Mac {
     lock_helpers: false,
     lock_keys: false,
     lds_order: false,
+    exchange: false,
 };
 
 /// The rule by itself: bit 12, and nothing that D3D's flag would change.
@@ -274,6 +275,7 @@ const WRITERS: Mac = Mac {
     lock_helpers: true,
     lock_keys: true,
     lds_order: false,
+    exchange: false,
 };
 
 /// `image_atomic_<op> v[vdata..], v[vaddr:vaddr+1], s[srsrc:srsrc+7]` on a

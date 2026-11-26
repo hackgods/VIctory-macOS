@@ -97,6 +97,26 @@ pub(crate) fn lds_order() -> bool {
     })
 }
 
+/// Whether a lane read across the two 32-lane halves of a console wave64,
+/// in a block every lane runs once, is handed over through group-shared
+/// memory at a group barrier (`victory_shader::emit::lower::exchange`,
+/// `victory_shader::emit::Options::halves_exchange`;
+/// `notes/ray-tracing-plan.md`): only with `VICTORY_HALVES_EXCHANGE=1`.
+/// Exact where it applies; a read it does not cover stays refused, or is
+/// answered by the reader's half with `VICTORY_HALVES_LOCAL=1`.
+pub(crate) fn exchange() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_EXCHANGE").ok().as_deref(), false);
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_EXCHANGE=1: lane reads across 32-lane halves are handed over through group-shared memory where every lane runs"
+            );
+        }
+        on
+    })
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -133,8 +153,9 @@ pub(crate) fn key(
     early_depth: bool,
     lock_writers: [bool; 2],
     lds_order: bool,
+    exchange: bool,
 ) -> [u8; 32] {
-    if !early_depth && lock_writers == [false; 2] && !lds_order {
+    if !early_depth && lock_writers == [false; 2] && !lds_order && !exchange {
         return *build;
     }
     let mut h = blake3::Hasher::new();
@@ -150,6 +171,9 @@ pub(crate) fn key(
     }
     if lds_order {
         h.update(b"lds order");
+    }
+    if exchange {
+        h.update(b"halves exchange");
     }
     *h.finalize().as_bytes()
 }
@@ -205,31 +229,45 @@ mod tests {
 
     /// Every combination of the settings is a key of its own; all off is
     /// the key without them; early depth alone is what it was before the
-    /// lock settings came, and the three of them without the LDS order
-    /// what they were before it came.
+    /// lock settings came, the three of them without the LDS order what
+    /// they were before it came, and all four without the exchange what
+    /// they were before that came.
     #[test]
     fn each_combination_of_settings_has_cache_entries_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(key(&build, false, [false, false], false), build);
+        assert_eq!(key(&build, false, [false, false], false, false), build);
         let of = |build: &[u8; 32], n: u8| {
-            key(build, n & 1 != 0, [n & 2 != 0, n & 4 != 0], n & 8 != 0)
+            key(
+                build,
+                n & 1 != 0,
+                [n & 2 != 0, n & 4 != 0],
+                n & 8 != 0,
+                n & 16 != 0,
+            )
         };
         let mut keys = std::collections::HashSet::new();
-        for n in 0..16u8 {
+        for n in 0..32u8 {
             let k = of(&build, n);
             assert_eq!(k, of(&build, n));
             keys.insert(k);
             // Over another build (other settings, another translator).
             assert!(n == 0 || k != of(&[8u8; 32], n));
         }
-        assert_eq!(keys.len(), 16);
+        assert_eq!(keys.len(), 32);
         let mut early = blake3::Hasher::new();
         early.update(&build);
         early.update(b"early depth");
         assert_eq!(
-            key(&build, true, [false, false], false),
+            key(&build, true, [false, false], false, false),
             *early.finalize().as_bytes()
         );
+        let mut four = blake3::Hasher::new();
+        four.update(&build);
+        four.update(b"early depth");
+        four.update(b"atomic lock helpers");
+        four.update(b"atomic lock keys");
+        four.update(b"lds order");
+        assert_eq!(of(&build, 15), *four.finalize().as_bytes());
         let mut three = blake3::Hasher::new();
         three.update(&build);
         three.update(b"early depth");

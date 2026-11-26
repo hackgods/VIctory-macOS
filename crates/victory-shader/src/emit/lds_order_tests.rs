@@ -22,6 +22,7 @@ const ORDER: Mac = Mac {
     lock_helpers: false,
     lock_keys: false,
     lds_order: true,
+    exchange: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

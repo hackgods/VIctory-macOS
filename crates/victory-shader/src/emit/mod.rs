@@ -219,6 +219,8 @@ mod container;
 mod crosslane_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod exchange_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
 #[cfg(test)]
@@ -460,6 +462,13 @@ pub struct Options {
     /// only accesses whose order changes nothing. Exact, or the program
     /// stays as it was. The shader cache keys on it.
     pub lds_order: bool,
+    /// With [`Options::host_wave32`]: a lane read across the two 32-lane
+    /// halves, in a block every lane runs exactly once, is handed over
+    /// through thread-group shared memory at a group barrier
+    /// (`lower::exchange`): the console's value, where
+    /// [`Options::halves_local`] gives the reader's own half's and the
+    /// default refuses. The shader cache keys on it.
+    pub halves_exchange: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -862,6 +871,7 @@ fn emit_pruned(
             lock_helpers: options.atomic_lock_helpers,
             lock_keys: options.atomic_lock_keys,
             lds_order: options.lds_order,
+            exchange: options.halves_exchange,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

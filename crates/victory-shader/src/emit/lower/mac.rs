@@ -115,6 +115,10 @@ pub(crate) struct Mac {
     /// [`super::lds_order`] where [`split_wave_barriers`] finds none
     /// (`emit::Options::lds_order`).
     pub lds_order: bool,
+    /// In halves, a lane read in a block every lane runs once is handed
+    /// over through group-shared memory, exact across the halves
+    /// ([`super::exchange`], `emit::Options::halves_exchange`).
+    pub exchange: bool,
 }
 
 /// `DB_SHADER_CONTROL`: the program exports depth (`Z_EXPORT_ENABLE`).

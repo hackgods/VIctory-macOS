@@ -197,6 +197,7 @@ fn shader(l: lower::Lowered) -> super::HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     }
 }
 

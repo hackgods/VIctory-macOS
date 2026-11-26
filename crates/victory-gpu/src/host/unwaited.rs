@@ -163,6 +163,9 @@ static FINISHED: AtomicU64 = AtomicU64::new(0);
 /// Since the last frame line: submissions left; then, by what finished
 /// them ([`By`]), how many and the microseconds it waited for the host GPU.
 static LEAVES: AtomicU64 = AtomicU64::new(0);
+/// And the microseconds it took to give them to the host GPU (the calls
+/// that submit, which a runtime may do much of its own work in).
+static GIVING_US: AtomicU64 = AtomicU64::new(0);
 static FINISHES: [AtomicU64; WAYS] = [const { AtomicU64::new(0) }; WAYS];
 static WAITED_US: [AtomicU64; WAYS] = [const { AtomicU64::new(0) }; WAYS];
 
@@ -280,16 +283,18 @@ pub(super) fn log(frames: f64) {
         return;
     }
     let left = LEAVES.swap(0, Relaxed) as f64 / frames;
+    let giving = GIVING_US.swap(0, Relaxed) as f64 / 1000.0 / frames;
     let by: [f64; WAYS] = std::array::from_fn(|i| FINISHES[i].swap(0, Relaxed) as f64 / frames);
     let ms: [f64; WAYS] =
         std::array::from_fn(|i| WAITED_US[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
     let spared: [f64; 2] = std::array::from_fn(|i| SPARED[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
-        "unwaited submissions: {left:.1}/frame left to the host GPU; finished by (the title's next submission, \
+        "unwaited submissions: {left:.1}/frame left to the host GPU, which took {giving:.1} ms/frame to give them \
+         to it; finished by (the title's next submission, \
          one of ours, a queue's signal, a held queue's wait, the present, a page mapping, a view heap being made, \
          nothing but our thread once it had run): \
-         {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the host GPU (the frame line's GPU time is their sum, \
-         with our own submissions' waits); {spared:.1?} per frame went on without finishing it \
+         {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the host GPU (the frame line's GPU time is these, \
+         the giving, and our own submissions' waits); {spared:.1?} per frame went on without finishing it \
          (Signals of other queues, waits it owed no write to)"
     );
 }
@@ -339,6 +344,7 @@ impl Host {
         ran: Ran,
     ) {
         *submitted += 1;
+        let started = Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::SUBMITTED, *submitted, 0);
         // Last, the list that shows the submission ran.
@@ -366,6 +372,11 @@ impl Host {
             }
             Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
         }
+        // Time on the host GPU's side, as when the submission is waited
+        // for: the frame line's GPU time.
+        let giving = started.elapsed().as_micros() as u64;
+        GIVING_US.fetch_add(giving, Relaxed);
+        SUBMISSION_US[1].fetch_add(giving, Relaxed);
         LEAVES.fetch_add(1, Relaxed);
         let writes = title
             .iter()

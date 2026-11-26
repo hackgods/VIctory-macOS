@@ -1465,6 +1465,16 @@ pub enum View<'a> {
     UintTextureUav(u32, u32),
     /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
     Uint2TextureUav(u32, u32),
+    /// A 2D texture in this format (width, height, levels), not filled and
+    /// not read back: an unordered view of level `uav` whose description
+    /// names the format and the level, or without one a shader view of
+    /// every level (size queries, `uav_size_tests`).
+    Sized {
+        format: DXGI_FORMAT,
+        size: (u32, u32),
+        levels: u32,
+        uav: Option<u32>,
+    },
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
@@ -1889,6 +1899,38 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         uavs.push((t, Some((w, h)), 4, rb));
+                    }
+                    View::Sized { format, size: (w, h), levels, uav } => {
+                        let (flags, state) = match uav {
+                            Some(_) => (
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            ),
+                            None => (
+                                D3D12_RESOURCE_FLAG_NONE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            ),
+                        };
+                        let mut desc = texture_as(w, h, flags, format);
+                        desc.MipLevels = levels as u16;
+                        let t = make(D3D12_HEAP_TYPE_DEFAULT, &desc, state)?;
+                        match uav {
+                            Some(level) => {
+                                let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                                    Format: format,
+                                    ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                                        Texture2D: D3D12_TEX2D_UAV {
+                                            MipSlice: level,
+                                            PlaneSlice: 0,
+                                        },
+                                    },
+                                };
+                                dev.CreateUnorderedAccessView(&t, None, Some(&view), at);
+                            }
+                            None => dev.CreateShaderResourceView(&t, None, at),
+                        }
+                        keep.push(t);
                     }
                     View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
                         let (format, words) = match *v {

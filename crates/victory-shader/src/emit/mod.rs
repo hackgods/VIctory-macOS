@@ -258,6 +258,8 @@ mod stride_tests;
 mod synthetic_tests;
 #[cfg(test)]
 mod typed_buffer_tests;
+#[cfg(test)]
+mod uav_size_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]

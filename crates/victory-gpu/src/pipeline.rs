@@ -62,12 +62,11 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    full_hash: [u8; 32],
     /// The container's length, as logged once its bytes are gone.
     size: usize,
-    /// The container, until `translated` has made its translation (or its
-    /// refusal) and let it go: a run holds one per distinct shader its title
-    /// passes, and nothing reads it after. Off Windows nothing translates,
-    /// so only tests keep it.
+    /// Released after translation unless an experimental mesh/pixel pair may need it.
     #[cfg(any(windows, test))]
     container: Mutex<Vec<u8>>,
     #[cfg(windows)]
@@ -90,15 +89,21 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     shaders
         .get_or_insert_with(HashMap::new)
         .entry(*full.as_bytes())
-        .or_insert_with(|| Arc::new(Shader::new(stage, bytes)))
+        .or_insert_with(|| Arc::new(Shader::with_hash(stage, bytes, full)))
         .clone()
 }
 
 impl Shader {
     fn new(stage: &'static str, bytes: &[u8]) -> Shader {
+        Self::with_hash(stage, bytes, blake3::hash(bytes))
+    }
+
+    fn with_hash(stage: &'static str, bytes: &[u8], digest: blake3::Hash) -> Shader {
         Shader {
             stage,
-            hash: blake3::hash(bytes).to_hex()[..16].to_owned(),
+            hash: digest.to_hex()[..16].to_owned(),
+            #[cfg(windows)]
+            full_hash: *digest.as_bytes(),
             size: bytes.len(),
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
@@ -135,23 +140,53 @@ impl Shader {
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
-                    *container = Vec::new();
+                    let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
+                        self.stage == "pixel"
+                            || (self.stage == "mesh"
+                                && victory_shader::emit::mesh_outputs(&t.host.dxil)
+                                    .is_some_and(|o| {
+                                        o.bytes() > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+                                    }))
+                    });
+                    if !keep {
+                        *container = Vec::new();
+                    }
                     done
                 };
                 let ms = started.elapsed().as_millis() as u64;
                 let (user_ms, kernel_ms) = thread_cpu_since(cpu);
                 match &done {
-                    Ok(t) => tracing::info!(
-                        stage = self.stage,
-                        hash = %self.hash,
-                        user_data = t.host.user_data.len(),
-                        samplers = t.host.samplers.len(),
-                        cached,
-                        ms,
-                        user_ms,
-                        kernel_ms,
-                        "shader translated"
-                    ),
+                    Ok(t) => {
+                        tracing::info!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            user_data = t.host.user_data.len(),
+                            samplers = t.host.samplers.len(),
+                            cached,
+                            ms,
+                            user_ms,
+                            kernel_ms,
+                            "shader translated"
+                        );
+                        // D3DMetal makes such a pipeline and marks it a no-op:
+                        // its draws are dropped without an error (#132).
+                        use victory_shader::emit::{METAL_MESH_OUTPUT_BYTES, mesh_outputs};
+                        if let Some(o) = mesh_outputs(&t.host.dxil)
+                            .filter(|o| o.bytes() > METAL_MESH_OUTPUT_BYTES)
+                            .filter(|_| crate::shader_cache::under_wine())
+                        {
+                            tracing::warn!(
+                                hash = %self.hash,
+                                bytes = o.bytes(),
+                                limit = METAL_MESH_OUTPUT_BYTES,
+                                vertices = o.vertices,
+                                primitives = o.primitives,
+                                vertex_components = o.vertex_components,
+                                primitive_components = o.primitive_components,
+                                "mesh shader outputs exceed Metal's limit; its draws are likely dropped"
+                            );
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -220,6 +255,117 @@ fn with_resources(
         None => Vec::new(),
     };
     Ok(Translated { host, used })
+}
+
+#[cfg(windows)]
+fn link_mesh_outputs() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS"))
+}
+
+#[cfg(windows)]
+struct LinkedPair {
+    mesh: Arc<Shader>,
+    pixel: Option<Arc<Shader>>,
+}
+
+#[cfg(windows)]
+type LinkedKey = ([u8; 32], Option<[u8; 32]>);
+
+#[cfg(windows)]
+impl Shader {
+    fn with_translation(&self, translated: Translated) -> Arc<Shader> {
+        let cell = OnceLock::new();
+        let _ = cell.set(Some(translated));
+        Arc::new(Shader {
+            stage: self.stage,
+            hash: self.hash.clone(),
+            full_hash: self.full_hash,
+            size: self.size,
+            container: Mutex::new(Vec::new()),
+            translated: cell,
+        })
+    }
+}
+
+/// Re-translates a mesh shader together with its paired pixel shader (if any)
+/// so arbitrary mesh outputs unread by the pixel shader are pruned under
+/// Metal's 32 KiB mesh output limit (`victory_shader::emit::METAL_MESH_OUTPUT_BYTES`).
+#[cfg(windows)]
+pub(crate) fn translate_linked(
+    ms: &Shader,
+    ps: Option<&Shader>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    static LINKED: Mutex<Option<HashMap<LinkedKey, Option<LinkedPair>>>> = Mutex::new(None);
+    let key = (ms.full_hash, ps.map(|p| p.full_hash));
+    if let Some(hit) = LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(&key))
+    {
+        return hit
+            .as_ref()
+            .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    }
+    let mesh_bytes = ms
+        .container
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let pixel_bytes = ps.map(|p| {
+        p.container
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    });
+    let options = crate::shader_cache::runtime_options();
+    let result = match victory_shader::emit::translate_linked(
+        &mesh_bytes,
+        pixel_bytes.as_deref(),
+        options,
+    ) {
+        Ok((ms_host, ps_host)) => {
+            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let ms_used = ms.translated()?.used.clone();
+            let mesh = ms.with_translation(Translated {
+                host: ms_host,
+                used: ms_used,
+            });
+            let pixel = match (ps, ps_host) {
+                (Some(p), Some(host)) => Some(p.with_translation(Translated {
+                    host,
+                    used: p.translated()?.used.clone(),
+                })),
+                _ => None,
+            };
+            tracing::info!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                bytes = ms_bytes,
+                "mesh and pixel linked under 32 KiB output budget"
+            );
+            Some(LinkedPair { mesh, pixel })
+        }
+        Err(e) => {
+            tracing::warn!(
+                mesh = %ms.hash,
+                pixel = ps.map_or("none", |p| p.hash.as_str()),
+                error = %e,
+                "linked mesh/pixel translation failed; using standalone translation"
+            );
+            None
+        }
+    };
+    let out = result
+        .as_ref()
+        .map(|pair| (pair.mesh.clone(), pair.pixel.clone()));
+    LINKED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, result);
+    out
 }
 
 #[repr(C)]

@@ -78,6 +78,7 @@ fn store_shader() -> Arc<Shader> {
     Arc::new(Shader {
         stage: "compute",
         hash: blake3::hash(&native.code).to_hex()[..16].to_owned(),
+        full_hash: *blake3::hash(&native.code).as_bytes(),
         size: container.len(),
         container: std::sync::Mutex::new(container),
         translated: OnceLock::from(Some(Translated {

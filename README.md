@@ -137,6 +137,8 @@ Please read [docs/fleet-legal.md](docs/fleet-legal.md) first. You can also run t
 
 These need a diagnostics build (`VICTORY_DIAGNOSTICS=1 tools/macos/victory.sh ...`) and are for chasing problems, not for playing.
 
+A diagnostics build also logs one bounded line per submission that refreshes title memory: the total range count and bytes, then the eight largest ranges' title start/length and host GPU address. It logs no memory contents. A batch combines requests from several lists, view heaps and page tables, so a range is not attributed to an individual descriptor or view.
+
 | Variable | What it does |
 | --- | --- |
 | `VICTORY_STACKS=<seconds>,...` | Prints every thread's stack at those times after start. |

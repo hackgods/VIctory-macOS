@@ -10,8 +10,13 @@
 //! pointers into memory no copy holds (zeros, marked missed) and stores and
 //! loads through a root UAV (title memory in such a program).
 
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT, DXGI_FORMAT_R32G32B32_FLOAT,
+    DXGI_FORMAT_R32G32B32A32_FLOAT,
+};
+
 use super::host::{Dispatch, Host, Root, View};
-use super::{HostShader, lower, validator};
+use super::{HostShader, VIEW_STRIDES, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
@@ -57,6 +62,110 @@ const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
         0x38 << 26 | 0x1C << 18 | (byte_off as u32 & 0xFFF),
         0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8,
     ]
+}
+
+/// A full typed store to element `s0` through the typed UAV at table slot 0,
+/// with write marks and `soffset` in the instruction's scalar-source field.
+fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
+    let mut words = vec![
+        s_mov_b32(4, 1), // s[4:5]: the table at s1
+        s_mov_b32(5, ZERO as u8),
+    ];
+    words.extend(s_load(2, 8, 4, 0));
+    words.push(v_mov_b32(0, 0)); // v0 = s0, the element index
+    words.push(S_WAITCNT_ALL);
+    for (v, bits) in [
+        (1, 0x3F80_0000),
+        (2, 0x4000_0000),
+        (3, 0x4040_0000),
+        (4, 0x4080_0000),
+    ] {
+        words.extend([0x7E00_0000 | (v as u32) << 17 | 0x01 << 9 | 0xFF, bits]);
+    }
+    words.extend([
+        0xE01C_2000,
+        0x8002_0100 | (soffset as u32) << 24, // buffer_store_format_xyzw v[1:4], v0, s[8:11], 0 idxen
+        S_ENDPGM,
+    ]);
+    let param = |root, user_data, slot| RootParam {
+        root,
+        table_offset_dwords: 0,
+        sgprs: 1,
+        base_register: 0,
+        user_data,
+        slot,
+    };
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![
+            param(RootType::Constants, 0, 0),
+            param(RootType::Table, 1, 1),
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 1,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 2 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        host_wave32: false,
+        view_marks: true,
+    })?;
+    assert!(lowered.view_marks, "the typed store marks its view");
+    assert_eq!(
+        lowered.root_srvs,
+        [VIEW_STRIDES],
+        "the view's run-time stride"
+    );
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    Ok(shader)
 }
 
 fn program() -> HostShader {
@@ -633,6 +742,109 @@ fn writes_through_views_mark_their_pages() {
             .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
             .collect();
         assert_eq!(marked, [100, 101, 200], "{label}: pages");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A typed store's write mark spans the view's real element width. Each store
+/// below ends exactly at a 64 KiB page boundary: 4-, 8-, 12- and 16-byte
+/// elements must all set only the first page's bit, where a hardcoded 16-byte
+/// width would also mark the next page. Inline zero is the no-offset soffset.
+#[test]
+fn typed_store_marks_use_the_element_stride_at_page_boundaries() {
+    let shader = typed_store_program(128).expect("lower");
+    let cases: [(&str, DXGI_FORMAT, u32); 4] = [
+        ("R32F", DXGI_FORMAT_R32_FLOAT, 4),
+        ("R32G32F", DXGI_FORMAT_R32G32_FLOAT, 8),
+        ("RGB32F", DXGI_FORMAT_R32G32B32_FLOAT, 12),
+        ("RGBA32F", DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        for &(name, format, stride) in &cases {
+            // WARP on some hosts loses the device on RGB32 typed views, so
+            // it runs only the formats it says it can load and store.
+            if warp && !host.typed_buffer_access(format, warp) {
+                eprintln!("{label} {name}: no typed UAV load and store; skipped");
+                continue;
+            }
+            let elements = 65_536 / stride;
+            let index = elements - 1;
+            // Put the element's last byte at 65,535. 65 KiB is not a
+            // multiple of 12, so RGB32 needs a four-byte mark phase.
+            let phase = 65_536 - elements * stride;
+            let base = 100;
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => index,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let views = [View::TypedUav(format, elements, stride)];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![stride],
+                                },
+                            ),
+                            (
+                                2,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![base, phase],
+                                },
+                            ),
+                            (3, Root::Uav(8)),
+                        ],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label} {name}: {e}"));
+            let marked: Vec<usize> = (0..out[1].len() * 32)
+                .filter(|&b| out[1][b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert_eq!(marked, [base as usize], "{label} {name}: pages");
+            // D3DMetal substitutes R32G32 for RGB32 typed buffers and drops
+            // the store. WARP still checks those bytes; both check the mark.
+            if !warp && super::host::under_wine() && stride == 12 {
+                eprintln!(
+                    "{label}: D3DMetal's RGB32 typed-buffer substitution; store bytes not compared"
+                );
+                continue;
+            }
+            let channels = stride / 4;
+            let values = [
+                1.0f32.to_bits(),
+                2.0f32.to_bits(),
+                3.0f32.to_bits(),
+                4.0f32.to_bits(),
+            ];
+            let mut want = vec![0; (elements * stride).div_ceil(4) as usize];
+            let at = (index * stride / 4) as usize;
+            want[at..at + channels as usize].copy_from_slice(&values[..channels as usize]);
+            assert_eq!(out[0], want, "{label} {name}: the typed store");
+        }
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

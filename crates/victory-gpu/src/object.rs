@@ -71,6 +71,31 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// A new reference to `this` unless its count is already zero, where the
+/// title's last release has run and the object is being freed. The caller
+/// must know the object's memory is still there (it holds a lock that the
+/// object's destructor takes before the memory goes).
+#[cfg(any(windows, test))]
+pub(crate) fn try_add_ref(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, by the caller's contract.
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        (n != 0).then_some(n + 1)
+    })
+    .is_ok()
+}
+
+/// Releases a reference through the object's own table, whatever its kind:
+/// the last one frees it.
+#[cfg(any(windows, test))]
+pub(crate) fn release_ref(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects; slot 2 of every table is its
+    // release (see `d3d12_object`).
+    let release: extern "system" fn(This) -> u32 =
+        unsafe { std::mem::transmute(*(*this).functions.add(2)) };
+    release(this)
+}
+
 /// An object's reference count.
 pub(crate) fn refs(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
@@ -394,6 +419,21 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table[1] = add_ref as *const ();
     table[2] = release as *const ();
     table
+}
+
+/// An object of no kind with `release` in its release slot, one reference
+/// held (tests). Its table is never freed.
+#[cfg(test)]
+pub(crate) fn test_object(release: extern "system" fn(This) -> u32) -> This {
+    let mut functions = d3d12_object(missing_table::<DEVICE, 7>());
+    functions[2] = release as *const ();
+    let table: &'static Table<7> = Box::leak(Box::new(Table(functions)));
+    let mut this = std::ptr::null();
+    assert_eq!(
+        hand_out(DEVICE, Box::new(Object::new(table)), &[1; 16], &[[1; 16]], &mut this),
+        S_OK
+    );
+    this
 }
 
 #[cfg(test)]

@@ -409,17 +409,46 @@ fn differences_with(
     lds_bytes: u32,
     narrow_waves: bool,
 ) -> Vec<String> {
-    let n = native(words, true, threads, lds_bytes);
-    let forms = [
-        (
-            "halves",
-            shader(lowered_with(&n, true, narrow_waves).expect("halves")),
-        ),
-        (
-            "wave64",
-            shader(lowered_with(&n, false, narrow_waves).expect("one wave64")),
-        ),
-    ];
+    differences_in(
+        true,
+        words,
+        threads,
+        per_lane,
+        want,
+        lds_bytes,
+        narrow_waves,
+    )
+}
+
+/// [`differences_with`] for a program of console waves of 64 lanes
+/// (`wave64`) or of 32, which a host of any wave size runs as it is.
+fn differences_in(
+    wave64: bool,
+    words: &[u32],
+    threads: u32,
+    per_lane: usize,
+    want: &[u32],
+    lds_bytes: u32,
+    narrow_waves: bool,
+) -> Vec<String> {
+    let n = native(words, wave64, threads, lds_bytes);
+    let forms = if wave64 {
+        vec![
+            (
+                "halves",
+                shader(lowered_with(&n, true, narrow_waves).expect("halves")),
+            ),
+            (
+                "wave64",
+                shader(lowered_with(&n, false, narrow_waves).expect("one wave64")),
+            ),
+        ]
+    } else {
+        vec![(
+            "wave32",
+            shader(lowered_with(&n, false, narrow_waves).expect("one wave32")),
+        )]
+    };
     let views = [
         View::Texture(1, 1, &[[0.0; 4]]),
         View::Buffer {
@@ -672,4 +701,156 @@ fn lds_synced_in_halves_matches_the_console_on_every_gpu() {
     let want: Vec<u32> = (0..64u32).map(|l| (l ^ 32).min(32)).collect();
     let failed = differences_with(&lds_across_halves(), 64, 1, &want, 256, true);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// `v_permlanex16_b32 v1, v0, s8, s9` with the FI and BOUND_CTRL bits
+/// (`op_sel` bits 0 and 1, word bits 11 and 12): lane `l` takes the value
+/// of `v0` from the other row of 16 in its 32-lane half, the lane its
+/// nibble of `s8` (lanes 0 to 7 of a row) or `s9` (lanes 8 to 15) names.
+const fn permlanex16(fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
+    [
+        0xD778_0001 | (fetch_inactive as u32) << 11 | (bound_ctrl as u32) << 12,
+        0x0024_1100,
+    ]
+}
+
+/// The selectors: every nibble of `s8` is odd and every one of `s9` is even.
+const PERM_LOW: u32 = 0x1357_9BDF;
+const PERM_HIGH: u32 = 0x2468_ACE0;
+/// What `v1` holds before an instruction that may leave it alone.
+const PERM_OLD: u32 = 0xAAAA;
+
+/// Per lane `l` of one console wave of `lanes`: `v0` (the lane's number)
+/// permuted with every lane active, then with only the even lanes active
+/// for FI clear and BOUND_CTRL clear, FI clear and BOUND_CTRL set, FI set
+/// and BOUND_CTRL clear, and FI and BOUND_CTRL both set, each over a `v1`
+/// holding [`PERM_OLD`]. EXEC is whole again for every store.
+fn permlanex16_program(lanes: u32) -> Vec<u32> {
+    let wave64 = lanes == 64;
+    let full = |w: &mut Vec<u32>| {
+        w.push(if wave64 {
+            0xBEFE_04C1 // s_mov_b64 exec, -1
+        } else {
+            0xBEFE_03C1 // s_mov_b32 exec_lo, -1
+        });
+    };
+    let even = |w: &mut Vec<u32>| {
+        w.push(if wave64 {
+            0xBEFE_040A // s_mov_b64 exec, s[10:11]
+        } else {
+            0xBEFE_030A // s_mov_b32 exec_lo, s10
+        });
+    };
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE88_03FF,
+        PERM_LOW, // s_mov_b32 s8, PERM_LOW
+        0xBE89_03FF,
+        PERM_HIGH, // s_mov_b32 s9, PERM_HIGH
+        0xBE8A_03FF,
+        0x5555_5555, // s_mov_b32 s10, 0x55555555
+        0xBE8B_03FF,
+        0x5555_5555, // s_mov_b32 s11, 0x55555555
+    ]);
+    w.extend(permlanex16(false, false));
+    w.extend(store(1, 0));
+    for (slot, (fi, bc)) in [(false, false), (false, true), (true, false), (true, true)]
+        .into_iter()
+        .enumerate()
+    {
+        w.extend([0x7E02_02FF, PERM_OLD]); // v_mov_b32 v1, PERM_OLD
+        even(&mut w);
+        w.extend(permlanex16(fi, bc));
+        full(&mut w);
+        w.extend(store(1, 4 * (slot as u32 + 1)));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What the console gives [`permlanex16_program`]'s lane `l`.
+fn permlanex16_console(l: u32) -> [u32; 5] {
+    let in_row = l & 15;
+    let selectors = if in_row >= 8 { PERM_HIGH } else { PERM_LOW };
+    let source = (l & !15 ^ 16) | (selectors >> (4 * (in_row & 7)) & 15);
+    let active = |lane: u32| lane.is_multiple_of(2);
+    let with_exec = |inactive_source: u32, fetch_inactive: bool| {
+        if !active(l) {
+            PERM_OLD
+        } else if fetch_inactive || active(source) {
+            source
+        } else {
+            inactive_source
+        }
+    };
+    [
+        source,
+        with_exec(PERM_OLD, false),
+        with_exec(0, false),
+        with_exec(PERM_OLD, true),
+        with_exec(0, true),
+    ]
+}
+
+/// The hand-encoded words are the instructions their comments name.
+#[test]
+fn the_permlanex16_program_is_what_its_comments_say() {
+    let mut names = Vec::new();
+    for words in [permlanex16(false, false), permlanex16(true, true)] {
+        let p = ir::build(
+            &[words[0], words[1], S_ENDPGM]
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<u8>>(),
+            false,
+            32,
+        )
+        .expect("ir::build");
+        names.push(
+            p.blocks[0]
+                .insts
+                .iter()
+                .map(|i| i.name().to_string())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(names[0][0], "v_permlanex16_b32");
+    assert_eq!(names[1][0], "v_permlanex16_b32");
+}
+
+/// The lanes of each row read the other row of their 32-lane half through
+/// their selector nibbles, and an inactive source lane gives the old value,
+/// zero or its register as FI and BOUND_CTRL say, on every hardware
+/// adapter, in console waves of 32 and of 64 (in halves and whole).
+#[test]
+fn permlanex16_picks_lanes_as_the_console_does_on_every_gpu() {
+    let mut failed = Vec::new();
+    for lanes in [32, 64] {
+        let want: Vec<u32> = (0..lanes).flat_map(permlanex16_console).collect();
+        failed.extend(differences_in(
+            lanes == 64,
+            &permlanex16_program(lanes),
+            lanes,
+            5,
+            &want,
+            0,
+            false,
+        ));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The model itself: lane 0 reads lane 16 | 15 (the low nibble of `s8` is
+/// 15, an odd and so inactive lane), lane 8 reads 16 | 0 (the low nibble of `s9`), the second half's
+/// lane 32 reads 48 | 15, and FI and BOUND_CTRL change only what an
+/// inactive source gives.
+#[test]
+fn the_permlanex16_model_follows_the_instruction() {
+    assert_eq!(permlanex16_console(0), [31, 0xAAAA, 0, 31, 31]);
+    assert_eq!(permlanex16_console(8), [16, 16, 16, 16, 16]);
+    assert_eq!(permlanex16_console(1), [29, 0xAAAA, 0xAAAA, 0xAAAA, 0xAAAA]);
+    assert_eq!(permlanex16_console(16)[0], 15);
+    assert_eq!(permlanex16_console(32)[0], 63);
+    assert_eq!(permlanex16_console(48)[0], 47);
 }

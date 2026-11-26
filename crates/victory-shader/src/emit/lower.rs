@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod mesh;
+pub(crate) use mesh::KeptOutputs;
+use mesh::prune_signature;
 
 type Why = &'static str;
 
@@ -30,6 +33,14 @@ enum Val {
     I32(V),
     Bit(V),
     Missing(Why),
+}
+
+#[cfg(test)]
+pub(crate) struct TypedBufferCalls {
+    /// Blocks with `bufferLoad.f32` and `bufferLoad.i32` calls.
+    pub loads: [Vec<usize>; 2],
+    /// Blocks with `bufferStore.f32` and `bufferStore.i32` calls.
+    pub stores: [Vec<usize>; 2],
 }
 
 pub(crate) struct Lowered {
@@ -67,6 +78,9 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Written typed-buffer calls, for structural tests of the dynamic path.
+    #[cfg(test)]
+    pub typed_buffer_calls: TypedBufferCalls,
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
@@ -113,9 +127,16 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_pruned(parts, None)
+}
+
+pub(crate) fn lower_pruned(
+    parts: &Parts,
+    keep: Option<&KeptOutputs>,
+) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, keep).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -131,6 +152,11 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;
+/// `dx.types.ResourceProperties`' second dword for a four-component typed
+/// handle: component type in byte 0 (`F32` = 9, `I32` = 4), component count in
+/// byte 1. UINT and SINT views both use the signless `.i32` DXIL overload.
+const TYPED_F32_PROPS: u32 = 9 | 4 << 8;
+const TYPED_I32_PROPS: u32 = 4 | 4 << 8;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
 
@@ -199,6 +225,8 @@ fn half_shift(width: u32) -> u32 {
 /// parameter and byte offset.
 type EntryAddress = (usize, u32);
 
+type HandleKey = (usize, Site, u8, bool, (u32, u32));
+
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
@@ -238,15 +266,15 @@ struct Lower<'a> {
     waterfall_compares: Set<Site>,
     waterfall_reads: Set<Value>,
     waterfall_loads: Set<Site>,
-    handles: Map<(usize, Site, u8, bool, u32), V>,
+    handles: Map<HandleKey, V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by base value, byte offset, dword, offset register, sampler
     /// heap and properties ([`Lower::entry_address`]).
-    entry_handles: Map<(EntryAddress, u8, bool, u32), V>,
+    entry_handles: Map<(EntryAddress, u8, bool, (u32, u32)), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: Map<(String, bool, u32), V>,
+    join_handles: Map<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: Map<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -517,6 +545,20 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// DXIL semantic index and interpolation mode for one GFX10 barycentric
+/// pair. Pull-model values are I/W, J/W and 1/W, not this semantic's weights.
+fn barycentric_signature(kind: Barycentric) -> Option<(u32, u8)> {
+    Some(match kind {
+        Barycentric::PerspectiveSample => (0, 6),
+        Barycentric::PerspectiveCenter => (0, 2),
+        Barycentric::PerspectiveCentroid => (0, 3),
+        Barycentric::PerspectivePullModel => return None,
+        Barycentric::LinearSample => (1, 7),
+        Barycentric::LinearCenter => (1, 4),
+        Barycentric::LinearCentroid => (1, 5),
+    })
+}
+
 /// The scalar instruction defining an SSA value in this block and its operands.
 fn scalar_def<'a, const N: usize>(
     block: &'a Block,
@@ -581,7 +623,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&KeptOutputs>) -> Self {
         let p = x.p;
         let mut phi_at = Map::default();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -592,6 +634,13 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if let Some(keep) = keep {
+            if x.native.stage == HwStage::Ps {
+                prune_signature(&mut s.inputs, keep);
+            } else if x.native.stage == HwStage::Ms {
+                prune_signature(&mut s.outputs, keep);
+            }
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -613,7 +662,10 @@ impl<'a> Lower<'a> {
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
                     || n.starts_with("v_mbcnt")
-                    || matches!(n, "v_readlane_b32" | "v_writelane_b32")
+                    || matches!(
+                        n,
+                        "v_readlane_b32" | "v_writelane_b32" | "v_permlanex16_b32"
+                    )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
             }) || {
@@ -673,11 +725,22 @@ impl<'a> Lower<'a> {
         let mut no_barrier = Set::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
+            if let Some(keep) = keep {
+                prune_signature(&mut s.prims, keep);
+            }
             s.threads = Some([ms.threads, 1, 1]);
             s.lds_dwords = ms.lds_bytes.div_ceil(4);
+            let mut max_vertices = ms.max_vertices;
+            let mut max_primitives = ms.max_primitives;
+            let declared =
+                super::MeshOutputs::of(&s.outputs, &s.prims, max_vertices, max_primitives);
+            if declared.bytes() > super::METAL_MESH_OUTPUT_BYTES {
+                max_vertices = max_vertices.min(ms.threads);
+                max_primitives = max_primitives.min(ms.threads);
+            }
             s.mesh = Some(super::shader::Mesh {
-                max_vertices: ms.max_vertices,
-                max_primitives: ms.max_primitives,
+                max_vertices,
+                max_primitives,
                 topology: ms.topology,
             });
             // Barriers order the lanes' LDS accesses; the console's
@@ -1100,7 +1163,8 @@ impl<'a> Lower<'a> {
             args.push(self.s.m.i32(4));
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
-            self.mark_view_write(h, off, 4 * u32::from(n), None);
+            let bytes = self.s.m.i32(4 * u32::from(n));
+            self.mark_view_write(h, off, bytes, None);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -1143,7 +1207,8 @@ impl<'a> Lower<'a> {
             );
             first.get_or_insert(r);
         }
-        self.mark_view_write(h, off, 4, None);
+        let bytes = self.s.m.i32(4);
+        self.mark_view_write(h, off, bytes, None);
         let zero = self.s.m.i32(0);
         let r = self.end_guarded(at, &[(first.expect("an atomic"), zero)])[0];
         if let Some(reg) = returned {
@@ -1499,6 +1564,17 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
+            typed_buffer_calls: TypedBufferCalls {
+                loads: [
+                    self.s.m.written_call_blocks("dx.op.bufferLoad.f32"),
+                    self.s.m.written_call_blocks("dx.op.bufferLoad.i32"),
+                ],
+                stores: [
+                    self.s.m.written_call_blocks("dx.op.bufferStore.f32"),
+                    self.s.m.written_call_blocks("dx.op.bufferStore.i32"),
+                ],
+            },
+            #[cfg(test)]
             split_barriers: self.split_barriers.len(),
             #[cfg(test)]
             wave_size: self.s.wave_size,
@@ -1570,6 +1646,54 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    fn barycentric_input(&mut self, kind: Barycentric, index: u8) -> Val {
+        // GFX10 supplies I and J, which weight P10 and P20 in
+        // P0 + P10 * I + P20 * J. DirectX orders SV_Barycentrics by the
+        // provoking vertex, then the other two vertices, so I/J are y/z.
+        // Pull-model registers instead contain I/W, J/W and 1/W and need a
+        // separate conversion.
+        let Some((semantic_index, interp)) = barycentric_signature(kind) else {
+            return Val::Missing("barycentrics read directly");
+        };
+        let col = match index {
+            0 => 1,
+            1 => 2,
+            _ => return Val::Missing("barycentrics read directly"),
+        };
+        let id = match self
+            .s
+            .inputs
+            .iter()
+            .position(|e| e.kind == 28 && e.index == semantic_index)
+        {
+            Some(id) if self.s.inputs[id].usage == 0 => {
+                self.s.inputs[id].interp = interp;
+                id
+            }
+            Some(id) if self.s.inputs[id].interp == interp => id,
+            // DXIL allows one perspective and one affine barycentric input.
+            // It cannot represent two sampling locations for either one.
+            Some(_) => return Val::Missing("barycentrics read directly"),
+            None => {
+                self.s.inputs.push(SigElement {
+                    name: "SV_Barycentrics".into(),
+                    index: semantic_index,
+                    kind: 28,
+                    comp: 9,
+                    interp,
+                    row: None,
+                    col: 0,
+                    cols: 3,
+                    usage: 0,
+                    half: false,
+                });
+                self.s.inputs.len() - 1
+            }
+        };
+        self.s.flags |= flags::BARYCENTRICS;
+        self.load_input(id, col)
+    }
+
     fn input(&mut self, input: Input) -> Val {
         let (kind, col) = match input {
             Input::VertexId => (1, 0),
@@ -1581,7 +1705,7 @@ impl<'a> Lower<'a> {
                     None => Val::Missing("a vertex input the signature lacks"),
                 };
             }
-            Input::Barycentric { .. } => return Val::Missing("barycentrics read directly"),
+            Input::Barycentric { kind, index } => return self.barycentric_input(kind, index),
             Input::PrimitiveId => return Val::Missing("the primitive id"),
             // The console code tests it against 0 (`v_cmp_ne_u32`), as the
             // host's value can be.
@@ -3050,65 +3174,6 @@ impl<'a> Lower<'a> {
             }
             _ => self.s.m.bin(e, Bin::UDiv, f, xy),
         })
-    }
-
-    /// Mesh: the counts and the primitives no lane exports. The console's
-    /// counts come from one lane's allocation request, which DXIL cannot
-    /// express (one call, dominating every output write).
-    // shortcut: the counts are the declared maxima and each lane first culls
-    // its primitive (all indices 0, zero area), so primitives past the
-    // program's count are culled and vertices past it unused; this costs
-    // the host the unused vertex and primitive slots. Pass the program's own
-    // counts if that shows in frame time.
-    fn mesh_prologue(&mut self, mesh: super::shader::Mesh) -> Result<(), Why> {
-        let threads = self.s.threads.expect("mesh")[0];
-        if mesh.topology != 2 {
-            return Err("a mesh shader not drawing triangles");
-        }
-        if threads > 128 || mesh.max_vertices > 256 || mesh.max_primitives > 256 {
-            return Err("a mesh shader beyond the host's limits");
-        }
-        let e = self.s.entry;
-        let void = self.s.t.void;
-        let (v, p) = (
-            self.s.m.i32(mesh.max_vertices),
-            self.s.m.i32(mesh.max_primitives),
-        );
-        self.s
-            .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
-        let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
-        let at = self.begin_guarded(guard);
-        let z = self.s.m.i32(0);
-        self.s.op(
-            self.cur,
-            "emitIndices",
-            Attr::NoUnwind,
-            void,
-            169,
-            &[flat, z, z, z],
-        );
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    /// Mesh: the thread's index in the group, which is its vertex and
-    /// primitive index.
-    fn mesh_thread(&mut self) -> V {
-        if let Some(f) = self.flat {
-            return f;
-        }
-        let e = self.s.entry;
-        let f = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            self.s.t.i32,
-            96,
-            &[],
-        );
-        self.flat = Some(f);
-        f
     }
 
     /// The console wave size.
@@ -4819,7 +4884,7 @@ impl<'a> Lower<'a> {
     /// notes, "Write marks"): the bits of its first and last byte, each set
     /// only where still clear. Nothing for handles that are no heap view, or
     /// without [`Parts::view_marks`].
-    fn mark_view_write(&mut self, h: V, x: V, bytes: u32, guard: Option<V>) {
+    fn mark_view_write(&mut self, h: V, x: V, bytes: V, guard: Option<V>) {
         if !self.x.view_marks {
             return;
         }
@@ -4841,7 +4906,10 @@ impl<'a> Lower<'a> {
             None => valid,
         };
         let first = self.s.m.bin(c, Bin::Add, phase, x);
-        let span = k(self, bytes.max(1) - 1);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let nonempty = self.s.m.cmp(c, pred::NE, bytes, zero);
+        let span = self.s.m.bin(c, Bin::Sub, bytes, one);
+        let span = self.s.m.select(c, nonempty, span, zero);
         let last = self.s.m.bin(c, Bin::Add, first, span);
         let (k16, cap) = (k(self, 16), k(self, super::VIEW_WRITE_BITS - 1));
         let mut bits = Vec::new();
@@ -4909,6 +4977,68 @@ impl<'a> Lower<'a> {
             self.s.m.cmp(c, pred::NE, x, zero)
         });
         Some((int, signed))
+    }
+
+    /// A 32-bit typed load through independently annotated float and integer
+    /// handles. The view's format is dynamic, so the overloads must be in
+    /// mutually exclusive branches: executing `bufferLoad.i32` on a float view
+    /// (or the reverse) is not a bitcast. Each result channel is an `i32` phi;
+    /// the float path bitcasts only after the float load has taken place.
+    fn typed_buffer_load(
+        &mut self,
+        float_h: V,
+        integer_h: V,
+        index: V,
+        integer: V,
+        count: u32,
+    ) -> Vec<V> {
+        let head = self.cur;
+        let (integer_block, float_block, join) = (
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+            self.s.m.new_block(),
+        );
+        self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
+        let iu = self.s.m.undef(self.s.t.i32);
+        let mut integer_values = Vec::new();
+        self.cur = integer_block;
+        let r = self.s.op(
+            integer_block,
+            "bufferLoad.i32",
+            Attr::ReadOnly,
+            self.s.t.res_ret_i32,
+            68,
+            &[integer_h, index, iu],
+        );
+        for ch in 0..count {
+            integer_values.push(self.s.m.extract(integer_block, r, ch));
+        }
+        self.s.m.terminate(integer_block, Term::Br(join));
+        let mut float_values = Vec::new();
+        self.cur = float_block;
+        let r = self.s.op(
+            float_block,
+            "bufferLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            68,
+            &[float_h, index, iu],
+        );
+        for ch in 0..count {
+            let x = self.s.m.extract(float_block, r, ch);
+            float_values.push(self.as_int(x));
+        }
+        self.s.m.terminate(float_block, Term::Br(join));
+        self.cur = join;
+        integer_values
+            .into_iter()
+            .zip(float_values)
+            .map(|(integer, float)| {
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s.m.set_phi(phi, vec![(integer, integer_block), (float, float_block)]);
+                phi
+            })
+            .collect()
     }
 
     /// Title memory at a raw GPU address (decision 0005: the unified-memory
@@ -5641,7 +5771,7 @@ impl<'a> Lower<'a> {
                 // compiler reloads one before every use rather than keep it
                 // (ActivateRays: 2,399 loads of one), and one handle made in
                 // the entry block serves them all.
-                let key = (address, *first, sampler, props.0);
+                let key = (address, *first, sampler, props);
                 if let Some(&h) = self.entry_handles.get(&key) {
                     return Ok(h);
                 }
@@ -5654,7 +5784,7 @@ impl<'a> Lower<'a> {
                 Ok(h)
             }
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -5763,7 +5893,7 @@ impl<'a> Lower<'a> {
                 // One handle at the join for every access the choice reaches
                 // (each is in a block the join dominates).
                 let _ = site;
-                let key = (format!("{src:?}"), sampler, props.0);
+                let key = (format!("{src:?}"), sampler, props);
                 if let Some(&h) = self.join_handles.get(&key) {
                     return Ok(h);
                 }
@@ -6956,6 +7086,43 @@ impl<'a> Lower<'a> {
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
+            }
+            "v_permlanex16_b32" => {
+                self.cross_lane(false)?;
+                let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let [two, seven, eight, fifteen, sixteen, row_mask] =
+                    [2, 7, 8, 15, 16, !15].map(|n| self.s.m.i32(n));
+                // The nibble for this lane comes from src1 at offsets 0..7
+                // and src2 at offsets 8..15. It indexes the other row of 16
+                // in the same 32-lane half of the wave.
+                let in_row = self.s.m.bin(c, Bin::And, lane, fifteen);
+                let hi = self.s.m.cmp(c, pred::IUGE, in_row, eight);
+                let selectors = self.s.m.select(c, hi, high, low);
+                let nibble = self.s.m.bin(c, Bin::And, in_row, seven);
+                let shift = self.s.m.bin(c, Bin::Shl, nibble, two);
+                let pick = self.s.m.bin(c, Bin::LShr, selectors, shift);
+                let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+                let row = self.s.m.bin(c, Bin::And, lane, row_mask);
+                let row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let source = self.s.m.bin(c, Bin::Or, row, pick);
+                let value = self.read_lane(value, source);
+
+                // With FI clear, guest EXEC controls whether the source
+                // contributes. BOUND_CTRL selects zero or keeps the old dst.
+                if let Some(active) = guard.filter(|_| v.opsel & 1 == 0) {
+                    let src_active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
+                    let src_active = self.read_lane(src_active, source);
+                    let zero = self.s.m.i32(0);
+                    let src_active = self.s.m.cmp(c, pred::NE, src_active, zero);
+                    if v.opsel & 2 != 0 {
+                        let value = self.s.m.select(c, src_active, value, zero);
+                        return int(self, value);
+                    }
+                    let write = self.s.m.bin(c, Bin::And, active, src_active);
+                    return self.write_i(inst, value, Some(write));
+                }
+                int(self, value)
             }
             "v_readfirstlane_b32"
                 if inst
@@ -8429,7 +8596,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, attribute.row, h)
+                        packed_half(&l.x.inputs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -9907,7 +10074,8 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
             };
-            self.mark_view_write(h, byte, 4, None);
+            let bytes = self.s.m.i32(4);
+            self.mark_view_write(h, byte, bytes, None);
             let r = self.end_guarded(at, &[(r, old)])[0];
             if returns {
                 self.write(inst, Reg::V(reg), r, None);
@@ -9941,7 +10109,8 @@ impl<'a> Lower<'a> {
                 self.s
                     .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
             }
-            self.mark_view_write(h, at, 4, None);
+            let bytes = self.s.m.i32(4);
+            self.mark_view_write(h, at, bytes, None);
             self.end_guarded(begin, &[]);
             return Ok(());
         }
@@ -9950,7 +10119,7 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             let typed_h = if typed {
-                Some(self.handle(site, src, false, (10 | u, 0x409))?)
+                Some(self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?)
             } else {
                 None
             };
@@ -9986,6 +10155,90 @@ impl<'a> Lower<'a> {
                 }
                 vals = wide;
             }
+            if typed && !d16 {
+                // As for loads, a dynamic integer view gets a separately
+                // annotated handle and a mutually exclusive integer store.
+                if count != 4 {
+                    return Err("a typed buffer store of some channels or at an offset");
+                }
+                if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
+                    return Err("a typed buffer store at an offset");
+                }
+                let h = typed_h.ok_or("a typed buffer store")?;
+                let element = index.unwrap_or(self.s.m.i32(0));
+                let (byte, bytes) = if self.x.view_marks {
+                    let at = self
+                        .s
+                        .view_index
+                        .get(&h)
+                        .copied()
+                        .ok_or("a typed buffer store")?;
+                    let stride = self.stride_at(at);
+                    (self.s.m.bin(self.cur, Bin::Mul, element, stride), stride)
+                } else {
+                    (element, self.s.m.i32(0))
+                };
+                let integer = self.integer_view(h).map(|(integer, _)| integer);
+                let integer_h = if integer.is_some() {
+                    Some(self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?)
+                } else {
+                    None
+                };
+                let outer = self.begin_guarded(guard);
+                self.mark_view_write(h, byte, bytes, None);
+                if let (Some(integer), Some(integer_h)) = (integer, integer_h) {
+                    let head = self.cur;
+                    let (integer_block, float_block, join) = (
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                        self.s.m.new_block(),
+                    );
+                    self.s.m.terminate(head, Term::CondBr(integer, integer_block, float_block));
+                    let iu = self.s.m.undef(self.s.t.i32);
+                    let mask = self.s.m.i8(0xF);
+                    self.cur = integer_block;
+                    let mut args = vec![integer_h, element, iu];
+                    args.extend_from_slice(&vals);
+                    args.push(mask);
+                    self.s.op(
+                        integer_block,
+                        "bufferStore.i32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                    self.s.m.terminate(integer_block, Term::Br(join));
+                    self.cur = float_block;
+                    let mut args = vec![h, element, iu];
+                    args.extend(vals.iter().map(|&x| self.as_float(x)));
+                    args.push(mask);
+                    self.s.op(
+                        float_block,
+                        "bufferStore.f32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                    self.s.m.terminate(float_block, Term::Br(join));
+                    self.cur = join;
+                } else {
+                    let mut args = vec![h, element, iu];
+                    args.extend(vals.iter().map(|&x| self.as_float(x)));
+                    args.push(self.s.m.i8(0xF));
+                    self.s.op(
+                        self.cur,
+                        "bufferStore.f32",
+                        Attr::NoUnwind,
+                        self.s.t.void,
+                        69,
+                        &args,
+                    );
+                }
+                self.end_guarded(outer, &[]);
+                return Ok(());
+            }
             let mut args = Vec::new();
             // Where the write starts in the view, and how many bytes it may
             // cover (for its marks).
@@ -9993,8 +10246,11 @@ impl<'a> Lower<'a> {
             let (op, name) = if typed {
                 // shortcut: typed stores are taken to write all four channels
                 // of a float format.
-                if count != 4 || *offen || *offset != 0 {
+                if count != 4 {
                     return Err("a typed buffer store of some channels or at an offset");
+                }
+                if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
+                    return Err("a typed buffer store at an offset");
                 }
                 let h = typed_h.ok_or("a typed buffer store")?;
                 let element = index.unwrap_or(self.s.m.i32(0));
@@ -10003,13 +10259,19 @@ impl<'a> Lower<'a> {
                 for x in vals {
                     args.push(self.as_float(x));
                 }
-                // The element's size is the view's stride (16 bytes at most).
-                (byte, bytes) = match self.s.view_index.get(&h).copied() {
-                    Some(at) if self.x.view_marks => {
-                        let stride = self.stride_at(at);
-                        (self.s.m.bin(self.cur, Bin::Mul, element, stride), 16)
-                    }
-                    _ => (element, 16),
+                // The element's size is the view's stride, not always 16. It
+                // is needed at run time only for the write marks.
+                (byte, bytes) = if self.x.view_marks {
+                    let at = self
+                        .s
+                        .view_index
+                        .get(&h)
+                        .copied()
+                        .ok_or("a typed buffer store")?;
+                    let stride = self.stride_at(at);
+                    (self.s.m.bin(self.cur, Bin::Mul, element, stride), stride)
+                } else {
+                    (element, self.s.m.i32(0))
                 };
                 (69, "bufferStore.f32")
             } else {
@@ -10023,14 +10285,16 @@ impl<'a> Lower<'a> {
                         args.extend([index, off]);
                         let s = self.s.m.i32(stride);
                         let row = self.s.m.bin(self.cur, Bin::Mul, index, s);
-                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), 4 * count);
+                        let width = self.s.m.i32(4 * count);
+                        (byte, bytes) = (self.s.m.bin(self.cur, Bin::Add, row, off), width);
                     }
                     None => {
                         let n = 4 * count;
                         let (h, off) =
                             self.raw_view(site, src, off, n, (11 | u, 0), true, guard)?;
                         args.extend([h, off, iu]);
-                        (byte, bytes) = (off, n);
+                        let width = self.s.m.i32(n);
+                        (byte, bytes) = (off, width);
                     }
                 }
                 args.extend(&vals);
@@ -10101,6 +10365,42 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
+        if typed && !d16 {
+            if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
+                return Err("a typed buffer load at an offset");
+            }
+            if uav {
+                self.s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
+            let index = index.unwrap_or(self.s.m.i32(0));
+            let xs = if let Some((integer, _)) = self.integer_view(h) {
+                let integer_h = self.handle(site, src, false, (10 | u, TYPED_I32_PROPS))?;
+                self.typed_buffer_load(h, integer_h, index, integer, count)
+            } else {
+                let r = self.s.op(
+                    self.cur,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                );
+                (0..count)
+                    .map(|ch| {
+                        let x = self.s.m.extract(self.cur, r, ch);
+                        self.as_int(x)
+                    })
+                    .collect()
+            };
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            for (k, x) in xs.into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let mut typed_h = None;
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
@@ -10109,7 +10409,7 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let h = self.handle(site, src, false, (10 | u, TYPED_F32_PROPS))?;
             typed_h = Some(h);
             let index = index.unwrap_or(self.s.m.i32(0));
             self.s.op(
@@ -10162,11 +10462,11 @@ impl<'a> Lower<'a> {
             // Two 16-bit channels per VGPR (an odd last high half 0): f16 for
             // float and normalized formats; for integer formats (the view's
             // kind, from the view-stride table) the integer's low 16 bits.
-            // shortcut: an integer view is read and written through the
-            // float-typed handle, so its channels' bits travel as the driver
-            // passes a mismatched component type (unchanged on the RX 6700
-            // XT and WARP, `stride_tests`); an integer-typed second handle
-            // for the slot would not rely on it.
+            // Unlike the 32-bit accesses above, `_d16` keeps the established
+            // widened-float path for narrow formats: an integer view is read
+            // and written through the float-typed handle, so its channels' bits
+            // travel as the driver passes a mismatched component type
+            // (unchanged on the RX 6700 XT and WARP, `stride_tests`).
             let integer = typed_h.and_then(|h| self.integer_view(h));
             let c = self.cur;
             let k16 = self.s.m.i32(16);
@@ -10265,7 +10565,7 @@ impl<'a> Lower<'a> {
                 for high in [false, true] {
                     let h = 2 * ch + u8::from(high);
                     let src = if pack2 {
-                        packed_half(outputs, row, h)
+                        packed_half(&self.x.outputs, row, h)
                     } else {
                         (!high).then_some((row, ch))
                     };
@@ -10366,6 +10666,14 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        // Every value first, then the stores, an element's channels side by
+        // side. Metal's DXIL converter (behind D3DMetal) makes one vector
+        // write of an element's channel stores, where the first of them is:
+        // a channel converted between two stores would be used there before
+        // it exists, which the converter does not notice and the Apple GPU
+        // compiler crashes on (found by Ahmet-Dedeler, Marvisak/VIctory#1128).
+        // Compilers emit an element's stores together; hosts expect that.
+        let mut ready = Vec::with_capacity(stores.len());
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -10394,15 +10702,19 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            ready.push((id, col, suffix, x));
+        }
+        let thread = (mesh && !ready.is_empty()).then(|| self.mesh_thread());
+        // Stable: two stores of one channel keep their order.
+        ready.sort_by_key(|&(id, col, ..)| (id, col));
+        for (id, col, suffix, x) in ready {
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),
                 self.s.m.i8(col),
                 x,
             ];
-            if mesh {
-                args.push(self.mesh_thread());
-            }
+            args.extend(thread);
             let void = self.s.t.void;
             self.s.op(
                 self.cur,
@@ -10455,7 +10767,7 @@ impl<'a> Lower<'a> {
                 .any(|o| o.param & 0x80 == 0 && o.usage != Usage::Other(0) && u32::from(o.row) == r)
         };
         let free: std::collections::BTreeSet<u32> = self
-            .s
+            .x
             .outputs
             .iter()
             .filter(|o| o.kind == 0)

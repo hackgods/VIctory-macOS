@@ -74,6 +74,36 @@ pub fn under_wine() -> bool {
 }
 
 impl Host {
+    /// Whether this device can create a typed buffer UAV and both load and
+    /// store through it. D3DMetal advertises RGB32 support but aborts when the
+    /// view is created, so those formats are skipped on the hardware adapter
+    /// under Wine; WARP is still queried normally.
+    pub fn typed_buffer_access(&self, format: DXGI_FORMAT, warp: bool) -> bool {
+        if !warp && under_wine()
+            && matches!(format, DXGI_FORMAT_R32G32B32_FLOAT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT)
+        {
+            return false;
+        }
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: format,
+            ..Default::default()
+        };
+        // SAFETY: the query writes the structure of the given size.
+        let ok = unsafe {
+            self.device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+                .is_ok()
+        };
+        ok && support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            && support.Support2.contains(
+                D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+            )
+    }
+
     /// Whether the device runs 64-bit atomics on typed resources in the
     /// descriptor heap. `victory_gpu` refuses pipelines that need them on
     /// devices without (D3DMetal 4.0 beta 3 has none).
@@ -1463,11 +1493,13 @@ pub enum View<'a> {
 #[cfg(test)]
 pub fn view_strides(views: &[View]) -> Vec<u32> {
     let kind = |f: DXGI_FORMAT| match f {
-        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R16G16B16A16_UINT | DXGI_FORMAT_R32G32_UINT
-        | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT | DXGI_FORMAT_R16G16_UINT
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R10G10B10A2_UINT | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R16G16_UINT
         | DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R8G8_UINT | DXGI_FORMAT_R16_UINT | DXGI_FORMAT_R8_UINT => super::VIEW_INTEGER,
-        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R16G16B16A16_SINT | DXGI_FORMAT_R32G32_SINT
-        | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT | DXGI_FORMAT_R32_SINT
+        DXGI_FORMAT_R32G32B32A32_SINT | DXGI_FORMAT_R32G32B32_SINT | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32G32_SINT | DXGI_FORMAT_R8G8B8A8_SINT | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R32_SINT
         | DXGI_FORMAT_R8G8_SINT | DXGI_FORMAT_R16_SINT | DXGI_FORMAT_R8_SINT => super::VIEW_INTEGER | super::VIEW_SIGNED,
         _ => 0,
     };

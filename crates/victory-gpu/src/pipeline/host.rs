@@ -441,6 +441,26 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
+        // Mesh shaders whose standalone output footprint exceeds Metal's 32 KiB
+        // limit are re-translated together with their paired pixel shader,
+        // pruning outputs the pixel shader never reads.
+        let linked = mesh.filter(|_| super::link_mesh_outputs()).and_then(|ms| {
+            let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
+            if bytes <= victory_shader::emit::METAL_MESH_OUTPUT_BYTES {
+                return None;
+            }
+            super::translate_linked(ms, find("pixel").map(Arc::as_ref))
+        });
+        let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
+            Some((ms, ps)) => {
+                let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
+                if let Some(ps) = ps {
+                    v.push((ps, D3D12_SHADER_VISIBILITY_PIXEL));
+                }
+                v
+            }
+            None => stages,
+        };
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {

@@ -759,6 +759,7 @@ impl State {
                         && u.dword == 0
                         && let Some(Root::View(address)) =
                             self.roots_ref(compute).get(usize::from(u.slot))
+                        && *address != 0
                         && let Some(shadow) = crate::shadow::find(*address, 1)
                     {
                         let uav = t.used.iter().any(|r| {
@@ -773,9 +774,10 @@ impl State {
                         .find(|m| m.0 == u.slot && u.root == RootType::Table);
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
-                        None if u.dword == victory_shader::emit::ROOT_VIEW_OFFSET => {
+                        None if is_root_view_offset(u) => {
                             // Where the root address lies in the copy its view shows.
                             let offset = match self.roots_ref(compute).get(usize::from(u.slot)) {
+                                Some(&Root::View(0)) => Some(0),
                                 Some(&Root::View(address)) => crate::shadow::find(address, 1)
                                     .and_then(|s| u32::try_from(s.offset(address)).ok()),
                                 _ => None,
@@ -930,6 +932,24 @@ impl State {
             not_run("a root view the title did not set");
             return None;
         };
+        let (key, host) = match self.heaps[0] {
+            0 => (MEMORY_HEAP, crate::memory::heap()),
+            h => (
+                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
+                crate::descriptor::heap(h as This).host(),
+            ),
+        };
+        let Some(host) = host else {
+            not_run("a root view without a host view heap");
+            return None;
+        };
+        if address == 0 {
+            let index = host.null_root_view(uav);
+            if index.is_none() {
+                not_run("no null root buffer view in the host heap");
+            }
+            return index.map(|slot| (slot, 0));
+        }
         let Some(shadow) = crate::shadow::find(address, 1) else {
             not_run("a root view outside title buffers");
             return None;
@@ -950,17 +970,6 @@ impl State {
             let len = if shadow.marked() { shadow.left(address) } else { shadow.left(address).min(1 << 20) };
             shadow.gpu_writes(list, address, len, true);
         }
-        let (key, host) = match self.heaps[0] {
-            0 => (MEMORY_HEAP, crate::memory::heap()),
-            h => (
-                std::ptr::from_ref(crate::descriptor::heap(h as This)) as usize,
-                crate::descriptor::heap(h as This).host(),
-            ),
-        };
-        let Some(host) = host else {
-            not_run("a root view without a host view heap");
-            return None;
-        };
         let copy = std::sync::Arc::as_ptr(&shadow) as usize;
         if let Some(&index) = self.root_slots.get(&(key, copy, uav)) {
             return Some((index, offset));
@@ -1169,7 +1178,7 @@ impl State {
                                 words.chunks(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                             let _ = write!(text, " (title words {w:x?}");
                             if let Some(view) = crate::descriptor::view(at) {
-                                let _ = write!(text, ": {}", describe(Some(&view)));
+                                let _ = write!(text, ": {}", describe(Some(&*view)));
                             }
                             let _ = write!(text, ")");
                         }
@@ -1246,6 +1255,9 @@ impl State {
         };
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u, &view, true);
+        }
+        if !heap.samplers() {
+            list.defer_slot(&host.viewed, index);
         }
     }
 
@@ -1348,11 +1360,12 @@ impl State {
             for k in 0..n {
                 let index = first + k;
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
-                match crate::descriptor::view(table + u64::from(k) * 32) {
+                let view = crate::descriptor::view(table + u64::from(k) * 32);
+                match view.as_deref() {
                     Some(view) => {
-                        host.make_at(index, &view);
+                        host.make_at(index, view);
                         if let Some(u) = used {
-                            readable(list, u, &view, true);
+                            readable(list, u, view, true);
                         }
                     }
                     None => {
@@ -1426,9 +1439,9 @@ impl State {
                 let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
-                let range = match view {
-                    View::Constant(address, size) => Some((address, u64::from(size))),
-                    ref v => crate::descriptor::host::buffer_range(v),
+                let range = match &*view {
+                    View::Constant(address, size) => Some((*address, u64::from(*size))),
+                    v => crate::descriptor::host::buffer_range(v),
                 };
                 let Some((at, len)) = range.filter(|r| r.1 <= 64) else {
                     continue;
@@ -1458,10 +1471,14 @@ impl State {
                 let (RootType::Table, Some(Root::Table(table))) = (u.root, self.compute.get(usize::from(u.slot))) else {
                     continue;
                 };
-                let Some(View::Unordered(r, ..)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                let Some(view) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
                     continue;
                 };
-                let Some(t) = crate::resource::host_resource(r as This) else { continue };
+                let View::Unordered(r, ..) = &*view else {
+                    continue;
+                };
+                let resource = *r;
+                let Some(t) = crate::resource::host_resource(resource as This) else { continue };
                 // SAFETY: a live resource.
                 let d = unsafe { t.GetDesc() };
                 if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D && d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D {
@@ -1479,9 +1496,9 @@ impl State {
                 };
                 // SAFETY: an open list.
                 unsafe { list.list.ResourceBarrier(&[all]) };
-                crate::list::ensure_state(list, r as This, COPY_SOURCE);
+                crate::list::ensure_state(list, resource as This, COPY_SOURCE);
                 let read = crate::capture::read_back(&host.device, &list.list, &t);
-                crate::list::ensure_state(list, r as This, UNORDERED);
+                crate::list::ensure_state(list, resource as This, UNORDERED);
                 let Some((buffer, f)) = read else { continue };
                 list.keep(&buffer);
                 struct Readback(ID3D12Resource);
@@ -1490,7 +1507,7 @@ impl State {
                 // SAFETY: as above.
                 unsafe impl Sync for Readback {}
                 let buffer = Readback(buffer);
-                let who = format!("{} s{}+{} {r:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
+                let who = format!("{} s{}+{} {resource:#x} {}x{}x{} f{}", stage.shader.hash, u.slot, u.table_offset_dwords, d.Width, d.Height, d.DepthOrArraySize, d.Format.0);
                 list.defer_after(move || {
                     let mut data = std::ptr::null_mut();
                     // SAFETY: the list has run; the mapping spans the first slice.
@@ -1525,10 +1542,10 @@ impl State {
                     (RootType::Table, Some(Root::Table(table))) => {
                         let handle = table + u64::from(u.table_offset_dwords) * 4;
                         let view = crate::descriptor::view(handle);
-                        let mut text = describe(view.as_ref());
+                        let mut text = describe(view.as_deref());
                         // The title's view words, and whether the host slot
                         // the shader reads was made from a view.
-                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = &view {
+                        if let Some(View::Shader(_, Some(w)) | View::Unordered(_, _, Some(w))) = view.as_deref() {
                             text.push_str(&format!(" words {w:?}"));
                         }
                         let slot = (self.heaps[0] != 0)
@@ -1537,7 +1554,7 @@ impl State {
                                 let i = handle.checked_sub(h.start)? / 32;
                                 h.host()?.describe_slot(u32::try_from(i).ok()?)
                             });
-                        let current: String = view.as_ref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
+                        let current: String = view.as_deref().map(|v| format!("{v:?}")).unwrap_or_default().chars().take(120).collect();
                         text.push_str(match slot.as_deref() {
                             Some("null") => " slot null",
                             Some(s) if s.starts_with(&current) => " slot made",
@@ -2023,6 +2040,12 @@ fn is_root_view(u: &victory_shader::emit::UserData) -> bool {
     u.root == RootType::Descriptor && u.dword >= victory_shader::emit::ROOT_SRV_VIEW
 }
 
+/// Whether `u` is a root view's offset in the copy its view shows: a root
+/// descriptor's dword 4. A root constant's dword 4 is a value.
+fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
+    u.root == RootType::Descriptor && u.dword == victory_shader::emit::ROOT_VIEW_OFFSET
+}
+
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
@@ -2059,6 +2082,22 @@ mod tests {
     use crate::object::{HRESULT, S_OK};
     use crate::compute::{Param, srv, uav};
     use windows::core::s;
+
+    /// A root constant's dword 4 is a value: only a root descriptor's dword
+    /// 4 names its view's offset.
+    #[test]
+    fn only_a_root_descriptors_dword_four_is_a_view_offset() {
+        let u = |root, dword| victory_shader::emit::UserData {
+            index: 0,
+            slot: 0,
+            root,
+            dword,
+        };
+        let offset = victory_shader::emit::ROOT_VIEW_OFFSET;
+        assert!(is_root_view_offset(&u(RootType::Descriptor, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Constants, offset)));
+        assert!(!is_root_view_offset(&u(RootType::Table, offset)));
+    }
 
     /// Reads 16 dwords 64 bytes apart from `offset` past the root view
     /// (heap index in the table) as the translated shaders do: the root
@@ -2603,6 +2642,81 @@ uint ps() : SV_Target { return 1; }
         out
     }
 
+    /// Three-channel typed SRVs keep their 12-byte element stride and a
+    /// format-correct w through the host descriptor.
+    #[test]
+    fn three_channel_typed_srvs_reach_shaders_with_their_own_stride() {
+        if !crate::shader_cache::under_wine() {
+            return;
+        }
+        let Some(host) = crate::host::host() else { return };
+        let (src, dst) = (buffer(4 * 12), buffer(256));
+        let (src_bytes, dst_bytes) = (
+            crate::resource::buffer_bytes(src).unwrap().0,
+            crate::resource::buffer_bytes(dst).unwrap().0,
+        );
+        let data = [
+            1000u32, 2000, 3000, 1003, 2003, 3003, 1006, 2006, 3006, 1009, 2009, 3009,
+        ];
+        // SAFETY: the source buffer's 48 bytes.
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr().cast::<u8>(), src_bytes, 48) };
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 2, 1, 0, 0, 0, 0, 0];
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        let uav_words = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        let out = crate::shadow::find(dst_bytes as u64, 256).expect("the output's host copy");
+        for (format, kind, w) in [(6, "float", 0x3f80_0000), (7, "uint", 1), (8, "int", 1)] {
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+                S_OK
+            );
+            let title_heap = crate::descriptor::heap(heap);
+            let srv_words = [format, 1, 0x1688, 0, 0, 0, 4, 0, 0, 0];
+            crate::descriptor::create_srv(null, src, &srv_words, title_heap.start);
+            crate::descriptor::create_uav(null, dst, null, &uav_words, title_heap.start + 32);
+            let heap_host = title_heap.host().expect("a host view heap");
+            assert!(heap_host.made(0) && heap_host.kept(0), "the source view is made");
+            assert!(heap_host.made(1) && heap_host.kept(1), "the output view is made");
+            let source = format!(
+                r#"Buffer<{kind}4> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {{
+    dst.Store4(id.x * 16, asuint(src[id.x]));
+}}
+"#
+            );
+            let (root, pso) = compile_cs(
+                &source,
+                &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)])],
+            );
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list and live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(1));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(4, 1, 1);
+            }
+            list.close();
+            crate::shadow::find(src_bytes as u64, 48)
+                .expect("the source's host copy")
+                .refresh(&list, src_bytes as u64, 48);
+            host.execute(&[&list]);
+            assert_eq!(
+                out.read_host(dst_bytes as u64, 16),
+                [
+                    1000, 2000, 3000, w, 1003, 2003, 3003, w, 1006, 2006, 3006, w, 1009, 2009,
+                    3009, w,
+                ],
+                "{kind} w"
+            );
+        }
+    }
+
     /// Root views (`victory_shader::emit`, "Root SRVs and root UAVs") through
     /// our device: a raw view of the host copy holding the root address,
     /// brought up to date from there to the copy's end, so data 1.5 MiB past
@@ -2674,6 +2788,39 @@ uint ps() : SV_Target { return 1; }
             host.execute(&[&list]);
             assert_eq!(out.read_host(dst_bytes as u64, 16), want, "round {round}");
         }
+
+        // Rebind the same slots to a null SRV, then to a null UAV. The
+        // previous round left nonzero words in the destination.
+        for null_uav in [false, true] {
+            list.reset();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            assert!(state.root_view(&list, true, 0, false).is_none(), "unset root");
+            state.set_view(true, 0, if null_uav { src + 0x18_0100 } else { 0 });
+            state.set_view(true, 1, if null_uav { 0 } else { dst_bytes as u64 });
+            let (input, at) = state.root_view(&list, true, 0, false).unwrap();
+            let (output, out_at) = state.root_view(&list, true, 1, true).unwrap();
+            assert_ne!(input, output);
+            assert_eq!(state.root_slots.len(), 1, "only the real buffer needs a dynamic view");
+            assert_eq!(out_at, 0);
+            if !null_uav {
+                assert_eq!(at, 0);
+            }
+            let constants = [at, 0];
+            // SAFETY: all descriptors are in the bound heap and held through execution.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(input));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(output));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            assert_eq!(out.read_host(dst_bytes as u64, 16), [0; 16]);
+        }
     }
 
     /// Title memory of `bytes` (64 KiB aligned) for textures at an address.
@@ -2715,6 +2862,151 @@ uint ps() : SV_Target { return 1; }
             dwords: 8,
             user_data: 0,
             slot: 0,
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Rewrite {
+        Mirrored,
+        Copied,
+        DuringSubmission,
+    }
+
+    /// A table slot rewritten after its draw is recorded must refresh the
+    /// buffer its host descriptor names at submission, not the old one.
+    #[test]
+    fn a_table_slot_rewritten_before_submission_refreshes_its_new_view() {
+        for mode in [Rewrite::Mirrored, Rewrite::Copied, Rewrite::DuringSubmission] {
+            check_table_slot_rewrite(mode);
+        }
+    }
+
+    /// `Copied` leaves the host mirror to the submission's heap sync;
+    /// `DuringSubmission` rewrites after that sync, before deferred work.
+    fn check_table_slot_rewrite(mode: Rewrite) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (a, b, out) = (buffer(256), buffer(256), buffer(256));
+        let (a_bytes, _) = crate::resource::buffer_bytes(a).unwrap();
+        let (b_bytes, _) = crate::resource::buffer_bytes(b).unwrap();
+        let (out_bytes, _) = crate::resource::buffer_bytes(out).unwrap();
+        let memory = (mode == Rewrite::Copied).then(|| crate::watch::tests::pool(1));
+        #[repr(C)]
+        struct Extended {
+            desc: [u32; 4],
+            address: u64,
+            size: u64,
+        }
+        let extended = Extended {
+            desc: [0, 4, 1, 0],
+            address: memory.map_or(0, |memory| memory as u64),
+            size: memory.map_or(0, |_| 4 * 32),
+        };
+        let mut heap = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&extended.desc).cast(),
+                &iid,
+                &mut heap,
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        if let Some(memory) = memory {
+            assert_eq!(
+                title_heap.start,
+                memory as u64,
+                "the placed heap starts at its memory"
+            );
+        }
+        let host_heap = title_heap
+            .host()
+            .unwrap_or_else(|| panic!("a host view heap ({mode:?})"));
+        let (a_bytes, b_bytes, out_bytes) = (a_bytes as u64, b_bytes as u64, out_bytes as u64);
+        let out_copy = crate::shadow::find(out_bytes, 256).expect("the output's host copy");
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_cbv(
+            std::ptr::null(),
+            &[a_bytes as u32, (a_bytes >> 32) as u32, 256, 0],
+            title_heap.start,
+        );
+        crate::descriptor::create_uav(
+            std::ptr::null(),
+            out,
+            std::ptr::null(),
+            &raw,
+            title_heap.start + 32,
+        );
+        let (root, pso) = compile();
+        let b_desc = [b_bytes as u32, (b_bytes >> 32) as u32, 256, 0];
+        let list = host.new_list().unwrap();
+        if mode == Rewrite::DuringSubmission {
+            let handle = title_heap.start;
+            list.defer(move || crate::descriptor::create_cbv(std::ptr::null(), &b_desc, handle));
+        }
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start);
+        assert!(
+            state
+                .tables(&list, &[used(ResourceType::Srv)], true)
+                .is_empty(),
+            "an in-place table"
+        );
+
+        // The title replaces the record after recording, before submission.
+        if mode == Rewrite::Copied {
+            let mut record = [0u32; 8];
+            let at = record.as_mut_ptr() as u64;
+            crate::descriptor::create_cbv(std::ptr::null(), &b_desc, at);
+            // SAFETY: one 32-byte record in each of our allocations.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    record.as_ptr().cast::<u8>(),
+                    title_heap.start as *mut u8,
+                    32,
+                )
+            };
+        } else if mode == Rewrite::Mirrored {
+            crate::descriptor::create_cbv(std::ptr::null(), &b_desc, title_heap.start);
+        }
+        // SAFETY: inside the title buffers.
+        unsafe {
+            (a_bytes as *mut u32).write(0x1111_1111);
+            (b_bytes as *mut u32).write(0x2222_2222);
+        }
+        // SAFETY: an open list and live objects of ours.
+        unsafe {
+            list.list
+                .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+            list.list.SetComputeRootDescriptorTable(1, host_heap.gpu(1));
+            list.list.SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            out_copy.read_host(out_bytes, 1),
+            [0x2222_2222],
+            "the new descriptor's data ({mode:?})"
+        );
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        if let Some(memory) = memory {
+            crate::watch::tests::free(memory);
         }
     }
 
@@ -3001,6 +3293,98 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&list]);
         assert!((texel() - 64.0 / 255.0).abs() < 1e-6, "made again with its bytes");
         assert_eq!(crate::texture::uploads(object), 1, "uploaded into the new one");
+    }
+
+    /// A dynamic texture descriptor a recorded list names stays made through
+    /// an eviction pass: unlike a title slot, it has no descriptor record
+    /// from which to make it again.
+    #[test]
+    fn a_recorded_list_keeps_its_dynamic_texture_descriptor() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let address = crate::watch::tests::pool(1) as u64;
+        let object = texture_at_address(address, &texture_words(64, 64, 42, 0x100, 4));
+        let view = View::Unordered(object as usize, 0, Some([42, 4, 0, 0, 0, 0, 0, 0, 0, 0]));
+
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let slots = crate::descriptor::heap(heap).host().expect("a host view heap");
+        let dynamic = slots.dynamic(1).expect("a dynamic slot");
+        assert!(dynamic >= slots.count(), "past the title's recorded slots");
+        slots.make_at(dynamic, &view);
+        assert!(slots.kept(dynamic), "made for the list");
+        let texture = crate::resource::made_copy(object).expect("its host texture");
+        let raw = windows::core::Interface::as_raw(&texture.texture) as usize;
+
+        // A clear through the dynamic descriptor, then a copy of what it left.
+        let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+        let mut total = 0;
+        // SAFETY: outputs for the texture's one subresource.
+        unsafe {
+            let desc = texture.texture.GetDesc();
+            host.device.GetCopyableFootprints(&desc, 0, 1, 0, Some(&mut footprint), None, None, Some(&mut total));
+        }
+        let (readback, data) = host.shared_buffer(total).unwrap();
+        let list = host.new_list().unwrap();
+        readable(&list, &used(ResourceType::Uav), &view, false);
+        let at = host.cpu_view();
+        let resource = crate::descriptor::host::make_view(&view, at).expect("a matching CPU descriptor");
+        let values = [0x1122_3344, 0x5566_7788, 0x99aa_bbcc, 0xddee_ff00];
+        // SAFETY: an open list and live objects; the clear names the dynamic slot.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(slots.heap.clone())]);
+            list.list.ClearUnorderedAccessViewUint(slots.gpu(dynamic), at, &resource, &values, &[]);
+        }
+        crate::list::ensure_state(&list, object, 0x800);
+        // SAFETY: borrowed resources; the copy is recorded before they are released.
+        unsafe {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&texture.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+        }
+        list.close();
+
+        // Force the eviction pass directly: an unordered texture is not a
+        // normal candidate, but the dynamic-slot rule applies to every view.
+        crate::descriptor::evict(&std::collections::HashSet::from([raw]));
+        assert!(slots.kept(dynamic), "the recorded list's descriptor is retained");
+        assert_eq!(slots.textures_at(&[dynamic]), [raw], "still views the held texture");
+
+        host.execute(&[&list]);
+        // SAFETY: inside the mapped readback, at the first and last texels.
+        unsafe {
+            let word = |x: u32, y: u32| {
+                (data.add(y as usize * footprint.Footprint.RowPitch as usize + x as usize * 4) as *const u32).read()
+            };
+            assert_eq!(word(0, 0), values[0], "the recorded clear used the descriptor");
+            assert_eq!(word(63, 63), values[0], "the whole texture was cleared");
+        }
+
+        slots.make_null(dynamic);
+        slots.release(dynamic, 1);
+        drop(list);
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(object, 0x10)(object),
+            0
+        );
+        drop(texture);
+        crate::watch::tests::free(address as usize);
     }
 
     /// Textures brought up in one submission share staging space (parts

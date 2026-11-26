@@ -132,7 +132,45 @@ const SHADER_VISIBLE: u32 = 1;
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
 /// start, end, heap.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
+
+#[cfg(any(windows, test))]
+type Registration = (u64, u64, usize);
+
+/// Registers a heap, retiring any range it overlaps. Descriptor handles carry
+/// no heap identity, so two live heaps cannot unambiguously own one address.
+#[cfg(any(windows, test))]
+fn register_heap(heaps: &mut Vec<Registration>, (start, end): (u64, u64), at: usize) {
+    heaps.retain(|&(old_start, old_end, _)| old_end <= start || end <= old_start);
+    heaps.push((start, end, at));
+}
+
+/// Removes only this heap's registration.
+#[cfg(any(windows, test))]
+fn unregister_heap(heaps: &mut Vec<Registration>, at: usize) {
+    heaps.retain(|&(_, _, heap)| heap != at);
+}
+
+#[cfg(any(windows, test))]
+static AMBIGUOUS_RANGE: std::sync::Once = std::sync::Once::new();
+
+/// The heap owning `handle`, if exactly one registered range contains it.
+#[cfg(any(windows, test))]
+fn heap_at(heaps: &[Registration], handle: u64) -> Option<usize> {
+    let mut found = None;
+    for &(start, end, at) in heaps {
+        if (start..end).contains(&handle) && found.replace(at).is_some() {
+            AMBIGUOUS_RANGE.call_once(|| {
+                tracing::warn!(
+                    handle,
+                    "overlapping descriptor heaps: descriptor write refused"
+                )
+            });
+            return None;
+        }
+    }
+    found
+}
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
 /// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
@@ -141,13 +179,10 @@ static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex
 fn mirror(handle: u64) {
     #[cfg(feature = "diagnostics")]
     let waited = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::MirrorWaitUs);
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     drop(waited);
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
+    let Some(at) = heap_at(&heaps, handle) else {
         return;
     };
     // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
@@ -178,7 +213,7 @@ fn mirror(handle: u64) {
 #[cfg(windows)]
 pub(crate) fn sync_heaps() {
     // Held throughout: a heap is not dropped while its slots are made.
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -221,7 +256,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
     let placed: Vec<View> = {
-        let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
             // SAFETY: registered heaps are live (removed when dropped).
@@ -238,7 +273,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     crate::texture::in_parallel(placed.len(), |i| {
         let _ = host::placed_texture(&placed[i]);
     });
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -259,7 +294,7 @@ pub(crate) fn make_read(slots: &[u32]) {
 /// shader-visible view heaps view.
 #[cfg(windows)]
 pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let mut textures = std::collections::HashSet::new();
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -271,12 +306,13 @@ pub(crate) fn read_textures(slots: &[u32]) -> std::collections::HashSet<usize> {
     textures
 }
 
-/// Every shader-visible view heap's slots viewing one of the host textures
-/// `textures` (raw pointers) are left null, made again when read
-/// (`crate::resource::evict` gives those textures up).
+/// Every shader-visible view heap's title slots viewing one of the host
+/// textures `textures` (raw pointers) are left null, made again when read
+/// (`crate::resource::evict` gives those textures up). Dynamic slots stay
+/// made for the lists that recorded them.
 #[cfg(windows)]
 pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(_, _, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -290,7 +326,7 @@ pub(crate) fn evict(textures: &std::collections::HashSet<usize>) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -303,7 +339,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 /// heap cannot be released; None if it is gone or has no host heap.
 #[cfg(windows)]
 pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) -> Option<R> {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if !heaps.iter().any(|&(_, _, h)| h == heap) {
         return None;
     }
@@ -317,8 +353,8 @@ pub(crate) fn with_host<R>(heap: usize, f: impl FnOnce(&host::HostHeap) -> R) ->
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.retain(|&(_, _, h)| h != at);
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        unregister_heap(&mut heaps, at);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
@@ -471,7 +507,10 @@ struct Views {
     free: Vec<u32>,
 }
 
-static VIEWS: std::sync::Mutex<Views> = std::sync::Mutex::new(Views {
+/// Read by every view written and every slot a draw binds, on the
+/// title's threads at once; written when a view is first seen or its
+/// resource released.
+static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
@@ -494,7 +533,23 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    // A view seen before, as most are: its entry is found under the shared
+    // lock, which keeps `forget` from making it stale while it is written.
+    let known = {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        let found = views.index.get(&view).map(|&i| (i, views.list[i as usize].1));
+        if let Some((i, generation)) = found {
+            // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+            unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        }
+        found.is_some()
+    };
+    if known {
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
@@ -525,7 +580,7 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -544,18 +599,83 @@ pub(crate) fn forget(resource: usize) {
     }
 }
 
-/// The view of entry `i` if `generation` is still its own.
-#[cfg(windows)]
-fn view_at(i: u32, generation: u32) -> Option<View> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+/// A current view whose resources cannot be freed while it is used: it holds
+/// a reference on each resource object the view names (and none is made for
+/// a resource the title's last release had already reached). The title's
+/// release never waits for it. A release that would have been the last runs
+/// at the pin's drop instead, on whichever thread drops it, so a pin is
+/// dropped outside the locks the destructor takes (`VIEWS`, `bindless`,
+/// `shadow`).
+#[cfg(any(windows, test))]
+pub(crate) struct ViewPin {
+    view: View,
+    held: [usize; 2],
+}
+
+#[cfg(any(windows, test))]
+impl std::ops::Deref for ViewPin {
+    type Target = View;
+
+    fn deref(&self) -> &Self::Target {
+        &self.view
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::fmt::Debug for ViewPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.view.fmt(f)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl Drop for ViewPin {
+    fn drop(&mut self) {
+        for r in self.held.into_iter().filter(|&r| r != 0) {
+            crate::object::release_ref(r as This);
+        }
+    }
+}
+
+/// The view of entry `i` if `generation` is still its own, pinned until the
+/// returned value is dropped.
+///
+/// The references are taken under the shared lock. `Resource::drop` takes
+/// the exclusive one (`forget`) before its memory goes, so the address of a
+/// current entry's resource is still there to count on. A resource whose
+/// count already reached zero is on its way out, and the view is not current
+/// for it.
+#[cfg(any(windows, test))]
+fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    if *current != generation {
+        return None;
+    }
+    let view = view.clone();
+    let mut held = [0usize; 2];
+    let mut all = true;
+    for (slot, r) in view.resources().into_iter().enumerate() {
+        if r == 0 {
+            continue;
+        }
+        if crate::object::try_add_ref(r as This) {
+            held[slot] = r;
+        } else {
+            all = false;
+        }
+    }
+    drop(views);
+    // Dropped here, with the lock released, if a resource was already gone:
+    // the references taken on the others may be their last.
+    let pin = ViewPin { view, held };
+    all.then_some(pin)
 }
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
 fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     records
         .iter()
         .map(|&[tag, i, generation]| {
@@ -564,16 +684,16 @@ fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
         .collect()
 }
 
-/// The view recorded at `handle`, if one is (and its resource is alive).
-pub(crate) fn view(handle: u64) -> Option<View> {
+/// The view recorded at `handle`, if one is (and its resource is alive),
+/// pinned until the returned value is dropped.
+#[cfg(any(windows, test))]
+pub(crate) fn view(handle: u64) -> Option<ViewPin> {
     if handle == 0 {
         return None;
     }
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
 }
 
 /// A description of `N` words, if the title passes one.
@@ -796,14 +916,16 @@ pub(crate) extern "system" fn create_heap(
             .flatten(),
     });
     #[cfg(windows)]
-    if visible {
-        let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        heaps.push((start, start + size, at));
-    }
+    let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     #[cfg(not(windows))]
     let _ = visible;
-    object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out)
+    let result = object::hand_out(DESCRIPTOR_HEAP, heap, iid, &HEAP_IIDS, out);
+    #[cfg(windows)]
+    if visible && result == crate::object::S_OK {
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
+        register_heap(&mut heaps, (start, start + size), at);
+    }
+    result
 }
 
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -899,6 +1021,52 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn registering_a_heap_retires_overlapping_ranges_but_keeps_adjacent_ones() {
+        let mut heaps = vec![(10, 20, 1), (20, 30, 2), (30, 40, 3), (40, 50, 4)];
+        register_heap(&mut heaps, (15, 35), 5);
+        assert_eq!(heaps, [(40, 50, 4), (15, 35, 5)]);
+        register_heap(&mut heaps, (35, 40), 6);
+        assert_eq!(heaps, [(40, 50, 4), (15, 35, 5), (35, 40, 6)]);
+    }
+
+    #[test]
+    fn lookup_is_half_open_and_refuses_ambiguous_ranges() {
+        let heaps = [(10, 20, 1), (20, 30, 2)];
+        assert_eq!(heap_at(&heaps, 10), Some(1));
+        assert_eq!(heap_at(&heaps, 19), Some(1));
+        assert_eq!(heap_at(&heaps, 20), Some(2));
+        assert_eq!(heap_at(&heaps, 30), None);
+        assert_eq!(heap_at(&[(10, 30, 1), (20, 40, 2)], 25), None);
+    }
+
+    #[test]
+    fn unregistering_a_retired_heap_keeps_its_replacement() {
+        let mut heaps = vec![(10, 20, 1)];
+        register_heap(&mut heaps, (10, 20), 2);
+        unregister_heap(&mut heaps, 1);
+        assert_eq!(heaps, [(10, 20, 2)]);
+    }
+
+    #[cfg(windows)]
+    struct HeapOwner(This);
+
+    #[cfg(windows)]
+    impl Drop for HeapOwner {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                slot::<extern "system" fn(This) -> u32>(self.0, 0x10)(self.0);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn owner(desc: HeapDesc, placement: Placement) -> HeapOwner {
+        let mut this = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut this), S_OK);
+        HeapOwner(this)
+    }
+
+    #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
         let desc = HeapDesc {
@@ -931,9 +1099,9 @@ pub(crate) mod tests {
         let at = |i: usize| heap.as_ptr() as u64 + 32 * i as u64;
         let (s0, s1, s2, s3) = (at(0), at(1), at(2), at(3));
         create_cbv(null, &[0x1000, 1, 256, 0], s0);
-        assert_eq!(view(s0), Some(View::Constant(0x1_0000_1000, 256)));
+        assert_eq!(view(s0).as_deref(), Some(&View::Constant(0x1_0000_1000, 256)));
         create_srv(null, null, std::ptr::null(), s1);
-        assert_eq!(view(s1), Some(View::Shader(0, None)));
+        assert_eq!(view(s1).as_deref(), Some(&View::Shader(0, None)));
         // The same view twice is one entry.
         create_srv(null, null, std::ptr::null(), s2);
         // SAFETY: both slots are in `heap`.
@@ -952,9 +1120,9 @@ pub(crate) mod tests {
             src_n.as_ptr(),
             0,
         );
-        assert_eq!(view(s2), view(s0));
-        assert_eq!(view(s3), view(s1));
-        assert_eq!(view(at(0) + 8), None);
+        assert_eq!(view(s2).as_deref(), view(s0).as_deref());
+        assert_eq!(view(s3).as_deref(), view(s1).as_deref());
+        assert!(view(at(0) + 8).is_none());
         heap[0] = 0;
     }
 
@@ -966,32 +1134,83 @@ pub(crate) mod tests {
         let slots = [0u64; 2 * 4];
         let a = slots.as_ptr() as u64;
         create_cbv(null, &[0x1000, 1, 256, 0], a);
-        assert_eq!(view(a), Some(View::Constant(0x1_0000_1000, 256)));
+        assert_eq!(view(a).as_deref(), Some(&View::Constant(0x1_0000_1000, 256)));
         create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        assert_eq!(view(a).as_deref(), Some(&View::Constant(0, 0)));
         create_srv(null, null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0, None)));
+        assert_eq!(view(a).as_deref(), Some(&View::Shader(0, None)));
         create_cbv(null, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Constant(0, 0)));
+        assert_eq!(view(a).as_deref(), Some(&View::Constant(0, 0)));
+    }
+
+    /// An object of ours that frees itself at its last release, as a
+    /// resource does: its views go stale first (`forget`), and `FREED` notes
+    /// its address.
+    static FREED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    fn freed(address: usize) -> bool {
+        FREED.lock().unwrap().contains(&address)
+    }
+
+    extern "system" fn release_resource_like(this: This) -> u32 {
+        if crate::object::refs(this) == 1 {
+            forget(this as usize);
+            FREED.lock().unwrap().push(this as usize);
+        }
+        crate::object::release_boxed::<crate::object::Object>(this)
     }
 
     /// A released resource's views go stale; the same view of a new
-    /// resource at the same address is a new record.
+    /// resource is a new record.
     #[test]
     fn views_die_with_their_resource() {
         let null = std::ptr::null();
         let slots = [0u64; 2 * 4];
         let (a, b) = (slots.as_ptr() as u64, slots.as_ptr() as u64 + 32);
-        let resource = 0x7777_0000usize as This;
+        let resource = crate::object::test_object(release_resource_like);
+        let address = resource as usize;
         create_srv(null, resource, std::ptr::null(), a);
-        assert_eq!(view(a), Some(View::Shader(0x7777_0000, None)));
-        forget(0x7777_0000);
-        assert_eq!(view(a), None, "stale after release");
-        create_srv(null, resource, std::ptr::null(), b);
-        assert_eq!(view(b), Some(View::Shader(0x7777_0000, None)));
+        assert_eq!(view(a).as_deref(), Some(&View::Shader(address, None)));
+        // The last release frees the object, and its views go stale.
+        assert_eq!(crate::object::release_ref(resource), 0);
+        assert!(view(a).is_none(), "stale after release");
+        let again = crate::object::test_object(release_resource_like);
+        create_srv(null, again, std::ptr::null(), b);
+        assert_eq!(
+            view(b).as_deref(),
+            Some(&View::Shader(again as usize, None))
+        );
         // SAFETY: both slots are in `slots`.
         let (old, new) = unsafe { (*(a as *const [u32; 3]), *(b as *const [u32; 3])) };
-        assert_ne!(old, new, "a new generation");
+        assert_ne!(old[1..], new[1..], "a new entry or generation");
+        assert_eq!(crate::object::release_ref(again), 0);
+    }
+
+    /// A final release with the view pinned does not wait: the title's call
+    /// returns at once, the resource is kept alive, and the last pin's drop
+    /// does the freeing (which makes the views stale then).
+    #[test]
+    fn a_pinned_resource_is_freed_by_the_last_pin() {
+        let null = std::ptr::null();
+        let slots = [0u64; 2 * 4];
+        let at = slots.as_ptr() as u64;
+        let resource = crate::object::test_object(release_resource_like);
+        let address = resource as usize;
+        FREED.lock().unwrap().retain(|&a| a != address);
+        create_srv(null, resource, std::ptr::null(), at);
+        let first = view(at).expect("a current view");
+        let second = view(at).expect("the same current view again");
+
+        // The title releases its last reference with both pins held; the
+        // call returns while the object is held by them.
+        assert_eq!(crate::object::release_ref(resource), 2);
+        assert!(!freed(address));
+        assert!(view(at).is_some(), "the entry stays current while pinned");
+        drop(first);
+        assert!(!freed(address));
+        drop(second);
+        assert!(freed(address), "the last pin freed it");
+        assert!(view(at).is_none(), "stale after the last pin");
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no
@@ -1027,6 +1246,86 @@ pub(crate) mod tests {
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         crate::watch::tests::free(memory);
+    }
+
+    /// A placed heap reused at the same address replaces the stale range;
+    /// descriptor writes go only to the new heap.
+    #[cfg(windows)]
+    #[test]
+    fn overlapping_placed_heaps_mirror_into_the_replacement() {
+        let mut memory = vec![0u8; 2 * 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement {
+            address,
+            size: 2 * 32,
+        };
+        let old = owner(desc, placement);
+        let new = owner(desc, placement);
+        {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(
+                heaps
+                    .iter()
+                    .filter(|&&(start, end, _)| (start..end).contains(&address))
+                    .count(),
+                1
+            );
+            assert_eq!(heap_at(&heaps, address), Some(new.0 as usize));
+        }
+
+        create_cbv(std::ptr::null(), &[0x1000, 1, 256, 0], address);
+        assert!(heap(old.0).pending.lock().unwrap().is_empty());
+        assert_eq!(heap(new.0).pending.lock().unwrap().as_slice(), [0]);
+
+        drop(old);
+        create_cbv(std::ptr::null(), &[0x2000, 1, 256, 0], address + 32);
+        assert_eq!(heap(new.0).pending.lock().unwrap().as_slice(), [0, 1]);
+    }
+
+    /// A creation that does not hand out a heap must not retire an existing
+    /// registration for the same memory.
+    #[cfg(windows)]
+    #[test]
+    fn failed_overlapping_creation_keeps_the_existing_heap() {
+        let mut memory = vec![0u8; 32];
+        let address = memory.as_mut_ptr() as u64;
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        };
+        let placement = Placement { address, size: 32 };
+        let existing = owner(desc, placement);
+        let extended = Extended(desc, placement);
+        let bad_iid = [0xff; 16];
+        let mut out = std::ptr::null();
+        assert_ne!(
+            create_heap(std::ptr::null(), &extended.0, &bad_iid, &mut out),
+            S_OK
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            create_heap(
+                std::ptr::null(),
+                &extended.0,
+                &HEAP_IIDS[0],
+                std::ptr::null_mut()
+            ),
+            crate::object::S_FALSE
+        );
+        {
+            let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(heap_at(&heaps, address), Some(existing.0 as usize));
+        }
+        create_cbv(std::ptr::null(), &[0x3000, 1, 256, 0], address);
+        assert_eq!(heap(existing.0).pending.lock().unwrap().as_slice(), [0]);
     }
 
     /// Grand Theft Auto VI places its shader-visible heap in its own memory

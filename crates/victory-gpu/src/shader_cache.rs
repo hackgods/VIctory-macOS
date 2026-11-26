@@ -165,21 +165,25 @@ fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
     })
 }
 
-/// The translation of a console shader container, from the cache when
-/// there is one, and whether it came from there.
-pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
     // leave the texels untouched (`emit`, "Atomic locks"). On a host of
     // 32-lane waves, wave64 programs run in halves (`build` keys on it).
-    let options = victory_shader::emit::Options {
+    victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
-    };
+    }
+}
+
+/// The translation of a console shader container, from the cache when
+/// there is one, and whether it came from there.
+pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
+    let options = runtime_options();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {

@@ -327,6 +327,22 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
     }
 }
 
+/// Per submission: the buffer range of the view currently in `index`. A
+/// table draw may have been recorded with another view in that slot.
+pub(crate) fn refresh_slot(
+    viewed: &Viewed,
+    index: u32,
+    mut add: impl FnMut(&Arc<Shadow>, usize, usize),
+) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
+        return;
+    };
+    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+        add(shadow, *address as usize, *len as usize);
+    }
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];

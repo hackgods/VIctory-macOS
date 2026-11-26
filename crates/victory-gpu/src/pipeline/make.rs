@@ -416,6 +416,8 @@ mod tests {
         let shader = Arc::new(Shader {
             stage: "compute",
             hash: "0123456789abcdef".into(),
+            #[cfg(windows)]
+            full_hash: [0; 32],
             size: 0,
             container: Mutex::new(Vec::new()),
             translated: OnceLock::new(),

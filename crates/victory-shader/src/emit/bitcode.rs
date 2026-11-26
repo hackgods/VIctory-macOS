@@ -595,15 +595,28 @@ impl Module {
         }
     }
 
+    /// Calls of functions named `name` that [`Module::write`] writes, and the
+    /// blocks holding them.
+    #[cfg(test)]
+    pub fn written_call_blocks(&self, name: &str) -> Vec<usize> {
+        let plan = self.plan();
+        let mut blocks = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name)
+                {
+                    blocks.push(b);
+                }
+            }
+        }
+        blocks
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
-        let plan = self.plan();
-        let calls = plan.layout.iter().flat_map(|&b| &self.blocks[b].body);
-        calls
-            .filter(|&&i| plan.live[i as usize])
-            .filter(|&&i| matches!(self.insts[i as usize].op, Op::Call(f, _) if self.funcs[f as usize].name == name))
-            .count()
+        self.written_call_blocks(name).len()
     }
 
     /// The globals and functions [`Module::write`] declares, each kept

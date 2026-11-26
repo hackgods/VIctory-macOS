@@ -134,6 +134,8 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+            atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: Default::default(),
@@ -156,6 +158,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -300,6 +303,8 @@ fn program() -> HostShader {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -319,6 +324,7 @@ fn program() -> HostShader {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -465,6 +471,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
     ];
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.push(vop2(V_LSHLREV_B32, 1, 128 + 6, 0)); // v1 = lane << 6
+    let load = w.len();
     w.extend(mubuf(0x0C, 2, 1, 0)); // buffer_load_dword v2, v1, s[0:3] offen
     w.push(vop2(V_LSHLREV_B32, 3, 128 + 2, 0)); // v3 = lane << 2
     w.push(S_WAITCNT_ALL);
@@ -520,29 +527,40 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         }),
         code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let l = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-        atomic_locks: false,
-        bias_as_gradients: false,
-        host_wave32: false,
-        narrow_waves: false,
-        halves_local: Default::default(),
-        mac: Default::default(),
-        view_marks: false,
-    })
-    .expect("lower");
+    let lower_shader = |native: &NativeProgram| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+        let io = io::raise(&p, native).expect("io::raise");
+        lower::lower(&lower::Parts {
+            native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: false,
+            narrow_waves: false,
+            halves_local: Default::default(),
+            mac: Default::default(),
+            view_marks: false,
+        })
+        .expect("lower")
+    };
+    let mut fixed = native.clone();
+    let [word, registers] = mubuf(0x0C, 2, 0, 0);
+    fixed.code[4 * load..4 * load + 4].copy_from_slice(&((word & !(1 << 12)) | 48).to_le_bytes());
+    fixed.code[4 * load + 4..4 * load + 8].copy_from_slice(&registers.to_le_bytes());
+    assert_eq!(lower_shader(&fixed).root_srv_bytes, [(2, 52)]);
+    let l = lower_shader(&native);
+    assert!(l.root_srv_bytes.is_empty(), "a shader with a dynamic load has no bound");
     assert!(l.root_srvs.is_empty() && !l.memory, "no root descriptor, no title memory");
     let marks: Vec<(u32, u32)> = l
         .user_data
@@ -560,6 +578,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -615,7 +634,8 @@ fn root_views_read_their_copy_and_zeros_past_it() {
 /// its first byte 16 bytes before a 64 KiB page ends, so the second store
 /// crosses into the next page), a store through view 1 (not marked) and an
 /// atomic add through view 2 (base bit 200). The stores land; exactly bits
-/// 100, 101 and 200 are set.
+/// 100, 101 and 200 are set (31, 32 and 200 with view 0 at base bit 31,
+/// whose two bits are in two dwords of the bitmap).
 #[test]
 fn writes_through_views_mark_their_pages() {
     /// MUBUF `op` of `vdata` at `byte_off` through `s[srsrc:srsrc+3]`.
@@ -683,6 +703,8 @@ fn writes_through_views_mark_their_pages() {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -701,6 +723,7 @@ fn writes_through_views_mark_their_pages() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -723,33 +746,49 @@ fn writes_through_views_mark_their_pages() {
             continue;
         };
         let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
-        for u in &shader.user_data {
-            ud[u.index as usize] = if u.root == RootType::Constants { value } else { 0 };
+        // View 0's second store crosses into the next page: from bit 100 both
+        // bits are in one bitmap dword, from bit 31 in two.
+        for (first, pages) in [(100, [100, 101, 200]), (31, [31, 32, 200])] {
+            let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => value,
+                    _ => 0,
+                };
+            }
+            let mut marks = marks.clone();
+            marks[0] = first;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: marks,
+                                },
+                            ),
+                            (2, Root::Uav(8)),
+                        ],
+                        views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let view_0 = [value, 0, 0, value, value, value, value, 0];
+            assert_eq!(out[0], view_0, "{label}: view 0");
+            assert_eq!(out[1][1], value, "{label}: view 1");
+            assert_eq!(out[2][2], value, "{label}: the atomic");
+            let marked: Vec<usize> = (0..out[3].len() * 32)
+                .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
+                .collect();
+            assert_eq!(marked, pages, "{label}: pages from bit {first}");
         }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: marks.clone() }),
-                        (2, Root::Uav(8)),
-                    ],
-                    views: &[View::RawUav(8), View::RawUav(8), View::RawUav(8)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: {e}"));
-        assert_eq!(out[0], [value, 0, 0, value, value, value, value, 0], "{label}: view 0");
-        assert_eq!(out[1][1], value, "{label}: view 1");
-        assert_eq!(out[2][2], value, "{label}: the atomic");
-        let marked: Vec<usize> = (0..out[3].len() * 32)
-            .filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0)
-            .collect();
-        assert_eq!(marked, [100, 101, 200], "{label}: pages");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
@@ -910,6 +949,8 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             host_wave32: false,
             view_marks: true,
             atomic_locks: false,
+            atomic_lock_rounds: false,
+        atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             halves_local: Default::default(),
@@ -943,6 +984,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1038,6 +1080,8 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: Default::default(),
@@ -1056,6 +1100,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
         memory: l.memory,
         memory_writes: l.memory_writes,
         view_addresses: l.view_addresses,
@@ -1164,6 +1209,559 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
                 .collect();
             assert_eq!(marked, want_bits, "{label} ({case}): dirty bits");
         }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Hardware proof that `EARLY_DEPTH_STENCIL` lets D3D12 / D3DMetal skip
+/// occluded pixels on translated opaque pixel shaders that only bind `u1`
+/// (`VIEW_WRITES`) for `mark_view_read` texture tracking.
+#[test]
+fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
+    use super::host::Host;
+    use crate::native::{HwStage, NativeProgram, RootParam, RootType, StageIo, Usage, VsInput};
+    use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    let vs_code_words: [u32; 3] = [
+        0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
+        0x0706_0504,
+        S_ENDPGM,
+    ];
+    let vs_native = NativeProgram {
+        stage: HwStage::Vs,
+        wave64: false,
+        vgprs: 8,
+        layout: Vec::new(),
+        used: Vec::new(),
+        io: StageIo::Vs {
+            inputs: vec![VsInput {
+                usage: Usage::Generic,
+                row: 0,
+                mask: 0xf,
+                vgpr: 4,
+            }],
+            outputs: Vec::new(),
+        },
+        code: vs_code_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let vp = ir::build(&vs_native.code, false, vs_native.vgprs).expect("vs ir");
+    let vst = structure::structure(&vp).expect("vs structure");
+    let vres = resource::track(&vp, &vs_native.layout, vs_native.stage, Some(&vst)).expect("vs res");
+    let vio = io::raise(&vp, &vs_native).expect("vs io");
+    let vs_lowered = lower::lower(&lower::Parts {
+        native: &vs_native,
+        p: &vp,
+        st: &vst,
+        io: &vio,
+        res: &vres,
+        inputs: vec![super::container::SigElement {
+            name: "POSITION".into(),
+            index: 0,
+            kind: 0,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xf,
+            half: false,
+        }],
+        outputs: vec![super::container::SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 4,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0xf,
+            half: false,
+        }],
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        host_wave32: false,
+        view_marks: false,
+    })
+    .expect("vs lower");
+    let vs_shader = HostShader {
+        stage: HwStage::Vs,
+        dxil: vs_lowered.dxil,
+        user_data: vs_lowered.user_data,
+        samplers: vs_lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: vs_lowered.root_cbvs,
+        root_srvs: vs_lowered.root_srvs,
+        root_uavs: vs_lowered.root_uavs,
+        root_srv_bytes: vs_lowered.root_srv_bytes,
+        memory: vs_lowered.memory,
+        memory_writes: vs_lowered.memory_writes,
+        view_addresses: vs_lowered.view_addresses,
+        heap: vs_lowered.heap,
+        heap_writes: vs_lowered.heap_writes,
+        view_marks: vs_lowered.view_marks,
+    };
+
+    let ps_words: [u32; 12] = [
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302, // s_load_dwordx8 s[12:19], s[4:5], 32 (heap slot 1)
+        0xFA00_0020,
+        S_WAITCNT_ALL,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1F08, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0x0003_0200,
+        S_WAITCNT_ALL,
+        0xF800_180F, // exp mrt0 v2, v3, v4, v5 done vm
+        0x0504_0302,
+        S_ENDPGM,
+    ];
+    let ps_native = NativeProgram {
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control: 0,
+            patches: Vec::new(),
+        },
+        code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let pp = ir::build(&ps_native.code, false, ps_native.vgprs).expect("ps ir");
+    let pst = structure::structure(&pp).expect("ps structure");
+    let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).expect("ps res");
+    let pio = io::raise(&pp, &ps_native).expect("ps io");
+    let ps_lowered = lower::lower(&lower::Parts {
+        native: &ps_native,
+        p: &pp,
+        st: &pst,
+        io: &pio,
+        res: &pres,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        halves_local: Default::default(),
+        mac: Default::default(),
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
+        host_wave32: false,
+        view_marks: true,
+    })
+    .expect("ps lower");
+    assert!(ps_lowered.early_depth_stencil);
+    let ps_shader = HostShader {
+        stage: HwStage::Ps,
+        dxil: ps_lowered.dxil,
+        user_data: ps_lowered.user_data,
+        samplers: ps_lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: ps_lowered.root_cbvs,
+        root_srvs: ps_lowered.root_srvs,
+        root_uavs: ps_lowered.root_uavs,
+        root_srv_bytes: ps_lowered.root_srv_bytes,
+        memory: ps_lowered.memory,
+        memory_writes: ps_lowered.memory_writes,
+        view_addresses: ps_lowered.view_addresses,
+        heap: ps_lowered.heap,
+        heap_writes: ps_lowered.heap_writes,
+        view_marks: ps_lowered.view_marks,
+    };
+
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut vs_shader.dxil.clone()).expect("VS DXIL validation");
+        v.validate(&mut ps_shader.dxil.clone()).expect("PS DXIL validation");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let words = (super::VIEW_READS + 64) / 32;
+    let texel = [[0.75f32, 0.25, 0.5, 1.0]];
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let root = host
+            .root_signature_for(&[
+                (&vs_shader, D3D12_SHADER_VISIBILITY_VERTEX),
+                (&ps_shader, D3D12_SHADER_VISIBILITY_PIXEL),
+            ])
+            .expect("root signature");
+        let dev = &host.device;
+        let layout = [D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: windows::core::s!("POSITION"),
+            SemanticIndex: 0,
+            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+            InputSlot: 0,
+            AlignedByteOffset: 0,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }];
+        let mut pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            // SAFETY: borrowed pointer for PSO creation.
+            pRootSignature: unsafe { std::mem::transmute_copy(&root) },
+            VS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: vs_shader.dxil.as_ptr().cast(),
+                BytecodeLength: vs_shader.dxil.len(),
+            },
+            PS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: ps_shader.dxil.as_ptr().cast(),
+                BytecodeLength: ps_shader.dxil.len(),
+            },
+            SampleMask: u32::MAX,
+            RasterizerState: D3D12_RASTERIZER_DESC {
+                FillMode: D3D12_FILL_MODE_SOLID,
+                CullMode: D3D12_CULL_MODE_NONE,
+                DepthClipEnable: true.into(),
+                ..Default::default()
+            },
+            InputLayout: D3D12_INPUT_LAYOUT_DESC {
+                pInputElementDescs: layout.as_ptr(),
+                NumElements: layout.len() as u32,
+            },
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            DSVFormat: DXGI_FORMAT_D32_FLOAT,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        pso_desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8;
+        pso_desc.DepthStencilState.DepthEnable = true.into();
+        pso_desc.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        pso_desc.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
+        // SAFETY: valid PSO description.
+        let pso: ID3D12PipelineState = unsafe { dev.CreateGraphicsPipelineState(&pso_desc) }
+            .unwrap_or_else(|e| panic!("{label}: PSO: {e}"));
+
+        let run_pass = |z: f32| -> Vec<u32> {
+            // SAFETY: standalone D3D12 resources for one pass.
+            unsafe {
+                let rtv_heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let dsv_heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                        NumDescriptors: 1,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let srv_heap: ID3D12DescriptorHeap = dev
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 4,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let rt_desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 16,
+                    Height: 16,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                };
+                let dsv_desc = D3D12_RESOURCE_DESC {
+                    Format: DXGI_FORMAT_D32_FLOAT,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+                    ..rt_desc
+                };
+                let default_heap = D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                };
+                let mut rt: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &default_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &rt_desc,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    None,
+                    &mut rt,
+                )
+                .unwrap();
+                let rt = rt.unwrap();
+                let mut dsv: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &default_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &dsv_desc,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                    None,
+                    &mut dsv,
+                )
+                .unwrap();
+                let dsv = dsv.unwrap();
+                dev.CreateRenderTargetView(&rt, None, rtv_heap.GetCPUDescriptorHandleForHeapStart());
+                dev.CreateDepthStencilView(&dsv, None, dsv_heap.GetCPUDescriptorHandleForHeapStart());
+
+                let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                let tex_desc = D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 1,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                let mut tex: Option<ID3D12Resource> = None;
+                dev.CreateCommittedResource(
+                    &default_heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &tex_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+                let tex = tex.unwrap();
+
+                let buf = |heap_type, bytes: u64, flags, state| -> ID3D12Resource {
+                    let mut r: Option<ID3D12Resource> = None;
+                    dev.CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap_type, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut r,
+                    )
+                    .unwrap();
+                    r.unwrap()
+                };
+
+                let tex_up = buf(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                let mut p = std::ptr::null_mut();
+                tex_up.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::copy_nonoverlapping(texel.as_ptr().cast::<u8>(), p.cast(), 16);
+                tex_up.Unmap(0, None);
+
+                let verts = [
+                    -1.0f32, -1.0, z, 1.0,
+                    -1.0, 3.0, z, 1.0,
+                    3.0, -1.0, z, 1.0,
+                ];
+                let vb = buf(D3D12_HEAP_TYPE_UPLOAD, 48, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                vb.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::copy_nonoverlapping(verts.as_ptr().cast::<u8>(), p.cast(), 48);
+                vb.Unmap(0, None);
+
+                let ud_buf = buf(D3D12_HEAP_TYPE_UPLOAD, 256, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                ud_buf.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::write_bytes(p, 0, 256);
+                ud_buf.Unmap(0, None);
+
+                let marks_buf = buf(D3D12_HEAP_TYPE_UPLOAD, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                marks_buf.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::copy_nonoverlapping([super::VIEW_MARK_NONE; 4].as_ptr().cast::<u8>(), p.cast(), 16);
+                marks_buf.Unmap(0, None);
+
+                let bitmap_bytes = u64::from(words) * 4;
+                let bitmap = buf(D3D12_HEAP_TYPE_DEFAULT, bitmap_bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                let readback = buf(D3D12_HEAP_TYPE_READBACK, bitmap_bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+
+                // Put texture SRV at heap slot 1 (slot 0 left null).
+                let slot1 = D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: srv_heap.GetCPUDescriptorHandleForHeapStart().ptr + inc as usize,
+                };
+                dev.CreateShaderResourceView(&tex, None, slot1);
+
+                let queue: ID3D12CommandQueue = dev
+                    .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        ..Default::default()
+                    })
+                    .unwrap();
+                let alloc: ID3D12CommandAllocator = dev
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let list: ID3D12GraphicsCommandList = dev
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, Some(&pso))
+                    .unwrap();
+
+                let src_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(tex_up.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                            Offset: 0,
+                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                Width: 1,
+                                Height: 1,
+                                Depth: 1,
+                                RowPitch: 256,
+                            },
+                        },
+                    },
+                };
+                let dst_loc = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::ManuallyDrop::new(Some(tex.clone())),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, None);
+                let mut tex_bar = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(tex.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[tex_bar.clone()]);
+                std::mem::ManuallyDrop::drop(&mut tex_bar.Anonymous.Transition);
+
+                let rtv_h = rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                let dsv_h = dsv_heap.GetCPUDescriptorHandleForHeapStart();
+                list.ClearRenderTargetView(rtv_h, &[0.0, 0.0, 0.0, 1.0], None);
+                list.ClearDepthStencilView(dsv_h, D3D12_CLEAR_FLAG_DEPTH, 0.5, 0, None);
+                list.OMSetRenderTargets(1, Some(&rtv_h), false, Some(&dsv_h));
+                list.RSSetViewports(&[D3D12_VIEWPORT {
+                    Width: 16.0,
+                    Height: 16.0,
+                    MaxDepth: 1.0,
+                    ..Default::default()
+                }]);
+                list.RSSetScissorRects(&[windows::Win32::Foundation::RECT {
+                    right: 16,
+                    bottom: 16,
+                    ..Default::default()
+                }]);
+                list.SetGraphicsRootSignature(&root);
+                list.SetDescriptorHeaps(&[Some(srv_heap.clone())]);
+                // PS root indices: 0 = VS b0, 1 = PS b0, 2 = PS t2 (marks), 3 = PS u1 (bitmap).
+                list.SetGraphicsRootConstantBufferView(0, ud_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootConstantBufferView(1, ud_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootShaderResourceView(2, marks_buf.GetGPUVirtualAddress());
+                list.SetGraphicsRootUnorderedAccessView(3, bitmap.GetGPUVirtualAddress());
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                list.IASetVertexBuffers(
+                    0,
+                    Some(&[D3D12_VERTEX_BUFFER_VIEW {
+                        BufferLocation: vb.GetGPUVirtualAddress(),
+                        SizeInBytes: 48,
+                        StrideInBytes: 16,
+                    }]),
+                );
+                list.DrawInstanced(3, 1, 0, 0);
+
+                let mut bm_bar = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: std::mem::ManuallyDrop::new(Some(bitmap.clone())),
+                            Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                };
+                list.ResourceBarrier(&[bm_bar.clone()]);
+                std::mem::ManuallyDrop::drop(&mut bm_bar.Anonymous.Transition);
+                list.CopyResource(&readback, &bitmap);
+                list.Close().unwrap();
+
+                let cmd: ID3D12CommandList = windows::core::Interface::cast(&list).unwrap();
+                queue.ExecuteCommandLists(&[Some(cmd)]);
+                let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+                queue.Signal(&fence, 1).unwrap();
+                while fence.GetCompletedValue() < 1 {
+                    assert!(dev.GetDeviceRemovedReason().is_ok());
+                    std::thread::yield_now();
+                }
+
+                let mut out = vec![0u32; words as usize];
+                readback.Map(0, None, Some(&mut p)).unwrap();
+                std::ptr::copy_nonoverlapping(p.cast::<u32>(), out.as_mut_ptr(), words as usize);
+                readback.Unmap(0, None);
+                out
+            }
+        };
+
+        let marked = |bits: &[u32]| -> Vec<usize> {
+            (0..bits.len() * 32)
+                .filter(|&b| bits[b / 32] >> (b % 32) & 1 != 0)
+                .collect()
+        };
+
+        // Pass 1: z = 0.9 > cleared depth 0.5 -> occluded, Early-Z skips PS & u1 write.
+        let occluded = run_pass(0.9);
+        if warp {
+            // WARP, the software device, does not always skip the shader of
+            // an occluded pixel, and CI has only WARP: the result is
+            // reported there, and asserted on a hardware device.
+            eprintln!("{label}: occluded draw marked {:?}", marked(&occluded));
+        } else {
+            assert_eq!(
+                marked(&occluded),
+                Vec::<usize>::new(),
+                "{label}: occluded draw must not mark texture reads"
+            );
+        }
+
+        // Pass 2: z = 0.2 < cleared depth 0.5 -> visible, PS marks texture slot 1.
+        let visible = run_pass(0.2);
+        assert_eq!(
+            marked(&visible),
+            vec![super::VIEW_READS as usize + 1],
+            "{label}: visible draw must mark texture slot 1"
+        );
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

@@ -130,6 +130,8 @@ enum Command {
     },
     /// Show the resolved configuration and check it.
     Config,
+    /// Check the host D3D12 device for mesh shaders and shader model 6.6.
+    GpuCheck,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -236,7 +238,33 @@ fn main() -> Result<()> {
             Ok(())
         }
         Command::Config => show_config(),
+        Command::GpuCheck => gpu_check(),
     }
+}
+
+#[cfg(windows)]
+fn gpu_check() -> Result<()> {
+    let support = victory_gpu::host_mesh_support()
+        .ok_or_else(|| anyhow::anyhow!("could not initialise VIctory's D3D12 host"))?;
+    let status = |feature| match feature {
+        Some(true) => "supported",
+        Some(false) => "unsupported",
+        None => "query failed",
+    };
+    println!("Mesh shaders: {}", status(support.mesh_shaders));
+    println!("Shader model 6.6: {}", status(support.shader_model_6_6));
+    anyhow::ensure!(
+        support.supported(),
+        "could not confirm both mesh pipeline requirements"
+    );
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn gpu_check() -> Result<()> {
+    anyhow::bail!(
+        "gpu-check requires the Windows build of VIctory. On macOS run tools/macos/victory.sh gpu-check"
+    )
 }
 
 fn show_config() -> Result<()> {

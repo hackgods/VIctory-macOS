@@ -100,6 +100,37 @@ fn atomic_locks() -> bool {
     })
 }
 
+/// Whether the lanes of a wave first try their 64-bit atomics' locks in
+/// rounds before the lanes still not done take turns (`emit`, "Atomic
+/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
+/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
+/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
+/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
+fn atomic_lock_rounds() -> bool {
+    static ROUNDS: OnceLock<bool> = OnceLock::new();
+    *ROUNDS.get_or_init(|| {
+        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+        rounds_on(atomic_locks(), var.as_deref())
+    })
+}
+
+/// Whether a glc-clear 64-bit `umax` first reduces each texel's lanes of
+/// a wave to their maximum key, one representative locking (`emit`,
+/// "Atomic locks"; #240): opt-in while it is measured,
+/// `VICTORY_ATOMIC_UMAX=1`. Only with [`atomic_lock_rounds`].
+fn atomic_umax() -> bool {
+    static UMAX: OnceLock<bool> = OnceLock::new();
+    *UMAX.get_or_init(|| {
+        atomic_lock_rounds() && std::env::var("VICTORY_ATOMIC_UMAX").as_deref() == Ok("1")
+    })
+}
+
+/// The rounds, given whether the locks are on and
+/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
+fn rounds_on(locks: bool, var: Option<&str>) -> bool {
+    locks && var != Some("0")
+}
+
 /// Whether compute shaders' biased samples run as scaled gradient samples:
 /// under Wine, whose D3DMetal ignores the bias there (#30).
 /// `VICTORY_BIAS_AS_GRADIENTS=0` or `1` overrides.
@@ -182,6 +213,13 @@ pub fn halves_walk() -> bool {
     crate::mac_switches::walk()
 }
 
+/// Whether, with half-local reads, the Mac port's hand-over across the
+/// halves comes before them (`victory_shader::emit::Options::halves_across`,
+/// `VICTORY_HALVES_ACROSS=1`; the rule is in `mac_switches`).
+pub fn halves_across() -> bool {
+    crate::mac_switches::across()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -208,17 +246,26 @@ pub(crate) fn under_wine() -> bool {
     false
 }
 
-/// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, narrow waves, half-local reads and shared LDS in halves,
-/// `local`): their own cache entries, one per combination.
-fn options_build(locks: bool, bias: bool, narrow: bool, local: [bool; 2]) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
+/// [`build`] for translations with host workarounds (atomic locks, their
+/// rounds and umax reduction, bias as gradients, narrow waves, half-local
+/// reads and shared LDS in halves, `local`): their own cache entries, one
+/// per combination.
+fn options_build(
+    locks: bool,
+    [rounds, umax]: [bool; 2],
+    bias: bool,
+    narrow: bool,
+    local: [bool; 2],
+) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 128] = [const { OnceLock::new() }; 128];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
         | usize::from(local[0]) << 3
-        | usize::from(local[1]) << 4;
-    BUILDS[n].get_or_init(|| options_key(build(), locks, bias, narrow, local))
+        | usize::from(local[1]) << 4
+        | usize::from(rounds) << 5
+        | usize::from(umax) << 6;
+    BUILDS[n].get_or_init(|| options_key(build(), locks, [rounds, umax], bias, narrow, local))
 }
 
 /// [`options_build`]'s key over the build `build`. A setting that is off
@@ -226,6 +273,7 @@ fn options_build(locks: bool, bias: bool, narrow: bool, local: [bool; 2]) -> &'s
 fn options_key(
     build: &[u8; 32],
     locks: bool,
+    [rounds, umax]: [bool; 2],
     bias: bool,
     narrow: bool,
     local: [bool; 2],
@@ -234,6 +282,12 @@ fn options_key(
     h.update(build);
     if locks {
         h.update(b"atomic locks");
+    }
+    if rounds {
+        h.update(b"atomic lock rounds");
+    }
+    if umax {
+        h.update(b"atomic umax");
     }
     if bias {
         h.update(b"bias as gradients");
@@ -248,6 +302,56 @@ fn options_key(
         h.update(b"halves shared lds");
     }
     *h.finalize().as_bytes()
+}
+
+/// What the translations made with `options` are keyed by: [`build`], or
+/// with host workarounds [`options_build`], and over either the Mac line's
+/// settings (`crate::mac_switches::key`). Also what the pre-build's list of
+/// the host pipeline library holds for (`crate::pipeline::library`).
+pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'static [u8; 32] {
+    let locks = options.atomic_locks;
+    let bias = options.bias_as_gradients;
+    let narrow = options.narrow_waves;
+    let rounds = locks && options.atomic_lock_rounds;
+    let umax = rounds && options.atomic_umax;
+    let local = [options.halves_local, options.halves_shared_lds];
+    let build = if !locks && !bias && !narrow && local == [false; 2] {
+        build()
+    } else {
+        options_build(locks, [rounds, umax], bias, narrow, local)
+    };
+    // The Mac line's settings, over whichever of those it is.
+    let key = crate::mac_switches::key(
+        build,
+        options.early_depth,
+        [options.atomic_lock_helpers, options.atomic_lock_keys],
+        options.lds_order,
+        options.halves_exchange,
+        options.uav_size_level0,
+        options.halves_walk,
+    );
+    // And the Mac port's hand-over before half-local reads
+    // (`VICTORY_HALVES_ACROSS=1`); off, it adds nothing.
+    let key = if options.halves_across {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"halves across");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
+    if key == *build {
+        return build;
+    }
+    // A handful of combinations in a run: each key kept once, for good.
+    static KEYS: Mutex<Vec<&'static [u8; 32]>> = Mutex::new(Vec::new());
+    let mut keys = KEYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kept) = keys.iter().find(|k| ***k == key) {
+        return kept;
+    }
+    let kept: &'static [u8; 32] = Box::leak(Box::new(key));
+    keys.push(kept);
+    kept
 }
 
 pub(crate) fn runtime_options() -> victory_shader::emit::Options {
@@ -266,6 +370,8 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
+        atomic_lock_rounds: atomic_lock_rounds(),
+        atomic_umax: atomic_umax(),
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
@@ -278,6 +384,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         halves_exchange: crate::mac_switches::exchange(),
         uav_size_level0: crate::mac_switches::uav_size_level0(),
         halves_walk: crate::mac_switches::walk(),
+        halves_across: crate::mac_switches::across(),
     }
 }
 
@@ -289,31 +396,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     options.uav_size_level0 = crate::mac_switches::uav_size_level0_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks
-        || options.bias_as_gradients
-        || options.narrow_waves
-        || options.halves_local
-        || options.halves_shared_lds
-    {
-        options_build(
-            options.atomic_locks,
-            options.bias_as_gradients,
-            options.narrow_waves,
-            [options.halves_local, options.halves_shared_lds],
-        )
-    } else {
-        build()
-    };
-    // The Mac line's settings, over whichever of those it is.
-    let build = &crate::mac_switches::key(
-        build,
-        options.early_depth,
-        [options.atomic_lock_helpers, options.atomic_lock_keys],
-        options.lds_order,
-        options.halves_exchange,
-        options.uav_size_level0,
-        options.halves_walk,
-    );
+    let build = translation_build(options);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),
@@ -402,7 +485,7 @@ fn cached(
     )
 }
 
-const MAGIC: &[u8; 4] = b"VSH1";
+const MAGIC: &[u8; 4] = b"VSH2";
 /// A container that does not translate: the reason follows.
 const REFUSED: &[u8; 4] = b"VSHE";
 const STAGES: [HwStage; 8] = [
@@ -458,6 +541,7 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_srv_bytes,
         memory,
         memory_writes,
         view_addresses,
@@ -505,6 +589,11 @@ fn encode(translation: &Result<HostShader, String>) -> Vec<u8> {
     for slots in [root_cbvs, root_srvs, root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
+    }
+    word(&mut out, root_srv_bytes.len() as u32);
+    for &(slot, end) in root_srv_bytes {
+        word(&mut out, u32::from(slot));
+        word(&mut out, end);
     }
     word(
         &mut out,
@@ -575,6 +664,11 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let n = r.word()? as usize;
+    let mut root_srv_bytes = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        root_srv_bytes.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     let memory = r.word()?;
     r.0.is_empty().then_some(Ok(HostShader {
         stage,
@@ -585,6 +679,7 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        root_srv_bytes,
         memory: memory & 1 != 0,
         memory_writes: memory & 2 != 0,
         view_addresses: memory & 4 != 0,
@@ -597,6 +692,17 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rounds are on wherever the locks are, `VICTORY_ATOMIC_LOCK_ROUNDS=0`
+    /// turns them off, and without the locks there are none (#240).
+    #[test]
+    fn lock_rounds_are_on_with_the_locks_unless_turned_off() {
+        assert!(rounds_on(true, None), "on by default with the locks");
+        assert!(rounds_on(true, Some("1")), "the old opt-in still works");
+        assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
+        assert!(!rounds_on(false, None), "no rounds without the locks");
+        assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
 
     fn shader() -> HostShader {
         HostShader {
@@ -618,6 +724,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            root_srv_bytes: vec![(1, 48), (5, 16384)],
             memory: true,
             memory_writes: true,
             view_addresses: true,
@@ -730,7 +837,7 @@ mod tests {
             let (l, b, w) = (n & 1 != 0, n & 2 != 0, n & 4 != 0);
             let keys: std::collections::HashSet<[u8; 32]> =
                 [[false, false], [true, false], [false, true], [true, true]]
-                    .map(|local| options_key(&k, l, b, w, local))
+                    .map(|local| options_key(&k, l, [false; 2], b, w, local))
                     .into();
             assert_eq!(keys.len(), 4);
         }
@@ -738,7 +845,7 @@ mod tests {
         narrow.update(&k);
         narrow.update(b"narrow waves");
         assert_eq!(
-            options_key(&k, false, false, true, [false, false]),
+            options_key(&k, false, [false; 2], false, true, [false, false]),
             *narrow.finalize().as_bytes()
         );
         // The encoding part is this file as built.

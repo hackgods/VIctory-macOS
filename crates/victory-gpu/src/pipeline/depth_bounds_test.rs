@@ -65,6 +65,7 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_srv_bytes: Vec::new(),
             memory: false,
             memory_writes: false,
             view_addresses: false,
@@ -125,15 +126,15 @@ fn render_with_depth_bounds(host: &crate::host::Host, shader: Arc<Shader>, ps: O
         topology: [u32; 2],
         dsv: [u32; 2],
     }
-    // The containers are behind a lock here (they are let go once
-    // translated): the stream points at copies that live through the call.
-    let code = shader.container.lock().unwrap().clone();
-    let ps_code = ps.as_ref().map(|ps| ps.container.lock().unwrap().clone());
+    // The containers' bytes, kept while a shader is not yet translated.
+    let bytes = |s: &Shader| s.container.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let shader_bytes = bytes(&shader);
+    let ps_bytes = ps.as_ref().map(|ps| bytes(ps));
     let stream = Stream {
         shader_kind: if mesh { 24 } else { 1 },
-        shader: Bytecode { code: code.as_ptr(), size: code.len() },
+        shader: Bytecode { code: shader_bytes.as_ptr(), size: shader_bytes.len() },
         ps_kind: 2,
-        ps: ps_code.as_ref().map_or(
+        ps: ps_bytes.as_ref().map_or(
             Bytecode { code: std::ptr::null(), size: 0 },
             |ps| Bytecode { code: ps.as_ptr(), size: ps.len() },
         ),

@@ -214,6 +214,8 @@ fn pump(held: &mut Holding, why: Why) {
         // lists read: the part before it has run when the copy is made.
         for part in crate::host::copy_order_parts(segments) {
             let at = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
             // The lists that have run: these, unless the host GPU was left
             // with them (then they come back with a later piece).
             let done = host.execute_title(queue, part);
@@ -677,6 +679,8 @@ extern "system" fn present(
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
+    #[cfg(windows)]
+    crate::shadow::trim_pool();
     #[cfg(feature = "diagnostics")]
     crate::frame::presented();
     if frame.is_power_of_two() {

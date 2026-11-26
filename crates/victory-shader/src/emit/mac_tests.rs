@@ -110,6 +110,8 @@ fn lowered_with(
         prims: vec![],
         mesh_stride: 0,
         atomic_locks,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -128,6 +130,7 @@ const EARLY: Mac = Mac {
     exchange: false,
     uav_level0: false,
     walk: false,
+    across: false,
 };
 
 /// The rule by itself: bit 12, and nothing that D3D's flag would change.
@@ -280,6 +283,7 @@ const WRITERS: Mac = Mac {
     exchange: false,
     uav_level0: false,
     walk: false,
+    across: false,
 };
 
 /// `image_atomic_<op> v[vdata..], v[vaddr:vaddr+1], s[srsrc:srsrc+7]` on a

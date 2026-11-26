@@ -105,10 +105,8 @@ pub(crate) mod pred {
     pub const OGE: u8 = 3;
     pub const OLT: u8 = 4;
     pub const OLE: u8 = 5;
-    // Not emitted: the AMD D3D12 driver treats it as UNE, so `v_cmp_lg`
-    // lowers as OLT | OGT instead.
-    #[allow(dead_code)]
-    pub const ONE: u8 = 6;
+    // 6 (ONE) is not emitted: the AMD D3D12 driver treats it as UNE, so
+    // `v_cmp_lg` lowers as OLT | OGT instead.
     pub const ORD: u8 = 7;
     pub const UNO: u8 = 8;
     pub const UEQ: u8 = 9;
@@ -613,6 +611,24 @@ impl Module {
         blocks
     }
 
+    /// [`Module::written_call_blocks`] of the calls whose first operand
+    /// after the `dx.op` opcode is `x`.
+    #[cfg(test)]
+    pub fn written_call_blocks_on(&self, name: &str, x: V) -> Vec<usize> {
+        let plan = self.plan();
+        let mut blocks = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && matches!(&self.insts[i as usize].op, Op::Call(f, args) if self.funcs[*f as usize].name == name && args.get(1) == Some(&x))
+                {
+                    blocks.push(b);
+                }
+            }
+        }
+        blocks
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
@@ -737,6 +753,21 @@ impl Module {
         };
         known.insert(v, x);
         x
+    }
+
+    /// The blocks, instructions (phis included) and conditional branches
+    /// [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_shape(&self) -> (usize, usize, usize) {
+        let plan = self.plan();
+        let mut shape = (plan.layout.len(), 0, 0);
+        for &b in &plan.layout {
+            let blk = &self.blocks[b];
+            let live = |&&i: &&u32| plan.live[i as usize];
+            shape.1 += blk.phis.iter().chain(&blk.body).filter(live).count();
+            shape.2 += usize::from(matches!(self.term(b), Some(Term::CondBr(..))));
+        }
+        shape
     }
 
     /// The globals and functions [`Module::write`] declares, each kept

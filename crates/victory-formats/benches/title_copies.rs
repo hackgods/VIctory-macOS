@@ -105,10 +105,22 @@ impl Ranges {
     }
 }
 
+/// How a submission's title copies find the copies they reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Way {
+    /// Every copy, as before the index.
+    Scan,
+    /// The index, every copy filed before the first title copy.
+    Index,
+    /// The index, filed in chunks between the title copies, as `host`
+    /// flushes before each.
+    Chunked,
+}
+
 /// One submission's title copies, one way or the other: 9 samples of
 /// BATCH submissions, µs each.
 fn run(
-    scan: bool,
+    way: Way,
     world: &[(u64, u64)],
     current: &mut HashMap<usize, (usize, Ranges)>,
     lcg: &mut Lcg,
@@ -127,15 +139,33 @@ fn run(
             }
             let windows = windows(lcg);
             let started = Instant::now();
-            if scan {
-                // Today: every copy, whatever the bytes can be in.
+            if way == Way::Scan {
+                // Before the index: every copy, whatever the bytes can be in.
                 for &(from, to) in &windows {
                     for (_, have) in current.values_mut() {
                         have.remove(from, to);
                     }
                 }
+            } else if way == Way::Chunked {
+                // As `host` runs it: its flushes come between the title
+                // copies, so the copies are filed in chunks, one before
+                // each title copy, and each title copy looks up after
+                // its chunk.
+                extents.clear();
+                let chunk = world.len().div_ceil(windows.len());
+                for (i, &(from, to)) in windows.iter().enumerate() {
+                    let end = ((i + 1) * chunk).min(world.len());
+                    for (key, &(start, len)) in world.iter().enumerate().take(end).skip(i * chunk) {
+                        extents.flushed(key, start as usize, (start + len) as usize);
+                    }
+                    for key in extents.overlapping(from, to) {
+                        if let Some((_, have)) = current.get_mut(&key) {
+                            have.remove(from, to);
+                        }
+                    }
+                }
             } else {
-                // The fix's way: each copy's extent filed as its flush
+                // The index filed whole: each copy's extent filed as its flush
                 // files it (charged to this way), a title copy then
                 // takes out of only the copies that can hold its bytes.
                 extents.clear();
@@ -198,8 +228,12 @@ fn main() {
     println!("bench_title_copied_visits_scan {}", TITLE_COPIES * COPIES);
     println!("bench_title_copied_visits_index {visits}");
 
-    for (name, scan) in [("scan", true), ("index", false)] {
-        let mut samples = run(scan, &world, &mut current, &mut lcg);
+    for (name, way) in [
+        ("scan", Way::Scan),
+        ("index", Way::Index),
+        ("chunked", Way::Chunked),
+    ] {
+        let mut samples = run(way, &world, &mut current, &mut lcg);
         samples.sort_by(|a, b| a.total_cmp(b));
         let median = samples[samples.len() / 2];
         let all = samples

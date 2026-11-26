@@ -21,3 +21,11 @@ harness = false
 [[bench]]
 name = "title_copies"
 harness = false
+
+[[bench]]
+name = "atomic_locks"
+harness = false
+
+[[bench]]
+name = "title_runs"
+harness = false

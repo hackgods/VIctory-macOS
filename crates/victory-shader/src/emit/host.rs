@@ -78,6 +78,7 @@ impl Host {
     /// store through it. D3DMetal advertises RGB32 support but aborts when the
     /// view is created, so those formats are skipped on the hardware adapter
     /// under Wine; WARP is still queried normally.
+    #[cfg(test)]
     pub fn typed_buffer_access(&self, format: DXGI_FORMAT, warp: bool) -> bool {
         if !warp && under_wine()
             && matches!(format, DXGI_FORMAT_R32G32B32_FLOAT | DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT)
@@ -260,6 +261,7 @@ impl Host {
     /// Every hardware adapter (as [`hardware_adapter`] tells them) whose
     /// device takes SM 6.6, by name: tests that compare GPUs of different
     /// wave widths run on each.
+    #[cfg(test)]
     pub fn each_hardware() -> Vec<(String, Self)> {
         let mut hosts = Vec::new();
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
@@ -295,6 +297,7 @@ impl Host {
 
     /// `device` (a hardware adapter's: its work is not serialised), if it
     /// takes SM 6.6.
+    #[cfg(test)]
     fn sm66(device: ID3D12Device) -> Result<Self, String> {
         let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
             HighestShaderModel: D3D_SHADER_MODEL_6_6,
@@ -939,6 +942,8 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -955,6 +960,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -1054,6 +1060,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
+        root_srv_bytes: Vec::new(),
         memory: false,
         memory_writes: false,
         view_addresses: false,
@@ -1475,6 +1482,8 @@ pub enum View<'a> {
         levels: u32,
         uav: Option<u32>,
     },
+    /// An RGBA32_UINT texture UAV (width, height), zeroed.
+    Uint4TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A typed buffer UAV in this format, of this many elements of this many
@@ -1554,7 +1563,7 @@ pub struct Dispatch<'a> {
 #[cfg(test)]
 impl Host {
     /// Runs a compute pipeline and returns each UAV's contents in heap
-    /// order (texels as float bits, row by row).
+    /// order (texels' dwords, row by row).
     pub fn dispatch(
         &self,
         root: &ID3D12RootSignature,
@@ -1621,20 +1630,16 @@ impl Host {
                 Flags: flags,
                 ..Default::default()
             };
-            // Texel words: 4 for RGBA32F, 1 for R32_UINT, 2 for R32G32_UINT.
-            let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // Texels in `format` of `words` dwords each.
+            let footprint_as = |r: &ID3D12Resource, w: u32, h: u32, format, words: u32| {
+                D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: match words {
-                                    1 => DXGI_FORMAT_R32_UINT,
-                                    2 => DXGI_FORMAT_R32G32_UINT,
-                                    _ => DXGI_FORMAT_R32G32B32A32_FLOAT,
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
@@ -1642,8 +1647,11 @@ impl Host {
                             },
                         },
                     },
-                };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
+                }
+            };
+            let footprint = |r: &ID3D12Resource, w: u32, h: u32| {
+                footprint_as(r, w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, 4)
+            };
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1674,16 +1682,17 @@ impl Host {
                 b.Unmap(0, None);
                 Ok(b)
             };
-            // Zeros a UAV made as a copy destination (`size`: a texture's,
-            // `n` its words per texel, else a buffer's dwords) and returns
-            // the upload buffer to keep. A new committed resource is not
-            // always zeroed: WARP hands out memory a freed buffer of ours held.
-            let zero = |r: &ID3D12Resource, size: Option<(u32, u32)>, n: u32| {
+            // Zeros a UAV made as a copy destination (`size`: a texture's
+            // and its format, `n` its words per texel, else a buffer's dwords)
+            // and returns the upload buffer to keep. A new committed resource
+            // is not always zeroed: WARP hands out memory a freed buffer of
+            // ours held.
+            let zero = |r: &ID3D12Resource, size: Option<(u32, u32, DXGI_FORMAT)>, n: u32| {
                 let zeros = match size {
-                    Some((w, h)) => {
+                    Some((w, h, format)) => {
                         let pitch = (w * 4 * n).next_multiple_of(256);
                         let zeros = upload(&vec![0; (pitch * h / 4) as usize])?;
-                        let from = footprint_as(&zeros, w, h, n);
+                        let from = footprint_as(&zeros, w, h, format, n);
                         list.CopyTextureRegion(&subresource(r), 0, 0, 0, &from, None);
                         zeros
                     }
@@ -1884,22 +1893,6 @@ impl Host {
                         )?;
                         uavs.push((b, None, n, rb));
                     }
-                    View::TextureUav(w, h) => {
-                        let t = make(
-                            D3D12_HEAP_TYPE_DEFAULT,
-                            &texture(w, h, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), 4)?);
-                        let pitch = (w * 16).next_multiple_of(256);
-                        let rb = make(
-                            D3D12_HEAP_TYPE_READBACK,
-                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
-                        )?;
-                        uavs.push((t, Some((w, h)), 4, rb));
-                    }
                     View::Sized { format, size: (w, h), levels, uav } => {
                         let (flags, state) = match uav {
                             Some(_) => (
@@ -1932,10 +1925,15 @@ impl Host {
                         }
                         keep.push(t);
                     }
-                    View::UintTextureUav(w, h) | View::Uint2TextureUav(w, h) => {
+                    View::TextureUav(w, h)
+                    | View::UintTextureUav(w, h)
+                    | View::Uint2TextureUav(w, h)
+                    | View::Uint4TextureUav(w, h) => {
                         let (format, words) = match *v {
+                            View::TextureUav(..) => (DXGI_FORMAT_R32G32B32A32_FLOAT, 4),
                             View::UintTextureUav(..) => (DXGI_FORMAT_R32_UINT, 1),
-                            _ => (DXGI_FORMAT_R32G32_UINT, 2),
+                            View::Uint2TextureUav(..) => (DXGI_FORMAT_R32G32_UINT, 2),
+                            _ => (DXGI_FORMAT_R32G32B32A32_UINT, 4),
                         };
                         let t = make(
                             D3D12_HEAP_TYPE_DEFAULT,
@@ -1943,14 +1941,14 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         dev.CreateUnorderedAccessView(&t, None, None, at);
-                        keep.push(zero(&t, Some((w, h)), words)?);
+                        keep.push(zero(&t, Some((w, h, format)), words)?);
                         let pitch = (w * 4 * words).next_multiple_of(256);
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
-                        uavs.push((t, Some((w, h)), words, rb));
+                        uavs.push((t, Some((w, h, format)), words, rb));
                     }
                     View::Cbv(data) => {
                         let b = upload(data)?;
@@ -2163,8 +2161,8 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_SOURCE,
                 )]);
                 match size {
-                    Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
+                    Some((w, h, format)) => list.CopyTextureRegion(
+                        &footprint_as(rb, *w, *h, *format, *n),
                         0,
                         0,
                         0,
@@ -2189,7 +2187,7 @@ impl Host {
                 let mut p = std::ptr::null_mut();
                 rb.Map(0, None, Some(&mut p)).map_err(err)?;
                 let words = match size {
-                    Some((w, h)) => {
+                    Some((w, h, _)) => {
                         let words = *n as usize;
                         let pitch = (*w as usize * 4 * words).next_multiple_of(256);
                         (0..*h as usize)

@@ -138,6 +138,13 @@ pub(crate) struct Mac {
     /// for the programs `emit::walk` opens to every lane
     /// (`emit::Options::halves_walk`).
     pub walk: bool,
+    /// In halves with half-local reads ([`HalvesLocal`]), a read across
+    /// the halves that [`Mac::exchange`] does not hand over is handed over
+    /// the Mac port's way where every lane of the group runs the block
+    /// together ([`Lower::across_first`], `emit::Options::halves_across`),
+    /// and only elsewhere answered from the reader's own half. Without
+    /// half-local reads that hand-over is made whatever this says.
+    pub across: bool,
 }
 
 thread_local! {
@@ -263,11 +270,12 @@ impl Lower<'_> {
         value: V,
         compare: Option<V>,
         old_read: bool,
+        not_rep: V,
     ) -> (V, V) {
         let helpers = self.x.mac.lock_helpers && self.s.pixel;
         let keys = self.x.mac.lock_keys && op == "umax" && !old_read;
         if !helpers && !keys {
-            return self.locked_atomic64(h, cs, coords, op, value, compare);
+            return self.locked_atomic64(h, cs, coords, op, value, compare, not_rep);
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -315,7 +323,7 @@ impl Lower<'_> {
         let t = self.s.m.bool(true);
         let goes = self.s.m.bin(c, Bin::Xor, out.expect("a lane test"), t);
         let at = self.begin_guarded(Some(goes));
-        let (lo, hi) = self.locked_atomic64(h, cs, coords, op, value, compare);
+        let (lo, hi) = self.locked_atomic64(h, cs, coords, op, value, compare, not_rep);
         let r = self.end_guarded(at, &[(lo, seen.0), (hi, seen.1)]);
         (r[0], r[1])
     }

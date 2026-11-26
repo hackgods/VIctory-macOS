@@ -39,6 +39,14 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+#[cfg(any(feature = "diagnostics", test))]
+fn test_interval(requested: Duration, hz: Option<&str>) -> Duration {
+    hz.and_then(|hz| hz.parse::<u32>().ok())
+        .and_then(|hz| Duration::from_secs(1).checked_div(hz))
+        .filter(|interval| !interval.is_zero())
+        .unwrap_or(requested)
+}
+
 /// Device method: a frame every `length` microseconds. The period is how
 /// many intervals a frame may take to reach the display (pipeline depth),
 /// not part of the rate.
@@ -49,11 +57,19 @@ pub(crate) extern "system" fn set_interval(
     _period: u32,
     _flags: u32,
 ) -> HRESULT {
-    let interval = match length {
+    let requested = match length {
         0 => SIXTIETH,
         us => Duration::from_micros(u64::from(us)),
     };
-    tracing::info!(?interval, "frame interval");
+    #[cfg(feature = "diagnostics")]
+    let interval = test_interval(requested, std::env::var("VICTORY_FRAME_HZ").ok().as_deref());
+    #[cfg(not(feature = "diagnostics"))]
+    let interval = requested;
+    if interval != requested {
+        tracing::info!(?interval, ?requested, "frame interval override");
+    } else {
+        tracing::info!(?interval, "frame interval");
+    }
     // A new interval starts from now, after the last tick handed out.
     let first = LAST
         .iter()
@@ -218,16 +234,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_test_frame_rate_changes_the_interval_only_when_valid() {
+        let requested = Duration::from_micros(33_333);
+        assert_eq!(
+            test_interval(requested, Some("60")),
+            Duration::from_nanos(16_666_666)
+        );
+        for value in [None, Some("0"), Some("invalid"), Some("1000000001")] {
+            assert_eq!(test_interval(requested, value), requested);
+        }
+    }
+
+    #[test]
     fn waits_end_on_ticks_and_count_frames() {
         let null = std::ptr::null();
-        assert_eq!(set_interval(null, null, 2_000, 1, 0), S_OK);
+        // 50 ms ticks: with 2 ms ticks a thread woken a few ms late finds the
+        // next tick ready, and a wait with no time-out does not time out.
+        assert_eq!(set_interval(null, null, 50_000, 1, 0), S_OK);
         let mut first = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut first), S_OK);
         let before = Instant::now();
         let mut second = 0;
         assert_eq!(wait(null, 0, 1_000, std::ptr::null(), 0, &mut second), S_OK);
         assert!(second > first);
-        assert!(before.elapsed() <= Duration::from_millis(50));
+        // A wait that ended on its tick, not on its 1 s time-out. The
+        // bound is wide because a busy CI host can wake a thread late.
+        assert!(before.elapsed() < Duration::from_millis(500), "{:?}", before.elapsed());
         assert_eq!(wait(null, 0, 0, std::ptr::null(), 0, &mut second), TIMEOUT);
         // Tokens count frames, a frame started early on a time-out too.
         let mut early = 0;
@@ -268,7 +300,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(110));
         let before = Instant::now();
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);
-        assert!(before.elapsed() < Duration::from_millis(10), "{:?}", before.elapsed());
+        // The next tick is about 40 ms away, so 30 ms still tells "at once" from "waited".
+        assert!(before.elapsed() < Duration::from_millis(30), "{:?}", before.elapsed());
         let late = LAST[2].load(Ordering::Relaxed);
         assert!(late >= flips[3] + 2, "{late} after {}", flips[3]);
         assert_eq!(wait(null, FLIP, u32::MAX, std::ptr::null(), 0, &mut token), S_OK);

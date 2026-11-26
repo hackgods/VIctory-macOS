@@ -117,6 +117,28 @@ pub(crate) fn exchange() -> bool {
     })
 }
 
+/// Whether, in a program in halves with half-local reads
+/// (`VICTORY_HALVES_LOCAL=1`), a read across the halves is handed over the
+/// way VIctory-macOS does it (its #309, #360 and #376;
+/// `victory_shader::emit::Options::halves_across`) before it is answered
+/// from the reader's own half: only with `VICTORY_HALVES_ACROSS=1`. This
+/// line's own exchange (`VICTORY_HALVES_EXCHANGE=1`) still comes first.
+/// Unset, a translation with half-local reads is what it was before that
+/// hand-over was merged; without half-local reads the hand-over is always
+/// made, as in VIctory-macOS, where the read would otherwise be refused.
+pub(crate) fn across() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_ACROSS").ok().as_deref(), false);
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_ACROSS=1: reads across 32-lane halves are handed over as in VIctory-macOS where every lane of the group runs together, before half-local reads answer them"
+            );
+        }
+        on
+    })
+}
+
 /// Whether a size query on a writable image asks for level 0 in every
 /// program (`victory_shader::emit::Options::uav_size_level0`): only with
 /// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC

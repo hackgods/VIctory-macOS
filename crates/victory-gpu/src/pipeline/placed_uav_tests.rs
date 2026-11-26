@@ -81,6 +81,7 @@ fn store_shader() -> Arc<Shader> {
         full_hash: *blake3::hash(&native.code).as_bytes(),
         size: container.len(),
         container: std::sync::Mutex::new(container),
+        spilled: OnceLock::new(),
         translated: OnceLock::from(Some(Translated {
             host,
             used: native.used,

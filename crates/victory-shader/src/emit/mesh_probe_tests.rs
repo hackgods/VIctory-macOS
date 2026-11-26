@@ -450,6 +450,7 @@ mod gpu {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            root_srv_bytes: Vec::new(),
             memory: false,
             memory_writes: false,
             view_addresses: false,

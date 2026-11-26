@@ -441,7 +441,7 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        if mesh.is_some() && !host()?.mesh_support().supported() {
             return refuse(
                 "the host GPU has no mesh shaders (or no shader model 6.6)",
                 shaders,
@@ -470,6 +470,34 @@ impl HostPipeline {
             }
             None => stages,
         };
+        if super::refuse_over_limit_mesh()
+            && let Some((ms, _)) = stages.iter().find(|(_, v)| *v == D3D12_SHADER_VISIBILITY_MESH)
+            && let Some(t) = ms.translated()
+            // The larger of the packed count and the aligned layout: shaders
+            // the packed count puts under the limit (34,816 bytes aligned,
+            // #172) still hang the queue.
+            // mac: where a linked pair's rows are merged
+            // (`VICTORY_MERGE_MESH_ROWS`, the default under Wine), the count
+            // is the measured rule's (`MeshOutputs::metal_bytes`), which
+            // the rows were ordered by: the aligned layout above models the
+            // clip distances differently and would refuse pairs that fit
+            // and draw.
+            && let Some(bytes) = victory_shader::emit::mesh_outputs(&t.host.dxil)
+                .map(|o| if super::merge_mesh_rows() != 0 { o.metal_bytes() } else { o.bytes() })
+                .max(metal_mesh_bytes(&t.host.dxil).filter(|_| super::merge_mesh_rows() == 0))
+            && bytes > victory_shader::emit::METAL_MESH_OUTPUT_BYTES
+        {
+            tracing::warn!(
+                ?shaders,
+                bytes,
+                "mesh outputs over Metal's 32 KiB after linking: pipeline refused \
+                 (VICTORY_MESH_OVER_LIMIT=1 makes it)"
+            );
+            return refuse(
+                "the mesh shader's outputs take more than the host GPU allows",
+                shaders,
+            );
+        }
         let host = host()?;
         // `SFI0`: 64-bit atomics on typed resources and on heap resources.
         let atomics64 = stages.iter().any(|(s, _)| {
@@ -681,6 +709,13 @@ impl HostPipeline {
         };
         let state = g.describe();
         let depth_with_bounds = g.depth_with_bounds(host);
+        // A pixel shader reading non-provoking vertex values (#203) takes
+        // them from a geometry shader made for the vertex shader.
+        let ps = stages.get(1).and_then(|(s, _)| s.translated());
+        let deltas = ps.is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
+        if mesh.is_some() && deltas {
+            return refuse("non-provoking vertex values in a mesh pipeline", shaders);
+        }
         if mesh.is_some() {
             let name = super::library::name(
                 "mesh",
@@ -750,9 +785,26 @@ impl HostPipeline {
 
         // Rectangle lists: a geometry shader made for the vertex shader adds
         // each rectangle's fourth corner (else rectangles are expanded on
-        // the CPU from vertex inputs, see `draw`).
-        let gs = match (g.topology.0, stages.first().and_then(|(s, _)| s.translated())) {
-            (RECTANGLES, Some(vs)) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
+        // the CPU from vertex inputs, see `draw`). Triangles whose pixel
+        // shader reads non-provoking vertex values: one that adds them.
+        let vs = stages.first().and_then(|(s, _)| s.translated());
+        let gs = match (g.topology.0, vs, ps) {
+            (RECTANGLES, ..) if deltas => {
+                return refuse("non-provoking vertex values in a rectangle list", shaders);
+            }
+            (_, Some(vs), Some(ps)) if deltas => {
+                if host_topology(g) != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE {
+                    return refuse("non-provoking vertex values of points or lines", shaders);
+                }
+                match victory_shader::emit::vertex_delta_gs(&vs.host.dxil, &ps.host.dxil) {
+                    Ok(gs) => gs,
+                    Err(e) => {
+                        tracing::warn!(error = %e, ?shaders, "no vertex value geometry shader");
+                        return None;
+                    }
+                }
+            }
+            (RECTANGLES, Some(vs), _) => match victory_shader::emit::rectangle_gs(&vs.host.dxil) {
                 Ok(gs) => gs,
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "no rectangle geometry shader");
@@ -761,6 +813,7 @@ impl HostPipeline {
             },
             _ => Vec::new(),
         };
+        let rectangles = !gs.is_empty() && !deltas;
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -825,7 +878,13 @@ impl HostPipeline {
                 return None;
             }
         };
-        tracing::info!(?shaders, ms = started.elapsed().as_millis(), rectangles = !gs.is_empty(), "host pipeline");
+        tracing::info!(
+            ?shaders,
+            ms = started.elapsed().as_millis(),
+            rectangles,
+            deltas,
+            "host pipeline"
+        );
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -843,7 +902,7 @@ impl HostPipeline {
             root,
             stages: bound,
             name: format!("{shaders:?}"),
-            rectangles: !gs.is_empty(),
+            rectangles,
             slots: g.slots(),
             inputs: g.elements(),
             marks,
@@ -984,6 +1043,63 @@ fn root_signature(
             std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
         Ok((device.CreateRootSignature(0, bytes)?, bytes.to_vec()))
     }
+}
+
+/// Output bytes as Apple's Metal counts them for a translated mesh shader
+/// (measured on D3DMetal): per vertex, clip/cull distances, position, then
+/// remaining outputs in signature order, aligned to own size; same for
+/// primitives; multiplied by declared max counts.
+pub(crate) fn metal_mesh_bytes(dxil: &[u8]) -> Option<u32> {
+    let u32_at = |b: &[u8], at: usize| {
+        b.get(at..at + 4)
+            .map(|v| u32::from_le_bytes(v.try_into().expect("4 bytes")) as usize)
+    };
+    let part = |name: &[u8; 4]| {
+        (0..u32_at(dxil, 28)?).find_map(|i| {
+            let at = u32_at(dxil, 32 + 4 * i)?;
+            (dxil.get(at..at + 4)? == name)
+                .then(|| dxil.get(at + 8..at + 8 + u32_at(dxil, at + 4)?))
+                .flatten()
+        })
+    };
+    let elements = |name: &[u8; 4]| -> Option<Vec<(usize, u32)>> {
+        let Some(data) = part(name) else {
+            return Some(Vec::new());
+        };
+        (0..u32_at(data, 0)?)
+            .map(|i| {
+                let at = 8 + 32 * i;
+                let mask = *data.get(at + 24)?;
+                Some((u32_at(data, at + 12)?, mask.count_ones()))
+            })
+            .collect()
+    };
+    const POSITION: usize = 1;
+    const DISTANCES: [usize; 2] = [2, 3];
+    let layout = |sizes: &mut dyn Iterator<Item = u32>| {
+        sizes
+            .filter(|&size| size > 0)
+            .fold(0, |end: u32, size| end.next_multiple_of(size) + size)
+    };
+    let vertex = elements(b"OSG1")?;
+    let distances = vertex
+        .iter()
+        .filter(|(kind, _)| DISTANCES.contains(kind))
+        .map(|&(_, n)| n)
+        .sum::<u32>();
+    let vertex_bytes = layout(
+        &mut std::iter::repeat_n(4, distances as usize)
+            .chain([16])
+            .chain(vertex.iter().filter(|e| e.0 != POSITION).map(|e| 4 * e.1)),
+    );
+    let primitive_bytes = layout(&mut elements(b"PSG1")?.iter().map(|e| 4 * e.1));
+    let info = part(b"PSV0")?.get(4..)?;
+    let maximum = |at: usize| {
+        Some(u32::from(u16::from_le_bytes(
+            info.get(at..at + 2)?.try_into().ok()?,
+        )))
+    };
+    Some(maximum(12)? * vertex_bytes + maximum(14)? * primitive_bytes)
 }
 
 #[cfg(test)]

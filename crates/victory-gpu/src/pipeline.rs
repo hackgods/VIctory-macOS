@@ -9,11 +9,12 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
-//! packet after the header stays zero: titles only copy it inline, which
-//! our null command-list limits keep from running.
+//! shortcut: only vertex or mesh plus pixel pipelines from streams and
+//! compute pipelines get host pipelines; amplification, tessellation and
+//! geometry stages, and the plain graphics description, keep their
+//! containers only. The 32-byte packet after the header stays zero: titles
+//! only copy it inline, which our null command-list limits keep from
+//! running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::HashMap;
@@ -69,6 +70,10 @@ pub(crate) struct Shader {
     /// Released after translation unless an experimental mesh/pixel pair may need it.
     #[cfg(any(windows, test))]
     container: Mutex<Vec<u8>>,
+    /// Its full BLAKE3 once the container is on disk instead
+    /// (`VICTORY_SPILL_SHADERS`, [`spill`]).
+    #[cfg(windows)]
+    spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -85,22 +90,81 @@ static SHADERS: Mutex<Option<HashMap<[u8; 32], Arc<Shader>>>> = Mutex::new(None)
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
-    let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
-    shaders
-        .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| {
-            // The programs the ambient stand-in follows are known by name
-            // (`crate::ambient`; nothing while it is off).
-            #[cfg(windows)]
-            crate::ambient::note_program(&full.to_hex()[..16], bytes);
-            // So are the ray passes `VICTORY_RAY_SKIP` leaves out
-            // (`crate::ray_skip`; nothing while it is off).
-            #[cfg(windows)]
-            crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
-            Arc::new(Shader::with_hash(stage, bytes, full))
-        })
-        .clone()
+    let mut created = false;
+    let shader = {
+        let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        shaders
+            .get_or_insert_with(HashMap::new)
+            .entry(*full.as_bytes())
+            .or_insert_with(|| {
+                created = true;
+                // The programs the ambient stand-in follows are known by
+                // name (`crate::ambient`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ambient::note_program(&full.to_hex()[..16], bytes);
+                // So are the ray passes `VICTORY_RAY_SKIP` leaves out
+                // (`crate::ray_skip`; nothing while it is off).
+                #[cfg(windows)]
+                crate::ray_skip::note_program(stage, &full.to_hex()[..16], bytes);
+                Arc::new(Shader::with_hash(stage, bytes, full))
+            })
+            .clone()
+    };
+    // Written outside the lock every pipeline creation takes.
+    #[cfg(windows)]
+    if created {
+        spill(&shader, full.as_bytes());
+    }
+    #[cfg(not(windows))]
+    let _ = created;
+    shader
+}
+
+/// Folder for shader containers kept on disk until translated
+/// (`VICTORY_SPILL_SHADERS=1`): the title passes tens of thousands of
+/// distinct containers and draws with a few hundred, and holding them all
+/// was ~700 MB of an 8 GB Mac's memory (#135).
+#[cfg(windows)]
+static SPILL_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// The file a container with BLAKE3 `full` is kept in.
+#[cfg(windows)]
+fn spill_path(dir: &std::path::Path, full: &[u8; 32]) -> std::path::PathBuf {
+    let hex = blake3::Hash::from(*full).to_hex();
+    dir.join(&hex[..2]).join(format!("{hex}.bin"))
+}
+
+/// Moves `shader`'s container to disk if spilling is on: written under a
+/// temporary name and renamed, so a file found there is whole; one already
+/// there from an earlier run is kept.
+#[cfg(windows)]
+fn spill(shader: &Shader, full: &[u8; 32]) {
+    if let Some(dir) = SPILL_DIR.get() {
+        spill_to(dir, shader, full);
+    }
+}
+
+/// [`spill`] into `dir`.
+#[cfg(windows)]
+fn spill_to(dir: &std::path::Path, shader: &Shader, full: &[u8; 32]) {
+    let path = spill_path(dir, full);
+    let there = std::fs::File::open(&path).is_ok();
+    if !there {
+        let Some(shard) = path.parent() else { return };
+        let mut container = shader.container.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let ok = crate::make_dir(shard).is_ok()
+            && std::fs::write(&tmp, &*container).is_ok()
+            && std::fs::rename(&tmp, &path).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return;
+        }
+        *container = Vec::new();
+    } else {
+        *shader.container.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+    }
+    let _ = shader.spilled.set(*full);
 }
 
 impl Shader {
@@ -117,6 +181,8 @@ impl Shader {
             size: bytes.len(),
             #[cfg(any(windows, test))]
             container: Mutex::new(bytes.to_vec()),
+            #[cfg(windows)]
+            spilled: OnceLock::new(),
             #[cfg(windows)]
             translated: OnceLock::new(),
         }
@@ -147,6 +213,11 @@ impl Shader {
                 let (started, cpu) = (std::time::Instant::now(), thread_cpu());
                 let (done, cached) = {
                     let mut container = self.container.lock().unwrap_or_else(|e| e.into_inner());
+                    if container.is_empty()
+                        && let (Some(full), Some(dir)) = (self.spilled.get(), SPILL_DIR.get())
+                    {
+                        *container = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+                    }
                     let done = translate(&container);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
@@ -268,7 +339,17 @@ fn with_resources(
 #[cfg(windows)]
 fn link_mesh_outputs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_LINK_MESH_OUTPUTS") || merge_mesh_rows() != 0)
+    // On by default under Wine (D3DMetal): an over-limit mesh pipeline there
+    // is made, draws nothing and its submission never completes (#172).
+    // mac: and whenever the rows of a linked pair are merged
+    // (`merge_mesh_rows`), which is a way of linking.
+    *ON.get_or_init(|| {
+        merge_mesh_rows() != 0
+            || match std::env::var_os("VICTORY_LINK_MESH_OUTPUTS") {
+                Some(v) => crate::switch::value_is_on(Some(&v)),
+                None => crate::shader_cache::under_wine(),
+            }
+    })
 }
 
 /// macOS port, `VICTORY_MERGE_MESH_ROWS`: a linked mesh and pixel pair also
@@ -317,6 +398,20 @@ pub(crate) fn link_mesh_over() -> u32 {
     })
 }
 
+/// Whether a mesh pipeline whose outputs are still over Metal's 32 KiB after
+/// linking is refused rather than made. On by default under Wine: on
+/// D3DMetal (3.0 and 4.0 beta 3) such a pipeline hangs the queue for good,
+/// and the title's watchdog then ends the run (#172). Its draws are
+/// dropped instead. `VICTORY_MESH_OVER_LIMIT=1` makes it anyway.
+#[cfg(windows)]
+pub(crate) fn refuse_over_limit_mesh() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| match std::env::var_os("VICTORY_MESH_OVER_LIMIT") {
+        Some(v) => !crate::switch::value_is_on(Some(&v)),
+        None => crate::shader_cache::under_wine(),
+    })
+}
+
 #[cfg(windows)]
 struct LinkedPair {
     mesh: Arc<Shader>,
@@ -337,6 +432,7 @@ impl Shader {
             full_hash: self.full_hash,
             size: self.size,
             container: Mutex::new(Vec::new()),
+            spilled: OnceLock::new(),
             translated: cell,
         })
     }
@@ -942,6 +1038,13 @@ mod placed_uav_tests;
 /// early, in `dir` (a folder of the cache) across runs.
 #[cfg(windows)]
 pub fn use_pipeline_cache(dir: std::path::PathBuf) {
+    if std::env::var_os("VICTORY_SPILL_SHADERS").is_some_and(|v| v != "0") {
+        let spill = dir.with_file_name("shader-containers");
+        if crate::make_dir(&spill).is_ok() {
+            tracing::info!(dir = %spill.display(), "shader containers kept on disk until translated");
+            let _ = SPILL_DIR.set(spill);
+        }
+    }
     library::use_pipeline_cache(dir);
 }
 
@@ -1099,6 +1202,24 @@ mod tests {
             None
         });
         assert_eq!(*seen.borrow(), [("vertex", 0x1000, 7)]);
+    }
+
+    /// A spilled container leaves memory, is on disk whole, and one already
+    /// there is kept rather than written again.
+    #[cfg(windows)]
+    #[test]
+    fn spilled_containers_round_trip_through_their_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..5000u32).map(|i| (i * 31) as u8).collect();
+        let full = *blake3::hash(&bytes).as_bytes();
+        let s = Shader::new("pixel", &bytes);
+        spill_to(dir.path(), &s, &full);
+        assert!(s.container.lock().unwrap().is_empty(), "left memory");
+        assert_eq!(s.spilled.get(), Some(&full));
+        assert_eq!(crate::read_file(&spill_path(dir.path(), &full)).unwrap(), bytes);
+        let again = Shader::new("pixel", &bytes);
+        spill_to(dir.path(), &again, &full);
+        assert!(again.container.lock().unwrap().is_empty() && again.spilled.get() == Some(&full));
     }
 
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {

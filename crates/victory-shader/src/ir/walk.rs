@@ -191,7 +191,7 @@ pub(crate) fn walked(p: &Program, wanted: &[bool]) -> Option<(Program, Vec<Skip>
     if blocks.len() != n {
         return None;
     }
-    let mut q = rename(blocks, p.wave64, p.vgprs);
+    let mut q = rename(blocks, p.wave64);
     let mut tested = Vec::new();
     for &(b, ..) in &left {
         tested.push(q.blocks[b].insts.pop()?.read(Reg::S(EXEC))?);
@@ -246,7 +246,7 @@ fn exec_at_end(p: &Program, mut b: usize) -> Option<Value> {
 /// Names the values of `blocks` (linked, without phis) anew: the second
 /// half of [`build_bounded`], which this copies so that the build itself
 /// stays as it is (the test below holds the two together).
-fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
+fn rename(mut blocks: Vec<Block>, wave64: bool) -> Program {
     let order = reverse_postorder(&blocks);
     let (live_in, live_out) = liveness(&blocks, &order);
     let mut values = 0u32;
@@ -301,10 +301,9 @@ fn rename(mut blocks: Vec<Block>, wave64: bool, vgprs: u16) -> Program {
                 .collect();
         }
     }
-    remove_trivial_phis(&mut blocks, values);
+    remove_trivial_phis_steps(&mut blocks, values);
     Program {
         wave64,
-        vgprs,
         blocks,
         inputs,
     }
@@ -356,7 +355,7 @@ mod tests {
             for b in &mut blocks {
                 b.phis.clear();
             }
-            assert_eq!(rename(blocks, p.wave64, p.vgprs), p);
+            assert_eq!(rename(blocks, p.wave64), p);
         }
     }
 

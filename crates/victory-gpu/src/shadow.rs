@@ -108,6 +108,9 @@ pub(crate) struct Shadow {
     /// goes.
     base: u64,
     slice: Option<Slice>,
+    /// True when the title's virtual range `[start, start + len)` is
+    /// `mach_vm_remap`-aliased onto `buffer`'s physical pages (zero-copy).
+    aliased: bool,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -116,9 +119,10 @@ pub(crate) struct Shadow {
 pub(crate) struct Widened {
     pub(crate) buffer: ID3D12Resource,
     data: *mut u8,
-    start: u64,
-    len: u64,
-    w: u32,
+    pub(crate) start: u64,
+    pub(crate) len: u64,
+    pub(crate) w: u32,
+    source: Arc<Shadow>,
 }
 
 // SAFETY: the resource is free-threaded; `data` is a persistent mapping
@@ -130,12 +134,61 @@ unsafe impl Sync for Widened {}
 /// Widened views by source range and fourth-component bits.
 type WidenedViews = Vec<(u64, u64, u32, std::sync::Weak<Widened>)>;
 
+/// Widened views by title range, including views whose exact shadow differs
+/// from the parent shadow a raw UAV writes.
+static WIDENED_RANGES: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>> = Mutex::new(Vec::new());
+/// Whether any widened view has been made. Writes are retained from the start
+/// of a list, so the first view made after a write can still consume them.
+pub(crate) static WIDENED_ANY: AtomicBool = AtomicBool::new(false);
+
+fn live_widened() -> Vec<Arc<Widened>> {
+    let mut ranges = WIDENED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len().is_power_of_two() {
+        ranges.retain(|(_, _, view)| view.strong_count() > 0);
+    }
+    ranges.iter().filter_map(|(_, _, view)| view.upgrade()).collect()
+}
+
+/// Every live widened view, for lists tracking which ones caught up with writes.
+pub(crate) fn widened_all() -> Vec<Arc<Widened>> {
+    live_widened()
+}
+
+/// Live widened views overlapping a title-memory range, across shadows.
+pub(crate) fn widened_in(from: usize, to: usize) -> Vec<Arc<Widened>> {
+    if from >= to {
+        return Vec::new();
+    }
+    live_widened()
+        .into_iter()
+        .filter(|view| {
+            let end = view.start.saturating_add(view.len);
+            view.start < to as u64 && (from as u64) < end
+        })
+        .collect()
+}
+
 #[cfg(test)]
 type WidenedPause = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
 #[cfg(test)]
 static WIDENED_AFTER_REFRESH: Mutex<Vec<(u64, WidenedPause)>> = Mutex::new(Vec::new());
 
 impl Widened {
+    /// The normal shadow this cache was expanded from.
+    pub(crate) fn source(&self) -> Arc<Shadow> {
+        self.source.clone()
+    }
+
+    /// The whole elements of this view touched by `[from, to)`, as indices
+    /// into the widened buffer. Raw UAV writes can touch part of an element.
+    pub(crate) fn overlap(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        let start = self.start as usize;
+        let end = start.saturating_add(self.len as usize);
+        let from = from.max(start);
+        let to = to.min(end);
+        (from < to).then(|| ((from - start) / 12, (to - start).div_ceil(12)))
+    }
+
     fn refresh(&self, shadow: &Shadow, from: usize, to: usize) {
         let start = self.start as usize;
         let end = start + self.len as usize;
@@ -170,40 +223,34 @@ impl Widened {
 type Snapshot = (Vec<(usize, Vec<u8>)>, std::collections::HashSet<usize>);
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
-static POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static POOL: Mutex<crate::recent::Pool> = Mutex::new(crate::recent::Pool::new());
 
 /// An empty buffer with room for `n` bytes, from the pool if it has one.
 fn pooled(n: usize) -> Vec<u8> {
-    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    let fit = pool
-        .iter()
-        .enumerate()
-        .filter(|(_, v)| v.capacity() >= n)
-        .min_by_key(|(_, v)| v.capacity())
-        .map(|(i, _)| i);
-    let mut v = match fit {
-        Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
-    };
-    v.clear();
-    v
+    let taken = POOL.lock().unwrap_or_else(|e| e.into_inner()).take(n);
+    taken.unwrap_or_else(|| Vec::with_capacity(n))
 }
 
 /// Returns a snapshot buffer to the pool, which keeps the largest up to
 /// [`POOL_BYTES`] in all: a world submission snapshots several copies, and
 /// fresh buffers cost a page fault per 4 KiB touched (millions per frame).
+/// What no snapshot used for a while goes at the present ([`trim_pool`]).
 fn give_back(v: Vec<u8>) {
+    let now = std::time::Instant::now();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
-    pool.push(v);
-    pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    let mut total = 0;
-    pool.retain(|v| {
-        total += v.capacity();
-        total <= POOL_BYTES
-    });
+    pool.give(v, now, POOL_BYTES);
 }
 
-/// Snapshot memory kept for reuse.
+/// At each present: frees the largest pooled buffer no snapshot took lately
+/// (the peak of a heavy frame, which `pooled` never picks again once lighter
+/// frames fit smaller ones), outside the pool's lock.
+pub(crate) fn trim_pool() {
+    let now = std::time::Instant::now();
+    let freed = POOL.lock().unwrap_or_else(|e| e.into_inner()).trim(now);
+    drop(freed);
+}
+
+/// Snapshot memory kept for reuse at most.
 const POOL_BYTES: usize = 512 << 20;
 
 // SAFETY: D3D12 resources are free-threaded; `data` is a persistent mapping
@@ -309,13 +356,14 @@ impl Shadow {
             return Some(view);
         }
         let count = len / 12;
-        let (buffer, data) = host()?.upload_buffer(count * 16)?;
+        let (buffer, data) = host()?.shared_buffer(count * 16)?;
         let widened = Arc::new(Widened {
             buffer,
             data,
             start: address,
             len,
             w,
+            source: self.clone(),
         });
         widened.refresh(self, address as usize, (address + len) as usize);
         #[cfg(test)]
@@ -346,6 +394,12 @@ impl Shadow {
         }
         views.push((address, len, w, Arc::downgrade(&widened)));
         drop(views);
+        let mut ranges = WIDENED_RANGES.lock().unwrap_or_else(|e| e.into_inner());
+        if ranges.len().is_power_of_two() {
+            ranges.retain(|(_, _, view)| view.strong_count() > 0);
+        }
+        ranges.push((address, len, Arc::downgrade(&widened)));
+        WIDENED_ANY.store(true, Ordering::Release);
         self.has_widened.store(true, Ordering::Release);
         Some(widened)
     }
@@ -377,6 +431,14 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (page.max(start), (page + PAGE).min(end));
         if from >= to {
+            return 0;
+        }
+        if self.aliased {
+            if self.has_widened.load(Ordering::Acquire) {
+                let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                self.refresh_widened(from, to);
+            }
+            crate::watch::notify_written(from, to - from);
             return 0;
         }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
@@ -450,11 +512,50 @@ impl Shadow {
             has_widened: AtomicBool::new(false),
             base: slice.map_or(0, |s| s.offset),
             slice,
+            aliased: false,
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
         }
         shadow
+    }
+
+    /// A zero-copy shadow whose title range `[start, start + len)` shares
+    /// physical pages with `buffer` (`mach_vm_remap`).
+    pub(crate) fn new_aliased(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+    ) -> Arc<Shadow> {
+        let marks = marks().take(pages(start, len));
+        let shadow = Arc::new(Shadow {
+            buffer,
+            data,
+            gpu,
+            start,
+            len,
+            tracked: None,
+            pending: Mutex::default(),
+            before: Mutex::default(),
+            marks,
+            widened: Mutex::default(),
+            widened_source: Mutex::default(),
+            has_widened: AtomicBool::new(false),
+            base: 0,
+            slice: None,
+            aliased: true,
+        });
+        if let Some(base) = marks {
+            self::marks().owners.insert(base, Arc::downgrade(&shadow));
+        }
+        shadow
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_aliased(&self) -> bool {
+        self.aliased
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a
@@ -496,6 +597,7 @@ impl Shadow {
     pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+        list.mark_widened_write(self, address as usize, len as usize);
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -510,6 +612,9 @@ impl Shadow {
     /// a title write there before the copy-back keeps the page's bytes from
     /// before it ([`crate::watch::Tracked::arm`]).
     pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
+        if self.aliased {
+            return;
+        }
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -593,6 +698,18 @@ impl Shadow {
     }
 
     fn copy_back_or_not(&self, address: usize, len: usize, back: bool) -> usize {
+        if self.aliased {
+            let (from, to) = self.inside(address, len);
+            if from < to {
+                let start = self.start as usize;
+                if self.has_widened.load(Ordering::Acquire) {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(start + from, start + to);
+                }
+                crate::watch::notify_written(start + from, to - from);
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let (segments, compared) = &mut *snapshot;
@@ -685,17 +802,47 @@ impl Shadow {
     // the heap's views no list declared) keeps the title's bytes, losing
     // the shaders' there (counted).
     pub(crate) fn copy_back_marked(&self, pages: &[usize]) -> usize {
+        if self.aliased {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let mut run: Option<(usize, usize)> = None;
+            let flush = |from: usize, to: usize| {
+                if self.has_widened.load(Ordering::Acquire) {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(from, to);
+                }
+                crate::watch::notify_written(from, to - from);
+            };
+            for &page in pages {
+                let (from, to) = (page.max(start), (page + PAGE).min(end));
+                if from >= to {
+                    continue;
+                }
+                match run {
+                    Some((r_from, r_to)) if r_to == from => run = Some((r_from, to)),
+                    Some((r_from, r_to)) => {
+                        flush(r_from, r_to);
+                        run = Some((from, to));
+                    }
+                    None => run = Some((from, to)),
+                }
+            }
+            if let Some((from, to)) = run {
+                flush(from, to);
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let Some(t) = &self.tracked else {
             return 0;
         };
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        // What goes back (address, bytes), and the pages equal to title
+        // What goes back (address ranges), and the pages equal to title
         // memory once it has: written, then guarded, all at once (each
         // opening and guarding is a Wine call and a guard-lock round trip,
         // ~1,000 pages a frame in #50's world).
-        let mut writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
+        let mut title = Vec::new();
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -716,27 +863,24 @@ impl Shadow {
             let n = to - from;
             // SAFETY: inside the mapping; only the submitting thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-            let mut title = vec![0u8; n];
+            title.resize(n, 0);
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
             let differs = match &saved {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
-                None => {
-                    let differs = *host != title[..];
-                    if differs {
-                        title.copy_from_slice(host);
-                    }
-                    differs
-                }
+                None => *host != title[..],
                 Some(before) => {
                     let before = &before[from - page..to - page];
                     merge_writeback(&mut title, host, before)
                 }
             };
             if differs {
-                writes.push((from, title));
+                match writes.last_mut() {
+                    Some((_, end)) if *end == from => *end = to,
+                    _ => writes.push((from, to)),
+                }
             }
             if self.has_widened.load(Ordering::Acquire) {
                 self.refresh_widened(from, to);
@@ -747,22 +891,14 @@ impl Shadow {
             }
         }
         let mut written = 0;
-        {
-            // Consecutive writes share one opening.
-            let mut i = 0;
-            while i < writes.len() {
-                let mut j = i + 1;
-                while j < writes.len() && writes[j].0 == writes[j - 1].0 + writes[j - 1].1.len() {
-                    j += 1;
-                }
-                let (from, to) = (writes[i].0, writes[j - 1].0 + writes[j - 1].1.len());
-                let _writing = crate::watch::writing(from, to - from);
-                for (at, bytes) in &writes[i..j] {
-                    crate::host::write_mapped(*at as *mut u8, bytes.as_ptr(), bytes.len());
-                    written += bytes.len();
-                }
-                i = j;
-            }
+        for (from, to) in writes {
+            let len = to - from;
+            let _writing = crate::watch::writing(from, len);
+            // SAFETY: this run is inside the shadow. The GPU is done and
+            // widened_source keeps the merged bytes stable until the write.
+            let src = unsafe { self.data.add(from - start) };
+            crate::host::write_mapped(from as *mut u8, src, len);
+            written += len;
         }
         if !taken.is_empty() {
             t.taken(&taken);
@@ -773,6 +909,9 @@ impl Shadow {
     /// Whether the title wrote none of the copy's memory since the copy took
     /// it (tracked memory only): [`Shadow::update`] would copy nothing.
     pub(crate) fn clean(&self) -> bool {
+        if self.aliased {
+            return !self.has_widened.load(Ordering::Acquire);
+        }
         self.tracked.as_ref().is_some_and(crate::watch::Tracked::clean)
     }
 
@@ -786,6 +925,17 @@ impl Shadow {
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        if self.aliased {
+            if self.has_widened.load(Ordering::Acquire) {
+                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+                if from < to {
+                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                    self.refresh_widened(from, to);
+                }
+            }
+            return 0;
+        }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         if self.clean() {
             return 0;
@@ -809,9 +959,13 @@ impl Shadow {
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame). Under them all of it too
-            // (`update_untracked_busy`): what the title wrote there is not
-            // known.
+            // gaps whole cost ~1 s per frame). Under them, the title's bytes
+            // as well, as nothing says what it wrote since: a submission
+            // waits for the one before it, so none of this submission's
+            // shaders has run yet, and a constant the title wrote there
+            // would stay stale for the whole submission. The same bytes go
+            // into the snapshot `writing` took, so copy-back tells the
+            // shader's write from them.
             busy.sort_unstable();
             let (mut at, mut bytes) = (from, 0);
             for (a, e) in busy {
@@ -820,7 +974,9 @@ impl Shadow {
                     bytes += self.update_untracked(at, a);
                 }
                 if e > a.max(at) {
-                    bytes += self.update_untracked_busy(a.max(at), e);
+                    let (a, e) = (a.max(at), e);
+                    bytes += self.update_untracked(a, e);
+                    self.sync_snapshot(a, e);
                 }
                 at = at.max(e);
             }
@@ -867,15 +1023,8 @@ impl Shadow {
         let start = self.start as usize;
         let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
         let mut sync_before = |a: usize, b: usize| {
-            let Some(before) = &mut before else { return };
-            let (a, b) = (a - start, b - start);
-            for (at, bytes) in before.0.iter_mut() {
-                let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
-                if s < e {
-                    // SAFETY: inside the mapping.
-                    let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
-                    bytes[s - *at..e - *at].copy_from_slice(host);
-                }
+            if let Some(before) = &mut before {
+                self.sync_snapshot_in(before, a, b);
             }
         };
         let mut copied = 0;
@@ -916,6 +1065,26 @@ impl Shadow {
         copied
     }
 
+    /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
+    /// into the snapshot a submission that is writing took.
+    fn sync_snapshot(&self, a: usize, b: usize) {
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        self.sync_snapshot_in(&mut before, a, b);
+    }
+
+    fn sync_snapshot_in(&self, before: &mut Snapshot, a: usize, b: usize) {
+        let start = self.start as usize;
+        let (a, b) = (a - start, b - start);
+        for (at, bytes) in before.0.iter_mut() {
+            let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
+            if s < e {
+                // SAFETY: inside the mapping.
+                let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
+                bytes[s - *at..e - *at].copy_from_slice(host);
+            }
+        }
+    }
+
     /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer).
     fn update_untracked(&self, from: usize, to: usize) -> usize {
         #[cfg(feature = "diagnostics")]
@@ -928,32 +1097,6 @@ impl Shadow {
             add(C::WholeUs, started.elapsed().as_micros() as u64);
         }
         to - from
-    }
-
-    /// [`Shadow::update`] of untracked `[from, to)` (inside the buffer; any
-    /// memory under Rosetta without write tracking) where a list submitted
-    /// earlier declared that shaders write. A submission waits for the one
-    /// before it, so none of this submission's shaders has run yet: it is
-    /// copied whole, as [`Shadow::update_untracked`] copies it. Skipped, the
-    /// title's constants there stayed stale for the whole submission (a
-    /// dispatch read its sizes as zeros and looped until the device was
-    /// removed). The same bytes go into the snapshot `writing` took, so
-    /// copy-back neither takes them for the GPU's nor puts them back over a
-    /// later title write.
-    fn update_untracked_busy(&self, from: usize, to: usize) -> usize {
-        let start = self.start as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let copied = self.copy(from, to);
-        let (a, b) = (from - start, to - start);
-        for (at, bytes) in before.0.iter_mut() {
-            let (s, e) = ((*at).max(a), (*at + bytes.len()).min(b));
-            if s < e {
-                // SAFETY: inside the mapping.
-                let host = unsafe { std::slice::from_raw_parts(self.data.add(s), e - s) };
-                bytes[s - *at..e - *at].copy_from_slice(host);
-            }
-        }
-        copied
     }
 
     /// Whether the copy may be brought up to date while a submission still
@@ -1036,12 +1179,12 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if self.has_widened.load(Ordering::Acquire) {
+            self.refresh_widened(from, to);
+        }
         if let Some(t) = &self.tracked {
             // SAFETY: `to - from` bytes inside the mapping, just copied.
             t.refreshed(from, unsafe { std::slice::from_raw_parts(at, to - from) });
-        }
-        if self.has_widened.load(Ordering::Acquire) {
-            self.refresh_widened(from, to);
         }
         to - from
     }
@@ -1158,11 +1301,14 @@ unsafe impl Send for Bitmap {}
 // SAFETY: as above.
 unsafe impl Sync for Bitmap {}
 
+/// The two bitmaps of [`bitmap`], each made when first asked for.
+static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] =
+    [const { std::sync::OnceLock::new() }; 2];
+
 /// The bitmap of other shaders, or (`memory`) of shaders that use title
 /// memory, whose marks go back only while it is not withheld
 /// (`crate::memory::withholding`).
 fn bitmap(memory: bool) -> Option<&'static Bitmap> {
-    static BITMAPS: [std::sync::OnceLock<Option<Bitmap>>; 2] = [const { std::sync::OnceLock::new() }; 2];
     BITMAPS[usize::from(memory)]
         .get_or_init(|| {
             // Written pages, then one read mark per heap index, then the lock
@@ -1188,6 +1334,62 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
 /// title memory, see [`bitmap`]).
 pub(crate) fn view_writes(memory: bool) -> Option<u64> {
     bitmap(memory).map(|b| b.gpu)
+}
+
+/// Frees the lock words of emulated 64-bit atomics (`victory_shader::emit`,
+/// "Atomic locks") in the bitmaps made so far, after a submission the host
+/// GPU ended: a lane that held a lock when its shader was cut short never
+/// frees it, and every later atomic on that lock would wait out its bound
+/// and go on without it (#240). Returns how many were taken. No submission
+/// runs then, so no lane holds one.
+pub(crate) fn free_atomic_locks() -> usize {
+    let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+    BITMAPS
+        .iter()
+        .filter_map(|b| b.get()?.as_ref())
+        .map(|b| {
+            // SAFETY: the mapped buffer of `dwords` dwords; the GPU is done
+            // with it (one submission runs at a time, and none runs now).
+            let words = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, dwords) };
+            free_locks(words)
+        })
+        .sum()
+}
+
+/// Clears the lock words in `words`, a bitmap buffer's dwords, leaving the
+/// written pages and read marks before them and the give-up count after
+/// them. Returns how many were taken.
+fn free_locks(words: &mut [u32]) -> usize {
+    let first = (victory_shader::emit::ATOMIC_LOCKS_AT / 4) as usize;
+    let locks = &mut words[first..first + victory_shader::emit::ATOMIC_LOCKS as usize];
+    let taken = locks.iter().filter(|&&w| w != 0).count();
+    locks.fill(0);
+    taken
+}
+
+/// After a submission: how many lanes gave up waiting for a 64-bit
+/// atomic's lock since the last call and went on without it, so that their
+/// updates may be lost (`victory_shader::emit`, "Atomic locks"; #240). The
+/// counts are cleared.
+pub(crate) fn take_gave_up() -> u64 {
+    let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+    BITMAPS
+        .iter()
+        .filter_map(|b| b.get()?.as_ref())
+        .map(|b| {
+            // SAFETY: the mapped buffer of `dwords` dwords; the GPU is done
+            // with it (one submission runs at a time, and none runs now).
+            let words = unsafe { std::slice::from_raw_parts_mut(b.data as *mut u32, dwords) };
+            take_count(words)
+        })
+        .sum()
+}
+
+/// Takes the give-up count from `words`, a bitmap buffer's dwords.
+fn take_count(words: &mut [u32]) -> u64 {
+    u64::from(std::mem::take(
+        &mut words[(victory_shader::emit::ATOMIC_LOCKS_GAVE_UP_AT / 4) as usize],
+    ))
 }
 
 /// Heap slots whose texture views shaders read: the marks seen so far (a
@@ -1274,6 +1476,53 @@ pub(crate) fn forget_read(slot: u32) {
 // shortcut: marks do not tell lists apart: a page that a withheld list and
 // another both wrote through views goes back unless the withheld list
 // declared it.
+pub(crate) const PARALLEL_REFRESH_MIN_BYTES: usize = 512 << 10;
+pub(crate) const PARALLEL_COPY_BACK_MIN_BYTES: usize = 64 << 10;
+
+fn parallel_copies_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+pub(crate) fn parallel_copies_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parallel_copies_enabled_value(std::env::var_os("VICTORY_PARALLEL_COPIES").as_deref()))
+}
+
+/// Whether `(start, len)` ranges are pairwise disjoint.
+#[cfg(test)]
+pub(crate) fn ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
+    spans_disjoint(
+        ranges
+            .iter()
+            .map(|&(start, len)| (start, start.saturating_add(len)))
+            .collect(),
+    )
+}
+
+fn spans_disjoint(mut spans: Vec<(u64, u64)>) -> bool {
+    spans.sort_unstable();
+    spans.windows(2).all(|w| w[0].1 <= w[1].0)
+}
+
+/// Copy-back workers must own different watch pages. Distinct virtual pages
+/// may still share backing memory, so ranges with a reported alias stay serial.
+pub(crate) fn copy_back_ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
+    let page = PAGE as u64;
+    let spans = ranges
+        .iter()
+        .filter(|&&(_, len)| len != 0)
+        .map(|&(start, len)| (start / page, start.saturating_add(len).div_ceil(page)));
+    spans_disjoint(spans.collect())
+        && !ranges.iter().any(|&(start, len)| {
+            len != 0 && crate::watch::aliased(start as usize, len as usize)
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    static MARKED_COPY_BACK_PARALLEL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
@@ -1337,9 +1586,39 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             None => by_copy.push((copy, vec![page])),
         }
     }
-    for (copy, mut list) in by_copy {
+    for (_, list) in &mut by_copy {
         list.sort_unstable();
         list.dedup();
+    }
+    let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
+    let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
+    let parallel = parallel_copies_enabled()
+        && by_copy.len() >= 2
+        && total_bytes >= PARALLEL_COPY_BACK_MIN_BYTES
+        && copy_back_ranges_disjoint(&shadow_ranges);
+    #[cfg(test)]
+    MARKED_COPY_BACK_PARALLEL.with(|taken| taken.set(Some(parallel)));
+    if parallel {
+        let total_pages: usize = by_copy.iter().map(|(_, list)| list.len()).sum();
+        let total_written = std::sync::atomic::AtomicUsize::new(0);
+        crate::texture::in_parallel(by_copy.len(), |i| {
+            let (copy, list) = &by_copy[i];
+            let written = copy.copy_back_marked(list);
+            total_written.fetch_add(written, Ordering::Relaxed);
+        });
+        #[cfg(feature = "diagnostics")]
+        {
+            crate::copystat::add(crate::copystat::C::MarkedPages, total_pages as u64);
+            crate::copystat::add(
+                crate::copystat::C::MarkedBytes,
+                total_written.into_inner() as u64,
+            );
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (total_pages, total_written);
+        return;
+    }
+    for (copy, list) in by_copy {
         let written = copy.copy_back_marked(&list);
         #[cfg(feature = "diagnostics")]
         {
@@ -1377,8 +1656,17 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(std::sync::atomic::Ordering::Acquire)
 }
 
+/// Epoch for [`find`]'s per-thread lookup cache; bumped on every change to
+/// `BUFFERS`, `ALIASED`, or `LOOSE` (while holding that table's write lock).
+static LOOKUP_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn lookup_changed() {
+    LOOKUP_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 fn changed() {
     GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    lookup_changed();
 }
 
 /// The longest title buffer registered so far (it stays after the buffer is
@@ -1397,12 +1685,18 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    lookup_changed();
 }
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    if buffers().remove(&(start, resource)).is_some_and(|e| e.shadow.is_some()) {
-        changed();
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        if entry.shadow.is_some() {
+            changed();
+        } else {
+            lookup_changed();
+        }
     }
 }
 
@@ -1427,10 +1721,263 @@ fn enclosing(map: &BTreeMap<(u64, usize), Entry>, span: u64, address: u64, end: 
         .map(|(k, _)| *k)
 }
 
+/// Zero-copy title regions aliased onto host buffers (`crate::alias`), by start address.
+static ALIASED: RwLock<BTreeMap<u64, Arc<Shadow>>> = RwLock::new(BTreeMap::new());
+static ALIASED_SPAN: AtomicU64 = AtomicU64::new(0);
+static ALIASED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn has_aliased_overlap(start: u64, end: u64) -> bool {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let lowest = start.saturating_sub(span);
+    if map
+        .range(lowest..=start)
+        .rev()
+        .any(|(&s, sh)| s + sh.len > start)
+    {
+        return true;
+    }
+    map.range(start..end).next().is_some()
+}
+
+pub(crate) fn register_aliased(shadow: Arc<Shadow>) {
+    ALIASED_SPAN.fetch_max(shadow.len, Ordering::Relaxed);
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    if map.insert(shadow.start, shadow).is_none() {
+        ALIASED_COUNT.fetch_add(1, Ordering::Release);
+    }
+    changed();
+}
+
+pub(crate) fn unregister_aliased(start: u64) -> bool {
+    let mut map = ALIASED.write().unwrap_or_else(|e| e.into_inner());
+    let removed = map.remove(&start).is_some();
+    if removed {
+        ALIASED_COUNT.fetch_sub(1, Ordering::Release);
+        changed();
+    }
+    removed
+}
+
+fn find_aliased(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if ALIASED_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let map = ALIASED.read().unwrap_or_else(|e| e.into_inner());
+    if map.is_empty() {
+        return None;
+    }
+    let span = ALIASED_SPAN.load(Ordering::Relaxed);
+    let lowest = end.saturating_sub(span);
+    if lowest > address {
+        return None;
+    }
+    map.range(lowest..=address)
+        .rev()
+        .find(|(_, s)| s.start + s.len >= end)
+        .map(|(_, s)| s.clone())
+}
+
+/// Number of sets in the per-thread 2-way lookup cache (power of two).
+const LOOKUP_SETS: usize = 2048;
+
+#[derive(Default)]
+struct LookupSlot {
+    address: u64,
+    end: u64,
+    shadow: std::sync::Weak<Shadow>,
+}
+
+struct LookupCache {
+    epoch: u64,
+    dirty: bool,
+    slots: Box<[[LookupSlot; 2]]>,
+}
+
+impl LookupCache {
+    fn new(epoch: u64) -> Self {
+        let slots = std::iter::repeat_with(|| [LookupSlot::default(), LookupSlot::default()])
+            .take(LOOKUP_SETS)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            epoch,
+            dirty: false,
+            slots,
+        }
+    }
+
+    fn clear_if_stale(&mut self, epoch: u64) {
+        if self.epoch != epoch {
+            if self.dirty {
+                for pair in &mut self.slots {
+                    *pair = [LookupSlot::default(), LookupSlot::default()];
+                }
+                self.dirty = false;
+            }
+            self.epoch = epoch;
+        }
+    }
+
+    fn get(&mut self, epoch: u64, address: u64, end: u64) -> Option<Arc<Shadow>> {
+        if self.epoch != epoch {
+            self.clear_if_stale(epoch);
+            return None;
+        }
+        let pair = &mut self.slots[lookup_set(address, end)];
+        for way in 0..2 {
+            if pair[way].address == address && pair[way].end == end {
+                if let Some(shadow) = pair[way].shadow.upgrade() {
+                    if way == 1 {
+                        pair.swap(0, 1);
+                    }
+                    return Some(shadow);
+                }
+                pair[way] = LookupSlot::default();
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, epoch: u64, address: u64, end: u64, shadow: &Arc<Shadow>) {
+        self.clear_if_stale(epoch);
+        let pair = &mut self.slots[lookup_set(address, end)];
+        let entry = LookupSlot {
+            address,
+            end,
+            shadow: Arc::downgrade(shadow),
+        };
+        if pair[0].address == address && pair[0].end == end {
+            pair[0] = entry;
+        } else {
+            pair[1] = std::mem::replace(&mut pair[0], entry);
+        }
+        self.dirty = true;
+    }
+}
+
+fn lookup_set(address: u64, end: u64) -> usize {
+    let mut h = address ^ end.rotate_left(29);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^= h >> 31;
+    (h as usize) & (LOOKUP_SETS - 1)
+}
+
+fn lookup_cache_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
+fn lookup_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| lookup_cache_enabled_value(std::env::var_os("VICTORY_LOOKUP_CACHE").as_deref()))
+}
+
+std::thread_local! {
+    static LOOKUP_CACHE: std::cell::RefCell<Option<LookupCache>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Hits and misses of [`find`]'s per-thread lookup cache (diagnostics).
+#[cfg(feature = "diagnostics")]
+static LOOKUP_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Logs [`LOOKUP_STATS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_lookups(frames: f64) {
+    let hits = LOOKUP_STATS[0].swap(0, Ordering::Relaxed);
+    let misses = LOOKUP_STATS[1].swap(0, Ordering::Relaxed);
+    let total = hits + misses;
+    if total > 0 {
+        tracing::info!(
+            "shadow lookup cache: {:.0} hits/frame, {:.0} misses/frame ({:.1}% hit)",
+            hits as f64 / frames,
+            misses as f64 / frames,
+            hits as f64 * 100.0 / total as f64
+        );
+    }
+}
+
+/// Logs the host buffers the copies of title memory hold, once per report:
+/// one per title buffer and one per window of loose memory, and the
+/// zero-copy aliases, whose host buffers are the title's own memory
+/// (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_held() {
+    // SAFETY: live buffers.
+    let size = |s: &Arc<Shadow>| unsafe { s.buffer.GetDesc() }.Width;
+    let held = |sizes: Vec<u64>| (sizes.len(), sizes.iter().sum::<u64>() as f64 / 1e6);
+    let buffers = held(
+        buffers_read()
+            .values()
+            .filter_map(|e| e.shadow.as_ref().map(size))
+            .collect(),
+    );
+    let loose = held(
+        LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(size)
+            .collect(),
+    );
+    let aliased = held(
+        ALIASED
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .map(size)
+            .collect(),
+    );
+    tracing::info!(
+        "host buffer copies held: {:.0} MB in all: title buffers {} ({:.0} MB), loose windows {} ({:.0} MB); \
+         aliased regions {} ({:.0} MB, the title's own memory, not extra)",
+        buffers.1 + loose.1,
+        buffers.0,
+        buffers.1,
+        loose.0,
+        loose.1,
+        aliased.0,
+        aliased.1,
+    );
+}
+
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     let end = address.checked_add(len.max(1))?;
+    if !lookup_cache_enabled() {
+        return find_uncached(address, end);
+    }
+    let epoch = LOOKUP_EPOCH.load(Ordering::Acquire);
+    let hit = LOOKUP_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.as_mut().and_then(|cache| cache.get(epoch, address, end))
+    });
+    if let Some(shadow) = hit {
+        #[cfg(feature = "diagnostics")]
+        LOOKUP_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return Some(shadow);
+    }
+    #[cfg(feature = "diagnostics")]
+    LOOKUP_STATS[1].fetch_add(1, Ordering::Relaxed);
+    let shadow = find_uncached(address, end)?;
+    LOOKUP_CACHE.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let cache = guard.get_or_insert_with(|| LookupCache::new(epoch));
+        cache.insert(epoch, address, end, &shadow);
+    });
+    Some(shadow)
+}
+
+fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if let Some(shadow) = find_aliased(address, end) {
+        return Some(shadow);
+    }
     {
         let map = buffers_read();
         let Some(key) = enclosing(&map, MAX_SPAN.load(Ordering::Relaxed), address, end) else {
@@ -1728,10 +2275,15 @@ impl Arena {
     }
 }
 
-/// Every host copy of title memory made so far (buffers and windows).
+/// Every host copy of title memory made so far (buffers, aliases, and windows).
 pub(crate) fn all() -> Vec<Arc<Shadow>> {
-    let mut all: Vec<Arc<Shadow>> =
-        buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
+    let mut all: Vec<Arc<Shadow>> = ALIASED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+        .cloned()
+        .collect();
+    all.extend(buffers_read().values().filter_map(|e| e.shadow.clone()));
     all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all
 }
@@ -1739,10 +2291,17 @@ pub(crate) fn all() -> Vec<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers_read()
+    let mut all: Vec<(u64, u64, u64)> = ALIASED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .values()
-        .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
+        .map(|s| (s.gpu, s.start, s.len))
         .collect();
+    all.extend(
+        buffers_read()
+            .values()
+            .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len))),
+    );
     all.extend(
         LOOSE
             .lock()
@@ -1769,6 +2328,9 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
+mod parallel_copy_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1780,6 +2342,34 @@ pub(crate) mod tests {
         // SAFETY: a bit of the mapped bitmap; no submission runs (the caller
         // holds the submission lock).
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
+    }
+
+    /// After a submission the host GPU ended, every lock word of the
+    /// emulated 64-bit atomics is free again, and the written pages and read
+    /// marks before them and the give-up count after them stay as they were
+    /// (#240). The count is taken once.
+    #[test]
+    fn freeing_atomic_locks_keeps_pages_and_read_marks() {
+        let dwords = (victory_shader::emit::VIEW_WRITES_BYTES / 4) as usize;
+        let first = (victory_shader::emit::ATOMIC_LOCKS_AT / 4) as usize;
+        let end = first + victory_shader::emit::ATOMIC_LOCKS as usize;
+        let mut words = vec![0xA5A5_A5A5u32; dwords];
+        assert_eq!(
+            free_locks(&mut words),
+            victory_shader::emit::ATOMIC_LOCKS as usize,
+            "every lock word counted as taken"
+        );
+        assert!(
+            words[..first].iter().all(|&w| w == 0xA5A5_A5A5),
+            "pages and read marks kept"
+        );
+        assert!(words[first..end].iter().all(|&w| w == 0), "every lock free");
+        assert_eq!(words[end..], [0xA5A5_A5A5], "the give-up count kept");
+        words[first + 7] = 1;
+        assert_eq!(free_locks(&mut words), 1, "one lock left taken");
+        assert_eq!(free_locks(&mut words), 0, "none the second time");
+        assert_eq!(take_count(&mut words), 0xA5A5_A5A5, "the give-up count");
+        assert_eq!(take_count(&mut words), 0, "taken once");
     }
 
     /// The title writes a constant under a range an earlier list of the
@@ -2234,6 +2824,158 @@ pub(crate) mod tests {
         crate::watch::tests::free(p);
     }
 
+    /// A write through a distinct exact shadow patches the touched bytes of
+    /// a widened element even when that shadow does not hold all 12 bytes.
+    #[test]
+    fn widened_views_patch_partial_elements_from_another_shadow() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(48).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 48);
+        // SAFETY: the parent shadow's 48 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 48) };
+
+        let (writer_buffer, writer_data) = host.shared_buffer(16).unwrap();
+        // SAFETY: a live buffer.
+        let writer_gpu = unsafe { writer_buffer.GetGPUVirtualAddress() };
+        let writer = Shadow::new(writer_buffer, writer_data, writer_gpu, start + 9, 15);
+        let changed: [u8; 15] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+        // SAFETY: the exact shadow's bytes, standing in for an unaligned UAV write.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), writer_data, 15) };
+        let (overlap_buffer, overlap_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let overlap_gpu = unsafe { overlap_buffer.GetGPUVirtualAddress() };
+        let overlap = Shadow::new(overlap_buffer, overlap_data, overlap_gpu, start + 10, 10);
+        let overlaid: [u8; 10] = [101, 102, 103, 104, 105, 106, 107, 108, 109, 110];
+        // SAFETY: the second exact shadow's bytes.
+        unsafe { std::ptr::copy_nonoverlapping(overlaid.as_ptr(), overlap_data, 10) };
+
+        let widened = parent.widened(start, 48, 1).expect("a widened view");
+        let list = host.new_list().unwrap();
+        let writes = [
+            (writer, start as usize + 9, 15),
+            (overlap, start as usize + 10, 10),
+        ];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            widened.read_host(8),
+            [0, 0, 0x6665_0100, 1, 0x6a69_6867, 0x6e6d_6c6b, 0x0f0e_0d0c, 1]
+        );
+
+    }
+
+    /// Partial patches through different exact shadows compose across
+    /// barriers instead of resetting earlier widened-only bytes.
+    #[test]
+    fn widened_views_compose_patches_across_barriers() {
+        use windows::core::Interface;
+
+        if host().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 12);
+        // SAFETY: the parent shadow's 12 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 12) };
+        let widened = parent.widened(start, 12, 1).expect("a widened view");
+
+        let (first_buffer, first_data) = host.shared_buffer(8).unwrap();
+        // SAFETY: a live buffer.
+        let first_gpu = unsafe { first_buffer.GetGPUVirtualAddress() };
+        let first = Shadow::new(first_buffer, first_data, first_gpu, start + 2, 4);
+        let first_bytes = [1u8, 2, 3, 4];
+        // SAFETY: the first exact shadow's four bytes.
+        unsafe { std::ptr::copy_nonoverlapping(first_bytes.as_ptr(), first_data, 4) };
+        let list = host.new_list().unwrap();
+        let writes = [(first.clone(), start as usize + 2, 4)];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(widened.read_host(4), [0x0201_0000, 0x0000_0403, 0, 1]);
+
+        let (second_buffer, second_data) = host.shared_buffer(8).unwrap();
+        // SAFETY: a live buffer.
+        let second_gpu = unsafe { second_buffer.GetGPUVirtualAddress() };
+        let second = Shadow::new(second_buffer, second_data, second_gpu, start + 6, 4);
+        let second_bytes = [5u8, 6, 7, 8];
+        // SAFETY: the second exact shadow's four bytes.
+        unsafe { std::ptr::copy_nonoverlapping(second_bytes.as_ptr(), second_data, 4) };
+        let list = host.new_list().unwrap();
+        let writes = [
+            (first, start as usize + 2, 4),
+            (second, start as usize + 6, 4),
+        ];
+        let ready = std::collections::HashSet::from([widened.buffer.as_raw() as usize]);
+        assert!(crate::widened::sync(&list, &writes, 1, &ready).is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(widened.read_host(4), [0x0201_0000, 0x0605_0403, 0x0000_0807, 1]);
+    }
+
+    /// An element-aligned shadow that starts after the widened view cannot
+    /// back the direct source root SRV; it must use the composed patch path.
+    #[test]
+    fn widened_views_patch_an_aligned_later_shadow() {
+        if host().is_none() {
+            return;
+        }
+        let host = host().unwrap();
+        let start = 0x1000u64;
+        let (parent_buffer, parent_data) = host.shared_buffer(24).unwrap();
+        // SAFETY: a live buffer.
+        let parent_gpu = unsafe { parent_buffer.GetGPUVirtualAddress() };
+        let parent = Shadow::new(parent_buffer, parent_data, parent_gpu, start, 24);
+        // SAFETY: the parent shadow's 24 bytes.
+        unsafe { std::ptr::write_bytes(parent_data, 0, 24) };
+        let widened = parent.widened(start, 24, 1).expect("a widened view");
+
+        let (later_buffer, later_data) = host.shared_buffer(12).unwrap();
+        // SAFETY: a live buffer.
+        let later_gpu = unsafe { later_buffer.GetGPUVirtualAddress() };
+        let later = Shadow::new(later_buffer, later_data, later_gpu, start + 12, 12);
+        let changed: [u8; 12] = [21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32];
+        // SAFETY: the later shadow's one element.
+        unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), later_data, 12) };
+        let list = host.new_list().unwrap();
+        let writes = [(later, start as usize + 12, 12)];
+        assert!(crate::widened::sync(
+            &list,
+            &writes,
+            0,
+            &std::collections::HashSet::new(),
+        )
+        .is_some());
+        list.close();
+        host.execute(&[&list]);
+        assert_eq!(
+            widened.read_host(8),
+            [0, 0, 0, 1, 0x1817_1615, 0x1c1b_1a19, 0x201f_1e1d, 1]
+        );
+    }
+
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
     /// a marked page after the copy took it (the guard saves its bytes from
@@ -2286,6 +3028,43 @@ pub(crate) mod tests {
         drop(quiet);
         assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
         unregister(p, p as u64);
+    }
+
+    #[test]
+    fn marked_writeback_copies_adjacent_pages_and_keeps_gaps_and_edges() {
+        let Some(host) = host() else {
+            return;
+        };
+        let base = crate::watch::tests::pool(4);
+        let start = base + 32;
+        let end = base + 4 * PAGE - 32;
+        let len = end - start;
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        // SAFETY: a live D3D12 buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, start as u64, len as u64);
+        assert!(copy.marked(), "the title allocation is tracked");
+        // SAFETY: a private allocation of four pages, untouched by the GPU.
+        unsafe { (base as *mut u8).write_bytes(0x11, 4 * PAGE) };
+        copy.update(start, len);
+        let changed = [(start, 0xaa), (base + PAGE, 0xbb), (end - 1, 0xcc)];
+        for (at, byte) in changed {
+            copy.write_host(at as u64, &[byte]);
+        }
+
+        let pages = [base, base + PAGE, base + 2 * PAGE, base + 3 * PAGE];
+        assert_eq!(copy.copy_back_marked(&pages), len - PAGE);
+        // SAFETY: all sampled addresses lie inside our allocation.
+        let read = |at: usize| unsafe { (at as *const u8).read_volatile() };
+        for (at, byte) in changed {
+            assert_eq!(read(at), byte);
+        }
+        for at in [start - 1, base + 2 * PAGE, end] {
+            assert_eq!(read(at), 0x11);
+        }
+        assert_eq!(copy.copy_back_marked(&pages), 0);
+        drop(copy);
+        crate::watch::tests::free(base);
     }
 
     /// While a submission runs on the host GPU, a copy a submitted list's
@@ -2614,7 +3393,11 @@ pub(crate) mod tests {
         assert_eq!(back, 0x33, "back in title memory");
         first.update(b + w - 64, 64);
         assert_eq!(byte(&first, w - 40), 0x33, "and in the first copy");
-        LOOSE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&(s, _), _| s != b as u64);
+        {
+            let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            loose.retain(|&(s, _), _| s != b as u64);
+            lookup_changed();
+        }
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
@@ -2635,5 +3418,147 @@ pub(crate) mod tests {
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
         // Too close to the top to round up to a window.
         assert!(loose(u64::MAX - 8, u64::MAX).is_none());
+    }
+
+    #[test]
+    fn lookup_cache_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(lookup_cache_enabled_value(None));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new("1"))));
+        assert!(lookup_cache_enabled_value(Some(OsStr::new(""))));
+        assert!(!lookup_cache_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn lookup_cache_hits_and_invalidates_on_register_and_unregister() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        let len = 0x20000usize;
+        // SAFETY: fresh committed range, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let outer_id = 0x7001usize;
+        let inner_id = 0x7002usize;
+        register(outer_id, base, len as u64);
+        let Some(outer) = find(base + 0x1000, 256) else {
+            unregister(outer_id, base);
+            // SAFETY: our allocation.
+            unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        let outer_hit = find(base + 0x1000, 256).expect("outer cache hit");
+        assert!(Arc::ptr_eq(&outer, &outer_hit));
+
+        // Registering an overlapping inner buffer without a shadow must invalidate
+        // the cached outer hit on this thread.
+        register(inner_id, base + 0x1000, 0x10000);
+        let inner = find(base + 0x1000, 256).expect("inner shadow");
+        assert!(!Arc::ptr_eq(&outer, &inner));
+
+        // Unregistering the inner buffer restores the outer shadow.
+        unregister(inner_id, base + 0x1000);
+        let restored = find(base + 0x1000, 256).expect("restored outer shadow");
+        assert!(Arc::ptr_eq(&outer, &restored));
+
+        unregister(outer_id, base);
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn lookup_cache_invalidates_on_aliased_register_and_unregister() {
+        let Some(h) = host() else { return };
+        let Some((buffer, data)) = h.shared_buffer(0x10000) else { return };
+        // SAFETY: live host buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let base = 0x7000_1000_0000u64;
+        let outer_id = 0x7003usize;
+        register(outer_id, base, 0x10000);
+        let outer = find(base + 0x100, 64).expect("outer shadow");
+        assert!(!outer.is_aliased());
+
+        let aliased = Shadow::new_aliased(buffer, data, gpu, base, 0x10000);
+        register_aliased(aliased.clone());
+        let hit = find(base + 0x100, 64).expect("aliased shadow");
+        assert!(hit.is_aliased());
+        assert!(Arc::ptr_eq(&aliased, &hit));
+
+        assert!(unregister_aliased(base));
+        let restored = find(base + 0x100, 64).expect("restored outer shadow");
+        assert!(!restored.is_aliased());
+        assert!(Arc::ptr_eq(&outer, &restored));
+
+        unregister(outer_id, base);
+    }
+
+    #[test]
+    fn lookup_cache_does_not_keep_released_shadow_alive() {
+        let base = 0x7000_2000_0000u64;
+        let id = 0x7004usize;
+        register(id, base, 0x10000);
+        let Some(shadow) = find(base + 64, 64) else {
+            unregister(id, base);
+            return;
+        };
+        let weak = Arc::downgrade(&shadow);
+        drop(shadow);
+        unregister(id, base);
+        assert_eq!(weak.strong_count(), 0, "TLS cache must not keep released shadow alive");
+    }
+
+    #[test]
+    fn lookup_cache_concurrent_register_stays_coherent() {
+        let base = 0x7000_3000_0000u64;
+        let outer_id = 0x7005usize;
+        let inner_id = 0x7006usize;
+        register(outer_id, base, 0x20000);
+        let Some(outer) = find(base + 0x1000, 64) else {
+            unregister(outer_id, base);
+            return;
+        };
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let _ = find(base + 0x1000, 64);
+                    }
+                    find(base + 0x1000, 64)
+                })
+            })
+            .collect();
+
+        for _ in 0..50 {
+            register(inner_id, base + 0x1000, 0x10000);
+            let _ = find(base + 0x1000, 64);
+            unregister(inner_id, base + 0x1000);
+        }
+        // Leave inner registered as the final state and verify every reader converges to it.
+        register(inner_id, base + 0x1000, 0x10000);
+        let expected = find(base + 0x1000, 64).expect("final inner shadow");
+        assert!(!Arc::ptr_eq(&outer, &expected));
+        done.store(true, Ordering::Release);
+
+        for r in readers {
+            let seen = r.join().expect("reader thread").expect("final shadow");
+            assert!(Arc::ptr_eq(&expected, &seen), "reader must not hold stale TLS entry");
+        }
+        unregister(inner_id, base + 0x1000);
+        unregister(outer_id, base);
+    }
+
+    #[test]
+    fn parallel_copies_switch_defaults_on_and_disables_with_zero() {
+        use std::ffi::OsStr;
+        assert!(parallel_copies_enabled_value(None));
+        assert!(parallel_copies_enabled_value(Some(OsStr::new("1"))));
+        assert!(!parallel_copies_enabled_value(Some(OsStr::new("0"))));
+    }
+
+    #[test]
+    fn ranges_disjoint_detects_overlap_and_allows_adjacent() {
+        assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
+        assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
+        assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
     }
 }

@@ -222,6 +222,8 @@ fn translated(
             mesh_stride: 0,
             view_marks: false,
             atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             halves_local: HalvesLocal { reads, lds: false },
@@ -257,9 +259,10 @@ fn walking() -> Mac {
     }
 }
 
-/// With the exchange alone a count behind an early-out, inside an `if` or
-/// under a group's branch is refused as before the walk existed (and with
-/// half-local reads translated as before). With the walk the program
+/// With the exchange alone a count behind an early-out or inside an `if`
+/// is refused as before the walk existed, and one under a group's branch
+/// alone is the Mac port's hand-over's since that was merged (and with
+/// half-local reads all are translated as before). With the walk the program
 /// translates in waves of 32 with the count handed over, the same
 /// translation with half-local reads or without: nothing in it is a half's
 /// own answer.
@@ -271,14 +274,23 @@ fn a_count_where_only_some_lanes_ran_is_handed_over() {
         ("group branch", under_a_group_branch()),
         ("if and group branch", in_an_if_under_a_group_branch()),
     ] {
-        let off = halves(&words, false, exchange())
-            .err()
-            .unwrap_or_else(|| panic!("{what}: translated without the walk"))
-            .to_string();
-        assert!(off.contains(REFUSAL), "{what}: {off}");
+        // Without the walk: refused, except under a group's branch alone,
+        // where every lane of the group runs together and the Mac port's
+        // hand-over answers since it was merged (its #376; refused before).
+        match halves(&words, false, exchange()) {
+            Err(off) => {
+                assert_ne!(what, "group branch", "{off}");
+                assert!(off.to_string().contains(REFUSAL), "{what}: {off}");
+            }
+            Ok(off) => {
+                assert_eq!(what, "group branch");
+                assert!(off.port_exchange && off.exchanges == 0, "{what}");
+            }
+        }
         let on = halves(&words, false, walking());
         let on = on.unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_eq!((on.wave_size, on.exchanges), (Some(32), 1), "{what}");
+        assert!(!on.port_exchange, "{what}: this line's exchange, not the Mac port's");
         let with_local = halves(&words, true, walking()).expect("handed over");
         assert_eq!(with_local.dxil, on.dxil, "{what}");
         let local = halves(&words, true, exchange()).expect("half-local");
@@ -825,6 +837,7 @@ mod gpu {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            root_srv_bytes: l.root_srv_bytes,
             memory: l.memory,
             memory_writes: l.memory_writes,
             view_addresses: l.view_addresses,

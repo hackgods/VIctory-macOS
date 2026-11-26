@@ -235,6 +235,23 @@ pub(crate) fn sync_heaps_ahead(ran: &dyn Fn() -> bool) {
     sync(Some(ran));
 }
 
+/// `VICTORY_HEAP_FAST_SKIP=1`: heap syncs look at a written page the way
+/// VIctory-macOS #279 does ([`host::HostHeap::sync_slots_bytes`]). Off
+/// unless asked for: this line's syncs have changed since (rounds ahead,
+/// told slots, slot locks), nothing here has run it in the game, and a
+/// tester of the Mac port reported loading screens that froze with it.
+#[cfg(windows)]
+fn fast_skip() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_FAST_SKIP"))
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// A heap page's bytes, for [`fast_skip`]'s look.
+    static PAGE_BUF: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
 #[cfg(windows)]
 fn sync(ran: Option<&dyn Fn() -> bool>) {
     // mac: lock waits and made slots are counted as a sync's (`slots`).
@@ -302,6 +319,19 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
                 );
                 let (first, last) = (first as u32, last.min(u64::from(heap.desc.count)) as u32);
                 if told == reports::Told::No {
+                    // VIctory-macOS #279's look, on this line a switch
+                    // (`fast_skip`): the page read once, empty and verified
+                    // slots passed by without the view lock.
+                    if fast_skip() {
+                        let len = end - page;
+                        let mut buf = PAGE_BUF.take();
+                        buf.resize(page_size, 0);
+                        if crate::host::read_into(page as *const u8, &mut buf[..len]) {
+                            host.sync_slots_bytes(first, last, start, step, page as u64, &buf[..len]);
+                        }
+                        PAGE_BUF.set(buf);
+                        continue;
+                    }
                     host.sync_slots(first, last, start, step);
                     continue;
                 }
@@ -407,6 +437,23 @@ pub(crate) fn make_read(slots: &[u32]) {
     }
 }
 
+/// Makes again, in every shader-visible view heap, the unordered texture
+/// views left null when their textures were given up
+/// (`VICTORY_EVICT_HEAP_UAV`): from now on shaders write through heaps.
+#[cfg(windows)]
+pub(crate) fn remake_unordered() {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut made = 0;
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), Some(step), VIEWS_KIND) = (heap.host.get(), increment(heap.desc.kind), heap.desc.kind) {
+            made += host.remake_unordered(start, u64::from(step));
+        }
+    }
+    tracing::info!(made, "shaders write through heaps: unordered texture views made again");
+}
+
 /// The host textures (raw pointers) that slots `slots` of the
 /// shader-visible view heaps view.
 #[cfg(windows)]
@@ -507,6 +554,15 @@ const RTV_TAG: u32 = u32::from_le_bytes(*b"vRTV");
 const _: () = assert!(size_of::<RtvRecord>() <= 112);
 
 impl RtvRecord {
+    /// All the view it records is made from: records with equal keys have
+    /// equal views (of the same host texture).
+    #[cfg(windows)]
+    pub(crate) fn key(&self) -> (usize, [u32; 7]) {
+        let mut words = [self.described; 7];
+        words[1..].copy_from_slice(&self.desc);
+        (self.resource as usize, words)
+    }
+
     /// The view description in the host's type (the same layout).
     #[cfg(windows)]
     pub(crate) fn desc(
@@ -699,12 +755,21 @@ fn record(handle: u64, view: View) {
     mirror(handle);
 }
 
+/// Bumped whenever [`forget`] invalidates a recorded view while holding `VIEWS`.
+static VIEWS_FORGOT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(any(windows, test))]
+pub(crate) fn views_forgot() -> u64 {
+    VIEWS_FORGOT.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
+    let mut removed = false;
     for i in entries {
         let (view, generation) = views.list[i as usize].clone();
         // Entries freed through a view's other resource may hold another
@@ -717,6 +782,10 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        removed = true;
+    }
+    if removed {
+        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -795,14 +864,12 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 
 /// For each record (tag, index, generation): whether it names a view that
 /// is current, as [`view_at`] would find it (one lock for them all).
-fn views_current(records: &[[u32; 3]]) -> Vec<bool> {
+fn views_current_into(records: &[[u32; 3]], out: &mut Vec<bool>) {
+    out.clear();
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    records
-        .iter()
-        .map(|&[tag, i, generation]| {
-            tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
-        })
-        .collect()
+    out.extend(records.iter().map(|&[tag, i, generation]| {
+        tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+    }));
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive),

@@ -74,7 +74,7 @@ pick_tasks() {
     major=$(macos_major)
     done_commits=$(gh issue list -R "$REPO" --state closed --assignee @me --label "$(label "done")" \
         --label "$(chip_label "$chip")" --limit 100 --json body --jq '.[].body' |
-        sed -nE 's/^commit: *([0-9a-f]{40}) *$/\1/p' | sort -u)
+        sed -nE 's/^commit: *([0-9a-f]{40}) *$/\1/p' | sort -u) || return 1
     gh issue list -R "$REPO" --state open --label "$(label task)" --label "$(label open)" \
         --label "$(chip_label "$chip")" --limit 100 --json number,title,body,author --jq '.[] | @json' |
         while read -r it; do
@@ -95,7 +95,23 @@ my_chip() { chip_family_of "$(brand)"; }
 legal_hash() { shasum -a 256 "$LEGAL" | cut -d ' ' -f 1; }
 accepted() { [ -f "$CACHE/accepted-legal" ] && [ "$(cut -d ' ' -f 1 "$CACHE/accepted-legal")" = "$(legal_hash)" ]; }
 GPTK_URL="https://developer.apple.com/download/all/?q=game%20porting%20toolkit"
-gptk_dmg() { find "$HOME/Downloads" -maxdepth 1 -name 'Game_Porting_Toolkit*.dmg' 2> /dev/null | sort | tail -n 1; }
+gptk_dmg() {
+    local candidate newest=""
+    # GPTK_DMG names the download, as it does for setup.sh. A worker that
+    # launchd starts may not be allowed to read Downloads.
+    if [ -z "${1:-}" ] && [ -f "${GPTK_DMG:-}" ]; then
+        printf '%s\n' "$GPTK_DMG"
+        return
+    fi
+    # setup.sh chooses the newest download by modification time.
+    for candidate in "${1:-$HOME/Downloads}"/Game_Porting_Toolkit*.dmg; do
+        [ -f "$candidate" ] || continue
+        if [[ -z "$newest" || "$candidate" -nt "$newest" ]]; then
+            newest=$candidate
+        fi
+    done
+    if [ -n "$newest" ]; then printf '%s\n' "$newest"; fi
+}
 
 gptk_version() {
     gptk_version_of "$(gptk_dmg)"
@@ -366,7 +382,7 @@ nap() {
 # look before it uses the Mac any further.
 cmd_work() {
     accepted || die "the fleet terms are not accepted yet; run tools/fleet/fleet.sh doctor"
-    local chip n held fails=0 done_count=0
+    local chip n held tasks fails=0 done_count=0
     chip=$(my_chip)
     is_chip "$chip" || die "unknown chip: $(brand)"
     mkdir -p "$CACHE"
@@ -380,7 +396,14 @@ cmd_work() {
             n=$held
             say "resuming task #$n"
         else
-            n=$(pick_tasks 2> /dev/null | head -n 1 | cut -f 1 || true)
+            # A failed GitHub call is not an empty queue: say so, or a
+            # worker that cannot sign in looks idle for ever.
+            if ! tasks=$(pick_tasks 2> /dev/null); then
+                say "could not read the tasks from GitHub (is gh signed in and online?); trying again in 5 minutes"
+                nap 300
+                continue
+            fi
+            n=$(head -n 1 <<< "$tasks" | cut -f 1)
             if [ -z "$n" ]; then
                 say "no tasks for this Mac right now ($done_count done so far)"
                 prewarm

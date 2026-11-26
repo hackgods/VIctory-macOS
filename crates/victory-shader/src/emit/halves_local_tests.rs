@@ -335,6 +335,8 @@ fn lowered_with(
         mesh_stride: 0,
         view_marks: false,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: local,
@@ -449,17 +451,28 @@ fn the_test_programs_are_what_their_comments_say() {
     }
 }
 
-/// Without the setting every read across the halves is refused with its
-/// reason, as before it existed. With it the same programs translate, in
-/// waves of 32. On a host of 64-lane waves the setting changes nothing.
+/// Without the setting a read across the halves is answered by the Mac
+/// port's hand-over where every lane of the group runs together (before
+/// that was merged every one was refused with its reason; a read where
+/// only some lanes run still is, `walk_tests`). With the setting the same
+/// programs translate with the half's own answer, in waves of 32, and
+/// not through that hand-over. On a host of 64-lane waves the setting
+/// changes nothing.
 #[test]
 fn reads_across_halves_are_refused_without_the_setting_and_translate_with_it() {
     for (what, words, refusal) in across() {
-        let off = outcome(&words, 0, false);
-        assert!(off.contains(refusal), "{what}, setting off: {off}");
+        // Each was refused with `refusal` until VIctory-macOS's hand-over
+        // was merged (its #309 and #360, `lower::halves`): every lane of
+        // the group runs these reads together, so that answers now.
+        let _ = refusal;
+        let off = lowered(&words, 64, 0, true, false)
+            .unwrap_or_else(|e| panic!("{what}, setting off: {e}"));
+        assert!(off.port_exchange && off.exchanges == 0, "{what}, setting off");
         let on = lowered(&words, 64, 0, true, true)
             .unwrap_or_else(|e| panic!("{what}, setting on: {e}"));
         assert_eq!(on.wave_size, Some(32), "{what}");
+        assert!(!on.port_exchange, "{what}: half-local reads come first");
+        assert_ne!(on.dxil, off.dxil, "{what}");
         #[cfg(windows)]
         if let Ok(mut v) = super::validator::Validator::load(
             super::validator::Validator::default_path().as_deref(),
@@ -524,12 +537,15 @@ fn shared_lds_of_a_one_wave64_group_runs_unsynced_with_its_own_setting() {
         assert_eq!(l.wave_size, Some(32));
         assert_eq!(l.split_barriers, 0);
     }
-    for (what, words, refusal) in across() {
-        let why = lowered_with(&words, 64, 0, true, lds(false))
-            .err()
-            .unwrap_or_else(|| panic!("{what}: translated"))
-            .to_string();
-        assert!(why.contains(refusal), "{what}: {why}");
+    // The LDS setting answers no read across the halves: without half-local
+    // reads those are the Mac port's hand-over's (refused before it was
+    // merged), with the setting or without, the same translation.
+    for (what, words, _) in across() {
+        let l = lowered_with(&words, 64, 0, true, lds(false))
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(l.port_exchange, "{what}");
+        let plain = lowered_with(&words, 64, 0, true, Default::default()).expect("handed over");
+        assert_eq!(l.dxil, plain.dxil, "{what}");
     }
     let dxil = |local| {
         lowered_with(&within_halves(), 64, 0, true, local)
@@ -555,6 +571,7 @@ pub(super) mod gpu {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            root_srv_bytes: l.root_srv_bytes,
             memory: l.memory,
             memory_writes: l.memory_writes,
             view_addresses: l.view_addresses,

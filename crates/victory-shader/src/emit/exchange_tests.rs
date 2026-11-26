@@ -235,6 +235,8 @@ fn lowered(
         mesh_stride: 0,
         view_marks: false,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: HalvesLocal { reads, lds: false },
@@ -247,8 +249,9 @@ fn halves(words: &[u32], reads: bool, mac: Mac) -> Result<lower::Lowered, crate:
     lowered(words, 64, 0, true, reads, mac)
 }
 
-/// Without the setting a lane read in halves is refused as before it
-/// existed. With it the program translates in waves of 32, with half-local
+/// Without the setting a lane read in halves is not this line's to answer
+/// (the Mac port's hand-over does, since the merge of its #360; before
+/// that it was refused). With it the program translates in waves of 32, with half-local
 /// reads or without: the read is the console's either way, so the two
 /// translations are the same.
 #[test]
@@ -260,14 +263,16 @@ fn a_lane_read_where_every_lane_runs_translates_with_the_setting() {
         three_values(),
         upper_half_adds_lane_31(),
     ] {
-        let off = halves(&words, false, Mac::default())
-            .err()
-            .expect("refused without the setting")
-            .to_string();
-        assert!(off.contains(REFUSAL), "{off}");
+        // Without the setting the read was refused ([`REFUSAL`]) until
+        // VIctory-macOS's own hand-over was merged (its #360,
+        // `lower::halves`): that answers now, with none of this line's
+        // exchanges. With the setting this line's exchange comes first.
+        let off = halves(&words, false, Mac::default()).expect("the Mac port's hand-over");
+        assert!(off.port_exchange && off.exchanges == 0);
         let on = halves(&words, false, exchange()).expect("handed over");
         assert_eq!(on.wave_size, Some(32));
         assert!(on.exchanges > 0);
+        assert!(!on.port_exchange);
         let with_local = halves(&words, true, exchange()).expect("handed over");
         assert_eq!(with_local.dxil, on.dxil);
         // Half-local reads alone are another translation: the half's answer.
@@ -335,8 +340,15 @@ fn the_setting_acts_only_in_halves_and_within_shared_memory() {
     // beside 24,576 bytes of LDS and not beside 25,088.
     let beside = |lds_bytes| lowered(&words, 1024, lds_bytes, true, false, exchange());
     assert_eq!(beside(24576).expect("fits").exchanges, 1);
-    let full = beside(25088).err().expect("refused").to_string();
-    assert!(full.contains(REFUSAL), "{full}");
+    // Past that this line's slots do not fit. The read was refused there
+    // ([`REFUSAL`]) until the Mac port's hand-over was merged: its two
+    // dwords a console wave fit, and it answers.
+    let full = beside(25088).expect("the Mac port's hand-over");
+    assert!(full.port_exchange && full.exchanges == 0);
+    // With neither there is the refusal: half-local reads off, and LDS
+    // that leaves no room for the Mac port's dwords either.
+    let none = beside(32768).err().expect("refused").to_string();
+    assert!(none.contains("no group-shared memory left"), "{none}");
 }
 
 /// A first-lane read under a narrowed EXEC: the lanes above 29 are left
@@ -380,25 +392,27 @@ fn ballots_and_integer_reductions_are_handed_over_per_half() {
         text.contains(&"v_readfirstlane_b32 s12, v0".to_owned()),
         "{text:?}"
     );
+    // Not this line's to hand over, with the setting or without (the first
+    // lane with its EXEC bit set is not known here). It was refused ("a
+    // first-lane read of a value that may differ") until the Mac port's
+    // hand-over was merged; that answers now, with the lower half's first
+    // lane, which is what a host of 64-lane waves reads too.
     for mac in [Mac::default(), exchange()] {
-        let why = halves(&narrowed, false, mac)
-            .err()
-            .expect("refused")
-            .to_string();
-        assert!(
-            why.contains("a first-lane read of a value that may differ"),
-            "{why}"
-        );
+        let l = halves(&narrowed, false, mac).expect("the Mac port's hand-over");
+        assert!(l.port_exchange && l.exchanges == 0);
     }
     for (what, words, refusal) in across() {
+        // Refused with `refusal` without the setting, until the Mac port's
+        // hand-over was merged: that answers now.
+        let _ = refusal;
         let off = halves(&words, false, Mac::default())
-            .err()
-            .unwrap_or_else(|| panic!("{what}: translated without the setting"))
-            .to_string();
-        assert!(off.contains(refusal), "{what}: {off}");
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(off.port_exchange && off.exchanges == 0, "{what}");
         let on = halves(&words, false, exchange());
         let on = on.unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_eq!((on.wave_size, on.exchanges), (Some(32), 1), "{what}");
+        assert!(!on.port_exchange, "{what}: this line's exchange comes first");
+        assert_ne!(on.dxil, off.dxil, "{what}");
         let with_local = halves(&words, true, exchange()).expect("handed over");
         assert_eq!(with_local.dxil, on.dxil, "{what}");
         let local = halves(&words, true, Mac::default()).expect("half-local");
@@ -420,6 +434,34 @@ fn ballots_and_integer_reductions_are_handed_over_per_half() {
             v.validate(&mut on.dxil.clone())
                 .unwrap_or_else(|e| panic!("{what}: DXIL validation failed: {e}"));
         }
+    }
+}
+
+/// With half-local reads the Mac port's hand-over (`lower::halves`) comes
+/// before them only with its setting ([`Mac::across`],
+/// `VICTORY_HALVES_ACROSS=1`): the translation is then the one without
+/// half-local reads. Without the setting half-local reads answer as before
+/// that hand-over was merged, and this line's exchange comes before either.
+#[test]
+fn the_ports_hand_over_comes_before_half_local_reads_only_when_asked() {
+    let asked = Mac {
+        across: true,
+        ..Mac::default()
+    };
+    for (what, words, _) in across() {
+        let lower = |reads, mac| halves(&words, reads, mac).unwrap_or_else(|e| panic!("{what}: {e}"));
+        let (port, local) = (lower(false, Mac::default()), lower(true, Mac::default()));
+        assert!(port.port_exchange && !local.port_exchange, "{what}");
+        assert_ne!(port.dxil, local.dxil, "{what}");
+        let first = lower(true, asked);
+        assert!(first.port_exchange, "{what}");
+        assert_eq!(first.dxil, port.dxil, "{what}");
+        // Without half-local reads the setting changes nothing.
+        assert_eq!(lower(false, asked).dxil, port.dxil, "{what}");
+        // This line's exchange still comes first.
+        let ours = lower(true, Mac { across: true, ..exchange() });
+        assert!(!ours.port_exchange && ours.exchanges == 1, "{what}");
+        assert_eq!(ours.dxil, lower(true, exchange()).dxil, "{what}");
     }
 }
 
@@ -608,6 +650,7 @@ mod gpu {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            root_srv_bytes: l.root_srv_bytes,
             memory: l.memory,
             memory_writes: l.memory_writes,
             view_addresses: l.view_addresses,

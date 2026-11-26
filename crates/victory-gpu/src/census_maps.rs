@@ -156,6 +156,16 @@ impl<K: Ord + Hash + Copy, V> Counts<K, V> {
         }
     }
 
+    /// Every key with its value, in no order that both forms share (the
+    /// ranges unordered views write, for the widened views of VIctory-macOS
+    /// #222, `crate::bindless::widened_writes`).
+    pub(crate) fn iter(&self) -> Box<dyn Iterator<Item = (&K, &V)> + '_> {
+        match self {
+            Counts::Tree(map) => Box::new(map.iter()),
+            Counts::Hash(map) => Box::new(map.iter()),
+        }
+    }
+
     /// The keys, in no order that both forms share.
     #[cfg(any(test, feature = "diagnostics"))]
     pub(crate) fn keys(&self) -> Box<dyn Iterator<Item = &K> + '_> {

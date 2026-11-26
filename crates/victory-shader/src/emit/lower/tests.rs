@@ -80,6 +80,8 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+            atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -137,6 +139,8 @@ fn lower_wave(
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -421,6 +425,8 @@ fn perm_features(selector: u32) -> u64 {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -1327,6 +1333,286 @@ fn packed_halves_fill_parameters_first_fit() {
 }
 
 #[test]
+fn ds_bpermute_refuses_gds() {
+    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
+    let words = [
+        0x7E02_0285,           // v_mov_b32 v1, 5
+        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
+        2 << 24 | 1 << 8,
+        0x7E00_0502, // v_readfirstlane_b32 s0, v2
+        0xBF07_8000, // s_cmp_lg_u32 s0, 0
+        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
+        0xBE83_0380, // s_mov_b32 s3, 0
+        S_ENDPGM,
+    ];
+    assert!(matches!(
+        lowers(&words, 0),
+        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
+    ));
+}
+
+// ---- one console wave split across host waves ----
+
+const V_LSHLREV_V1_2_V0: u32 = 0x3402_0082; // v_lshlrev_b32 v1, 2, v0
+const DS_WRITE_V1_V0: [u32; 2] = [0xD834_0000, 0x0000_0001]; // ds_write_b32 v1, v0
+const DS_READ_V2_V1_4: [u32; 2] = [0xD8D8_0004, 0x0200_0001]; // ds_read_b32 v2, v1 offset:4
+const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
+const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
+const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
+
+/// `s_cbranch_execz` over the next `words` words.
+const fn skip(words: u32) -> u32 {
+    0xBF88_0000 | words
+}
+
+fn wave64(words: &[u32]) -> ir::Program {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    ir::build(&code, true, 256).unwrap()
+}
+
+/// [`super::split_wave_barriers`] of a program.
+fn barriers_at(p: &ir::Program) -> Option<Vec<(usize, usize)>> {
+    let st = structure::structure(p).unwrap();
+    let mut at: Vec<_> = super::split_wave_barriers(p, &st)?.into_iter().collect();
+    at.sort_unstable();
+    Some(at)
+}
+
+/// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
+/// LDS: the barriers it got for narrow host waves.
+fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
+    lowered(words, lanes, narrow_waves).split_barriers
+}
+
+/// The same program, lowered.
+fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: true,
+        vgprs: 256,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 1 << 15 | 2 << 1,
+            threads: [lanes, 1, 1],
+        }),
+        code,
+    };
+    let p = ir::build(&native.code, true, 256).unwrap();
+    let st = structure::structure(&p).unwrap();
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = io::raise(&p, &native).unwrap();
+    lower(&Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves,
+        halves_local: Default::default(),
+        mac: Default::default(),
+        host_wave32: false,
+        view_marks: false,
+    })
+    .expect("lower")
+}
+
+#[test]
+fn a_read_after_another_lanes_write_syncs_in_a_split_wave() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2)]);
+    assert_eq!(split_barriers(&w, 64, true), 1);
+    // Option off, or a group one host wave holds: as before.
+    assert_eq!(split_barriers(&w, 64, false), 0);
+    assert_eq!(split_barriers(&w, 32, true), 0);
+    // Synced, it no longer asks for 64-lane waves a 32-lane host lacks
+    // (D3DMetal runs nothing then); without the option it still does.
+    assert_eq!(lowered(&w, 64, true).wave_size, None);
+    assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
+    assert_eq!(lowered(&w, 32, true).wave_size, None);
+}
+
+#[test]
+fn a_divergent_write_syncs_at_the_join_before_the_read() {
+    // 34d88edf583f3778's shape: lanes with v0 = 0 write, all read.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(2)];
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(S_ENDPGM);
+    let p = wave64(&w);
+    let at = barriers_at(&p).unwrap();
+    assert_eq!(at.len(), 1);
+    let (b, i) = at[0];
+    assert!(p.blocks[b].insts[i].name().starts_with("ds_read"));
+    assert_eq!(p.blocks[b].preds.len(), 2, "the join");
+    assert_eq!(split_barriers(&w, 64, true), 1);
+}
+
+#[test]
+fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    let p = wave64(&w);
+    let at = barriers_at(&p).unwrap();
+    assert_eq!(at, [(0, p.blocks[0].insts.len())], "the end of the entry");
+    assert_eq!(split_barriers(&w, 64, true), 1);
+}
+
+#[test]
+fn no_barrier_in_divergent_code() {
+    // Write and read both under the branch: no barrier can go there.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    assert!(barriers_at(&wave64(&w)).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
+}
+
+const S_MOV_S20_0: u32 = 0xBE94_0380; // s_mov_b32 s20, 0
+const S_ADD_S20_1: u32 = 0x8014_8114; // s_add_u32 s20, s20, 1
+const S_CMP_LT_S20_4: u32 = 0xBF0A_8414; // s_cmp_lt_u32 s20, 4
+const S_CMP_LT_S20_S21: u32 = 0xBF0A_1514; // s_cmp_lt_u32 s20, s21
+const READFIRSTLANE_S21_V0: u32 = 0x7E2A_0500; // v_readfirstlane_b32 s21, v0
+
+/// `body` in a loop on s20, ending at the compare `cmp` (`s_cbranch_scc1`
+/// back to the body's start).
+fn looped(before: &[u32], body: &[u32], cmp: u32) -> Vec<u32> {
+    let mut w = before.to_vec();
+    w.push(S_MOV_S20_0);
+    w.extend(body);
+    let back = -(body.len() as i32 + 3);
+    w.extend([S_ADD_S20_1, cmp, 0xBF85_0000 | (back as u32 & 0xFFFF)]);
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_loop_programs_are_what_their_comments_say() {
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_readfirstlane_b32 s21, v0",
+        "s_mov_b32 s20, 0",
+        "ds_write_b32 v1, v0",
+        "ds_read_b32 v2, v1 offset:4",
+        "s_add_u32 s20, s20, 1",
+        "s_cmp_lt_u32 s20, s21",
+        "s_cbranch_scc1",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let w = looped(&[], &[], S_CMP_LT_S20_4);
+    let code: Vec<u8> = w.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(all.contains("s_cmp_lt_u32 s20, 4"), "{all}");
+}
+
+#[test]
+fn lds_in_a_loop_on_a_scalar_count_syncs_inside_the_loop() {
+    // Each pass writes, then reads what another lane wrote: a barrier
+    // before the read, and one before the write, which the last pass's read
+    // of another lane must not miss.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_4,
+    );
+    let p = wave64(&w);
+    assert!(p.blocks[1].insts[0].name().starts_with("ds_write"));
+    assert_eq!(barriers_at(&p).unwrap(), [(1, 0), (1, 1)]);
+    assert_eq!(split_barriers(&w, 64, true), 2);
+    assert_eq!(lowered(&w, 64, true).wave_size, None);
+}
+
+#[test]
+fn lds_in_a_loop_on_a_lane_value_gets_no_barrier() {
+    // The count comes from a lane (`v_readfirstlane`): the host waves need
+    // not agree on it, so no barrier can go in the loop.
+    let w = looped(
+        &[V_LSHLREV_V1_2_V0, READFIRSTLANE_S21_V0],
+        &[DS_WRITE_V1_V0, DS_READ_V2_V1_4].concat(),
+        S_CMP_LT_S20_S21,
+    );
+    assert!(barriers_at(&wave64(&w)).is_none());
+    assert_eq!(split_barriers(&w, 64, true), 0);
+    // A loop on a lane's own condition (`s_cbranch_vccnz`) neither.
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([
+        0x7D88_0480, // v_cmp_gt_u32 vcc, 0, v2
+        0xBF87_FFFA, // s_cbranch_vccnz (back to the write)
+        S_ENDPGM,
+    ]);
+    assert!(barriers_at(&wave64(&w)).is_none());
+}
+
+#[test]
+fn a_write_after_another_lanes_read_syncs_before_it() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.extend(DS_READ_V2_V1_4);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), [(0, 2), (0, 3), (0, 4)]);
+}
+
+#[test]
+fn a_read_before_divergent_writes_syncs_where_all_lanes_run() {
+    let mut w = vec![V_LSHLREV_V1_2_V0];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    let p = wave64(&w);
+    assert_eq!(barriers_at(&p).unwrap(), [(0, p.blocks[0].insts.len())]);
+    // A write after a read, both under the branch: no barrier can go
+    // there, and the program runs as before.
+    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
+    w.extend(DS_READ_V2_V1_4);
+    w.extend(DS_WRITE_V1_V0);
+    w.push(RESTORE_EXEC);
+    w.push(S_ENDPGM);
+    assert_eq!(barriers_at(&wave64(&w)).unwrap(), []);
+}
+
+#[test]
 fn ds_bpermute_wave64_preserves_32_lane_half() {
     // Without reading v0 (`thread_id`), only the wave64 half-wave base
     // (`lane_index & !31`) introduces `dx.op.waveGetLaneIndex`.
@@ -1371,10 +1657,12 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             prims: vec![],
             mesh_stride: 0,
             atomic_locks: false,
-            bias_as_gradients: false,
-            narrow_waves: false,
             halves_local: Default::default(),
             mac: Default::default(),
+            atomic_lock_rounds: false,
+        atomic_umax: false,
+            bias_as_gradients: false,
+            narrow_waves: false,
             host_wave32: false,
             view_marks: false,
         })
@@ -1391,148 +1679,250 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
     }
 }
 
-#[test]
-fn ds_bpermute_refuses_gds() {
-    // ds_bpermute_b32 with gds=1 (bit 17), consumed by a branch, must fail with GDS.
-    let words = [
-        0x7E02_0285,           // v_mov_b32 v1, 5
-        0xDACC_0000 | 1 << 17, // ds_bpermute_b32 gds
-        2 << 24 | 1 << 8,
-        0x7E00_0502, // v_readfirstlane_b32 s0, v2
-        0xBF07_8000, // s_cmp_lg_u32 s0, 0
-        0xBF85_0001, // s_cbranch_scc1 -> s_endpgm
-        0xBE83_0380, // s_mov_b32 s3, 0
-        S_ENDPGM,
+fn lower_ps_for_early_z(
+    extra: &[u32],
+    export: [u32; 2],
+    outputs: Vec<crate::emit::container::SigElement>,
+    db_shader_control: u32,
+    view_marks: bool,
+) -> Lowered {
+    use crate::native::{HwStage, NativeProgram, RootParam, RootType, StageIo};
+    const S_WAITCNT_ALL: u32 = 0xBF8C_0000;
+    let mut w = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302, // s_load_dwordx8 s[12:19], s[4:5], 32
+        0xFA00_0020,
+        S_WAITCNT_ALL,
+        0x7E00_0280, // v_mov_b32 v0, 0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0xF000_1F08, // image_load v[2:5], v[0:1], s[12:19] dmask:0xf dim:2D unorm
+        0x0003_0200,
+        S_WAITCNT_ALL,
     ];
-    assert!(matches!(
-        lowers(&words, 0),
-        Err(crate::ShaderError::Unsupported { what: "GDS", .. })
-    ));
-}
-
-// ---- one console wave split across host waves ----
-
-const V_LSHLREV_V1_2_V0: u32 = 0x3402_0082; // v_lshlrev_b32 v1, 2, v0
-const DS_WRITE_V1_V0: [u32; 2] = [0xD834_0000, 0x0000_0001]; // ds_write_b32 v1, v0
-const DS_READ_V2_V1_4: [u32; 2] = [0xD8D8_0004, 0x0200_0001]; // ds_read_b32 v2, v1 offset:4
-const SAVE_EXEC: u32 = 0xBE80_047E; // s_mov_b64 s[0:1], exec
-const CMPX_V0_EQ_0: u32 = 0x7DA4_0080; // v_cmpx_eq_u32 exec, 0, v0
-const RESTORE_EXEC: u32 = 0xBEFE_0400; // s_mov_b64 exec, s[0:1]
-
-/// `s_cbranch_execz` over the next `words` words.
-const fn skip(words: u32) -> u32 {
-    0xBF88_0000 | words
-}
-
-fn wave64(words: &[u32]) -> ir::Program {
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    ir::build(&code, true, 256).unwrap()
-}
-
-/// Lowers a wave64 compute program of `lanes` threads with 512 bytes of
-/// LDS: the barriers it got for narrow host waves.
-fn split_barriers(words: &[u32], lanes: u32, narrow_waves: bool) -> usize {
-    lowered(words, lanes, narrow_waves).split_barriers
-}
-
-/// The same program, lowered.
-fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    w.extend_from_slice(extra);
+    w.extend_from_slice(&export);
+    w.push(S_ENDPGM);
     let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: true,
-        vgprs: 256,
-        layout: vec![],
-        used: vec![],
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: 1 << 15 | 2 << 1,
-            threads: [lanes, 1, 1],
-        }),
-        code,
+        stage: HwStage::Ps,
+        wave64: false,
+        vgprs: 8,
+        layout: vec![RootParam {
+            root: RootType::ResourceHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 4,
+            slot: 0,
+        }],
+        used: Vec::new(),
+        io: StageIo::Ps {
+            inputs: Vec::new(),
+            input_addr: 0,
+            db_shader_control,
+            patches: Vec::new(),
+        },
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let p = ir::build(&native.code, true, 256).unwrap();
-    let st = structure::structure(&p).unwrap();
-    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
-    let io = io::raise(&p, &native).unwrap();
+    let p = crate::ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = crate::structure::structure(&p).expect("structure");
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = crate::io::raise(&p, &native).expect("io::raise");
     lower(&Parts {
         native: &native,
         p: &p,
         st: &st,
         io: &io,
         res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
+        inputs: Vec::new(),
+        outputs,
+        prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
-        bias_as_gradients: false,
-        narrow_waves,
         halves_local: Default::default(),
         mac: Default::default(),
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: false,
         host_wave32: false,
-        view_marks: false,
+        view_marks,
     })
     .expect("lower")
 }
 
 #[test]
-fn a_read_after_another_lanes_write_syncs_in_a_split_wave() {
-    let mut w = vec![V_LSHLREV_V1_2_V0];
-    w.extend(DS_WRITE_V1_V0);
-    w.extend(DS_READ_V2_V1_4);
-    w.push(S_ENDPGM);
-    let at = super::split_wave_barriers(&wave64(&w)).unwrap();
-    assert_eq!(at.into_iter().collect::<Vec<_>>(), [(0, 2)]);
-    assert_eq!(split_barriers(&w, 64, true), 1);
-    // Option off, or a group one host wave holds: as before.
-    assert_eq!(split_barriers(&w, 64, false), 0);
-    assert_eq!(split_barriers(&w, 32, true), 0);
-    // Synced, it no longer asks for 64-lane waves a 32-lane host lacks
-    // (D3DMetal runs nothing then); without the option it still does.
-    assert_eq!(lowered(&w, 64, true).wave_size, None);
-    assert_eq!(lowered(&w, 64, false).wave_size, Some(64));
-    assert_eq!(lowered(&w, 32, true).wave_size, None);
+fn pixel_shader_with_only_read_marks_enables_early_depth_stencil() {
+    let lowered = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 0, true);
+    assert!(lowered.view_marks);
+    assert!(lowered.early_depth_stencil);
+    #[cfg(windows)]
+    if let Ok(mut v) = crate::emit::validator::Validator::load(
+        crate::emit::validator::Validator::default_path().as_deref(),
+    ) {
+        v.validate(&mut lowered.dxil.clone()).unwrap();
+    }
 }
 
 #[test]
-fn a_divergent_write_syncs_at_the_join_before_the_read() {
-    // 34d88edf583f3778's shape: lanes with v0 = 0 write, all read.
-    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(2)];
-    w.extend(DS_WRITE_V1_V0);
-    w.push(RESTORE_EXEC);
-    w.extend(DS_READ_V2_V1_4);
-    w.push(S_ENDPGM);
-    let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
-    assert_eq!(at.len(), 1);
-    let (b, i) = at[0];
-    assert!(p.blocks[b].insts[i].name().starts_with("ds_read"));
-    assert_eq!(p.blocks[b].preds.len(), 2, "the join");
-    assert_eq!(split_barriers(&w, 64, true), 1);
+fn pixel_shader_skips_early_depth_stencil_with_discard_depth_or_uav() {
+    // 1. No view_marks -> no injected UAV, no need for ForceEarlyDepthStencil.
+    let no_marks = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 0, false);
+    assert!(!no_marks.early_depth_stencil);
+
+    // 2. Depth export (exp mrtz v2, off, off, off done vm).
+    let depth_out = vec![crate::emit::container::SigElement {
+        name: "SV_Depth".into(),
+        index: 0,
+        kind: 17,
+        comp: 9,
+        interp: 0,
+        row: None,
+        col: 0,
+        cols: 1,
+        usage: 1,
+        half: false,
+    }];
+    let depth = lower_ps_for_early_z(&[], [0xF800_1881, 0x0000_0002], depth_out, 0, true);
+    assert!(!depth.early_depth_stencil);
+
+    // 3. Stencil / POPS (db_shader_control bit 16).
+    let pops = lower_ps_for_early_z(&[], [0xF800_180F, 0x0504_0302], Vec::new(), 1 << 16, true);
+    assert!(!pops.early_depth_stencil);
+
+    // 4. Conditional discard (divergent forward exit to `exp null done`).
+    let discard = lower_ps_for_early_z(
+        &[
+            0xBE88_037E, // s_mov_b32 s8, exec_lo
+            0x7C22_0480, // v_cmpx_lt_f32 exec, 0, v2
+            0x8A08_7E08, // s_andn2_b32 s8, s8, exec_lo
+            0xBF84_0004, // s_cbranch_scc0 -> kill (past s_mov + exp mrt0 + s_endpgm)
+            0xBEFE_0308, // s_mov_b32 exec_lo, s8
+            0xF800_180F, // exp mrt0 v2, v3, v4, v5 done vm
+            0x0504_0302,
+            S_ENDPGM,
+        ],
+        [0xF800_1890, 0x0000_0000], // kill: exp null done vm
+        Vec::new(),
+        0,
+        true,
+    );
+    assert!(!discard.early_depth_stencil);
+
+    // 5. Title UAV store (`buffer_store_dword` through heap slot 2).
+    let uav = lower_ps_for_early_z(
+        &[
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 64
+            0xFA00_0040,
+            0xBF8C_0000, // s_waitcnt lgkmcnt(0)
+            0xE070_0000, // buffer_store_dword v2, off, s[8:11], 0
+            0x8002_0000,
+        ],
+        [0xF800_180F, 0x0504_0302],
+        Vec::new(),
+        0,
+        true,
+    );
+    assert!(!uav.early_depth_stencil);
 }
 
-#[test]
-fn a_write_before_divergent_reads_syncs_where_all_lanes_run() {
-    let mut w = vec![V_LSHLREV_V1_2_V0];
-    w.extend(DS_WRITE_V1_V0);
-    w.extend([SAVE_EXEC, CMPX_V0_EQ_0, skip(2)]);
-    w.extend(DS_READ_V2_V1_4);
-    w.push(RESTORE_EXEC);
-    w.push(S_ENDPGM);
-    let p = wave64(&w);
-    let at: Vec<_> = super::split_wave_barriers(&p).unwrap().into_iter().collect();
-    assert_eq!(at, [(0, p.blocks[0].insts.len())], "the end of the entry");
-    assert_eq!(split_barriers(&w, 64, true), 1);
+/// GLOBAL `op` with address `s[saddr:saddr+1] + vaddr + offset`.
+const fn global(op: u32, vdst: u8, vaddr: u8, saddr: u8, offset: u32) -> [u32; 2] {
+    [
+        0x37 << 26 | op << 18 | 2 << 14 | (offset & 0xFFF),
+        vaddr as u32 | (saddr as u32) << 16 | (vdst as u32) << 24,
+    ]
 }
 
+/// Lowers a one-thread compute program with a pointer to title memory in
+/// root constants s[0:1] (and s2, s3), the raw UAV of table entry 0 (s4) in
+/// s[8:11], around `body`.
+fn lower_memory(body: &[u32]) -> Lowered {
+    let mut words = vec![
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xFA00_0000,
+    ];
+    words.extend_from_slice(body);
+    words.push(S_ENDPGM);
+    let constants = RootParam {
+        sgprs: 4,
+        ..root(RootType::Constants, 0, 0)
+    };
+    let buffer = UsedResource {
+        kind: ResourceType::Uav,
+        root: RootType::Table,
+        table_offset_dwords: 0,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 4,
+        slot: 1,
+    };
+    let l = lower_with(
+        &words,
+        vec![constants, root(RootType::Table, 4, 1)],
+        vec![buffer],
+    )
+    .expect("lower");
+    assert!(l.memory);
+    l
+}
+
+/// Each title-memory access reads the page table twice, its level-1 entry
+/// and then the page's entry (view and start in one load), and the null
+/// pair's view, the same for all, is read once in the entry block: here
+/// two loads behind a branch from it.
 #[test]
-fn no_barrier_in_divergent_code() {
-    // Write and read both under the branch: no barrier can go there.
-    let mut w = vec![V_LSHLREV_V1_2_V0, SAVE_EXEC, CMPX_V0_EQ_0, skip(4)];
-    w.extend(DS_WRITE_V1_V0);
-    w.extend(DS_READ_V2_V1_4);
-    w.push(RESTORE_EXEC);
-    w.push(S_ENDPGM);
-    assert!(super::split_wave_barriers(&wave64(&w)).is_none());
-    assert_eq!(split_barriers(&w, 64, true), 0);
+fn the_null_pair_is_read_once_in_the_entry_block() {
+    let mut w = vec![
+        0xBF06_8002, // s_cmp_eq_u32 s2, 0
+        0xBF85_000A, // s_cbranch_scc1 -> s_endpgm
+        0x7E02_0280, // v_mov_b32 v1, 0
+    ];
+    w.extend(global(0x0C, 2, 1, 0, 0)); // global_load_dword v2, v1, s[0:1]
+    w.extend(global(0x0C, 3, 1, 0, 0x100));
+    w.push(0xBF8C_0000); // s_waitcnt
+    w.extend([0xE070_0000, 0x8002_0200]); // buffer_store_dword v2, off, s[8:11], 0
+    w.extend([0xE070_0004, 0x8002_0300]); // v3 at 4
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    assert_eq!(table.len(), 1 + 2 * 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + 2 * 3, "{loads:?}");
+    assert_eq!(table.iter().filter(|&&b| b == 0).count(), 1, "{table:?}");
+    assert_eq!(loads.iter().filter(|&&b| b == 0).count(), 1, "{loads:?}");
+}
+
+/// A box32 node's last 48 bytes are read through its first 64 bytes'
+/// page-table lookup, and looked up again only in lanes whose node starts
+/// in the last 64 bytes of a page (`raw_load_past`): the head's lookup and
+/// the null pair's view in the entry block, then the head's 16 dwords and
+/// the tail's 12 through that lookup, and the second lookup in a block of
+/// its own.
+#[test]
+fn a_box32_nodes_tail_reuses_its_heads_lookup() {
+    // The descriptor in s[12:15], based at the pointer.
+    let mut w = vec![
+        0x908C_8800, // s_lshr_b64 s[12:13], s[0:1], 8
+        0x880D_FF0D, // s_or_b32 s13, s13, 0x80000000
+        0x8000_0000,
+        0xBE8E_03C1, // s_mov_b32 s14, -1
+        0xBE8F_03FF, // s_mov_b32 s15: type 8, barycentrics, no bound
+        8 << 28 | 1 << 24 | 1 << 27 | 0x3FF,
+    ];
+    // v2..v12: the node pointer and the ray, from s2 and s3.
+    w.extend((0..11u32).map(|k| 0x7E00_0200 | (2 + k) << 17 | (2 + k % 2)));
+    // image_bvh_intersect_ray v[20:23], v[2:12], s[12:15]
+    w.extend([0xF198_9F01, 20 << 8 | (12 >> 2) << 16 | 2]);
+    // buffer_store_dwordx4 v[20:23], off, s[8:11], 0
+    w.extend([0xE078_0000, 0x8002_1400]);
+    let l = lower_memory(&w);
+    let [loads, table] = &l.raw_loads;
+    let at = |b: usize| loads.iter().filter(|&&x| x == b).count();
+    assert_eq!(table.len(), 1 + 2 + 2, "{table:?}");
+    assert_eq!(loads.len(), 1 + (2 + 4) + 3 + (2 + 3), "{loads:?}");
+    assert_eq!(table[..3], [0; 3], "{table:?}");
+    let again = table[3];
+    assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
+    let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
+    assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
 }

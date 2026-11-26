@@ -149,6 +149,8 @@ fn converted(forms: &[Form]) -> Vec<Option<u32>> {
         prims: vec![],
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -474,6 +476,8 @@ fn lowered_wave64(
         mesh_stride: 0,
         view_marks: false,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: lower::HalvesLocal {

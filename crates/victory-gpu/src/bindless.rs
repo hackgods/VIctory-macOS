@@ -10,7 +10,7 @@
 //! `crate::watch`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use crate::census_maps::{Counts, Hashing};
@@ -196,7 +196,7 @@ fn seen(view: &View) -> Option<Seen> {
     if let View::Shader(resource, _) = view
         && let Some(texture) = crate::resource::made_copy(*resource as This)
     {
-        return crate::texture::title_written(&texture.texture).then_some(Seen::Texture(*resource));
+        return texture.title_written().then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
     let (shadow, address, len) = match *view {
@@ -356,7 +356,7 @@ impl Uploads {
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
+        if !shadow.clean() && !crate::watch::clean_bit(*bit) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -401,9 +401,28 @@ pub(crate) fn refresh_slot(
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if !shadow.clean() && !crate::watch::clean_bit(shadow.dirty_bit()) {
         add(shadow, *address as usize, *len as usize);
     }
+}
+
+/// Heap UAV ranges that may need to refresh a widened SRV after a later
+/// buffer barrier. Computed heap indices do not name ordinary write steps.
+pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
+    if !crate::under_wine() {
+        return Vec::new();
+    }
+    viewed
+        .inner
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .ranges
+        .iter()
+        .filter(|((_, address, end, uav), _)| *uav && address < end)
+        .map(|((_, address, end, _), (_, shadow))| {
+            (shadow.clone(), *address as usize, (end - address) as usize)
+        })
+        .collect()
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them
@@ -418,7 +437,28 @@ pub(crate) fn note_draw(writes: bool) {
     HEAP_DRAWS[0].fetch_add(1, Relaxed);
     if writes {
         HEAP_DRAWS[1].fetch_add(1, Relaxed);
+        if !HEAP_WRITTEN.swap(true, Relaxed) {
+            REMAKE.store(true, Relaxed);
+        }
     }
+}
+
+/// A shader wrote through a heap's views (ever): textures viewed for
+/// unordered access there may hold what the GPU wrote, which no state move
+/// shows (`crate::resource::evictable`).
+static HEAP_WRITTEN: AtomicBool = AtomicBool::new(false);
+/// The unordered views left null are to be made again before the next
+/// submission ([`take_remake`]).
+static REMAKE: AtomicBool = AtomicBool::new(false);
+
+/// Whether any shader wrote through a heap yet.
+pub(crate) fn heap_written() -> bool {
+    HEAP_WRITTEN.load(Relaxed)
+}
+
+/// Whether the null unordered views are to be made again now (once).
+pub(crate) fn take_remake() -> bool {
+    REMAKE.swap(false, Relaxed)
 }
 
 /// Every view heap's registry.

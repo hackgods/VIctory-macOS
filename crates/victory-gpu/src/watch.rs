@@ -1064,6 +1064,24 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
 }
 
+/// Reports GPU shader writes into aliased title memory `[at, at + len)` so
+/// any other trackers over those pages (such as textures' staging) know they
+/// changed and re-upload on next use. Fast-paths out when no tracker or alias
+/// covers the range.
+pub(crate) fn notify_written(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    let mut g = guards();
+    if g.holders.range(first..last).next().is_none()
+        && g.alias_of.range(first..last).next().is_none()
+    {
+        return;
+    }
+    changed(&mut g, first, last, false);
+}
+
 /// What shaders wrote into host copies of `[at, at + len)` is dropped:
 /// every host buffer copy holding the memory takes it from title memory
 /// again at its next refresh (the pages count as changed in each, aliases
@@ -1292,9 +1310,48 @@ pub(crate) mod tests {
         p
     }
 
+    /// Frees a test's allocation at `p`, unless the guards still guard or
+    /// hold a page of it: then it stays allocated, as the other tests'
+    /// pools do.
+    ///
+    /// A copy that a batch, a page table or a widened view still holds
+    /// keeps its tracker after the test drops its own handle. Freed under
+    /// it, the pages stayed in `protected`, and a test running at the same
+    /// time that was given the same address got them unguarded:
+    /// [`protect`] skips a page it has guarded already, so the new
+    /// allocation stayed writable and its writes went unseen (#31: a guard
+    /// test failed in 7 of 150 full runs on an M5 Pro, whichever drew the
+    /// address; 2 of 300 with this). The title's own memory does not go
+    /// this way: the runtime tells the guards when it unmaps it
+    /// ([`title_memory_remapped`]).
     pub(crate) fn free(p: usize) {
+        if still_watched(p) {
+            return;
+        }
         // SAFETY: an allocation of ours.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// Whether the guards guard or hold a page of the allocation at `p`.
+    fn still_watched(p: usize) -> bool {
+        use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+        // The allocation's length: its regions, while they start from `p`
+        // (guarded and open pages are regions of their own).
+        let mut len = 0;
+        loop {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery((p + len) as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 || info.AllocationBase as usize != p || info.RegionSize == 0 {
+                break;
+            }
+            len += info.RegionSize;
+        }
+        let (first, last) = (p / PAGE, (p + len).div_ceil(PAGE));
+        let g = guards();
+        g.protected.range(first..last).next().is_some()
+            || g.holders.range(first..last).next().is_some()
     }
 
     /// Everything is changed at first; after taking, only what is written
@@ -1373,10 +1430,29 @@ pub(crate) mod tests {
     #[test]
     fn a_range_over_foreign_memory_guards_only_the_runtimes() {
         use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery};
+        // This test tracks a mostly free address range. In the parallel suite,
+        // other tests can map their views in its holes even after both of our
+        // allocations succeed. Keep those views out of this address space.
+        const CHILD: &str = "VICTORY_TEST_FOREIGN_WINDOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let name = "watch::tests::a_range_over_foreign_memory_guards_only_the_runtimes";
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .expect("run foreign-window test in a child");
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            assert!(
+                result.status.success() && stdout.contains("1 passed"),
+                "foreign-window child {}: {stdout}{}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
         const WINDOW: usize = 4 << 20;
         // In a free 4 MiB-aligned window: plain committed memory (as the
-        // process heap's) 1 MiB in, a pool 2 MiB in. Other tests allocate
-        // meanwhile, so a window taken under our feet is tried again.
+        // process heap's) 1 MiB in, a pool 2 MiB in.
         let (base, foreign, pool) = (0..8)
             .find_map(|_| {
                 // SAFETY: a fresh reservation, released at once; then

@@ -22,8 +22,10 @@
 //! 0 is uploaded (every mip and array slice), depth and stencil planes are
 //! not.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use crate::host::{HostList, host};
@@ -55,6 +57,10 @@ pub(crate) struct Staging {
     /// The memory's pages changed since detiled (none: not the runtime's
     /// memory, compared instead).
     tracked: Option<crate::watch::Tracked>,
+    /// True once real readable title memory has been uploaded at least once.
+    uploaded_once: std::sync::atomic::AtomicBool,
+    /// Last `crate::queue::presented()` frame on which an untracked check ran.
+    checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
     /// its start, whole layout blocks); empty where the layout gives none.
     spans: Vec<(usize, usize)>,
@@ -77,6 +83,11 @@ struct Last {
     /// part way).
     read: Vec<u8>,
     valid: bool,
+    /// A refresh compares `read` (taken out) with the memory on several
+    /// workers, the lock let go meanwhile: a refresh that finds this set
+    /// leaves the texture to it (it would have waited for it, then found
+    /// nothing new).
+    comparing: bool,
     /// Something was detiled (bytes or zeros), so the staging buffer holds
     /// the memory as it was then.
     uploaded: bool,
@@ -116,6 +127,8 @@ struct Buffers {
     free_bytes: u64,
     /// Taken by the submission being prepared.
     used: Vec<(u64, ID3D12Resource, usize)>,
+    /// The bytes of buffers submissions needed lately.
+    lately: crate::recent::Peak,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
@@ -125,26 +138,47 @@ static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     free: std::collections::VecDeque::new(),
     free_bytes: 0,
     used: Vec::new(),
+    lately: crate::recent::Peak::new(),
 });
 
-/// Free staging buffers kept at most.
+/// Free staging buffers kept at least, and at most: between them, what any
+/// submission needed lately. A big texture that changes again has its
+/// buffer back, not a new committed one (~50 ms per 128 MiB if the 5 ms per
+/// 12.7 MB above is linear); a peak does not stay for good.
 const KEPT_BYTES: u64 = 64 << 20;
+const KEPT_BYTES_MAX: u64 = 256 << 20;
 
 /// Called before a submission's uploads: the buffers of the last one are
-/// free again (the oldest dropped past `KEPT_BYTES`).
+/// free again (the oldest dropped past what any submission needed lately,
+/// `KEPT_BYTES` to `KEPT_BYTES_MAX`), and so are its chunks, of which the
+/// pool keeps what any submission needed lately, at most `CHUNKS_KEPT` (a
+/// peak of 16 held 512 MB for good). Dropping a chunk from the pool frees it
+/// only when the lists using it are done: each keeps its own reference
+/// (`record_upload`). The big textures' read buffers that no refresh used
+/// lately go too, one a call.
 pub(crate) fn recycle() {
+    let now = std::time::Instant::now();
+    let mut big = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
+    let freed = big.trim(now);
+    drop(big);
+    drop(freed);
     {
         let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let c = &mut *c;
+        let needed = c.current + usize::from(c.used > 0);
+        let kept = c.lately.begin(now, needed).min(CHUNKS_KEPT);
         (c.current, c.used) = (0, 0);
-        c.all.truncate(CHUNKS_KEPT);
+        c.all.truncate(kept);
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
+    let needed: u64 = b.used.iter().map(|e| e.0).sum();
+    let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
     for e in b.used.drain(..) {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
-    while b.free_bytes > KEPT_BYTES
+    while b.free_bytes > kept
         && let Some((n, ..)) = b.free.pop_front()
     {
         b.free_bytes -= n;
@@ -186,15 +220,23 @@ struct Chunks {
     /// The chunk being carved and the bytes taken from it.
     current: usize,
     used: u64,
+    /// The chunks submissions needed lately.
+    lately: crate::recent::Peak,
 }
 
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks { all: Vec::new(), current: 0, used: 0 });
+static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
+    all: Vec::new(),
+    current: 0,
+    used: 0,
+    lately: crate::recent::Peak::new(),
+});
 
 const CHUNK: u64 = 32 << 20;
-/// Chunks kept between submissions (more are made while one needs them).
+/// Chunks kept between submissions at most (more are made while one needs
+/// them).
 const CHUNKS_KEPT: usize = 16;
 
 /// `size` bytes of staging space: a buffer, the offset of the space in it
@@ -249,9 +291,14 @@ fn is_host_written(resource: This) -> bool {
 /// Whether `resource`'s host copy takes its contents from title memory:
 /// a texture the host GPU does not render to or write.
 pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
-    const TARGET_DEPTH_UNORDERED: i32 = 0x7;
     // SAFETY: a live resource.
-    unsafe { texture.GetDesc() }.Flags.0 & TARGET_DEPTH_UNORDERED == 0
+    flags_title_written(unsafe { texture.GetDesc() }.Flags.0 as u32)
+}
+
+/// [`title_written`] for a texture with resource flags `flags`.
+pub(crate) fn flags_title_written(flags: u32) -> bool {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    flags & TARGET_DEPTH_UNORDERED == 0
 }
 
 /// Copies [`alias_copy`] recorded since the last frame-rate line.
@@ -408,7 +455,7 @@ pub(crate) fn record_upload(
         // SAFETY: an open list; the barrier names a live texture.
         unsafe { list.list.ResourceBarrier(&[b]) };
     }
-    copies(list, &copy.texture, staging, (buffer, *at), subresources, String::new);
+    copies(list, &copy.texture, staging, (buffer, *at), subresources);
     list.keep(buffer);
     staging.uploads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     staging.copied.fetch_add(subresources.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -433,16 +480,13 @@ pub(crate) fn copied(resource: This) -> u64 {
 
 
 /// Records the copy of `subresources` of `buffer` (laid out as `staging`
-/// says) into `texture` (in the copy destination state); `name` names it
-/// in diagnostics notes.
-#[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))]
+/// says) into `texture` (in the copy destination state).
 fn copies(
     list: &HostList,
     texture: &ID3D12Resource,
     staging: &Staging,
     (buffer, at): (&ID3D12Resource, u64),
     subresources: &[u32],
-    name: impl Fn() -> String,
 ) {
     for &i in subresources {
         let i = i as usize;
@@ -458,8 +502,7 @@ fn copies(
             list.note_read(
                 || {
                     format!(
-                        "texture upload {} ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
-                        name(),
+                        "texture upload ({}x{}x{} f{} mips {}) sub {i} of {} from staging {gpu:#x}+{:#x}: offset {:#x} {}x{}x{} pitch {}",
                         d.Width,
                         d.Height,
                         d.DepthOrArraySize,
@@ -502,30 +545,44 @@ fn copies(
 /// and the subresources detiled into it.
 pub(crate) type Upload = (ID3D12Resource, u64, Vec<u32>);
 
-/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
-/// at most: the title's own threads need the rest), here when that is
-/// fewer than two.
-pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
-    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(1, 4).min(n);
-    if threads < 2 {
-        (0..n).for_each(f);
-        return;
-    }
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Relaxed);
-                    if i >= n {
-                        break;
-                    }
-                    f(i);
+/// The texture workers: up to a quarter of the CPUs (four at most), none
+/// where that is fewer than two.
+fn workers() -> Option<&'static rayon::ThreadPool> {
+    static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    WORKERS
+        .get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map_or(4, |n| n.get() / 4)
+                .clamp(1, 4);
+            if threads < 2 {
+                return None;
+            }
+            match rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("texture worker {i}"))
+                .build()
+            {
+                Ok(pool) => Some(pool),
+                Err(error) => {
+                    tracing::warn!(%error, "could not start texture workers");
+                    None
                 }
-            });
-        }
-    });
+            }
+        })
+        .as_ref()
+}
+
+/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
+/// at most: the title's own threads need the rest). Reuse the workers and
+/// their thread-local scratch across submissions.
+pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
+    if n > 1
+        && let Some(pool) = workers()
+    {
+        pool.install(|| (0..n).into_par_iter().for_each(&f));
+    } else {
+        (0..n).for_each(f);
+    }
 }
 
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
@@ -569,12 +626,22 @@ impl Staging {
     /// Returns the bytes of title memory read, and the buffer it detiled
     /// into with the subresources detiled.
     fn refresh_now(&self) -> (usize, Option<Upload>) {
+        if self.tracked.is_none()
+            && once_per_frame()
+            && skip_same_frame(
+                &self.uploaded_once,
+                &self.checked_frame,
+                crate::queue::presented(),
+            )
+        {
+            return (0, None);
+        }
         let all = || (0..self.footprints.len() as u32).collect::<Vec<_>>();
         let size = self.layout.size as usize;
         let start = self.memory as usize;
-        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
-        let last = &mut *last;
+        let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = &self.tracked {
+            let last = &mut *guard;
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
             if t.clean() {
@@ -652,13 +719,34 @@ impl Staging {
         // textures may be unmapped until their pages arrive) instead of
         // faulting: asking `VirtualQuery` first cost about 2 ms in the
         // title's big pools (see `crate::host::copy_mapped`).
-        let memory = self.memory;
-        let Some(runs) = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
-            scratch.resize(COMPARE_CHUNK, 0);
-            read_changed(last, size, scratch, |at, to| {
-                crate::host::read_into(memory.wrapping_add(at), to)
-            })
-        }) else {
+        if guard.comparing {
+            return (0, None);
+        }
+        let memory = self.memory.expose_provenance();
+        let read = move |at: usize, to: &mut [u8]| {
+            crate::host::read_into(
+                std::ptr::with_exposed_provenance(memory.wrapping_add(at)),
+                to,
+            )
+        };
+        // A large memory on the workers, a part each: one thread reads and
+        // compares at about 14 GB/s under Wine on Rosetta, so a 90 MiB
+        // texture held a refresh 6.5 ms on one worker, 2.8 ms on three.
+        let runs;
+        (guard, runs) = if guard.valid
+            && size > COMPARE_PART
+            && let Some(pool) = workers()
+        {
+            read_changed_in_parts(&self.last, guard, size, pool, read)
+        } else {
+            let runs = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
+                scratch.resize(COMPARE_CHUNK, 0);
+                read_changed(&mut guard, size, scratch, read)
+            });
+            (guard, runs)
+        };
+        let last = &mut *guard;
+        let Some(runs) = runs else {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -696,6 +784,10 @@ impl Staging {
             .map(|i| i as u32)
             .collect();
         let buffer = if fresh.is_empty() { None } else { self.detile(&last.read, &fresh) };
+        if buffer.is_some() {
+            self.uploaded_once
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         last.uploaded = last.uploaded || buffer.is_some();
         if buffer.is_none() {
             // Read again (and detiled) at the next refresh.
@@ -756,11 +848,36 @@ thread_local! {
     static SCRATCH: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
 }
 
+/// The read buffers of textures over [`Scratch::KEEP`], shared by the
+/// threads: each refresh of such a texture allocated and zeroed its whole
+/// size again (a page fault per 4 KiB and the fill) though it reads only
+/// the spans that changed. Kept while refreshes of that size are lately
+/// (`recycle` trims), and then without a fill: only growth is zeroed.
+static SCRATCH_BIG: Mutex<crate::recent::Pool> = Mutex::new(crate::recent::Pool::new());
+
+/// [`SCRATCH_BIG`]'s bytes at most (the buffers of several workers' big
+/// textures at once).
+const SCRATCH_BIG_BYTES: usize = 256 << 20;
+
 impl Scratch {
+    const KEEP: usize = 32 << 20;
+
     /// The thread's buffer, at least `size` bytes.
     fn take(size: usize) -> Self {
+        if size > Self::KEEP {
+            let taken = SCRATCH_BIG
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(size);
+            // Filled without the lock: several workers refresh big textures.
+            return Scratch(crate::recent::Pool::filled(taken, size));
+        }
         let mut v = SCRATCH.take();
         if v.len() < size {
+            // Vec can double across the retention limit on an otherwise cacheable request.
+            if size <= Self::KEEP && v.capacity() > Self::KEEP / 2 {
+                v.reserve_exact(size - v.len());
+            }
             v.resize(size, 0);
         }
         Scratch(v)
@@ -769,10 +886,14 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // The largest textures' buffers are not kept.
-        const KEEP: usize = 32 << 20;
-        if self.0.len() <= KEEP {
+        // The largest textures' buffers go to the shared pool, which keeps
+        // those lately used.
+        if self.0.capacity() <= Self::KEEP {
             SCRATCH.set(std::mem::take(&mut self.0));
+        } else {
+            let now = std::time::Instant::now();
+            let mut pool = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
+            pool.keep(std::mem::take(&mut self.0), now, SCRATCH_BIG_BYTES);
         }
     }
 }
@@ -795,7 +916,11 @@ thread_local! {
 ///
 /// The memory is read a `scratch` at a time and compared with `last.read`
 /// there, so memory that did not change is read once, as comparing it alone
-/// reads it, and not copied. The answer is the runs of bytes that differ
+/// reads it, and not copied. The compare itself is
+/// `victory_formats::texture::changed_runs`: a chunk that compares
+/// slice-equal is answered so without a walk — the byte walk runs only
+/// in the chunks that differ, almost every chunk of almost every
+/// refresh comparing equal. The answer is the runs of bytes that differ
 /// (they need not be maximal across the chunks), kept up to date in
 /// `last.read`; a memory not read whole yet is one run of everything. A
 /// read that fails part way leaves `last.read` half new: it stays invalid
@@ -818,38 +943,99 @@ fn read_changed(
         return Some(vec![(0, size)]);
     }
     let mut runs: Vec<(usize, usize)> = Vec::new();
-    let mut at = 0;
-    while at < size {
-        let n = scratch.len().min(size - at);
-        let chunk = &mut scratch[..n];
-        if !read(at, chunk) {
-            // Where no differing byte was kept, `last.read` is still the
-            // memory's; where one was, it is half new, and not trusted.
-            last.valid = runs.is_empty();
-            return None;
-        }
-        let kept = &mut last.read[at..at + n];
-        if *kept == *chunk {
-            // The usual case: one slice comparison, no byte walk.
-            at += n;
-            continue;
-        }
-        let mut i = 0;
-        while i < n {
-            if kept[i] != chunk[i] {
-                let first = i;
-                while i < n && kept[i] != chunk[i] {
-                    i += 1;
-                }
-                runs.push((at + first, i - first));
-                kept[first..i].copy_from_slice(&chunk[first..i]);
-            } else {
-                i += 1;
-            }
-        }
-        at += n;
+    if !compare_range(0, &mut last.read, scratch, &read, &mut runs) {
+        // Where no differing byte was kept, `last.read` is still the
+        // memory's; where one was, it is half new, and not trusted.
+        last.valid = runs.is_empty();
+        return None;
     }
     Some(runs)
+}
+
+/// Memory a worker reads and compares at a time when a large memory is
+/// split (whole compare chunks, so the runs are those one thread finds).
+/// Smaller memories, most textures, stay on the refresh's own thread.
+const COMPARE_PART: usize = 8 * COMPARE_CHUNK;
+
+/// [`read_changed`] of a memory larger than `COMPARE_PART` whose
+/// `last.read` is valid, on the workers a part each, with the same answer.
+/// `last`'s lock is let go meanwhile, `comparing` set and `read` taken
+/// out: a worker waiting for the parts may run another refresh of this
+/// texture (from another submission), which would wait on the lock it
+/// holds. A part that fails to read fails the answer; `last.read` stays
+/// valid only if no part kept a differing byte, as one thread's would.
+fn read_changed_in_parts<'a>(
+    lock: &'a Mutex<Last>,
+    mut guard: std::sync::MutexGuard<'a, Last>,
+    size: usize,
+    pool: &rayon::ThreadPool,
+    read: impl Fn(usize, &mut [u8]) -> bool + Sync,
+) -> (std::sync::MutexGuard<'a, Last>, Option<Vec<(usize, usize)>>) {
+    /// On a panic in a part: the bytes are gone, so the memory is read
+    /// whole at the next refresh.
+    struct Reset<'a>(&'a Mutex<Last>);
+    impl Drop for Reset<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+                (last.comparing, last.valid) = (false, false);
+            }
+        }
+    }
+    guard.read.resize(size, 0);
+    let mut kept = std::mem::take(&mut guard.read);
+    guard.comparing = true;
+    drop(guard);
+    let reset = Reset(lock);
+    let parts: Vec<(bool, Vec<(usize, usize)>)> = pool.install(|| {
+        kept.par_chunks_mut(COMPARE_PART)
+            .enumerate()
+            .map(|(k, kept)| {
+                // Borrowed only inside the part: a worker runs other work
+                // (another refresh, which borrows it too) only between parts.
+                COMPARE_SCRATCH.with_borrow_mut(|scratch| {
+                    scratch.resize(COMPARE_CHUNK, 0);
+                    let mut runs = Vec::new();
+                    let whole = compare_range(k * COMPARE_PART, kept, scratch, &read, &mut runs);
+                    (whole, runs)
+                })
+            })
+            .collect()
+    });
+    drop(reset);
+    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    (guard.read, guard.comparing) = (kept, false);
+    let whole = parts.iter().all(|&(whole, _)| whole);
+    let runs: Vec<(usize, usize)> = parts.into_iter().flat_map(|(_, runs)| runs).collect();
+    if !whole {
+        guard.valid = runs.is_empty();
+        return (guard, None);
+    }
+    (guard, Some(runs))
+}
+
+/// Reads the memory behind `read` from `at` on, a `scratch` at a time, and
+/// compares it with `kept`, the bytes last read there, adding the runs that
+/// differ (and keeping their bytes): false at the first chunk with a page
+/// that is not readable (the chunks after it are not read).
+fn compare_range(
+    at: usize,
+    kept: &mut [u8],
+    scratch: &mut [u8],
+    read: &impl Fn(usize, &mut [u8]) -> bool,
+    runs: &mut Vec<(usize, usize)>,
+) -> bool {
+    let mut done = 0;
+    while done < kept.len() {
+        let n = scratch.len().min(kept.len() - done);
+        let chunk = &mut scratch[..n];
+        if !read(at + done, chunk) {
+            return false;
+        }
+        victory_formats::texture::changed_runs(at + done, &mut kept[done..done + n], chunk, runs);
+        done += n;
+    }
+    true
 }
 
 /// Whether any changed run of a texture's memory (offset, length) touches
@@ -955,6 +1141,8 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         mips: u32::from(d.MipLevels),
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
+        uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
         uploads: Default::default(),
@@ -964,9 +1152,63 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     Some(s)
 }
 
+/// Opt-in (`VICTORY_TEXTURE_ONCE_PER_FRAME=1`): check already-uploaded
+/// untracked textures at most once per presented frame instead of on every
+/// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
+/// watch tracking is off). Newly created or not-yet-readable textures are
+/// still checked on every submission until their first real upload lands.
+fn once_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"))
+}
+
+fn skip_same_frame(
+    uploaded_once: &std::sync::atomic::AtomicBool,
+    checked_frame: &std::sync::atomic::AtomicU64,
+    frame: u64,
+) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    uploaded_once.load(Relaxed) && checked_frame.swap(frame, Relaxed) == frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_scratch_reuses_growing_buffers_within_the_retained_capacity() {
+        let mib = 1 << 20;
+        SCRATCH.set(Vec::new());
+        drop(Scratch::take(31 * mib));
+        drop(Scratch::take(32 * mib));
+        let kept = SCRATCH.take();
+        assert_eq!(kept.len(), 32 * mib);
+        assert!(
+            kept.capacity() <= 32 * mib,
+            "kept {} bytes",
+            kept.capacity()
+        );
+        drop(kept);
+        drop(Scratch::take(33 * mib));
+        assert_eq!(SCRATCH.take().capacity(), 0);
+    }
+
+    #[test]
+    fn parallel_texture_work_reuses_workers_and_finishes_before_returning() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        let workers = Mutex::new(HashSet::new());
+        let visits = [const { AtomicUsize::new(0) }; 16];
+        for pass in 1..=8 {
+            in_parallel(visits.len(), |i| {
+                let _ = workers.lock().unwrap().insert(std::thread::current().id());
+                visits[i].fetch_add(1, Relaxed);
+            });
+            assert!(visits.iter().all(|count| count.load(Relaxed) == pass));
+        }
+        assert!(workers.into_inner().unwrap().len() <= 4);
+    }
 
     #[test]
     fn subresource_len_stays_inside_staging_total() {
@@ -1016,6 +1258,104 @@ mod tests {
             assert_eq!(last.read, memory);
             assert_eq!(changed(&mut last, &memory, all), (Some(false), 4500));
         }
+    }
+
+    /// A large memory compared on the workers a part each answers as one
+    /// thread does: the same runs, the same bytes kept, and on a page that
+    /// is not readable the same verdict on whether `last.read` stays valid.
+    #[test]
+    fn parts_on_the_workers_answer_as_one_thread_does() {
+        let Some(pool) = workers() else {
+            return;
+        };
+        let size = 3 * COMPARE_PART + 12_345;
+        let memory: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let read_of = |memory: &[u8], hole: usize| {
+            let memory = memory.to_vec();
+            move |at: usize, to: &mut [u8]| {
+                let n = hole.saturating_sub(at).min(to.len());
+                to[..n].copy_from_slice(&memory[at..at + n]);
+                n == to.len()
+            }
+        };
+        let fresh = || Last {
+            read: memory.clone(),
+            valid: true,
+            ..Last::default()
+        };
+        // Changes in the first byte, across a chunk and a part boundary,
+        // in the middle of a part, and in the tail.
+        let mut changed = memory.clone();
+        for at in [
+            0,
+            COMPARE_CHUNK - 1,
+            COMPARE_PART - 2,
+            COMPARE_PART + 1,
+            2 * COMPARE_PART + 77_777,
+            size - 1,
+        ] {
+            changed[at] ^= 0x5a;
+        }
+        for (now, hole) in [
+            (&memory, usize::MAX),
+            (&changed, usize::MAX),
+            (&changed, 2 * COMPARE_PART + 5),
+            (&memory, COMPARE_PART + 5),
+        ] {
+            let mut one = fresh();
+            let mut scratch = vec![0; COMPARE_CHUNK];
+            let expected = read_changed(&mut one, size, &mut scratch, read_of(now, hole));
+            let lock = Mutex::new(fresh());
+            let guard = lock.lock().unwrap();
+            let (guard, answer) =
+                read_changed_in_parts(&lock, guard, size, pool, read_of(now, hole));
+            assert_eq!(answer, expected, "hole at {hole}");
+            assert_eq!(guard.valid, one.valid, "hole at {hole}");
+            assert!(!guard.comparing);
+            if hole == usize::MAX {
+                assert_eq!(guard.read, *now);
+            }
+        }
+    }
+
+    /// While a refresh compares a texture's memory on the workers, another
+    /// refresh of it finds `comparing` set (with the lock let go) and leaves
+    /// the texture to it.
+    #[test]
+    fn a_refresh_meanwhile_sees_the_texture_being_compared() {
+        let Some(pool) = workers() else {
+            return;
+        };
+        let size = COMPARE_PART + 1;
+        let lock = Mutex::new(Last {
+            read: vec![0; size],
+            valid: true,
+            ..Last::default()
+        });
+        let seen = std::sync::atomic::AtomicBool::new(false);
+        let guard = lock.lock().unwrap();
+        let read = |_, to: &mut [u8]| {
+            // The other part may hold it a moment; the refresh's own hold
+            // would last until the parts are done.
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let last = loop {
+                if let Ok(last) = lock.try_lock() {
+                    break last;
+                }
+                let now = std::time::Instant::now();
+                assert!(now < until, "let go while the parts run");
+                std::thread::yield_now();
+            };
+            let being_compared = last.comparing && last.read.is_empty();
+            seen.store(being_compared, std::sync::atomic::Ordering::Relaxed);
+            to.fill(0);
+            true
+        };
+        let (guard, answer) = read_changed_in_parts(&lock, guard, size, pool, read);
+        assert!(seen.into_inner());
+        assert_eq!(answer, Some(Vec::new()));
+        assert_eq!(guard.read.len(), size);
+        assert!(!guard.comparing);
     }
 
     #[test]
@@ -1155,5 +1495,23 @@ mod tests {
         assert!(committed(rw.cast::<u8>(), 4096));
         // SAFETY: freeing the allocation above.
         unsafe { VirtualFree(rw, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn once_per_frame_skips_repeat_checks_only_after_first_upload() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+        let uploaded = AtomicBool::new(false);
+        let checked = AtomicU64::new(u64::MAX);
+        // Before the first real upload, every submission checks.
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        // After the first real upload, check once on frame 10, skip repeats,
+        // and check again once frame advances to 11.
+        uploaded.store(true, Relaxed);
+        assert!(!skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(skip_same_frame(&uploaded, &checked, 10));
+        assert!(!skip_same_frame(&uploaded, &checked, 11));
+        assert!(skip_same_frame(&uploaded, &checked, 11));
     }
 }

@@ -45,10 +45,6 @@ impl Swizzle {
     pub const SW_64KB_S: Swizzle = Swizzle(9);
     pub const SW_64KB_D: Swizzle = Swizzle(10);
     pub const SW_64KB_S_T: Swizzle = Swizzle(17);
-    pub const SW_64KB_D_T: Swizzle = Swizzle(18);
-    pub const SW_4KB_S_X: Swizzle = Swizzle(21);
-    pub const SW_4KB_D_X: Swizzle = Swizzle(22);
-    pub const SW_4KB_R_X: Swizzle = Swizzle(23);
     pub const SW_64KB_Z_X: Swizzle = Swizzle(24);
     pub const SW_64KB_S_X: Swizzle = Swizzle(25);
     pub const SW_64KB_D_X: Swizzle = Swizzle(26);
@@ -775,6 +771,59 @@ impl Layout {
     }
 }
 
+/// The runs of bytes that differ between `kept`, the bytes a texture's
+/// memory last compared equal, and `fresh`, a chunk of it just read (`at`
+/// the chunk's offset in the memory), walked byte by byte: added to
+/// `runs` and copied into `kept`, which ends the memory's. This is the
+/// compare with the fast path off — every chunk walked, as the compare
+/// was before the slice guard ([`changed_runs`]) — kept public for the
+/// bench that times both.
+pub fn walk_changed(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(usize, usize)>) {
+    let n = fresh.len();
+    let mut i = 0;
+    while i < n {
+        if kept[i] != fresh[i] {
+            let first = i;
+            while i < n && kept[i] != fresh[i] {
+                i += 1;
+            }
+            runs.push((at + first, i - first));
+            kept[first..i].copy_from_slice(&fresh[first..i]);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// The compare core of an untracked texture refresh: the runs of bytes
+/// that differ between `kept`, the bytes the memory last compared equal,
+/// and `fresh`, a chunk of it just read (`at` the chunk's offset in the
+/// memory), added to `runs` and copied into `kept`, which is kept the
+/// memory's. A chunk that compares slice-equal holds no differing byte
+/// and is not walked: nothing tracks the memory's writes under Rosetta
+/// (VIctory-macOS issue #1), so a refresh reads it whole and compares,
+/// and almost every chunk of almost every refresh is equal. The walk
+/// itself is [`walk_changed`], so the two shapes cannot drift.
+pub fn changed_runs(at: usize, kept: &mut [u8], fresh: &[u8], runs: &mut Vec<(usize, usize)>) {
+    if *kept == *fresh {
+        // The usual case: one slice comparison, no byte walk.
+        return;
+    }
+    // A streamed page can change in an otherwise equal MiB read. Skip
+    // equal blocks at either end before looking for individual runs. Keep
+    // the middle contiguous so a run crossing a block boundary stays one run.
+    const BLOCK: usize = 4096;
+    let mut start = 0;
+    let mut end = fresh.len();
+    while end - start >= BLOCK && kept[start..start + BLOCK] == fresh[start..start + BLOCK] {
+        start += BLOCK;
+    }
+    while end - start >= BLOCK && kept[end - BLOCK..end] == fresh[end - BLOCK..end] {
+        end -= BLOCK;
+    }
+    walk_changed(at + start, &mut kept[start..end], &fresh[start..end], runs);
+}
+
 enum Buffers<'a> {
     Detile {
         tiled: &'a [u8],
@@ -988,6 +1037,60 @@ mod tests {
             block: 1,
             samples: 1,
             swizzle,
+        }
+    }
+
+    /// The compare core of an untracked refresh: a chunk that compares
+    /// equal reports nothing, a differing one the runs of its differing
+    /// bytes at their offsets in the memory, and `kept` ends the
+    /// memory's; the walk behind the fast path answers the same.
+    #[test]
+    fn changed_runs_report_and_keep_the_differing_bytes() {
+        let memory = [7u8; 100];
+        let mut kept = memory;
+        let mut runs = Vec::new();
+        changed_runs(0, &mut kept, &memory, &mut runs);
+        assert!(runs.is_empty());
+        assert_eq!(kept, memory);
+        // A chunk read at offset 40 with two differing bytes: their
+        // runs, at the memory's offsets, and kept becomes the memory's.
+        let mut fresh = memory;
+        fresh[43] = 9;
+        fresh[70] = 5;
+        changed_runs(40, &mut kept[40..], &fresh[40..], &mut runs);
+        assert_eq!(runs, vec![(43, 1), (70, 1)]);
+        assert_eq!(kept, fresh);
+        // The walk with the fast path off answers the same.
+        let mut walked = memory;
+        let mut walk_runs = Vec::new();
+        walk_changed(40, &mut walked[40..], &fresh[40..], &mut walk_runs);
+        assert_eq!(walk_runs, runs);
+        assert_eq!(walked, fresh);
+    }
+
+    #[test]
+    fn sparse_changes_match_the_byte_walk_in_an_unaligned_chunk() {
+        let original = vec![0; 32_773];
+        let cases: &[&[(usize, usize)]] = &[
+            &[],
+            &[(0, 1), (32_772, 32_773)],
+            &[(4_095, 4_097), (16_380, 20_481)],
+            &[(12_288, 16_384), (16_385, 16_386)],
+            &[(0, 32_773)],
+        ];
+        for &changes in cases {
+            let mut fresh = original.clone();
+            for &(from, to) in changes {
+                fresh[from..to].fill(1);
+            }
+            let mut kept = original.clone();
+            let mut expected = original.clone();
+            let mut runs = vec![(0, 5)];
+            let mut reference = runs.clone();
+            changed_runs(37, &mut kept, &fresh, &mut runs);
+            walk_changed(37, &mut expected, &fresh, &mut reference);
+            assert_eq!(runs, reference);
+            assert_eq!(kept, fresh);
         }
     }
 

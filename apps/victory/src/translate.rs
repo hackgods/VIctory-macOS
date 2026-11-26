@@ -174,6 +174,9 @@ struct Checks {
     /// With `exchange`: every lane walks the skips around a hand-over
     /// (`VICTORY_HALVES_WALK=1`, as `run`).
     walk: bool,
+    /// With half-local reads: the Mac port's hand-over across the halves
+    /// comes before them (`VICTORY_HALVES_ACROSS=1`, as `run`).
+    across: bool,
 }
 
 pub fn run(
@@ -230,6 +233,10 @@ pub fn run(
     if walk {
         println!("halves       walk the skips around a hand-over, where that is exact (VICTORY_HALVES_WALK=1)");
     }
+    let across = victory_gpu::shader_cache::halves_across();
+    if across {
+        println!("halves       hand reads over as VIctory-macOS does, before half-local reads (VICTORY_HALVES_ACROSS=1)");
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -237,8 +244,7 @@ pub fn run(
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     let started = std::time::Instant::now();
@@ -276,6 +282,7 @@ pub fn run(
                                 lds_order,
                                 exchange,
                                 walk,
+                                across,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -395,8 +402,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
     };
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let threads = thread_count(jobs);
     // The pre-build's key listing (diagnostics) translates nothing.
     if pipelines && std::env::var_os("VICTORY_PREBUILD_KEYS").is_some() {
         return crate::prebuild::run(&paths, threads);
@@ -643,6 +649,7 @@ fn translate(
                         lds_order: checks.lds_order,
                         halves_exchange: checks.exchange,
                         halves_walk: checks.walk,
+                        halves_across: checks.across,
                         ..Default::default()
                     };
                     let _ = emit::uav_size_queries();
@@ -948,7 +955,12 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// The worker threads to use: `--jobs`, else one per core.
+fn thread_count(jobs: Option<usize>) -> usize {
+    jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+}
+
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 

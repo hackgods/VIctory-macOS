@@ -1,20 +1,38 @@
-//! Detiling a sampled texture's refresh under Rosetta, where no memory is
-//! tracked (VIctory-macOS issue #1): the refresh must still read and compare
-//! the whole memory (the compare is the change detector), but does it then
-//! detile every subresource, as it does today, or only the subresources the
-//! changed bytes touch? Streamed textures change mip by mip, so each
-//! submission changes one 64 KiB page, cycling across the subresources.
-//! Run with `cargo bench -p victory-formats --bench tex_refresh`.
+//! A sampled texture's refresh under Rosetta, where no memory is
+//! tracked (VIctory-macOS issue #1): the refresh reads and compares the
+//! whole memory — the compare is the change detector — then detiles.
+//! The compare is timed alone, both ways: every chunk walked byte by
+//! byte, as it was before the slice fast path (`walk_changed`), and
+//! with the fast path (`changed_runs`, the compare production uses),
+//! which answers an equal chunk with one slice comparison and walks
+//! only the chunks that differ. Almost every chunk of the hot path is
+//! equal: the title makes about 80 sampled-texture copies a frame,
+//! each touching a few KiB, and every other chunk of every sampled
+//! texture is unchanged. The whole refresh — read, compare, and detile
+//! — is timed with the detile of every subresource and with the span
+//! detile, only the subresources the changed bytes touch; the detile is
+//! timed alone too. The read is a memcpy of resident memory standing in
+//! for the kernel's read of the title's memory, which costs more under
+//! Wine than this copy, so the whole-refresh numbers understate the
+//! read and overstate the compare's share of it. The compare is the
+//! production function (`victory_formats::texture::changed_runs`), so
+//! the bench and the refresh it measures cannot drift. Streamed
+//! textures change mip by mip, so each submission changes one 64 KiB
+//! page, cycling across the subresources. Run with
+//! `cargo bench -p victory-formats --bench tex_refresh`.
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
+use victory_formats::texture::{changed_runs, walk_changed, Desc, Dimension, Layout, Swizzle};
 
 /// One page a submission changes.
 const PAGE: usize = 64 * 1024;
 /// Two rounds over a 13-mip texture's subresources; the median is over all.
 const SUBMISSIONS: usize = 26;
+/// The size the untracked refresh reads and compares at a time, as
+/// victory-gpu's texture.rs (`COMPARE_CHUNK`).
+const COMPARE_CHUNK: usize = 1 << 20;
 
 /// The bytes of the texture's memory subresource `i` lies in, as the GPU's
 /// staging computes them from the layout (rounded out to its blocks).
@@ -63,6 +81,71 @@ fn write_page(tiled: &mut [u8], at: usize) -> (usize, usize) {
         *b = b.wrapping_add(1);
     }
     (at, len)
+}
+
+/// The compare of one whole untracked refresh: `tiled`, the texture's
+/// memory, compared with `kept`, the bytes last compared equal, a
+/// `COMPARE_CHUNK` at a time — every chunk walked byte by byte when
+/// `bytewalk` (the compare as it was before the slice fast path), the
+/// production compare otherwise. The answer is the runs of bytes that
+/// differ, and `kept` ends the memory's. The read is not part of this
+/// number: the whole-refresh timings below carry it as the memcpy
+/// stand-in for the kernel's read.
+fn compare_all(bytewalk: bool, kept: &mut [u8], tiled: &[u8]) -> Vec<(usize, usize)> {
+    let size = tiled.len();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < size {
+        let n = COMPARE_CHUNK.min(size - at);
+        if bytewalk {
+            walk_changed(at, &mut kept[at..at + n], &tiled[at..at + n], &mut runs);
+        } else {
+            changed_runs(at, &mut kept[at..at + n], &tiled[at..at + n], &mut runs);
+        }
+        at += n;
+    }
+    runs
+}
+
+/// One whole untracked refresh of `tiled` into `linear` with `kept`, the
+/// bytes last compared equal: the memory read a `COMPARE_CHUNK` at a
+/// time — a memcpy of resident memory standing in for the kernel's read
+/// of the title's memory, which costs more under Wine — and compared
+/// with `kept` (`changed_runs`, the production compare), then the
+/// detile of every subresource (`whole`) or of only the subresources
+/// the differing runs touch.
+fn refresh(
+    layout: &Layout,
+    linear: &mut [Vec<u8>],
+    tiled: &[u8],
+    kept: &mut [u8],
+    scratch: &mut [u8],
+    spans: &[(usize, usize)],
+    whole: bool,
+) {
+    let mips = layout.mips.len() as u32;
+    let size = tiled.len();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < size {
+        let n = COMPARE_CHUNK.min(size - at);
+        // The read: a memcpy stand-in for the kernel's read of the
+        // title's memory, which costs more under Wine than this copy.
+        scratch[..n].copy_from_slice(&tiled[at..at + n]);
+        changed_runs(at, &mut kept[at..at + n], &scratch[..n], &mut runs);
+        at += n;
+    }
+    let subs: Vec<u32> = if whole {
+        (0..spans.len() as u32).collect()
+    } else {
+        (0..spans.len() as u32)
+            .filter(|&i| {
+                let (a, b) = spans[i as usize];
+                runs.iter().any(|&(from, len)| from < b && a < from + len)
+            })
+            .collect()
+    };
+    detile(layout, linear, black_box(tiled), &subs, mips);
 }
 
 fn median(mut samples: Vec<Duration>) -> Duration {
@@ -125,7 +208,7 @@ fn main() {
         let pages: Vec<usize> = (0..SUBMISSIONS)
             .map(|i| spans[i % count as usize].0.min(size - 1))
             .collect();
-        // Today's untracked behavior: a differing byte anywhere re-detiles
+        // Before the span detile: a differing byte anywhere re-detiles
         // every subresource.
         let mut full = Vec::new();
         for &at in &pages {
@@ -135,7 +218,7 @@ fn main() {
             full.push(start.elapsed());
             checksum += u64::from(linear[len % count as usize][0]);
         }
-        // The fix: only the subresources the changed page touches.
+        // The span detile: only the subresources the changed page touches.
         let mut partial = Vec::new();
         for &at in &pages {
             let (at, len) = write_page(&mut tiled, at);
@@ -147,6 +230,66 @@ fn main() {
             partial.push(start.elapsed());
             checksum += u64::from(linear[len % count as usize][0]);
         }
+        // The compare alone, every chunk walked byte by byte: the shape
+        // before the slice fast path, whose cost the review asked about.
+        let mut kept = tiled.clone();
+        let mut bytewalk = Vec::new();
+        for &at in &pages {
+            write_page(&mut tiled, at);
+            let start = Instant::now();
+            let runs = compare_all(true, &mut kept, black_box(&tiled));
+            bytewalk.push(start.elapsed());
+            checksum += runs.iter().map(|&(_, len)| len as u64).sum::<u64>();
+        }
+        // The compare alone with the fast path: the production compare.
+        let mut fast = Vec::new();
+        kept.copy_from_slice(&tiled);
+        for &at in &pages {
+            write_page(&mut tiled, at);
+            let start = Instant::now();
+            let runs = compare_all(false, &mut kept, black_box(&tiled));
+            fast.push(start.elapsed());
+            checksum += runs.iter().map(|&(_, len)| len as u64).sum::<u64>();
+        }
+        // The whole refresh, read (the memcpy stand-in) + compare + detile:
+        // every subresource, then only the touched ones. Each keeps its
+        // own `kept`, the bytes last compared equal, as the refresh
+        // keeps `last.read`.
+        let mut scratch = vec![0u8; COMPARE_CHUNK];
+        let mut whole_full = Vec::new();
+        kept.copy_from_slice(&tiled);
+        for &at in &pages {
+            let (_, len) = write_page(&mut tiled, at);
+            let start = Instant::now();
+            refresh(
+                &layout,
+                &mut linear,
+                black_box(&tiled),
+                &mut kept,
+                &mut scratch,
+                &spans,
+                true,
+            );
+            whole_full.push(start.elapsed());
+            checksum += u64::from(linear[len % count as usize][0]);
+        }
+        let mut whole_partial = Vec::new();
+        kept.copy_from_slice(&tiled);
+        for &at in &pages {
+            let (_, len) = write_page(&mut tiled, at);
+            let start = Instant::now();
+            refresh(
+                &layout,
+                &mut linear,
+                black_box(&tiled),
+                &mut kept,
+                &mut scratch,
+                &spans,
+                false,
+            );
+            whole_partial.push(start.elapsed());
+            checksum += u64::from(linear[len % count as usize][0]);
+        }
         black_box(checksum);
         println!(
             "bench_tex_refresh_us_full_{name} {:.3}",
@@ -155,6 +298,22 @@ fn main() {
         println!(
             "bench_tex_refresh_us_partial_{name} {:.3}",
             median(partial).as_secs_f64() * 1e6
+        );
+        println!(
+            "bench_tex_refresh_us_compare_bytewalk_{name} {:.3}",
+            median(bytewalk).as_secs_f64() * 1e6
+        );
+        println!(
+            "bench_tex_refresh_us_compare_fast_{name} {:.3}",
+            median(fast).as_secs_f64() * 1e6
+        );
+        println!(
+            "bench_tex_refresh_us_whole_full_{name} {:.3}",
+            median(whole_full).as_secs_f64() * 1e6
+        );
+        println!(
+            "bench_tex_refresh_us_whole_partial_{name} {:.3}",
+            median(whole_partial).as_secs_f64() * 1e6
         );
     }
 }

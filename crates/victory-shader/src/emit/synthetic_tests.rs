@@ -117,6 +117,7 @@ fn build_wave(words: &[u32], wave64: bool) -> Result<HostShader, crate::ShaderEr
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
         root_uavs: lowered.root_uavs,
+        root_srv_bytes: lowered.root_srv_bytes,
         memory: lowered.memory,
         memory_writes: lowered.memory_writes,
         view_addresses: lowered.view_addresses,
@@ -142,6 +143,8 @@ fn lowered(native: &NativeProgram) -> Result<lower::Lowered, crate::ShaderError>
         prims: Vec::new(),
         mesh_stride: 0,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+            atomic_umax: false,
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
@@ -440,6 +443,12 @@ fn run_permute_cs(wave64: bool, body: &[u32], want: &[u32]) {
             eprintln!("no SM 6.6 {label} device; skipped");
             continue;
         };
+        // A wave64 program needs 64 lanes in a wave: a 32-lane host (D3DMetal
+        // takes WaveSize(64) and runs 32) runs it in halves (`lower::halves`).
+        if wave64 && !warp && host.wave32().unwrap_or(false) {
+            eprintln!("{label}: waves of 32 lanes at most; skipped");
+            continue;
+        }
         // Fixed WaveSize pipelines are refused by WARP, and WaveSize(64) by
         // 32-lane hardware adapters.
         let Ok((root, pso)) = host.compute_pipeline(&shader) else {
@@ -926,6 +935,8 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             prims: Vec::new(),
             mesh_stride: 0,
             atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
             halves_local: Default::default(),
@@ -949,6 +960,7 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            root_srv_bytes: l.root_srv_bytes,
             memory: l.memory,
             memory_writes: l.memory_writes,
             view_addresses: l.view_addresses,
@@ -1045,7 +1057,11 @@ fn pops_wait_loop_exits_immediately_for_inactive_lanes() {
         vec![pos_sig("SV_Target", 16, 0)],
     );
 
-    let host = Host::new(true).expect("WARP host");
+    // Wine has no WARP.
+    let Ok(host) = Host::new(true) else {
+        eprintln!("no WARP device; skipped");
+        return;
+    };
     let (root, pso) = host.pipeline(&vs, &ps).expect("pipeline");
     let pixels = host
         .draw(

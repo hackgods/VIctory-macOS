@@ -7,7 +7,7 @@
 # build/deps folder of the Minecraft Bedrock macOS setup.
 #
 # The patches in tools/macos/patches are applied to the source. A Wine that
-# is already installed gets only its server rebuilt (see below), and
+# is already installed gets only its server and ntdll rebuilt (see below), and
 #   tools/macos/build-crossover-wine.sh --stamp
 # prints the stamp of the patches that setup.sh compares with the install's.
 set -eu
@@ -49,10 +49,19 @@ x86() { arch -x86_64 /usr/bin/env PATH="$NATIVE_TOOLS:$BREW/opt/bison/bin:$BREW/
 
 mkdir -p "$WORK" "$OBJ"
 TAR="$WORK/crossover-sources-$VERSION.tar.gz"
+verify_source_tar() {
+  [[ $VERSION != 26.3.0 ]] ||
+    printf '%s  %s\n' ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872 "$1" | shasum -a 256 -c --quiet
+}
 if [[ ! -d $WORK/sources/wine ]]; then
-  [[ -f $TAR ]] || curl -fL --retry 3 -o "$TAR" "https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
-  if [[ $VERSION == 26.3.0 ]]; then
-    echo "ac99c8ca4b3848f3e81784135f023df266b61c2345726ea55a50b3e030dd6872  $TAR" | shasum -a 256 -c --quiet || { echo "checksum mismatch for ${TAR:t}" >&2; exit 1; }
+  if [[ ! -f $TAR ]] || ! verify_source_tar "$TAR"; then
+    (
+      partial="$(mktemp "$TAR.part.XXXXXX")"
+      trap 'rm -f "$partial"' EXIT
+      curl -fL --retry 3 -o "$partial" "https://media.codeweavers.com/pub/crossover/source/crossover-sources-$VERSION.tar.gz"
+      verify_source_tar "$partial" || { echo "checksum mismatch for ${TAR:t}" >&2; exit 1; }
+      mv "$partial" "$TAR"
+    )
   fi
   tar -xzf "$TAR" -C "$WORK"
 fi
@@ -68,12 +77,13 @@ if ! grep -q 'victory-macos fallback' "$VK"; then
 fi
 
 # An installed Wine has D3DMetal's DLLs copied over Wine's own, and make
-# install would put Wine's back. So it gets only its server rebuilt, which
-# is enough while the patches change nothing but the server.
+# install would put Wine's back. So it gets only its server and ntdll's Unix
+# library rebuilt, which D3DMetal does not replace. That is enough while the
+# patches change nothing but those.
 installed=0
 if [[ -x $PREFIX/bin/wine ]]; then
   installed=1
-  outside=($(grep -h '^+++ ' "${PATCHES[@]}" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | grep -v '^server/' || true))
+  outside=($(grep -h '^+++ ' "${PATCHES[@]}" /dev/null | awk '{sub(/^b\//, "", $2); print $2}' | grep -v -e '^server/' -e '^dlls/ntdll/unix/' || true))
   (( ${#outside} == 0 )) || { echo "the patches change ${outside[*]}: remove $PREFIX and build Wine again" >&2; exit 1; }
 fi
 
@@ -110,9 +120,10 @@ if [[ ! -f Makefile ]]; then
     --without-ffmpeg > configure.log 2>&1 || { tail -20 configure.log; exit 1; }
 fi
 if (( installed )); then
-  echo "rebuilding the server of the installed CrossOver Wine"
-  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
+  echo "rebuilding the server and ntdll of the installed CrossOver Wine"
+  x86 make -j"$(sysctl -n hw.ncpu)" server/wineserver dlls/ntdll/ntdll.so > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }
   install -m 755 server/wineserver "$PREFIX/bin/wineserver"
+  install -m 755 dlls/ntdll/ntdll.so "$PREFIX/lib/wine/x86_64-unix/ntdll.so"
 else
   echo "building CrossOver Wine"
   x86 make -j"$(sysctl -n hw.ncpu)" > make.log 2>&1 || { grep -E 'error:|\*\*\*' make.log | grep -v Wno-error | head -5; exit 1; }

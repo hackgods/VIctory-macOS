@@ -65,22 +65,24 @@ impl Ranges {
     }
 
     /// The parts of `[from, to)` not in the set, in order.
-    pub(crate) fn missing(&self, from: usize, to: usize) -> Vec<(usize, usize)> {
-        let mut out = Vec::new();
+    pub(crate) fn missing(
+        &self,
+        from: usize,
+        to: usize,
+    ) -> impl Iterator<Item = (usize, usize)> + '_ {
+        let first = self.0.partition_point(|&(_, end)| end <= from);
         let mut at = from;
-        for &(s, e) in &self.0[self.0.partition_point(|&(_, e)| e <= from)..] {
-            if s >= to {
-                break;
-            }
-            if s > at {
-                out.push((at, s));
-            }
-            at = at.max(e);
-        }
-        if at < to {
-            out.push((at, to));
-        }
-        out
+        self.0[first..]
+            .iter()
+            .copied()
+            .take_while(move |&(start, _)| start < to)
+            // The requested end closes the last uncovered interval.
+            .chain(std::iter::once((to, to)))
+            .filter_map(move |(start, end)| {
+                let gap = (at, start);
+                at = at.max(end);
+                (gap.0 < gap.1).then_some(gap)
+            })
     }
 }
 
@@ -459,14 +461,18 @@ mod tests {
     #[test]
     fn missing_lists_the_parts_not_in_the_set() {
         let r = set(&[(10, 20), (30, 40)]);
-        assert_eq!(r.missing(0, 50), [(0, 10), (20, 30), (40, 50)]);
-        assert_eq!(r.missing(12, 18), []);
-        assert_eq!(r.missing(15, 35), [(20, 30)]);
-        assert_eq!(r.missing(5, 12), [(5, 10)]);
-        assert_eq!(r.missing(38, 45), [(40, 45)]);
-        assert_eq!(r.missing(50, 60), [(50, 60)]);
-        assert_eq!(r.missing(25, 25), []);
-        assert_eq!(Ranges::default().missing(3, 9), [(3, 9)]);
+        let missing = |from, to| r.missing(from, to).collect::<Vec<_>>();
+        assert_eq!(missing(0, 50), [(0, 10), (20, 30), (40, 50)]);
+        assert_eq!(missing(12, 18), []);
+        assert_eq!(missing(15, 35), [(20, 30)]);
+        assert_eq!(missing(5, 12), [(5, 10)]);
+        assert_eq!(missing(38, 45), [(40, 45)]);
+        assert_eq!(missing(50, 60), [(50, 60)]);
+        assert_eq!(missing(25, 25), []);
+        assert_eq!(
+            Ranges::default().missing(3, 9).collect::<Vec<_>>(),
+            [(3, 9)]
+        );
     }
 
     /// Every operation against a bitmap, on a long run of random ones.

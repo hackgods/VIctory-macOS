@@ -25,6 +25,7 @@ const ORDER: Mac = Mac {
     exchange: false,
     uav_level0: false,
     walk: false,
+    across: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.
@@ -276,6 +277,8 @@ fn lowered(
         mesh_stride: 0,
         view_marks: false,
         atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves,
         halves_local,
@@ -659,6 +662,7 @@ mod gpu {
             root_cbvs: l.root_cbvs,
             root_srvs: l.root_srvs,
             root_uavs: l.root_uavs,
+            root_srv_bytes: l.root_srv_bytes,
             memory: l.memory,
             memory_writes: l.memory_writes,
             view_addresses: l.view_addresses,

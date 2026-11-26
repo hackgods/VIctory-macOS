@@ -35,24 +35,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use victory_formats::pagetable::{self, BLOCK, CAPACITY, LEVEL1};
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
 use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
-/// Pages per level-2 block: 4096 pages of 64 KiB, 256 MiB.
-const BLOCK: usize = 4096;
-/// Level-1 entries: 2^40 bytes in 256 MiB blocks.
-const LEVEL1: usize = 4096;
-/// Level-2 blocks a table has room for besides the null one: copies in 512
-/// distinct 256 MiB regions (the world's ~4,100 copies use a few dozen).
-const CAPACITY: usize = 512;
-/// Sentinel in [`Layout::owner`] for a page with no host copy.
-const NO_OWNER: u32 = u32::MAX;
-/// Total dwords in a page table buffer (level-1 + `CAPACITY + 1` blocks of
-/// `BLOCK` 2-dword entries).
-const TABLE_DWORDS: usize = LEVEL1 + (CAPACITY + 1) * BLOCK * 2;
 /// Bits in a list's dirty-page bitmap (one per level-2 entry across all blocks).
 const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
 /// 32-bit words in a dirty-page bitmap.
@@ -93,14 +82,14 @@ impl Map {
 }
 
 /// What a heap's page table names: the copies, the level-1 index of each
-/// block (block 0 is the null one), and the copy each entry names (or [`NO_OWNER`]).
+/// block (block 0 is the null one), and the copy each entry names (or none).
 #[derive(Default)]
 struct Layout {
     copies: Vec<Arc<Shadow>>,
     /// Each copy's bit in the change tracker (`crate::watch::clean_bit`).
     bits: Vec<Option<u32>>,
     blocks: Vec<usize>,
-    owner: Vec<u32>,
+    owner: Vec<Option<usize>>,
 }
 
 /// A 256 KiB dirty-page bitmap buffer kept zeroed while in [`BITMAP_POOL`].
@@ -214,6 +203,10 @@ struct Shared {
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
+    /// The table's working buffers, kept between rewrites (grown as
+    /// needed, never shrunk): the copies' order, the level-1 index, each
+    /// entry's owner and the dwords ([`pagetable::Scratch`]).
+    scratch: pagetable::Scratch,
 }
 
 // SAFETY: `data` is the persistent mapping of `table`, written only under
@@ -270,8 +263,14 @@ struct Stats {
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
 
-fn stats<R>(f: impl FnOnce(&mut Stats) -> R) -> R {
-    f(STATS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
+fn stats<R: Default>(f: impl FnOnce(&mut Stats) -> R) -> R {
+    if !tracing::event_enabled!(tracing::Level::INFO) {
+        return R::default();
+    }
+    f(STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_default())
 }
 
 /// `bytes` of a range shaders wrote through a view did not go back into
@@ -282,7 +281,13 @@ pub(crate) fn note_withheld(bytes: u64) {
 
 /// A draw or dispatch of `pipeline` uses title memory.
 pub(crate) fn note_use(pipeline: &str) {
-    stats(|s| *s.uses.entry(pipeline.to_owned()).or_default() += 1);
+    stats(|s| {
+        if let Some(count) = s.uses.get_mut(pipeline) {
+            *count += 1;
+        } else {
+            s.uses.insert(pipeline.to_owned(), 1);
+        }
+    });
 }
 
 /// Frames presented, and the last one in which a list using title memory
@@ -391,96 +396,11 @@ pub(crate) fn heap() -> Option<&'static crate::descriptor::host::HostHeap> {
         .as_ref()
 }
 
-/// Writes the page table for host copies `copies` (start, bytes), copy `k`'s
-/// view pair at heap index `pairs[k]`, and `null` for unowned pages directly into
-/// `out` (which must hold at least [`TABLE_DWORDS`] dwords). Returns
-/// `(written_dwords, blocks, owner)` where `owner` holds copy indices or
-/// [`NO_OWNER`]. At most [`CAPACITY`] blocks besides the null one.
-fn write_table(
-    copies: &[(u64, u64)],
-    pairs: &[u32],
-    null: u32,
-    out: &mut [u32],
-) -> (usize, Vec<usize>, Vec<u32>) {
-    assert!(out.len() >= TABLE_DWORDS);
-    let mut order: Vec<usize> = (0..copies.len()).collect();
-    order.sort_by_key(|&k| std::cmp::Reverse(copies[k].1));
-    // Build level-1 in cached stack memory so we never read from write-combined upload memory.
-    let mut level1 = [0u32; LEVEL1];
-    // Block 0 is the null block (no copy).
-    let mut blocks = vec![usize::MAX];
-    let mut owner = vec![NO_OWNER; BLOCK];
-    let mut full = false;
-    for &k in &order {
-        let (start, len) = copies[k];
-        let Some(end) = start.checked_add(len) else {
-            continue;
-        };
-        if len == 0 || end > 1 << 40 {
-            continue;
-        }
-        for page in start >> 16..=(end - 1) >> 16 {
-            let l1 = (page >> 12) as usize;
-            if level1[l1] == 0 {
-                if blocks.len() > CAPACITY {
-                    full = true;
-                    continue;
-                }
-                level1[l1] = blocks.len() as u32;
-                blocks.push(l1);
-                owner.resize(owner.len() + BLOCK, NO_OWNER);
-            }
-            let entry = level1[l1] as usize * BLOCK + (page & 0xFFF) as usize;
-            // Larger copies come first: a copy holding the whole page takes
-            // it from them; one holding part of it only takes it if free.
-            let whole = page << 16 >= start && (page + 1) << 16 <= end;
-            if whole || owner[entry] == NO_OWNER {
-                owner[entry] = k as u32;
-            }
-        }
-    }
-    if full {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
-    }
-    out[..LEVEL1].copy_from_slice(&level1);
-    let l2_dwords = owner.len() * 2;
-    let l2 = &mut out[LEVEL1..LEVEL1 + l2_dwords];
-    let (slots, _) = l2.as_chunks_mut::<2>();
-    for (slot, &o) in slots.iter_mut().zip(&owner) {
-        if o == NO_OWNER {
-            slot[0] = null;
-            slot[1] = 0;
-        } else {
-            let k = o as usize;
-            slot[0] = pairs[k];
-            slot[1] = copies[k].0 as u32;
-        }
-    }
-    (LEVEL1 + l2_dwords, blocks, owner)
-}
-
-#[cfg(test)]
-fn table(
-    copies: &[(u64, u64)],
-    pairs: &[u32],
-    null: u32,
-) -> (Vec<u32>, Vec<usize>, Vec<Option<usize>>) {
-    let mut dwords = vec![0u32; TABLE_DWORDS];
-    let (len, blocks, owner) = write_table(copies, pairs, null, &mut dwords);
-    dwords.truncate(len);
-    let owner = owner
-        .into_iter()
-        .map(|o| (o != NO_OWNER).then_some(o as usize))
-        .collect();
-    (dwords, blocks, owner)
-}
-
 impl Shared {
     /// A page table for `heap`, named nothing yet (written at the first
     /// submission that uses it).
     fn new(heap: &HostHeap) -> Option<Shared> {
-        let bytes = TABLE_DWORDS as u64 * 4;
+        let bytes = (LEVEL1 + (CAPACITY + 1) * BLOCK * 2) as u64 * 4;
         let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
@@ -496,6 +416,7 @@ impl Shared {
             pairs: HashMap::new(),
             generation: u64::MAX,
             layout: Arc::default(),
+            scratch: pagetable::Scratch::default(),
         })
     }
 
@@ -534,18 +455,30 @@ impl Shared {
             slots.push(slot);
         }
         let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
-        // SAFETY: `self.data` is the persistent mapping of `self.table`, with room
-        // for `TABLE_DWORDS` dwords; no submission runs.
-        let out = unsafe { std::slice::from_raw_parts_mut(self.data as *mut u32, TABLE_DWORDS) };
-        let (_, blocks, owner) = write_table(&ranges, &slots, self.null, out);
-        tracing::debug!(copies = ranges.len(), blocks = blocks.len() - 1, "title memory page table");
+        // The last table's blocks and owners, built back into if no list
+        // still reads them (a reader clones the layout, under the lock
+        // this holds); their buffers are kept between rewrites.
+        let spent = std::mem::take(&mut self.layout);
+        let mut out = match Arc::try_unwrap(spent) {
+            Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
+            Err(_) => pagetable::Outputs::default(),
+        };
+        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        // SAFETY: the mapping has room for `CAPACITY` blocks, which the
+        // builder keeps to; no submission runs.
+        unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
+        tracing::debug!(copies = ranges.len(), blocks = built.blocks.len() - 1, "title memory page table");
+        if built.full {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
+        }
+        self.generation = now;
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
-            blocks,
-            owner,
+            blocks: out.blocks,
+            owner: out.owners,
         });
-        self.generation = now;
         stats(|s| s.tables += 1);
     }
 }
@@ -580,7 +513,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
         for (c, bit) in l.copies.iter().zip(&l.bits) {
-            if !crate::watch::clean_bit(*bit) {
+            if !c.clean() && !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
             }
@@ -618,7 +551,7 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             let block = entry / BLOCK;
             if block == 0
                 || l.blocks.get(block).is_none()
-                || l.owner.get(entry).is_none_or(|&o| o == NO_OWNER)
+                || l.owner.get(entry).is_none_or(|o| o.is_none())
             {
                 return true;
             }
@@ -670,6 +603,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
+            // Most words are 0: write back only the ones that are not.
             if *mark == 0 {
                 continue;
             }
@@ -687,7 +621,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
-                    Some(&k) if k != NO_OWNER => writes.push((k as usize, at)),
+                    Some(&Some(k)) => writes.push((k, at)),
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -735,6 +669,20 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use victory_formats::pagetable::table;
+
+    #[test]
+    fn memory_stats_follow_the_frame_report_filter() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        for (filter, expected) in [("warn,victory_gpu::host=info", false), ("info", true)] {
+            let subscriber =
+                tracing_subscriber::registry().with(tracing_subscriber::EnvFilter::new(filter));
+            tracing::subscriber::with_default(subscriber, || {
+                assert_eq!(stats(|_| true), expected);
+            });
+        }
+    }
 
     /// Writes of lists using title memory are held back from a frame with a
     /// miss through the next one, then go back again.
@@ -816,8 +764,8 @@ mod tests {
 
     #[test]
     fn has_missed_checks_block_zero_out_of_range_unowned_and_owned() {
-        let mut owner = vec![NO_OWNER; 2 * BLOCK];
-        owner[BLOCK + 5] = 0;
+        let mut owner = vec![None; 2 * BLOCK];
+        owner[BLOCK + 5] = Some(0);
         let l = Layout {
             copies: Vec::new(),
             bits: Vec::new(),

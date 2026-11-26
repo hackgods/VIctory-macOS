@@ -175,6 +175,17 @@ pub extern "system" fn XMemVirtualAlloc(
             );
         }
     }
+    if !at.is_null()
+        && victory_gpu::alias_buffers()
+        && kind & MEM_COMMIT != 0
+        && kind & MEM_RESERVE_PLACEHOLDER == 0
+        && protect == PAGE_READWRITE
+        && (at as usize).is_multiple_of(PAGE)
+        && size >= PAGE
+        && size.is_multiple_of(PAGE)
+    {
+        victory_gpu::alias_region(at as usize, size, false);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -341,6 +352,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
+            victory_gpu::unalias_region(address as usize);
             VirtualFree(address, 0, MEM_RELEASE);
             return;
         }
@@ -368,6 +380,10 @@ const PAGE: usize = 64 << 10;
 struct Section {
     handle: HANDLE,
     size: usize,
+    /// Optional shared CPU/GPU backing. The file still supplies Wine's
+    /// placeholder-view metadata.
+    #[cfg(feature = "diagnostics")]
+    shared: Option<victory_gpu::PhysicalHeap>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -387,6 +403,10 @@ impl Section {
     /// The address of our view of the whole section, mapped the first time;
     /// `None` if the host would not map it.
     fn whole(&self) -> Option<usize> {
+        #[cfg(feature = "diagnostics")]
+        if let Some(shared) = &self.shared {
+            return Some(shared.cpu_address());
+        }
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let at = *self.whole.get_or_init(|| {
             // SAFETY: our section; the view is ours until the section drops.
@@ -431,7 +451,8 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each slice (section, page index) is mapped: the addresses of
     /// its page in every view showing it (the GPU side's change tracking
-    /// follows writes through one view to the others, `aliases`).
+    /// follows writes through one view to the others,
+    /// `victory_gpu::title_memory_aliased`).
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
@@ -444,9 +465,10 @@ impl Slice {
 
 /// Every address of a title view showing a page that title memory at
 /// `[at, at + len)` shows, except the page's own address: pushed to `out`
-/// as (page address, other address). The GPU side's change tracking
-/// (`victory_gpu::watch`) marks writes there too.
-pub fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
+/// as (page address, other address). Tests read `shown` back with it; the
+/// GPU side's change tracking (`victory_gpu::watch`) marks writes there too.
+#[cfg(test)]
+fn aliases(at: usize, len: usize, out: &mut Vec<(usize, usize)>) {
     let physical = physical();
     let end = at.saturating_add(len);
     let first = physical
@@ -556,6 +578,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     let section = Arc::new(Section {
         handle,
         size,
+        #[cfg(feature = "diagnostics")]
+        shared: victory_gpu::physical_heap(size),
         whole: OnceLock::new(),
     });
     let mut physical = physical();
@@ -927,7 +951,23 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    let mapped = commit(base, len);
+    #[cfg(feature = "diagnostics")]
+    let mapped = mapped
+        && slice.section.shared.as_ref().is_none_or(|shared| {
+            // SAFETY: this live view is ours. The slice will hold the
+            // backing heap until the view is unmapped.
+            let aliased = unsafe { shared.alias_view(base, slice.index * PAGE, len) };
+            if !aliased {
+                tracing::warn!(
+                    address = format_args!("{base:#x}"),
+                    len,
+                    "sharing the mapped XMem view with the host heap failed"
+                );
+            }
+            aliased
+        });
+    if !mapped {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
@@ -1389,6 +1429,14 @@ mod tests {
         let mut n = 3;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
         assert_eq!(n, 3);
+        #[cfg(feature = "diagnostics")]
+        if std::env::var("VICTORY_PHYSICAL_TILES").as_deref() == Ok("1") {
+            let physical = physical();
+            assert!(
+                physical.pages[&pages[0]].section.shared.is_some(),
+                "the test must use shared physical pages"
+            );
+        }
         // Packed into 21 bits as `number >> 4`, as the title keeps them.
         for p in pages {
             assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);

@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::s;
 
-use crate::host::{HostList, host, transition};
+use crate::host::{HostList, host, transition, uav_barrier};
 use crate::object::This;
 use crate::resource::HostTexture;
 
@@ -466,17 +466,29 @@ impl Twin {
             l.ResourceBarrier(&[state(COPY_SOURCE as i32, 0)]);
         }
         COPIES.fetch_add(1, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            // The bytes of the twin's planes the copy moves (the depth
+            // texture's side may be half as big: 16-bit depth).
+            let bytes: u64 = self
+                .routes
+                .iter()
+                .map(|r| {
+                    u64::from(r.twin.Footprint.RowPitch)
+                        * u64::from(r.twin.Footprint.Height)
+                        * u64::from(r.twin.Footprint.Depth)
+                })
+                .sum();
+            let (copies, moved) = if to_depth {
+                (C::TwinToDepth, C::TwinToDepthBytes)
+            } else {
+                (C::TwinToTwin, C::TwinToTwinBytes)
+            };
+            add(copies, 1);
+            add(moved, bytes);
+        }
         converted
-    }
-}
-
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
-    D3D12_RESOURCE_BARRIER {
-        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-        Anonymous: D3D12_RESOURCE_BARRIER_0 {
-            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
-        },
     }
 }
 

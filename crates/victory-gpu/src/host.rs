@@ -1655,6 +1655,10 @@ impl Host {
         let mut next_log_secs = 1u64;
         let mut logged_hang = false;
         loop {
+            // SAFETY: our fence.
+            if unsafe { self.fence.GetCompletedValue() } >= value {
+                return;
+            }
             // SAFETY: our event and fence.
             let woke = unsafe { WaitForSingleObject(event, poll_ms) };
             // SAFETY: as above.
@@ -1797,7 +1801,7 @@ impl Host {
         let holding = Holding::enter();
         // Ensure the GPU is completely idle before descriptor heap creation /
         // null-fill begins (VIctory-macOS issue #31).
-        let landed = self.finish_flight_locked(&mut held, None);
+        let landed = self.finish_flight_locked(&mut held, None, None);
         Some(Quiet {
             holding: Some(holding),
             held: Some(held),
@@ -1822,7 +1826,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.finish_flight_locked(&mut submitted, None);
+        self.finish_flight_locked(&mut submitted, None, None);
 
         #[cfg(feature = "diagnostics")]
         let gpu_timing = timing();
@@ -1996,6 +2000,7 @@ impl Host {
             prep.heaps,
             prep.started,
             prep.prepared,
+            prep.prepared.elapsed(),
             removed_in,
         );
         // A listed frame: what this submission's lists drew, as it is now
@@ -2184,6 +2189,7 @@ impl Host {
     /// Runs post-GPU completion work under `self.submitted` after the host
     /// fence has completed: timing/removal checks, mark & shadow copy-back,
     /// `after` callbacks, bottom-of-pipe writes, retirement, and info-queue logs.
+    #[allow(clippy::too_many_arguments)]
     fn finish_post_gpu(
         &self,
         runs: &[&HostList],
@@ -2191,9 +2197,9 @@ impl Host {
         heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
         started: std::time::Instant,
         prepared: std::time::Instant,
+        gpu: std::time::Duration,
         removed_in: Option<usize>,
     ) {
-        let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         // The host resets a device whose submission runs for about 2 s.

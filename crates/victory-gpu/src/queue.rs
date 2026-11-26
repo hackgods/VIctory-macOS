@@ -299,7 +299,12 @@ fn pump_ready_under_drain(why: Why) -> bool {
                         "held work runs without its waits after {VALVE:?} (safety valve)"
                     );
                 }
-                let item = held.take_ready(&read_value, &fence);
+                let no_write =
+                    |_: &std::sync::Arc<crate::host::HostList>, _: &crate::hold::ValueWait| false;
+                let no_join = |_: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                               _: &std::sync::Arc<crate::host::HostList>| false;
+                let item =
+                    held.take_ready_with(&read_value, &fence, &no_write, &no_join, false);
                 if item.is_none() && !held.is_empty() {
                     start_held_timer();
                 }
@@ -320,25 +325,39 @@ fn pump_ready_under_drain(why: Why) -> bool {
                 }
             }
             Ready::Segments {
-                queue,
+                queues,
                 segments,
+                signals,
                 waited,
                 unknown,
+                coalesced_bop_waits,
+                hazard_splits,
             } => {
+                let _ = (coalesced_bop_waits, hazard_splits);
                 pieces += 1;
                 segments_count += segments.len() as u32;
                 unknown_count += unknown;
                 waited_all.extend(waited);
+                let run_segments: Vec<std::sync::Arc<crate::host::HostList>> =
+                    segments.into_iter().map(|(s, _)| s).collect();
                 let at = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
                 if crate::host::flight1_enabled() {
-                    host.execute_flight1(segments);
+                    host.execute_flight1(run_segments);
                 } else {
-                    host.execute_sync_segments(segments);
+                    host.execute_sync_segments(run_segments);
+                }
+                for (fence, value) in signals {
+                    if !crate::host::flight1_enabled()
+                        || !host.attach_signal(fence as This, value, true)
+                    {
+                        crate::fence::set(fence as This, value);
+                        crate::fence::let_go(fence as This);
+                    }
                 }
                 ran += at.elapsed();
-                held().finish_running(queue);
+                held().finish_running(&queues);
             }
         }
     }

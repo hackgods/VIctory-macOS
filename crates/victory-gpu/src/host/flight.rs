@@ -152,6 +152,7 @@ struct InFlight {
     split_count: usize,
     started: std::time::Instant,
     prepared: std::time::Instant,
+    launched: std::time::Instant,
     waited: bool,
 }
 
@@ -183,7 +184,7 @@ impl Host {
         // Wait-Before-Prep: drain Flight N-1 completely before Flight N
         // touches any shared Shadow, descriptor heap, upload staging pool, or
         // Mark buffer.
-        self.finish_flight_locked(&mut submitted, None);
+        self.finish_flight_locked(&mut submitted, None, None);
 
         let prep = {
             let run_refs: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
@@ -230,6 +231,7 @@ impl Host {
             group.push(mark.list());
         }
         let queue = self.queue();
+        let launched = std::time::Instant::now();
         // SAFETY: closed lists; fence and events are ours.
         let waited = unsafe {
             let mut first = 0;
@@ -269,6 +271,7 @@ impl Host {
             split_count,
             started: prep.started,
             prepared: prep.prepared,
+            launched,
             waited,
         };
         {
@@ -325,17 +328,20 @@ impl Host {
         }
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.finish_flight_locked(&mut submitted, None)
+        self.finish_flight_locked(&mut submitted, None, None)
     }
 
     /// Completes any active flight under `Host::submitted`. When
     /// `only_if_fence` is `Some(v)`, only lands if the active flight matches
     /// fence value `v` (used by `victory-flight` so it never blocks on a newer
-    /// flight while holding `Host::submitted`).
+    /// flight while holding `Host::submitted`). `waited_at`, when provided by
+    /// `victory-flight`, records the exact instant the GPU fence completed so
+    /// lock-wait latency is never billed as GPU execution time.
     pub(super) fn finish_flight_locked(
         &self,
         submitted: &mut u64,
         only_if_fence: Option<u64>,
+        waited_at: Option<std::time::Instant>,
     ) -> bool {
         let flight = {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
@@ -350,9 +356,18 @@ impl Host {
             return false;
         };
 
-        if flight.waited {
-            self.wait_for(flight.fence_value);
-        }
+        let gpu_done = if flight.waited {
+            // SAFETY: plain fence completion query.
+            if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                self.wait_for(flight.fence_value);
+                std::time::Instant::now()
+            } else {
+                waited_at.unwrap_or_else(std::time::Instant::now)
+            }
+        } else {
+            std::time::Instant::now()
+        };
+        let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
 
@@ -393,6 +408,7 @@ impl Host {
                 flight.heaps,
                 flight.started,
                 flight.prepared,
+                gpu_duration,
                 None,
             );
         }
@@ -439,10 +455,23 @@ fn spawn_flight_worker() {
                 if waited {
                     host.wait_for_on_event(host.flight_event, fence_value, 250);
                 }
+                let gpu_done = std::time::Instant::now();
+                // Skip acquiring `Host::submitted` if `victory-submit` already
+                // claimed and began landing this flight while we waited.
+                let still_mine = host
+                    .flight
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .in_flight
+                    .as_ref()
+                    .is_some_and(|f| f.fence_value == fence_value);
+                if !still_mine {
+                    continue;
+                }
                 let landed = {
                     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
                     let _holding = Holding::enter();
-                    host.finish_flight_locked(&mut submitted, Some(fence_value))
+                    host.finish_flight_locked(&mut submitted, Some(fence_value), Some(gpu_done))
                 };
                 // Strictly AFTER dropping `Host::submitted`: wake held work or
                 // the submit worker in case this flight's BoP writes or fence

@@ -24,7 +24,9 @@
 //!   (`VICTORY_ASYNC_HEAP_SYNC=1` writes heap slots while the GPU runs
 //!   already); the texture uploads while its own upload list is on the GPU
 //!   (one list and one staging pool, reset per submission); a title copy or
-//!   move; a step of ours; a declaration of what shaders write (snapshots,
+//!   move; a step of ours, but one that writes only the list's own memory
+//!   or our flags (`Step::Own`) from title memory it cannot write; a
+//!   declaration of what shaders write (snapshots,
 //!   arming); a title-memory program's tables; a fill from title memory it
 //!   may write or lands in; refreshes of a copy it may write (the prewarm's
 //!   rules, [`Host::prewarm`]), or of the title memory it lands in (those
@@ -288,6 +290,7 @@ impl Host {
         let why = match step {
             Step::Copy(..) | Step::Move(..) => Some(Why::Copy),
             Step::Host(_) => Some(Why::Host),
+            &Step::Own(_, at, len) => (len > 0 && b.footprint().reaches(at, len)).then_some(Why::Host),
             Step::GpuWrite(..) => Some(Why::Write),
             Step::Memory(_) => Some(Why::Memory),
             &Step::Fill(_, src, len) => b.footprint().reaches(src, len).then_some(Why::Fill),
@@ -373,6 +376,12 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 pub(super) fn finished_beside() -> u64 {
     FINISHED_BY.iter().map(|n| n.load(Relaxed)).sum()
+}
+
+/// Finishes so far for `why` (tests).
+#[cfg(test)]
+pub(super) fn finished_for(why: Why) -> u64 {
+    FINISHED_BY[why as usize].load(Relaxed)
 }
 
 /// Since the last frame line: looks at a held wait answered from the

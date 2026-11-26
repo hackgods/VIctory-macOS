@@ -1440,7 +1440,15 @@ enum Step {
     /// may have rewritten the slot since the draw was recorded.
     Slot(std::sync::Arc<crate::bindless::Viewed>, u32),
     /// Work that writes host memory only.
+    // mac: made only by tests and diagnostics since the rest is `Own`.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     Host(Box<dyn Fn() + Send>),
+    /// mac: work that writes only the list's own memory or our own flags,
+    /// and reads no title memory but `[address, address + bytes)` (none if
+    /// 0 bytes): run as [`Step::Host`]; a submission prepared while the one
+    /// before still runs need not wait for that one first
+    /// (`unwaited::flights`), unless that one may write what it reads.
+    Own(Box<dyn Fn() + Send>, usize, usize),
     /// Shaders write a range (address, bytes) of a buffer's host copy;
     /// whether they mark the pages they write (no snapshot then), and
     /// whether their program uses title memory (then the range is withheld
@@ -3639,9 +3647,11 @@ impl HostList {
             deferred.budget_zeroed = true;
             let at = *data;
             // SAFETY: the list's own mapped word, written before it runs.
-            deferred.copies.push(Step::Host(Box::new(move || unsafe {
-                (at as *mut u32).write_volatile(0)
-            })));
+            deferred.copies.push(Step::Own(
+                Box::new(move || unsafe { (at as *mut u32).write_volatile(0) }),
+                0,
+                0,
+            ));
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
@@ -3820,8 +3830,17 @@ impl HostList {
     }
 
     /// Runs `work` on host memory at submission, in order with the copies.
+    // mac: used only by tests and diagnostics since the rest is `defer_own`.
+    #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
+    }
+
+    /// mac: [`HostList::defer_host`] for work that writes only the list's
+    /// own memory or our own flags and reads no title memory but
+    /// `[at, at + len)` (none if `len` is 0) ([`Step::Own`]).
+    pub(crate) fn defer_own(&self, at: usize, len: usize, work: impl Fn() + Send + 'static) {
+        self.deferred().copies.push(Step::Own(Box::new(work), at, len));
     }
 
     /// Brings a texture's staging buffer and host texture `copy` up to date
@@ -3854,7 +3873,7 @@ impl HostList {
                 match step {
                     Step::Refresh(..) | Step::Slot(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Move(..) | Step::Fill(..) => C::StepCopyUs,
-                    Step::Host(_) => C::StepWorkUs,
+                    Step::Host(_) | Step::Own(..) => C::StepWorkUs,
                     Step::GpuWrite(..) => C::StepGpuWriteUs,
                     Step::Texture(..) => C::StepTextureUs,
                     Step::Heap(_) => C::StepHeapUs,
@@ -3910,7 +3929,7 @@ impl HostList {
                     crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
-                Step::Host(work) => {
+                Step::Host(work) | Step::Own(work, ..) => {
                     work();
                     #[cfg(feature = "diagnostics")]
                     {

@@ -30,18 +30,28 @@
 //! - `map pieces near`, `mid`, `far` (within 1 km of the focus, within 3 km,
 //!   further) and `nowhere`: the loaded pieces by what the title's own
 //!   "remove if nobody needs it" (+0x23cac30) looks at. A group is written
-//!   `b<box> i<flags> r<refs> d<dependents> pieces/entities`:
+//!   `b<box> s<state> d<dependents> pieces/entities`:
 //!   - box: the piece's word in the box streamer's table (pointer at store
 //!     +0xe0), low 9 bits. Any of 0x79 set means a search still asks for the
 //!     piece; with 0x80 set the piece is switched by script and 0x100 says on.
-//!   - flags, refs, dependents: from the piece's streaming record (the
-//!     engine at +0x764b240 keeps 28-byte records in 503 buckets): the byte
-//!     at +0x19 (bit 0 is "do not delete"), the words at +0xc and +0xe
-//!     added, the word at +0x14. `i--` if there is no record.
+//!   - state, dependents: from the piece's streaming record (the engine
+//!     at +0x764b240 keeps 28-byte records in 503 buckets): bits 5 to 8 of
+//!     the word at +0x1a, and the word at +0x14. The title's own check
+//!     before it removes a piece (+0x51c6150) takes state 5 as "can go
+//!     now" and 0 to 4 as "not yet". `s-` if there is no record. (The flags
+//!     byte at +0x19 and the reference words read 0 for every piece in the
+//!     run of 12:56 and are no longer shown.)
 //!
 //!   Pieces far from the focus that still have a search bit are held by
-//!   whoever sets that bit; with no bit and no "do not delete" they are free
-//!   to go and something does not remove them.
+//!   whoever sets that bit; with no bit they are free to go and something
+//!   does not remove them.
+//! - `streaming`: the engine's time budget for placing map pieces in one
+//!   frame (dword at engine +0x166c8, microseconds; 0 is no limit; the
+//!   title's governor at +0x2294750 sets it to its estimate of the work
+//!   divided by the frame time in 33 ms units, kept between 250 and 1250),
+//!   the governor's mode word (+0xab44324), and how many requests wait in
+//!   each of the engine's 17 stage lists (heads at engine +0x167b0, a
+//!   request's next at +0x80), as `stage:count`.
 //!
 //! That step (RVA 0x16cd4d0) was first read as the step of the whole map
 //! and paced by `VICTORY_MAPDATA_STEPS`; it is the state machine of the
@@ -92,9 +102,17 @@ pub(crate) const FOCUS: u32 = 0x0ab5_6e38;
 /// records (28 bytes, the object's number in the low 28 bits of the first
 /// dword) are counted at +0x24 and start at the pointer at +0x28, both
 /// shifted by 16 bytes times the dword at the engine's +0x14.
-const ENGINE: u32 = 0x0764_b240;
+pub(crate) const ENGINE: u32 = 0x0764_b240;
 const BUCKETS: usize = 503;
 const RECORD: usize = 0x1c;
+/// In the engine: the time budget of a frame for placing map pieces, the
+/// heads of its stage lists, their number, and a request's next pointer.
+const BUDGET: usize = 0x166c8;
+pub(crate) const STAGES: usize = 0x167b0;
+pub(crate) const STAGE_COUNT: usize = 17;
+pub(crate) const REQUEST_NEXT: usize = 0x80;
+/// The mode word of the governor that sets the budget.
+const GOVERNOR_MODE: u32 = 0x0ab4_4324;
 /// A piece is near the focus within this, far beyond the second.
 const NEAR: f32 = 1000.0;
 const FAR: f32 = 3000.0;
@@ -201,10 +219,38 @@ impl Places {
     }
 }
 
-/// What the title's "remove if nobody needs it" looks at for one piece:
-/// the box streamer's word (low 9 bits), the streaming record's flags byte
-/// (`None` without a record), its two reference words added, its dependents.
-type Need = (u16, Option<u8>, u32, u16);
+/// What the title's removal looks at for one piece: the box streamer's
+/// word (low 9 bits), the streaming record's state (`None` without a
+/// record), its dependents.
+type Need = (u16, Option<u8>, u16);
+
+/// The state in a streaming record: bits 5 to 8 of the word at +0x1a.
+fn state_of(record: &[u8; RECORD]) -> u8 {
+    (u16::from_le_bytes([record[0x1a], record[0x1b]]) >> 5 & 0xf) as u8
+}
+
+/// Per stage list of the engine: the stage, the requests waiting in it, and
+/// whether the walk was cut short.
+type Waiting = Vec<(usize, u32, bool)>;
+
+/// The `streaming` line.
+fn streaming_line(budget: Option<u32>, mode: Option<u32>, waiting: &[(usize, u32, bool)]) -> String {
+    let budget = match budget {
+        Some(0) => "no limit".to_owned(),
+        Some(us) => format!("{us} us a frame"),
+        None => "unknown".to_owned(),
+    };
+    let mode = mode.map_or("unknown".to_owned(), |m| format!("{m:#x}"));
+    let waiting: Vec<String> = waiting
+        .iter()
+        .filter(|&&(_, n, _)| n != 0)
+        .map(|&(stage, n, cut)| format!("{stage}:{n}{}", if cut { "+" } else { "" }))
+        .collect();
+    format!(
+        "streaming: map placing budget {budget}, governor mode {mode}, requests waiting by stage {}",
+        if waiting.is_empty() { "none".to_owned() } else { waiting.join(" ") }
+    )
+}
 
 /// The class of a piece by its distance from the focus: near, mid, far,
 /// nowhere (no place, or no focus to measure from).
@@ -240,9 +286,9 @@ impl Needs {
         let mut out: Vec<String> = groups
             .iter()
             .take(GROUPS)
-            .map(|&(&(b, i, r, d), &(n, e))| {
-                let i = i.map_or("--".to_owned(), |i| format!("{i:02x}"));
-                format!("b{b:03x} i{i} r{r} d{d} {n}/{e}")
+            .map(|&(&(b, state, d), &(n, e))| {
+                let state = state.map_or("-".to_owned(), |s| s.to_string());
+                format!("b{b:03x} s{state} d{d} {n}/{e}")
             })
             .collect();
         if groups.len() > GROUPS {
@@ -434,6 +480,29 @@ impl Reader {
         })
     }
 
+    /// The engine's budget, and per stage list the requests waiting (and
+    /// whether the walk was cut short: the lists change under us).
+    fn streaming(&mut self, base: usize) -> (Option<u32>, Option<u32>, Waiting) {
+        let mode = self.dword(base + GOVERNOR_MODE as usize);
+        let Some(engine) = self.pointer(base + ENGINE as usize).filter(|&e| e != 0) else {
+            return (None, mode, Vec::new());
+        };
+        let waiting = (0..STAGE_COUNT)
+            .map(|stage| {
+                let (mut request, mut n) = (self.pointer(engine + STAGES + 8 * stage).unwrap_or(0), 0u32);
+                while request != 0 && n < 1 << 14 {
+                    n += 1;
+                    match self.pointer(request + REQUEST_NEXT) {
+                        Some(next) => request = next,
+                        None => return (stage, n, true),
+                    }
+                }
+                (stage, n, request != 0)
+            })
+            .collect();
+        (self.dword(engine + BUDGET), mode, waiting)
+    }
+
     /// The store's loaded pieces: the slots in use, the pieces by the place
     /// of their first entity (each carrying its number of entities), and
     /// the pieces by need in the four classes of distance from `focus`.
@@ -473,10 +542,9 @@ impl Reader {
             places.add(place, n);
             let box_word = self.bytes::<2>(box_words + 2 * i).map_or(0xffff, u16::from_le_bytes);
             let record = self.record(engine, first_object.wrapping_add(i as u32));
-            let word = |r: &[u8; RECORD], at: usize| u16::from_le_bytes(r[at..at + 2].try_into().unwrap());
             let need: Need = match record.as_ref() {
-                Some(r) => (box_word & 0x1ff, Some(r[0x19]), u32::from(word(r, 0xc)) + u32::from(word(r, 0xe)), word(r, 0x14)),
-                None => (box_word & 0x1ff, None, 0, 0),
+                Some(r) => (box_word & 0x1ff, Some(state_of(r)), u16::from_le_bytes([r[0x14], r[0x15]])),
+                None => (box_word & 0x1ff, None, 0),
             };
             needs[class_of(place, focus)].add(need, n);
         }
@@ -552,11 +620,13 @@ pub fn watch(base: u64) -> Result<(), &'static str> {
                             places.text(true)
                         );
                         for (class, needs) in CLASSES.iter().zip(&needs) {
-                            tracing::info!("map pieces {class} (box, flags, refs, dependents, pieces/entities) {}", needs.text());
+                            tracing::info!("map pieces {class} (box, state, dependents, pieces/entities) {}", needs.text());
                         }
                     }
                     None => tracing::info!("map pieces: the store is not as read (store +0x40.. {fields})"),
                 }
+                let (budget, mode, stages) = reader.streaming(base);
+                tracing::info!("{}", streaming_line(budget, mode, &stages));
             }
         })
         .map(|_| ())
@@ -629,20 +699,39 @@ mod tests {
     #[test]
     fn needs_name_the_groups_with_the_most_entities_first() {
         let mut needs = Needs::default();
-        needs.add((0x008, Some(0x01), 1, 0), 20);
-        needs.add((0x008, Some(0x01), 1, 0), 30);
-        needs.add((0x000, Some(0x00), 2, 1), 400);
-        needs.add((0x180, None, 0, 0), 1);
-        assert_eq!(
-            needs.text(),
-            "4/451: b000 i00 r2 d1 1/400; b008 i01 r1 d0 2/50; b180 i-- r0 d0 1/1"
-        );
+        needs.add((0x008, Some(5), 0), 20);
+        needs.add((0x008, Some(5), 0), 30);
+        needs.add((0x000, Some(3), 1), 400);
+        needs.add((0x180, None, 0), 1);
+        assert_eq!(needs.text(), "4/451: b000 s3 d1 1/400; b008 s5 d0 2/50; b180 s- d0 1/1");
         assert_eq!(Needs::default().text(), "0/0: none");
         for k in 0..(GROUPS as u16 + 3) {
-            needs.add((k, Some(0), 0, 0), 1000 + u32::from(k));
+            needs.add((k, Some(0), 0), 1000 + u32::from(k));
         }
-        assert!(needs.text().starts_with("13/9487: b008 i00 r0 d0 1/1008; b007 i00 r0 d0 1/1007; "));
+        assert!(needs.text().starts_with("13/9487: b008 s0 d0 1/1008; b007 s0 d0 1/1007; "));
         assert!(needs.text().ends_with("; 6 more groups 7/3454"), "{}", needs.text());
+    }
+
+    #[test]
+    fn a_records_state_is_four_bits_of_its_last_word() {
+        let mut record = [0u8; RECORD];
+        record[0x1a..].copy_from_slice(&(5u16 << 5 | 0x1f | 0xfe00).to_le_bytes());
+        assert_eq!(state_of(&record), 5);
+        record[0x1a..].copy_from_slice(&(0xfu16 << 5).to_le_bytes());
+        assert_eq!(state_of(&record), 15);
+    }
+
+    #[test]
+    fn the_streaming_line_names_the_stages_with_requests() {
+        assert_eq!(
+            streaming_line(Some(250), Some(0x6), &[(0, 0, false), (7, 12, false), (8, 16384, true)]),
+            "streaming: map placing budget 250 us a frame, governor mode 0x6, requests waiting by stage 7:12 8:16384+"
+        );
+        assert_eq!(
+            streaming_line(Some(0), None, &[]),
+            "streaming: map placing budget no limit, governor mode unknown, requests waiting by stage none"
+        );
+        assert!(streaming_line(None, Some(0), &[]).starts_with("streaming: map placing budget unknown, governor mode 0x0"));
     }
 
     #[test]

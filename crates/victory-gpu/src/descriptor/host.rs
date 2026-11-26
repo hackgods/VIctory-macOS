@@ -1006,13 +1006,7 @@ impl HostHeap {
         let view_is_sampler = is_sampler(&view);
         if view_is_sampler != self.sampler {
             warn_heap_mismatch(index, self.sampler, view_is_sampler);
-            if made[index as usize] != 0 {
-                self.ready[index as usize].store(0, Ordering::Relaxed);
-                made[index as usize] = 0;
-                self.set_made_nonzero(index, false);
-                self.make_null(index);
-                self.note_address(index, None);
-            }
+            self.unmake_locked(&mut made, index);
             return None;
         }
         // A placed texture's view left null below is made when a draw reads
@@ -1122,6 +1116,7 @@ impl HostHeap {
                 let [tag, i, generation] = record;
                 let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
                 if let Some(view) = &view
+                    && is_sampler(view) == self.sampler
                     && !is_placed_texture(view)
                 {
                     prepare(view);
@@ -1145,6 +1140,12 @@ impl HostHeap {
                 }
                 match view.as_deref().filter(|_| current) {
                     None => self.unmake_locked(&mut made, index),
+                    // As in `mirror`: a record of the other heap kind is
+                    // cleared, never made (#414).
+                    Some(view) if is_sampler(view) != self.sampler => {
+                        warn_heap_mismatch(index, self.sampler, !self.sampler);
+                        self.unmake_locked(&mut made, index);
+                    }
                     Some(view) => {
                         let [_, i, generation] = *record;
                         let key = u64::from(generation) << 32 | u64::from(i);

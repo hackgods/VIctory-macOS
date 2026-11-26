@@ -2,12 +2,13 @@
 //! time goes, by pass. D3DMetal answers timestamp queries with zeros, so
 //! `VICTORY_GPU_TIMING` can time only whole host lists. For world frame `k`
 //! (counted, as `VICTORY_CAPTURE_WORLD` counts, from the first frame that
-//! ran 500 draws), every title list recorded then is cut into a host list
-//! of its own at each pipeline it sets, and each host list submitted then
-//! runs and is waited for on its own: its wall time from submission to the
-//! fence is its GPU time, plus a submission's own cost (the line names the
-//! least any took). Two frames later, the line names the costliest runs
-//! with their pipelines, draws and dispatches.
+//! ran 500 draws), each host list of the title lists recorded then (a pass,
+//! mostly) runs and is waited for on its own: its wall time from
+//! submission to the fence is its GPU time, plus a submission's own cost
+//! (the line names the least any took). With `VICTORY_GPU_PASS_CUTS=<n>`,
+//! up to `n` times the title list is also cut into a host list of its own
+//! where it sets another pipeline. Two frames later, the line names the
+//! costliest lists with their pipelines, draws and dispatches.
 //!
 //! Cutting a list makes a new host list carry its state again (as a wait
 //! does, `crate::list`), and on Metal a render pass ends at each list's
@@ -28,13 +29,45 @@ pub(crate) fn requested() -> Option<u64> {
     })
 }
 
+/// Cuts left for the timed frame (`VICTORY_GPU_PASS_CUTS`, none by
+/// default): each makes a host list of its own. 3,124 cuts in one world
+/// frame (a cut at every pipeline set) made as many host lists, two
+/// command allocators and lists each, and the process ran out of memory
+/// (run v3-verify: Wine refused a 4 KiB allocation, then the title's crash
+/// handler crashed).
+static CUTS_LEFT: std::sync::OnceLock<AtomicU64> = std::sync::OnceLock::new();
+
+fn cuts_left() -> &'static AtomicU64 {
+    CUTS_LEFT.get_or_init(|| {
+        AtomicU64::new(
+            std::env::var("VICTORY_GPU_PASS_CUTS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0),
+        )
+    })
+}
+
+/// Whether one more cut may be made (and counts it).
+pub(crate) fn take_cut() -> bool {
+    cuts_left()
+        .fetch_update(Relaxed, Relaxed, |n| n.checked_sub(1))
+        .is_ok()
+}
+
+/// Sets the cuts left (tests).
+#[cfg(test)]
+pub(crate) fn allow_cuts(n: u64) {
+    cuts_left().store(n, Relaxed);
+}
+
 /// The frame number timed, once the world's first frame is known.
 fn timed_frame() -> Option<u64> {
     Some(crate::capture::world()? + requested()?)
 }
 
-/// Whether lists recorded now are cut at each pipeline they set: the frame
-/// after the last presented is the timed one.
+/// Whether lists recorded now are timed (and cut, with cuts left): the
+/// frame after the last presented is the timed one.
 pub(crate) fn cutting() -> bool {
     timed_frame() == Some(crate::queue::presented() + 1)
 }

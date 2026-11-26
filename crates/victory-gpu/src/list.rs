@@ -220,17 +220,18 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
-/// `VICTORY_GPU_PASS_TIMING` (`crate::gpu_pass`): before the title list
-/// sets another pipeline, what it recorded is cut off as at a wait, and the
-/// rest goes on in a host list of its own; both run and are timed on their
-/// own.
+/// `VICTORY_GPU_PASS_TIMING` (`crate::gpu_pass`): the title list's host
+/// list runs and is timed on its own; with cuts left
+/// (`VICTORY_GPU_PASS_CUTS`), what it recorded before the title sets
+/// another pipeline is cut off as at a wait, and the rest goes on in a host
+/// list of its own.
 #[cfg(all(windows, feature = "diagnostics"))]
 fn cut_for_timing(this: This) {
     let Some(current) = host_list(this) else {
         return;
     };
     current.mark_pass_timed();
-    if current.is_empty() {
+    if current.is_empty() || !crate::gpu_pass::take_cut() {
         return;
     }
     let Some(next) = next_segment(this) else {
@@ -2140,10 +2141,10 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
-    /// `VICTORY_GPU_PASS_TIMING`: setting a pipeline after commands cuts
-    /// the title list into a host list of its own, as a wait does; with
-    /// nothing recorded since the last cut it cuts nothing. Every part is
-    /// timed on its own.
+    /// `VICTORY_GPU_PASS_TIMING`: setting a pipeline marks the host list to
+    /// be timed on its own; after commands, with a cut left, it also cuts
+    /// the title list into a host list of its own, as a wait does. With no
+    /// cut left, or nothing recorded since the last cut, it cuts nothing.
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn a_pipeline_set_after_commands_cuts_a_timed_list() {
@@ -2162,8 +2163,14 @@ mod tests {
             return; // no host GPU here
         };
         first.defer_host(|| {});
+        crate::gpu_pass::allow_cuts(0);
+        cut_for_timing(list);
+        assert_eq!(segments(list).len(), 1, "no cut left");
+        assert!(first.is_pass_timed());
+        crate::gpu_pass::allow_cuts(5);
         cut_for_timing(list);
         cut_for_timing(list);
+        crate::gpu_pass::allow_cuts(0);
         let parts = segments(list);
         assert_eq!(parts.len(), 2, "one cut: nothing was recorded after it");
         assert!(parts.iter().all(|h| h.is_pass_timed()));

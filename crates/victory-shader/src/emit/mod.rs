@@ -2,7 +2,9 @@
 //! or mesh shader as a PC DXIL container (SM 6.6) that host D3D12 accepts.
 //! Compute shaders keep the console's thread-group size; one that depends
 //! on the lane layout (cross-lane operations) declares the console's wave
-//! size (`WaveSize`), so the host device must support it.
+//! size (`WaveSize`), so the host device must support it; a wave64 one on a
+//! host of 32-lane waves declares 32 and runs in halves
+//! ([`Options::host_wave32`]).
 //!
 //! What the host binds for a translated shader ([`HostShader`]):
 //!
@@ -213,6 +215,8 @@ mod container;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(all(test, windows))]
+mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
@@ -390,6 +394,12 @@ pub struct Options {
     /// gradients scaled by `2^bias`, for hosts that ignore the bias of a
     /// compute shader's sample (D3DMetal, #30).
     pub bias_as_gradients: bool,
+    /// The host's waves have at most 32 lanes (`WaveLaneCountMax` 32:
+    /// NVIDIA, Intel), so it refuses `WaveSize(64)`: a console wave64
+    /// compute program that needs the console's lanes runs as two waves of
+    /// 32, and is refused where it reads across them (`lower::halves`).
+    /// The translation differs, so the shader cache keys on it.
+    pub host_wave32: bool,
     /// The host runs wave64 programs in 32-lane waves whatever `WaveSize`
     /// says (D3DMetal): a compute group that is one console wave of more
     /// than 32 lanes gets group barriers where its lanes read LDS other
@@ -521,6 +531,7 @@ pub fn emit_with(
         view_marks: options.view_marks,
         atomic_locks: options.atomic_locks,
         bias_as_gradients: options.bias_as_gradients,
+        host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
     };
     let l = match lower::lower(&parts(st, res)) {

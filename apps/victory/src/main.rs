@@ -93,6 +93,11 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Translate for a host whose waves have at most 32 lanes (NVIDIA,
+        /// Intel), as `run` does there: wave64 compute programs in halves.
+        /// With `--pipelines`, set by the GPU that makes them.
+        #[arg(long, conflicts_with = "cache")]
+        wave32: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -193,16 +198,17 @@ fn main() -> Result<()> {
             list,
             jobs,
             cache: false,
+            wave32,
         } => {
             #[cfg(windows)]
             {
-                translate::run(paths, validate, pipelines, list, jobs)
+                translate::run(paths, validate, pipelines, list, jobs, wave32)
             }
             // Translation checks shaders with the Windows DXC host, which
             // other hosts do not have yet.
             #[cfg(not(windows))]
             {
-                let _ = (paths, validate, pipelines, list, jobs);
+                let _ = (paths, validate, pipelines, list, jobs, wave32);
                 anyhow::bail!("translate needs a Windows host for now")
             }
         }

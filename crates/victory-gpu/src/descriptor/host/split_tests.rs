@@ -247,3 +247,103 @@ fn a_pass_made_on_several_threads_shows_what_the_pass_alone_makes() {
     assert_eq!(host.log_messages(), None);
     drop((wide, alone, one));
 }
+
+/// A measurement, not a check (`--nocapture` shows it): how long the host
+/// takes to make a buffer view in a descriptor heap, alone and from several
+/// threads at once, in one shader-visible heap and in a heap per thread,
+/// and how long to copy a made view instead. It says whether making a heap
+/// sync's slots side by side (`VICTORY_HEAP_SYNC_THREADS`) can gain on
+/// this host, and what copying would cost.
+#[test]
+fn how_long_the_host_takes_to_make_and_to_copy_views() {
+    let Some(host) = host() else {
+        return; // no host GPU here
+    };
+    const N: u32 = 16_384;
+    const MOST: u32 = 4;
+    let Some((buffer, _)) = host.upload_buffer(1 << 16) else {
+        return;
+    };
+    let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    let heap = |visible: bool| -> Option<(ID3D12DescriptorHeap, usize)> {
+        let flags = if visible { D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE } else { D3D12_DESCRIPTOR_HEAP_FLAG_NONE };
+        let desc = D3D12_DESCRIPTOR_HEAP_DESC { Type: kind, NumDescriptors: MOST * N, Flags: flags, NodeMask: 0 };
+        // SAFETY: plain heap creation; a live heap's start.
+        unsafe {
+            let heap: ID3D12DescriptorHeap = host.device.CreateDescriptorHeap(&desc).ok()?;
+            let start = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            Some((heap, start))
+        }
+    };
+    // SAFETY: a plain query.
+    let step = unsafe { host.device.GetDescriptorHandleIncrementSize(kind) } as usize;
+    let at = |start: usize, i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start + i as usize * step };
+    // A raw view of 16 dwords from dword `i % 1024` on.
+    let view = |i: u32| D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_SRV {
+                FirstElement: u64::from(i % 1024),
+                NumElements: 16,
+                StructureByteStride: 0,
+                Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+            },
+        },
+    };
+    // Microseconds a call: the wall time of `threads` threads doing `n`
+    // calls each, over all their calls. Made side by side it falls with
+    // the threads; made one after the other inside the host it stays.
+    let timed = |threads: u32, n: u32, f: &(dyn Fn(u32, u32) + Sync)| -> f64 {
+        let began = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for t in 0..threads {
+                scope.spawn(move || (0..n).for_each(|i| f(t, i)));
+            }
+        });
+        began.elapsed().as_secs_f64() * 1e6 / f64::from(threads * n)
+    };
+    let (Some(visible), Some(made)) = (heap(true), heap(false)) else {
+        return;
+    };
+    let own: Vec<_> = (0..MOST).filter_map(|_| heap(false)).collect();
+    if own.len() != MOST as usize {
+        return;
+    }
+    let (visible, made) = (visible.1, made.1);
+    let own: Vec<usize> = own.iter().map(|h| h.1).collect();
+    // SAFETY (all calls below): live heaps of MOST * N slots, a live buffer
+    // of 64 KiB; each thread writes slots of its own.
+    let make = |start: usize, slot: u32, i: u32| unsafe {
+        host.device.CreateShaderResourceView(&buffer, Some(&view(i)), at(start, slot))
+    };
+    // Warm: every slot of every heap written once.
+    for slot in 0..MOST * N {
+        make(visible, slot, slot);
+        make(made, slot, slot);
+    }
+    let threads = [1u32, 2, 4];
+    let one_heap = threads.map(|t| timed(t, N, &|thread, i| make(visible, thread * N + i, i)));
+    let own_heaps = threads.map(|t| timed(t, N, &|thread, i| make(own[thread as usize], i, i)));
+    let nulls = timed(1, N, &|_, i| unsafe {
+        host.device.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&view(0)), at(visible, i))
+    });
+    let copies = threads.map(|t| {
+        timed(t, N, &|thread, i| unsafe {
+            host.device.CopyDescriptorsSimple(1, at(visible, thread * N + i), at(made, i), kind)
+        })
+    });
+    let runs = timed(1, N / 64, &|_, i| unsafe {
+        host.device.CopyDescriptorsSimple(64, at(visible, i * 64), at(made, i * 64), kind)
+    }) / 64.0;
+    eprintln!(
+        "the host's descriptor calls, microseconds a view on 1, 2 and 4 threads (wall time over all threads' \
+         views): CreateShaderResourceView of a buffer into one shader-visible heap {one_heap:.2?}, into a heap of \
+         each thread's own {own_heaps:.2?}; a null view {nulls:.2}; CopyDescriptorsSimple of one made view into \
+         the shader-visible heap {copies:.2?}, of a run of 64 {runs:.3} a view"
+    );
+    // SAFETY: a plain device query.
+    assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    assert_eq!(host.log_messages(), None);
+}

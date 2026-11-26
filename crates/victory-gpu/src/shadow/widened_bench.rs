@@ -9,6 +9,20 @@ use crate::backend::HostGpu;
 #[test]
 #[ignore = "times widened bookkeeping at barriers on host lists"]
 fn barriers_over_a_long_widened_history() {
+    barriers(0);
+}
+
+/// As above, over a heap whose views are mostly shader resource views, as
+/// the world's (~140,000 ranges, a fraction of them unordered).
+#[test]
+#[ignore = "times widened bookkeeping at barriers on host lists"]
+fn barriers_over_a_heap_of_mostly_shader_views() {
+    barriers(120_000);
+}
+
+/// Sixty barriers over a heap of 15,000 unordered ranges and `shader`
+/// shader resource ranges.
+fn barriers(shader: usize) {
     let Some(host) = host() else {
         return; // no host GPU here
     };
@@ -24,10 +38,14 @@ fn barriers_over_a_long_widened_history() {
     let parent = new(0x1000, 48);
     let _widened = parent.widened(0x1000, 48, 1).expect("a widened view");
     let written = new(0x100_0000, 1 << 20);
+    let read = new(0x200_0000, 8 << 20);
     const RANGES: usize = 15_000;
     let viewed = Arc::new(crate::bindless::Viewed::default());
     for i in 0..RANGES {
         viewed.add_unordered(&written, 0x100_0000 + 64 * i as u64, 64);
+    }
+    for i in 0..shader {
+        viewed.add_range(&read, 0x200_0000 + 64 * i as u64, 64, false);
     }
     // Ten lists of six barriers each ("a frame"), each barrier after a
     // heap-writing draw and a hundred UAV writes.
@@ -55,7 +73,7 @@ fn barriers_over_a_long_widened_history() {
     }
     times.sort_unstable();
     eprintln!(
-        "60 barriers over histories up to {} writes: median {} us (5 warm rounds, {:?})",
+        "60 barriers over histories up to {} writes, {shader} shader ranges besides: median {} us (5 warm rounds, {:?})",
         6 * (RANGES + 100),
         times[2],
         times

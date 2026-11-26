@@ -67,7 +67,18 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+    /// The unordered ranges of `ranges` (copy, start, end), in its order,
+    /// and the widened writes they make, made at the first barrier after a
+    /// change ([`widened_writes_into`]): a barrier after a heap-writing
+    /// draw walked all of `ranges` for them (the world's 140,000, under
+    /// this lock, which refreshes of table slots wait for).
+    unordered: BTreeMap<(usize, u64, u64), Arc<Shadow>>,
+    widened: Option<Arc<Vec<WidenedWrite>>>,
 }
+
+/// A widened write a heap's unordered view makes: copy, title address,
+/// bytes.
+type WidenedWrite = (Arc<Shadow>, usize, usize);
 
 /// A copy, and the counts of its ranges' starts and ends.
 type Ends = (Arc<Shadow>, BTreeMap<u64, u32>, BTreeMap<u64, u32>);
@@ -96,6 +107,14 @@ impl Inner {
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
+                    if key.3 && key.1 < key.2 {
+                        if now > 0 {
+                            self.unordered.insert((key.0, key.1, key.2), shadow.clone());
+                        } else {
+                            self.unordered.remove(&(key.0, key.1, key.2));
+                        }
+                        self.widened = None;
+                    }
                     let ends = self
                         .ends
                         .entry((key.0, key.3))
@@ -207,11 +226,34 @@ impl Viewed {
     /// `address` (tests: no view or resource needed).
     #[cfg(test)]
     pub(crate) fn add_unordered(&self, shadow: &Arc<Shadow>, address: u64, len: u64) {
-        let seen = Seen::Buffer(shadow.clone(), address, len, true);
+        self.add_range(shadow, address, len, true);
+    }
+
+    /// A slot whose view (`unordered` or a shader resource view) reaches
+    /// `len` bytes of `shadow` at `address` (tests).
+    #[cfg(test)]
+    pub(crate) fn add_range(&self, shadow: &Arc<Shadow>, address: u64, len: u64, unordered: bool) {
+        let seen = Seen::Buffer(shadow.clone(), address, len, unordered);
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .count(u32::MAX, &seen, true); // no slot: only textures name theirs
+    }
+
+    /// Such a slot made something else again (tests).
+    #[cfg(test)]
+    pub(crate) fn remove_range(
+        &self,
+        shadow: &Arc<Shadow>,
+        address: u64,
+        len: u64,
+        unordered: bool,
+    ) {
+        let seen = Seen::Buffer(shadow.clone(), address, len, unordered);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count(u32::MAX, &seen, false); // no slot: only textures name theirs
     }
 
     /// The buffer ranges views reach, merged per host copy and kind
@@ -515,24 +557,33 @@ pub(crate) fn refresh_slot(
 
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier, added to `out` (the caller's buffer, kept from barrier to
-/// barrier: the world's heaps have tens of thousands). Computed heap indices
-/// do not name ordinary write steps.
-pub(crate) fn widened_writes_into(viewed: &Viewed, out: &mut Vec<(Arc<Shadow>, usize, usize)>) {
+/// barrier: the world's heaps have tens of thousands). The list of them is
+/// made once per change of the heap's unordered ranges and shared, so the
+/// heap's lock is held for a lookup, not a walk. Computed heap indices do
+/// not name ordinary write steps.
+pub(crate) fn widened_writes_into(viewed: &Viewed, out: &mut Vec<WidenedWrite>) {
     if !crate::under_wine() {
         return;
     }
-    out.extend(
-        viewed
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .ranges
-            .iter()
-            .filter(|((_, address, end, uav), _)| *uav && address < end)
-            .map(|((_, address, end, _), (_, shadow))| {
-                (shadow.clone(), *address as usize, (end - address) as usize)
-            }),
-    );
+    let writes = {
+        let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let Inner {
+            unordered, widened, ..
+        } = &mut *inner;
+        widened
+            .get_or_insert_with(|| {
+                Arc::new(
+                    unordered
+                        .iter()
+                        .map(|(&(_, address, end), shadow)| {
+                            (shadow.clone(), address as usize, (end - address) as usize)
+                        })
+                        .collect(),
+                )
+            })
+            .clone()
+    };
+    out.extend(writes.iter().cloned());
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them

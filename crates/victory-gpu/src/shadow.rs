@@ -3569,6 +3569,54 @@ pub(crate) mod tests {
         list.close();
     }
 
+    /// A heap's widened writes are its unordered ranges in order, the
+    /// shared list of them made again after a range comes or goes, and a
+    /// range viewed twice counted once until both slots let it go.
+    #[test]
+    fn a_heaps_widened_writes_follow_its_unordered_ranges() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let (a, b) = (
+            loose_shadow(0x30_0000, 0x1000),
+            loose_shadow(0x40_0000, 0x1000),
+        );
+        let viewed = crate::bindless::Viewed::default();
+        let expanded = || {
+            let mut out = Vec::new();
+            crate::bindless::widened_writes_into(&viewed, &mut out);
+            out.iter()
+                .map(|(s, at, len)| (s.range().0, *at, *len))
+                .collect::<Vec<_>>()
+        };
+        viewed.add_range(&b, 0x40_0000, 0x40, true);
+        viewed.add_range(&a, 0x30_0100, 0x40, true);
+        viewed.add_range(&a, 0x30_0000, 0x40, false);
+        viewed.add_range(&a, 0x30_0000, 0x40, true);
+        viewed.add_range(&a, 0x30_0000, 0x40, true);
+        // In the order of the heap's ranges: by copy, then start.
+        let (first, second) = if Arc::as_ptr(&a) < Arc::as_ptr(&b) {
+            (0x30_0000, 0x40_0000)
+        } else {
+            (0x40_0000, 0x30_0000)
+        };
+        let all = [
+            (0x30_0000, 0x30_0000, 0x40),
+            (0x30_0000, 0x30_0100, 0x40),
+            (0x40_0000, 0x40_0000, 0x40),
+        ];
+        let ordered: Vec<_> = [first, second]
+            .iter()
+            .flat_map(|&copy| all.iter().copied().filter(move |w| w.0 == copy))
+            .collect();
+        assert_eq!(expanded(), ordered);
+        viewed.remove_range(&a, 0x30_0000, 0x40, true);
+        assert_eq!(expanded(), ordered, "still viewed by the other slot");
+        viewed.remove_range(&a, 0x30_0000, 0x40, true);
+        viewed.remove_range(&b, 0x40_0000, 0x40, true);
+        assert_eq!(expanded(), [(0x30_0000, 0x30_0100, 0x40)]);
+    }
+
     /// An element-aligned shadow that starts after the widened view cannot
     /// back the direct source root SRV; it must use the composed patch path.
     #[test]

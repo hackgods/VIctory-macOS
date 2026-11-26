@@ -23,6 +23,7 @@
 
 #[cfg(windows)]
 mod crash;
+pub mod map_budget;
 pub mod map_evict;
 pub mod masked;
 pub mod pool_watch;

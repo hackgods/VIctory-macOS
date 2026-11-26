@@ -154,6 +154,19 @@ pub fn run(
             Err(why) => println!("lookup guard   not applied: {why}"),
         }
     }
+    // macOS port: the title's time budget for placing map pieces, made
+    // larger (victory_loader::map_budget); off unless asked for.
+    if let Some(k) = victory_loader::map_budget::wanted(std::env::var(victory_loader::map_budget::SWITCH).ok().as_deref())
+    {
+        match victory_loader::map_budget::patch(image.base() as u64, k) {
+            Ok(()) => println!(
+                "map budget     on: {} to {} us a frame for placing map pieces (the title's limits times {k})",
+                250 * k,
+                1250 * k
+            ),
+            Err(why) => println!("map budget     not applied: {why}"),
+        }
+    }
     // macOS port: map pieces nobody asks for any more are put out when the
     // title's pool of buildings fills up (victory_loader::map_evict); off
     // unless asked for.

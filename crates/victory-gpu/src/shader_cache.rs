@@ -269,6 +269,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         atomic_lock_keys: lock_writers[1],
         lds_order: crate::mac_switches::lds_order(),
         halves_exchange: crate::mac_switches::exchange(),
+        uav_size_level0: crate::mac_switches::uav_size_level0(),
     }
 }
 
@@ -300,6 +301,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         [options.atomic_lock_helpers, options.atomic_lock_keys],
         options.lds_order,
         options.halves_exchange,
+        options.uav_size_level0,
     );
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

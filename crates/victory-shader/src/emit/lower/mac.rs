@@ -122,6 +122,12 @@ pub(crate) struct Mac {
     /// write is tested by both ([`Lower::pair_high`]), not by the low one
     /// alone.
     pub exchange: bool,
+    /// A size query on a writable image (`getDimensions`) asks for level 0
+    /// instead of an undefined level (`emit::Options::uav_size_level0`).
+    /// D3DMetal answered the undefined one wrongly in the title's shadow
+    /// min/max program (`07f451a14b13fecb`: sample coordinates fit a width
+    /// and height of 65,536; `notes/PLAN.md`, 26 November 15:15).
+    pub uav_level0: bool,
 }
 
 /// `DB_SHADER_CONTROL`: the program exports depth (`Z_EXPORT_ENABLE`).

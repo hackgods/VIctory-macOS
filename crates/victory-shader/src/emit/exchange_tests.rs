@@ -27,6 +27,7 @@ const REFUSAL: &str = "a lane read that may cross 32-lane halves (wave64 on a 32
 fn exchange() -> Mac {
     Mac {
         exchange: true,
+        uav_level0: false,
         ..Mac::default()
     }
 }

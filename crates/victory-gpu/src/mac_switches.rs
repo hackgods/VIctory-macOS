@@ -117,6 +117,23 @@ pub(crate) fn exchange() -> bool {
     })
 }
 
+/// Whether a size query on a writable image asks for level 0
+/// (`victory_shader::emit::Options::uav_size_level0`): only with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`. It makes the title's shadow min/max
+/// program right under D3DMetal, and the TAA disocclusion mask then comes
+/// out white outside one rectangle (skin speckles), which is why it is off
+/// (`notes/PLAN.md`, 26 November 15:15 and 16:00).
+pub(crate) fn uav_size_level0() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref(), false);
+        if on {
+            tracing::info!("VICTORY_UAV_SIZE_LEVEL0=1: size queries on writable images ask for level 0");
+        }
+        on
+    })
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -154,8 +171,9 @@ pub(crate) fn key(
     lock_writers: [bool; 2],
     lds_order: bool,
     exchange: bool,
+    uav_size_level0: bool,
 ) -> [u8; 32] {
-    if !early_depth && lock_writers == [false; 2] && !lds_order && !exchange {
+    if !early_depth && lock_writers == [false; 2] && !lds_order && !exchange && !uav_size_level0 {
         return *build;
     }
     let mut h = blake3::Hasher::new();
@@ -174,6 +192,9 @@ pub(crate) fn key(
     }
     if exchange {
         h.update(b"halves exchange");
+    }
+    if uav_size_level0 {
+        h.update(b"uav size level 0");
     }
     *h.finalize().as_bytes()
 }
@@ -235,7 +256,7 @@ mod tests {
     #[test]
     fn each_combination_of_settings_has_cache_entries_of_its_own() {
         let build = [7u8; 32];
-        assert_eq!(key(&build, false, [false, false], false, false), build);
+        assert_eq!(key(&build, false, [false, false], false, false, false), build);
         let of = |build: &[u8; 32], n: u8| {
             key(
                 build,
@@ -243,22 +264,23 @@ mod tests {
                 [n & 2 != 0, n & 4 != 0],
                 n & 8 != 0,
                 n & 16 != 0,
+                n & 32 != 0,
             )
         };
         let mut keys = std::collections::HashSet::new();
-        for n in 0..32u8 {
+        for n in 0..64u8 {
             let k = of(&build, n);
             assert_eq!(k, of(&build, n));
             keys.insert(k);
             // Over another build (other settings, another translator).
             assert!(n == 0 || k != of(&[8u8; 32], n));
         }
-        assert_eq!(keys.len(), 32);
+        assert_eq!(keys.len(), 64);
         let mut early = blake3::Hasher::new();
         early.update(&build);
         early.update(b"early depth");
         assert_eq!(
-            key(&build, true, [false, false], false, false),
+            key(&build, true, [false, false], false, false, false),
             *early.finalize().as_bytes()
         );
         let mut four = blake3::Hasher::new();

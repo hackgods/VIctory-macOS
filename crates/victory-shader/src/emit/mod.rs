@@ -472,6 +472,11 @@ pub struct Options {
     /// [`Options::halves_local`] gives the reader's own half's and the
     /// default refuses. The shader cache keys on it.
     pub halves_exchange: bool,
+    /// A size query on a writable image asks for level 0, where DXC (and
+    /// the default here) leaves the level undefined (`lower::Mac`). A
+    /// writable view has one level, so it is the same query. The shader
+    /// cache keys on it.
+    pub uav_size_level0: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -901,6 +906,7 @@ fn emit_pruned(
             lock_keys: options.atomic_lock_keys,
             lds_order: options.lds_order,
             exchange: options.halves_exchange,
+            uav_level0: options.uav_size_level0,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

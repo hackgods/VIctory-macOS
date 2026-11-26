@@ -4674,12 +4674,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        // Level 0 for a writable image too (mac): its view has one level, so
-        // 0 is what DXC's undefined level means, and D3DMetal answers an
-        // undefined one with no size (width 0; the title's shadow min/max
-        // program then sampled a corner of its atlas, notes/PLAN.md 26
-        // November 15:15).
-        let mip = if image.is_some() {
+        let mip = if image.is_some() && (!uav || self.x.mac.uav_level0) {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -9432,10 +9427,10 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            // Level 0, not an undefined one, for a writable image: see
-            // `descriptor_data` (mac).
-            let mip = if uav {
+            let mip = if uav && self.x.mac.uav_level0 {
                 self.s.m.i32(0)
+            } else if uav {
+                self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
             };

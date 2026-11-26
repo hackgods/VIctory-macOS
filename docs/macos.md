@@ -244,6 +244,7 @@ It assumes that what is not on screen sends out what is. It has no occlusion but
 | `VICTORY_AMBIENT_LEFT=<multiple>` | How much of what the game's resolve left counts: up to that many times the estimate's luminance, and the larger of the two is written. Unset or 0: the estimate replaces it. The fork has 4. With it, `fresh` seconds after a jump the leftover counts for no more than the estimate. |
 | `VICTORY_AMBIENT_AIR=<multiple>` | Bounds what the air scatters by that multiple of the light around, right after `CS_AccumulateLocalLightInscatteringVolume`. Unset or 0: the game's own. Without rays the air of a room is lit by the sky's light. |
 | `VICTORY_AMBIENT_SHADE=s,r,n,t` | The shading in creases, as above. |
+| `VICTORY_AMBIENT_MIX=<mean part>,<turn>,<least>,<most>` | How a texel's light is put together: the part of it that is the slow mean of the whole picture (0.2), how strongly its normal turns it toward where the light comes from (1.2), and the least and most it may be as multiples of the mean around it (0.2 and 2.5). These are the fork's fixed numbers. The sky's cells lie far away along the view, so a surface that faces the camera has the sky behind it: a larger mean part or a smaller turn gives it more of the sky. |
 | `VICTORY_AMBIENT_REFLECT=<part>` | The most a reflection may hold, as a part of the light around the point seen there (0.5). 0 leaves reflections alone, as the fork does. |
 
 `VICTORY_AMBIENT_SKY`, `_LEVEL`, `_TINT` and `_FILE` belong to the constant stand-in and do nothing with the estimate.

@@ -39,6 +39,36 @@ pub(crate) fn left(value: Option<&str>) -> f32 {
         .unwrap_or(0.0)
 }
 
+/// How a texel's light is put together from the points' and the slow mean
+/// (numbers fixed in the fork): the part of it that is the slow mean of the
+/// whole picture; how strongly the points' directions turn it by the
+/// texel's normal; and the least and the most it may be, as multiples of
+/// the points' mean there.
+pub(crate) const MIX: [f32; 4] = [0.2, 1.2, 0.2, 2.5];
+
+/// `VICTORY_AMBIENT_MIX=<mean part>,<turn>,<least>,<most>`: [`MIX`] with
+/// the values given in their places (one left out or unreadable keeps its
+/// default; the mean part is held to 0..1, the others to 0 and above, the
+/// most to no less than the least).
+///
+/// For the first looks on this line. Outdoors the fork has the sky's light
+/// from the title's own resolve under the estimate; here the estimate is
+/// alone, and it sees the sky behind whatever faces the camera (the sky's
+/// cells lie far away along the view), so such a surface gets the least
+/// multiple of what is around it plus the mean part. A larger mean part or
+/// a smaller turn gives it more of the sky.
+pub(crate) fn mix(value: Option<&str>) -> [f32; 4] {
+    let mut mix = MIX;
+    for (to, v) in mix.iter_mut().zip(value.unwrap_or_default().split(',')) {
+        if let Some(v) = v.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0) {
+            *to = v;
+        }
+    }
+    mix[0] = mix[0].min(1.0);
+    mix[3] = mix[3].max(mix[2]);
+    mix
+}
+
 /// The program that keeps the light visible surfaces send out, for the
 /// title's own screen traces, by the start of its name, and where it writes
 /// it (R11G11B10_FLOAT, half the picture's size): root parameter and place
@@ -201,6 +231,7 @@ cbuffer Set : register(b0) {
     float tan_y; float follow; float most; uint width;
     uint height; uint flat; float air; uint slices;
     float jump; float fresh; float dt; float held;
+    float mean_part; float turn; float least_part; float most_part;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are. Read through the structured view, written
@@ -376,9 +407,9 @@ void main(uint3 at : SV_DispatchThreadID) {
             sum += w;
         }
         float3 all = float3(sr.w, sg.w, sb.w) / sum;
-        float3 lit = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
-        lit = clamp(lit, 0.2 * all, 2.5 * all);
-        found = lerp(lit, around.rgb, 0.2) * level * open;
+        float3 lit = all + turn * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+        lit = clamp(lit, least_part * all, most_part * all);
+        found = lerp(lit, around.rgb, mean_part) * level * open;
     }
     // What the program left counts as far as it can be true (`most` times
     // the estimate; 0: not at all): the sky's light outdoors, not the
@@ -420,14 +451,14 @@ void main(uint3 at : SV_DispatchThreadID) {
 #ifdef HOLD
 RWTexture2D<uint> light : register(u0);
 // Reflections: no brighter than a part of the light around the point seen
-// there (a fifth of it the slow mean, as for the light itself).
+// there (the slow mean's part of it as for the light itself).
 [numthreads(8, 8, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
     uint2 q = min((uint2)(((float2)at.xy + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
-    float cap = luma(lerp(seen_there, cells[CELLS].rgb, 0.2)) * level * held;
+    float cap = luma(lerp(seen_there, cells[CELLS].rgb, mean_part)) * level * held;
     float3 there = unpack(light[at.xy]);
     float has = luma(there);
     if (has > cap) light[at.xy] = pack(there * (cap / has));
@@ -483,10 +514,12 @@ pub(crate) struct Pass {
     /// The most a reflection may hold, as a part of the light around
     /// (`crate::ambient_set::keep`).
     pub(crate) held: f32,
+    /// [`mix`]: the slow mean's part, the turn, the least and the most.
+    pub(crate) mix: [f32; 4],
 }
 
 /// Dwords of the passes' constant buffer.
-pub(crate) const CONSTANTS: usize = 16;
+pub(crate) const CONSTANTS: usize = 20;
 
 /// A pass's root constants, in the order the constant buffer declares them
 /// (all scalars, so four to a row whatever the compiler's packing).
@@ -498,7 +531,8 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
         *to = f.to_bits();
     }
     out[7..12].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat), p.air.to_bits(), p.slices]);
-    out[12..].copy_from_slice(&[p.jump, p.fresh, p.dt, p.held].map(f32::to_bits));
+    out[12..16].copy_from_slice(&[p.jump, p.fresh, p.dt, p.held].map(f32::to_bits));
+    out[16..].copy_from_slice(&p.mix.map(f32::to_bits));
     out
 }
 
@@ -510,6 +544,7 @@ pub(crate) fn start_line(
     air: f32,
     settle: Option<Settle>,
     held: f32,
+    mix: [f32; 4],
 ) -> String {
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
     let left = if most > 0.0 {
@@ -537,7 +572,9 @@ pub(crate) fn start_line(
     format!(
         "VICTORY_AMBIENT=estimate: the screen probes' indirect diffuse light is replaced by an \
          estimate from the light visible surfaces send out ({share} of it; {CX}x{CY} cells, \
-         {PX}x{PY} points), {shaded}; {left}; {reflections}; {air}; {settles}"
+         {PX}x{PY} points; a texel is {} the slow mean, turned {} by its normal, between {} and {} \
+         times the mean around it), {shaded}; {left}; {reflections}; {air}; {settles}",
+        mix[0], mix[1], mix[2], mix[3]
     )
 }
 
@@ -755,12 +792,13 @@ pub(crate) mod reference {
                     }
                     sum += w;
                 }
+                let [mean_part, turn, least, most] = set.mix;
                 for (k, found) in found.iter_mut().enumerate() {
                     let s = sums[k];
                     let all = s[3] / sum;
-                    let lit = all + 1.2 * dot([s[0], s[1], s[2]], n) / sum;
-                    let lit = lit.max(0.2 * all).min(2.5 * all);
-                    *found = (lit + (around[k] - lit) * 0.2) * set.level * open;
+                    let lit = all + turn * dot([s[0], s[1], s[2]], n) / sum;
+                    let lit = lit.max(least * all).min(most * all);
+                    *found = (lit + (around[k] - lit) * mean_part) * set.level * open;
                 }
             }
             if set.most <= 0.0 {
@@ -842,9 +880,9 @@ pub(crate) mod reference {
     /// The `HOLD` pass: a reflection `there`, held to the part `held` of
     /// the light around the point seen there (`seen_there`, a fifth of it
     /// the slow mean `around`), `level` being the estimate's share.
-    pub(crate) fn hold(there: V3, held: f32, level: f32, around: V3, seen_there: V3) -> V3 {
-        let light = [0, 1, 2].map(|k| seen_there[k] + (around[k] - seen_there[k]) * 0.2);
-        let cap = luma(light) * level * held;
+    pub(crate) fn hold(there: V3, set: &super::Pass, around: V3, seen_there: V3) -> V3 {
+        let light = [0, 1, 2].map(|k| seen_there[k] + (around[k] - seen_there[k]) * set.mix[0]);
+        let cap = luma(light) * set.level * set.held;
         let has = luma(there);
         if has > cap { there.map(|v| v * (cap / has)) } else { there }
     }
@@ -927,13 +965,26 @@ mod tests {
         use super::reference::hold;
         let (around, there) = ([0.2f32; 3], [1.0f32, 1.0, 1.0]);
         // The light around the point: 0.8 of its own, 0.2 of the slow mean.
-        let glaze = hold([6.0, 4.0, 2.0], 0.5, 1.0, around, there);
+        let glaze = hold([6.0, 4.0, 2.0], &SET, around, there);
         assert!(near(luma(glaze), 0.5 * 0.84, 1e-4) && near(glaze[0] / glaze[2], 3.0, 1e-4), "{glaze:?}");
-        assert_eq!(hold([0.1; 3], 0.5, 1.0, around, there), [0.1; 3]);
+        assert_eq!(hold([0.1; 3], &SET, around, there), [0.1; 3]);
         // With the estimate's share.
-        assert!(near(hold([9.0; 3], 0.5, 0.5, around, there)[0], 0.21, 1e-4));
+        assert!(near(hold([9.0; 3], &Pass { level: 0.5, ..SET }, around, there)[0], 0.21, 1e-4));
         // In a dark room, the sky's reflection goes with the room.
-        assert!(near(hold([9.0; 3], 0.5, 1.0, [0.02; 3], [0.01; 3])[0], 0.5 * 0.012, 1e-4));
+        assert!(near(hold([9.0; 3], &SET, [0.02; 3], [0.01; 3])[0], 0.5 * 0.012, 1e-4));
+        // With all of it the slow mean.
+        assert!(near(hold([9.0; 3], &Pass { mix: [1.0, 1.2, 0.2, 2.5], ..SET }, around, there)[0], 0.1, 1e-4));
+    }
+
+    #[test]
+    fn the_mix_keeps_the_forks_numbers_unless_set() {
+        assert_eq!(mix(None), [0.2, 1.2, 0.2, 2.5]);
+        assert_eq!(mix(Some("")), MIX);
+        assert_eq!(mix(Some("0.5")), [0.5, 1.2, 0.2, 2.5]);
+        assert_eq!(mix(Some("0.5, 0 ,1,4")), [0.5, 0.0, 1.0, 4.0]);
+        assert_eq!(mix(Some("x,,0.4")), [0.2, 1.2, 0.4, 2.5]);
+        // Held to what makes sense: a part, nothing negative, most above least.
+        assert_eq!(mix(Some("3,-1,5,nan")), [1.0, 1.2, 5.0, 5.0]);
     }
 
     #[test]
@@ -986,16 +1037,20 @@ mod tests {
             fresh: 1.5,
             dt: 0.3,
             held: 0.5,
+            mix: [0.25, 1.0, 0.5, 2.0],
         };
         let c = constants(&p);
         let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
         assert_eq!(floats, [0.8, 1.0, 0.6, 0.1, 0.45, 0.04, 4.0]);
         assert_eq!(c[7..12], [2560, 1440, 1, 3.0f32.to_bits(), 64]);
-        assert_eq!(c[12..].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(), [3.0, 1.5, 0.3, 0.5]);
+        assert_eq!(
+            c[12..].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
+            [3.0, 1.5, 0.3, 0.5, 0.25, 1.0, 0.5, 2.0]
+        );
         let declared = declared(SOURCE);
         assert_eq!(
             declared,
-            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held"]
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held", "mean_part", "turn", "least_part", "most_part"]
         );
         assert_eq!(declared.len(), CONSTANTS);
     }
@@ -1044,12 +1099,12 @@ mod tests {
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0, None, 0.5);
+        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0, None, 0.5, MIX);
         assert!(line.starts_with("VICTORY_AMBIENT=estimate: "), "{line}");
-        assert!(line.contains("(1 of it; 64x36 cells, 160x90 points), shaded from depth"), "{line}");
+        assert!(line.contains("(1 of it; 64x36 cells, 160x90 points; a texel is 0.2 the slow mean, turned 1.2 by its normal, between 0.2 and 2.5 times the mean around it), shaded from depth"), "{line}");
         assert!(line.contains("what the title's resolve left is replaced; reflections held to 0.5 of the light around; what the air scatters is left alone; "), "{line}");
         assert!(line.ends_with("the mean of the light around goes 0.04 of the way a frame"), "{line}");
-        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0, settle(Some("250,3")), 0.0);
+        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0, settle(Some("250,3")), 0.0, MIX);
         assert!(line.contains("(0.5 of it;") && line.contains("not shaded"), "{line}");
         assert!(line.contains("counts up to 4 times it; reflections left alone; "), "{line}");
         assert!(line.contains("the air scatters no more than 3 times the light around (VICTORY_AMBIENT_AIR); "), "{line}");
@@ -1178,6 +1233,7 @@ mod tests {
         fresh: 0.0,
         dt: 0.0,
         held: 0.5,
+        mix: MIX,
     };
 
     /// Texels are placed by their depth: the picture's middle straight
@@ -1250,6 +1306,12 @@ mod tests {
         let dark = scene.raise([600, 180], &points, around, &SET, [0.0; 3])[0];
         let lit = scene.raise([40, 180], &points, around, &SET, [0.0; 3])[0];
         assert!(lit > 0.75 && lit < 1.0 && dark >= 0.1 - 1e-4 && dark < 0.25, "{lit} {dark}");
+        // The mix: all of it the slow mean; no turn and no bounds; and the
+        // bounds alone.
+        let mixed = |mix: [f32; 4], p: [i32; 2]| scene.raise(p, &points, around, &Pass { mix, ..SET }, [0.0; 3])[0];
+        assert!(near(mixed([1.0, 1.2, 0.2, 2.5], [600, 180]), 0.5, 1e-4));
+        let plain = mixed([0.0, 0.0, 0.0, 9.0], [600, 180]);
+        assert!(plain < dark && plain > 0.0 && near(mixed([0.0, 0.0, 2.0, 9.0], [600, 180]), 2.0 * plain, 1e-3), "{plain}");
         // Without a depth image: the slow mean alone.
         let flat = scene.raise([40, 180], &points, around, &Pass { flat: true, ..SET }, [0.0; 3]);
         assert_eq!(flat, [0.5, 0.0, 0.0]);

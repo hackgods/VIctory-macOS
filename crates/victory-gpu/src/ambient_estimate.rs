@@ -65,6 +65,9 @@
 //!   the estimate, fixed).
 //! - Without a depth image of the light's size the slow mean alone is
 //!   written; the fork then leaves the title's output.
+//! - The fork's four fixed numbers of a texel's light (the slow mean's
+//!   part, the normal's turn, the least and the most) can be set
+//!   (`VICTORY_AMBIENT_MIX`); unset they are the fork's.
 //! - Reflections are held to a part of the light around, as the constant
 //!   stand-in holds them to a part of its level ([`hold`],
 //!   `VICTORY_AMBIENT_REFLECT`); the fork leaves them alone (`0` here).
@@ -160,10 +163,20 @@ fn reflect_part() -> f32 {
     *SET.get_or_init(|| crate::ambient_set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
 }
 
+/// How a texel's light is put together (`VICTORY_AMBIENT_MIX`, `set::mix`;
+/// the fork's fixed numbers unless set).
+fn mix() -> [f32; 4] {
+    static SET: OnceLock<[f32; 4]> = OnceLock::new();
+    *SET.get_or_init(|| set::mix(var("VICTORY_AMBIENT_MIX").as_deref()))
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if let Some(share) = share() {
-        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part()));
+        tracing::info!(
+            "{}",
+            set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part(), mix())
+        );
     }
 }
 
@@ -526,6 +539,7 @@ fn settings(share: f32) -> set::Pass {
         fresh: settle().map_or(0.0, |s| s.fresh),
         dt: 0.0,
         held: reflect_part(),
+        mix: mix(),
     }
 }
 
@@ -949,6 +963,7 @@ mod tests {
         fresh: 0.0,
         dt: 0.25,
         held: 0.5,
+        mix: set::MIX,
     };
 
     /// The passes on the GPU give what the arithmetic on the CPU gives
@@ -972,6 +987,8 @@ mod tests {
             // 0.5 s after a jump of 2 fresh seconds: what was left counts
             // for 1.75 times the estimate.
             (set::Pass { most: 4.0, fresh: 2.0, jump: 3.0, ..base }, [9.0, 0.0, 9.0], true),
+            // Another mix: half the slow mean, no turn, narrower bounds.
+            (set::Pass { mix: [0.5, 0.0, 0.5, 1.5], ..base }, [0.0; 3], true),
             (base, [0.0; 3], false),
         ] {
             let (cells, mean, places, points, written) = run(host, &pass, &given, was, depth);
@@ -1168,7 +1185,7 @@ mod tests {
                 let point = ((q[1] * set::PX + q[0]) * 3) as usize;
                 let seen_there = [points[point][3], points[point + 1][3], points[point + 2][3]];
                 let was = reference::unpack(reference::pack(there_at(x, y)));
-                let want = reference::hold(was, BASE.held, BASE.level, [mean[0], mean[1], mean[2]], seen_there);
+                let want = reference::hold(was, &BASE, [mean[0], mean[1], mean[2]], seen_there);
                 assert!(close(got, reference::unpack(reference::pack(want))), "reflection at {x},{y}: {got:?} {want:?} (was {was:?})");
                 if want == was { kept += 1 } else { held += 1 }
             }

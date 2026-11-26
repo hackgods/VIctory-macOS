@@ -22,7 +22,8 @@
 //!   if the submission is that queue's ([`settle_signal`]);
 //! - a queue's head whose wait does not hold, if the submission owes a
 //!   bottom-of-pipe write where the wait reads (`crate::hold::World::owed`,
-//!   [`settle_waits`]);
+//!   [`settle_waits`]); with `VICTORY_ASYNC_SETTLE_ALL=1` every Signal and
+//!   every such head, as in the fork;
 //! - a present, before the picture is looked at (`crate::queue`);
 //! - a queue's page mapping (`CopyPageMappingsBatchX`), which the console
 //!   does after the queue's work before it: what that work owes title
@@ -526,9 +527,14 @@ mod tests {
         settle(By::Signal);
         FORCED.store(false, Relaxed);
         assert_eq!(word.load(Acquire), 7, "the bottom-of-pipe write was made");
-        // Its list is held by nobody else once the finished ones are given up.
+        // Its list is held by nobody else once the finished ones are given
+        // up (our thread may be giving it up just now).
         drop(back);
         drop(take_done());
+        let asked = Instant::now();
+        while std::sync::Arc::strong_count(&list) > 1 && asked.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(std::sync::Arc::strong_count(&list), 1, "the list came back");
         // Under the lock nothing is left, and the last submission ran.
         let submitted = host.submissions(By::Ours);

@@ -507,6 +507,12 @@ pub struct Structured {
     paired_masks: Map<Key, Bool>,
     /// Wave64 masks: low dword's value by the high dword's.
     pub highs: Map<Value, Value>,
+    /// Wave64 masks of [`Structured::other`]: the high dword's value by the
+    /// low dword's, as their uses read the pair (none where two uses pair
+    /// one low dword with different high ones). The two dwords of such a
+    /// mask may be written by different instructions (`s_mov_b32` each), so
+    /// the write of the low one does not name the high one.
+    pub other_highs: Map<Value, Value>,
     /// Masks (low dwords) set only in lanes whose EXEC bit is set where
     /// they are written: every such lane reaches the writing block, so a
     /// ballot there gives the mask as data.
@@ -946,7 +952,18 @@ impl<'a> Lanes<'a> {
             return Err(TOO_LARGE);
         }
         let joined = self.join_arguments();
+        let mut other_highs: Map<Value, Value> = Map::default();
+        let mut twice: Vec<Value> = Vec::new();
+        for &(lo, hi) in self.other.keys().filter(|(lo, hi)| lo != hi) {
+            if other_highs.insert(lo, hi).is_some_and(|old| old != hi) {
+                twice.push(lo);
+            }
+        }
+        for lo in twice {
+            other_highs.remove(&lo);
+        }
         Ok(Structured {
+            other_highs,
             masks: self.masks.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             other: self.other.iter().map(|(&(lo, _), &m)| (lo, m)).collect(),
             highs: self

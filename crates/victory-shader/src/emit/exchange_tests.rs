@@ -102,6 +102,22 @@ fn upper_half_adds_lane_31() -> Vec<u32> {
     w
 }
 
+/// A lane mask held as a number, its two dwords written by two
+/// instructions: the upper half's lanes (`s[6:7]` is 0 and all ones) take
+/// their thread id, the lower half's 0. (`v_mbcnt` makes it a program of
+/// console lanes, as the lane operations around such a mask do.)
+fn numeric_mask() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.push(V16_IS_32_TIMES_V0);
+    w.extend([0xD765_0001, 0x0001_00C1]); // v_mbcnt_lo_u32_b32 v1, -1, 0
+    w.push(sop1(6, 0x03, 128)); // s_mov_b32 s6, 0
+    w.push(sop1(7, 0x03, 193)); // s_mov_b32 s7, -1
+    w.extend(vop3(6, V_CNDMASK_B32, k(0), v(0), 6)); // v_cndmask_b32 v6, 0, v0, s[6:7]
+    w.extend(store(6, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// A read that only some lanes reach: the lanes whose thread id is not 5
 /// read lane 40 under a branch.
 fn under_a_branch() -> Vec<u32> {
@@ -124,7 +140,16 @@ fn under_a_branch() -> Vec<u32> {
 /// The hand-encoded words are the instructions their comments name.
 #[test]
 fn the_test_programs_are_what_their_comments_say() {
-    let programs: [(Vec<u32>, &[&str]); 5] = [
+    let programs: [(Vec<u32>, &[&str]); 6] = [
+        (
+            numeric_mask(),
+            &[
+                "v_mbcnt_lo_u32_b32 v1, -1, 0",
+                "s_mov_b32 s6, 0",
+                "s_mov_b32 s7, -1",
+                "v_cndmask_b32 v6, 0, v0, s[6:7]",
+            ],
+        ),
         (
             one_read(40),
             &["v_readlane_b32 s12, v0, 40", "v_mov_b32 v1, s12"],
@@ -379,6 +404,31 @@ fn lane_reads_take_turns_whatever_is_handed_over_between() {
     w.push(S_ENDPGM);
     let l = halves(&w, false, exchange()).expect("handed over");
     assert_eq!((l.exchanges, l.lane_exchanges), (3, 2));
+}
+
+/// A numeric mask whose dwords two instructions write is known as a pair
+/// from its use, and with the setting the lane tests the dword of its own
+/// half instead of the low one for every lane: another translation, in
+/// halves and on a host of 64-lane waves alike. (The builder's prefix sums
+/// end with this mask: without the high dword the upper half never adds
+/// the lower half's total.)
+#[test]
+fn a_numeric_mask_written_a_dword_at_a_time_keeps_its_high_dword() {
+    for words in [numeric_mask(), upper_half_adds_lane_31()] {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 32).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        assert_eq!(st.other_highs.len(), 1);
+    }
+    let words = numeric_mask();
+    for host_wave32 in [true, false] {
+        let dxil = |mac| {
+            lowered(&words, 64, 0, host_wave32, false, mac)
+                .expect("translates")
+                .dxil
+        };
+        assert_ne!(dxil(exchange()), dxil(Mac::default()));
+    }
 }
 
 // ---- A model of the hand-over ----
@@ -647,6 +697,15 @@ mod gpu {
             }
         });
         failed.extend(differences("mask, a wave cut short", &mask, 96, 2, &want));
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// A numeric mask of the upper half, its dwords written one at a time:
+    /// lanes 32 to 63 take their thread id, the others 0.
+    #[test]
+    fn a_numeric_mask_selects_the_upper_half_on_every_gpu() {
+        let want: Vec<u32> = (0..64).map(|l| if l < 32 { 0 } else { l }).collect();
+        let failed = differences("numeric mask", &numeric_mask(), 64, 1, &want);
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }

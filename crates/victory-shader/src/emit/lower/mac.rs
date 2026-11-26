@@ -115,9 +115,12 @@ pub(crate) struct Mac {
     /// [`super::lds_order`] where [`split_wave_barriers`] finds none
     /// (`emit::Options::lds_order`).
     pub lds_order: bool,
-    /// In halves, a lane read in a block every lane runs once is handed
-    /// over through group-shared memory, exact across the halves
-    /// ([`super::exchange`], `emit::Options::halves_exchange`).
+    /// In halves, a read across them in a block every lane runs once is
+    /// handed over through group-shared memory, exact across the halves
+    /// ([`super::exchange`], `emit::Options::halves_exchange`). Also: a
+    /// lane mask held as a number whose two dwords different instructions
+    /// write is tested by both ([`Lower::pair_high`]), not by the low one
+    /// alone.
     pub exchange: bool,
 }
 

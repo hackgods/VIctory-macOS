@@ -3059,7 +3059,11 @@ impl<'a> Lower<'a> {
             .iter()
             .find(|i| i.writes.iter().any(|w| w.1 == lo))?;
         let &(reg, _) = inst.writes.iter().find(|w| w.1 == lo)?;
+        // Mac (`exchange`): a pair written one dword at a time is the pair
+        // its uses read.
+        let paired = || self.x.st.other_highs.get(&lo).copied();
         inst.write(pick(reg)?)
+            .or_else(|| self.x.mac.exchange.then(paired).flatten())
     }
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {

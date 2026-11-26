@@ -3,6 +3,8 @@
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
+//! `VICTORY_ASYNC_SUBMIT=1` overlaps one part so far: the waits do the heap
+//! syncs of later submissions ([`overlap`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -17,6 +19,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
+
+pub(crate) mod overlap;
 
 /// A console state as a host texture state: PC bits only (not the console's
 /// own, compression hints from bit 25 up, which the host rejects), and none
@@ -1631,6 +1635,15 @@ impl Host {
         }
     }
 
+    /// [`Host::wait_for`], unless the fence passed `value` already: the
+    /// event may have been taken by a wait that saw it first.
+    fn finish(&self, value: u64) {
+        // SAFETY: our fence.
+        if unsafe { self.fence.GetCompletedValue() } < value {
+            self.wait_for(value);
+        }
+    }
+
     /// The queue submissions go to now.
     fn queue(&self) -> ID3D12CommandQueue {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -1738,7 +1751,15 @@ impl Host {
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
     pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
-        if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        if !crate::under_wine() {
+            return None;
+        }
+        if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            // Work done in a submission's wait (`overlap`): the fill waits
+            // for that submission to end, as a fill on another thread does.
+            if let Some(value) = overlap::in_flight() {
+                self.finish(value);
+            }
             return None;
         }
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1929,6 +1950,9 @@ impl Host {
                 .collect();
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
+        // `VICTORY_ASYNC_SUBMIT`: the wait does later submissions' heap
+        // syncs (`overlap`); not while lists are timed one by one.
+        let overlapped = groups.len() == 1 && overlap::enabled();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1962,7 +1986,7 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
-                        self.wait_for(*submitted);
+                        self.wait_gpu(*submitted, overlapped);
                         true
                     }
                     Err(e) => {
@@ -4287,6 +4311,7 @@ impl Meter {
                  max records {records:.0}/frame ({counted:.0} under a count)",
                 making = crate::pipeline::making()
             );
+            overlap::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
@@ -5460,7 +5485,7 @@ mod withholding {
 }
 
 #[cfg(test)]
-mod marks {
+pub(crate) mod marks {
     use super::LOST;
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Direct3D::*;
@@ -5514,7 +5539,7 @@ mod marks {
 
     /// A draw over a `width` x `height` target whose pixels each loop `n`
     /// times, then write `tag` into their own word of a buffer the CPU reads.
-    struct Spin {
+    pub(crate) struct Spin {
         root: ID3D12RootSignature,
         pso: ID3D12PipelineState,
         _target: ID3D12Resource,
@@ -5544,7 +5569,7 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 "#;
 
     impl Spin {
-        fn new(host: &super::Host, width: u32, height: u32) -> Spin {
+        pub(crate) fn new(host: &super::Host, width: u32, height: u32) -> Spin {
             use crate::compute::Param;
             use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
             let blob = |entry: windows::core::PCSTR, target: windows::core::PCSTR| {
@@ -5696,8 +5721,27 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 
         /// Draws; how long the submission took (ms) and how many pixels
         /// wrote `tag`.
-        fn draw(&self, host: &super::Host, n: u32, tag: u32) -> (f64, usize) {
+        pub(crate) fn draw(&self, host: &super::Host, n: u32, tag: u32) -> (f64, usize) {
             let list = host.new_list().unwrap();
+            self.record(&list, n, tag);
+            list.close();
+            let started = std::time::Instant::now();
+            host.execute(&[&list]);
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            (ms, self.ran(tag))
+        }
+
+        /// How many pixels wrote `tag`.
+        pub(crate) fn ran(&self, tag: u32) -> usize {
+            let pixels = (self.width * self.height) as usize;
+            // SAFETY: our mapped buffer of 2 words per pixel.
+            (0..pixels)
+                .filter(|&i| unsafe { self.words.add(2 * i).read_volatile() } == tag)
+                .count()
+        }
+
+        /// The draw, recorded into an open list.
+        pub(crate) fn record(&self, list: &super::HostList, n: u32, tag: u32) {
             let l = &list.list;
             // SAFETY: an open list; our pipeline, buffer and target.
             unsafe {
@@ -5721,16 +5765,6 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
                 l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
                 l.DrawInstanced(3, 1, 0, 0);
             }
-            list.close();
-            let started = std::time::Instant::now();
-            host.execute(&[&list]);
-            let ms = started.elapsed().as_secs_f64() * 1e3;
-            let pixels = (self.width * self.height) as usize;
-            // SAFETY: our mapped buffer of 2 words per pixel.
-            let ran = (0..pixels)
-                .filter(|&i| unsafe { self.words.add(2 * i).read_volatile() } == tag)
-                .count();
-            (ms, ran)
         }
     }
 

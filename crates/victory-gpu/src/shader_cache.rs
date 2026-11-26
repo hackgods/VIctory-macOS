@@ -102,13 +102,22 @@ fn atomic_locks() -> bool {
 
 /// Whether the lanes of a wave first try their 64-bit atomics' locks in
 /// rounds before the lanes still not done take turns (`emit`, "Atomic
-/// locks"; #240): opt-in while it is measured, `VICTORY_ATOMIC_LOCK_ROUNDS=1`.
-/// Only with [`atomic_locks`].
+/// locks"; #240): wherever [`atomic_locks`] are on. In the game the rounds
+/// took a world frame from 7.9 to 2.5 s on an M2 Max, from 5.29 to 0.71 s
+/// on an M4 Pro and from 2.9 to 0.88 s on an M4, and left no GPU resets.
+/// `VICTORY_ATOMIC_LOCK_ROUNDS=0` goes back to the turns alone.
 fn atomic_lock_rounds() -> bool {
     static ROUNDS: OnceLock<bool> = OnceLock::new();
     *ROUNDS.get_or_init(|| {
-        atomic_locks() && std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").as_deref() == Ok("1")
+        let var = std::env::var("VICTORY_ATOMIC_LOCK_ROUNDS").ok();
+        rounds_on(atomic_locks(), var.as_deref())
     })
+}
+
+/// The rounds, given whether the locks are on and
+/// `VICTORY_ATOMIC_LOCK_ROUNDS`: on with the locks unless it is `0`.
+fn rounds_on(locks: bool, var: Option<&str>) -> bool {
+    locks && var != Some("0")
 }
 
 /// Whether compute shaders' biased samples run as scaled gradient samples:
@@ -507,6 +516,17 @@ fn decode(bytes: &[u8]) -> Option<Result<HostShader, String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rounds are on wherever the locks are, `VICTORY_ATOMIC_LOCK_ROUNDS=0`
+    /// turns them off, and without the locks there are none (#240).
+    #[test]
+    fn lock_rounds_are_on_with_the_locks_unless_turned_off() {
+        assert!(rounds_on(true, None), "on by default with the locks");
+        assert!(rounds_on(true, Some("1")), "the old opt-in still works");
+        assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
+        assert!(!rounds_on(false, None), "no rounds without the locks");
+        assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
 
     fn shader() -> HostShader {
         HostShader {

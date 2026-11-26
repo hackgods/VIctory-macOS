@@ -193,7 +193,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
                 if let Source::Loaded { load, .. } = source
                     && let Some((_, a)) = out.scalar.iter().find(|s| s.0 == load)
@@ -1097,8 +1097,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at `at`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1113,8 +1113,17 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        // Only the lanes that reach and run the access read the descriptor:
+        // at a join, lanes whose EXEC bit is clear came by an edge where it
+        // may never have been made (cool_fox fork, after its own analysis
+        // dropped a program that way).
+        let mut known = Vec::new();
+        if let Some(l) = self.lanes {
+            known.push((l.reach[at.0], true));
+            if let Some(guard) = l.guards[at.0][at.1] {
+                known.push((guard, true));
+            }
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
@@ -1259,8 +1268,85 @@ impl<'a> Tracer<'a> {
             }),
             _ => (0..preds.len()).map(|j| edge(j, joins, known)).collect::<Result<_, _>>(),
         };
+        let source = match args {
+            Ok(args) => Ok(Source::Phi { block, args }),
+            // An edge holds no descriptor. With only one edge the lanes
+            // that read the descriptor can have come by, it is what the
+            // registers hold on that one (a lane that took another edge
+            // does not read it), if that can be named where it is read.
+            Err(e) => match self.only_edge(block, known) {
+                Some(j) => match edge(j, joins, known) {
+                    Ok(source) if self.anywhere(&source) => Ok(source),
+                    _ => Err(e),
+                },
+                None => Err(e),
+            },
+        };
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        source.map(Some)
+    }
+
+    /// The one edge into the join `block` that lanes satisfying `known`
+    /// can have taken, if the lanes' paths ([`Structured`]) rule out every
+    /// other: the console compiler makes a descriptor inside a branch that
+    /// lanes failing a test skip (with `s_cbranch_execz` when none is left)
+    /// and uses it after the join, where those lanes' EXEC bits are clear
+    /// (the access's guard). None at loop headers and without the lanes'
+    /// paths. After the cool_fox fork's `only_edge`.
+    fn only_edge(&self, block: usize, known: &mut Known) -> Option<usize> {
+        let lanes = self.lanes?;
+        let preds = &self.p.blocks[block].preds;
+        if preds.len() < 2 || preds.iter().any(|&q| self.rpo[q] >= self.rpo[block]) {
+            return None;
+        }
+        let mut only = None;
+        for (j, &q) in preds.iter().enumerate() {
+            let n = known.len();
+            known.push((lanes.reach[q], true));
+            if let LaneExit::Branch {
+                when,
+                taken,
+                not_taken,
+            } = lanes.exits[q]
+                && taken != not_taken
+            {
+                known.push((when, taken == block));
+            }
+            let possible = meet(lanes, known);
+            known.truncate(n);
+            if possible {
+                if only.is_some() {
+                    return None;
+                }
+                only = Some(j);
+            }
+        }
+        only
+    }
+
+    /// Whether lowering can make a handle for `source` in any block: its
+    /// heap index comes from root parameters and constants alone (a table
+    /// offset the code computes exists only where the load is).
+    fn anywhere(&self, source: &Source) -> bool {
+        match source {
+            Source::Constant(_) => true,
+            Source::Built { address, .. } => address.dynamic.is_none(),
+            Source::Loaded { load, .. } => {
+                let inst = self.inst(*load);
+                match &inst.fields {
+                    Fields::Smem {
+                        base,
+                        offset,
+                        soffset,
+                        ..
+                    } => self
+                        .smem_address(inst, base, *offset, soffset)
+                        .is_ok_and(|a| a.dynamic.is_none()),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Whether some lane goes from block `q` to `b` (true without the
@@ -3887,5 +3973,65 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
+        // Lanes failing `v_cmp_gt_u32` clear EXEC and take `s_cbranch_execz`
+        // directly to the join block without initializing the immediate
+        // sampler `s[8:11]`. The join's `image_sample_lz` is guarded by EXEC,
+        // so only the arm where `s[8:11]` was built can execute it.
+        let code: Vec<u8> = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+            0x7E06_0302, // v_mov_b32 v3, v2
+            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+            0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+            0xBE88_0380, // s_mov_b32 s8, 0
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let text: Vec<String> = crate::gfx10::decode(&code)
+            .unwrap()
+            .iter()
+            .map(|i| i.text(true))
+            .collect();
+        for want in [
+            "v_cmp_gt_u32 vcc, 16, v0",
+            "s_and_b32 exec_lo, exec_lo, vcc_lo",
+            "s_cbranch_execz",
+            "image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]",
+        ] {
+            assert!(
+                text.iter().any(|t| t.contains(want)),
+                "{want:?} not in {text:?}"
+            );
+        }
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let structured = lanes(&p).expect("structured form");
+        assert!(
+            structured.guards[2][0].is_some(),
+            "join access must carry an EXEC guard"
+        );
+        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
+        assert!(
+            r.descriptors
+                .iter()
+                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
+            "guarded join should resolve the immediate sampler from the live arm: {:?}",
+            r.descriptors
+        );
     }
 }

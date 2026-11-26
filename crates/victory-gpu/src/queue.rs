@@ -28,6 +28,26 @@ pub(crate) struct QueueDesc {
     nodes: u32,
 }
 
+#[cfg(all(test, windows))]
+pub(crate) const QUEUE_IID: Iid = QUEUE_IIDS[0];
+
+#[cfg(all(test, windows))]
+impl QueueDesc {
+    pub(crate) fn compute() -> Self {
+        Self {
+            kind: 2,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn submit_one(queue: This, list: This) {
+    execute(queue, 1, &list);
+}
+
 /// The title reads the list type right after the header.
 #[repr(C)]
 struct Queue {

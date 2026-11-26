@@ -46,6 +46,37 @@ pub(crate) fn lock_writers(wine: bool) -> [bool; 2] {
     })
 }
 
+/// Which parts of the quicker heap sync are on (`crate::descriptor::sync_heaps`
+/// makes 25,000 to 40,000 host descriptor slots again in a world frame, on
+/// the submitting thread): the heap census in hash maps
+/// (`crate::census_maps`), and buffer shader views made from one lookup
+/// (`crate::descriptor::host`, "quick"). By default both under Wine (`wine`
+/// says whether; asked once), where a frame's CPU part is the cost.
+/// `VICTORY_QUICK_SYNC=0`: neither, as before; `maps` or `views`: that part
+/// alone; `1`: both, anywhere. Neither changes what a slot shows.
+pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
+    static ON: OnceLock<[bool; 2]> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let value = std::env::var("VICTORY_QUICK_SYNC").ok();
+        let [maps, views] = quick(value.as_deref(), wine());
+        tracing::info!(
+            maps,
+            views,
+            "VICTORY_QUICK_SYNC: the heap census in hash maps, buffer shader views of a heap sync made from one lookup"
+        );
+        [maps, views]
+    })
+}
+
+/// [`quick_sync`]'s rule: census maps, views.
+fn quick(value: Option<&str>, default: bool) -> [bool; 2] {
+    match value {
+        Some("maps") => [true, false],
+        Some("views") => [false, true],
+        value => [setting(value, default); 2],
+    }
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -86,7 +117,19 @@ pub(crate) fn key(build: &[u8; 32], early_depth: bool, lock_writers: [bool; 2]) 
 
 #[cfg(test)]
 mod tests {
-    use super::{key, setting, writers};
+    use super::{key, quick, setting, writers};
+
+    #[test]
+    fn the_quick_sync_switch_names_its_parts() {
+        for default in [false, true] {
+            assert_eq!(quick(Some("0"), default), [false, false]);
+            assert_eq!(quick(Some("maps"), default), [true, false]);
+            assert_eq!(quick(Some("views"), default), [false, true]);
+            assert_eq!(quick(Some("1"), default), [true, true]);
+            assert_eq!(quick(None, default), [default, default]);
+            assert_eq!(quick(Some("both"), default), [default, default]);
+        }
+    }
 
     #[test]
     fn a_switch_is_off_at_0_on_at_1_and_else_the_default() {

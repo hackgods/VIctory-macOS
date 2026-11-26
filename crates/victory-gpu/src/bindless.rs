@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
+use crate::census_maps::{Counts, Hashing};
 use crate::descriptor::View;
 use crate::host::HostList;
 use crate::object::This;
@@ -48,10 +49,10 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
-#[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
-    ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
+    /// These two in the form `VICTORY_QUICK_SYNC` chooses (`crate::census_maps`).
+    slots: HashMap<u32, Seen, Hashing>,
+    ranges: Counts<Range, (u32, Arc<Shadow>)>,
     textures: BTreeMap<usize, u32>,
     /// `ranges` merged per copy and kind ([`Viewed::ranges`]), kept current
     /// as ranges come and go (each list running heap shaders asks for all
@@ -64,6 +65,19 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        let [quick, _] = crate::mac_switches::quick_sync(crate::shader_cache::under_wine);
+        Inner {
+            slots: HashMap::with_hasher(Hashing::new(quick)),
+            ranges: Counts::new(quick),
+            textures: BTreeMap::new(),
+            hulls: HashMap::new(),
+            ends: HashMap::new(),
+        }
+    }
 }
 
 /// A copy, and the counts of its ranges' starts and ends.
@@ -84,7 +98,7 @@ impl Inner {
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
-                let e = self.ranges.entry(key).or_insert_with(|| (0, shadow.clone()));
+                let e = self.ranges.entry_or(key, || (0, shadow.clone()));
                 let was = e.0;
                 step(&mut e.0);
                 let now = e.0;
@@ -414,6 +428,8 @@ pub(crate) fn log(frames: f64) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
         let copies = {
             let mut c: Vec<usize> = inner.ranges.keys().map(|k| k.0).collect();
+            // The ranges come in order only from the B-tree form.
+            c.sort_unstable();
             c.dedup();
             c.len()
         };

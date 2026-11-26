@@ -2612,6 +2612,88 @@ void main() {
         compile_cs(SOURCE, &[Param::Table(&[srv(0, 1)]), Param::Table(&[uav(0, 1)]), constants])
     }
 
+    /// The order of a title copy and a dispatch before it, on the GPU
+    /// (`VICTORY_COPY_ORDER=split`, `crate::host::copy_order_parts`). Two
+    /// host lists: the first reads 16 dwords of a buffer into one output,
+    /// the second copies new values over them and reads them into another
+    /// output. Run as one submission, both outputs hold the new values (a
+    /// submission's copies are all made before its first GPU command);
+    /// split, the first holds the old ones, as on the console.
+    #[test]
+    fn a_copy_keeps_its_order_with_an_earlier_lists_dispatch_when_the_piece_is_split() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let _split = crate::mac_switches::tests::ForcedCopyOrder::on();
+        let (src, outs) = (buffer(4096), [buffer(256), buffer(256)]);
+        let at = crate::resource::buffer_bytes(src).unwrap().0 as u64 + 0x100;
+        let out_bytes = outs.map(|o| crate::resource::buffer_bytes(o).unwrap().0 as u64);
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 8, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(0x8efb471d, 0x616c, 0x4f49, [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51]);
+        assert_eq!(crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap), S_OK);
+        let title_heap = crate::descriptor::heap(heap);
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        for (k, out) in outs.iter().enumerate() {
+            crate::descriptor::create_uav(null, *out, null, &uav, title_heap.start + 32 * (k as u64 + 1));
+        }
+        let heap_host = title_heap.host().expect("a host view heap");
+        let (root, pso) = compile();
+        let copies = out_bytes.map(|o| crate::shadow::find(o, 256).expect("an output's host copy"));
+        // A dispatch that reads the 16 dwords into output `k`.
+        let record = |list: &HostList, k: u32| {
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_view(true, 0, at);
+            let (index, offset) = state.root_view(list, true, 0, false).expect("a root view");
+            let constants = [offset, 0];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(index));
+                list.list.SetComputeRootDescriptorTable(1, heap_host.gpu(k + 1));
+                list.list.SetComputeRoot32BitConstants(2, 2, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+        };
+        let old: Vec<u32> = (0..16).map(|k| 0x0a00 + k).collect();
+        let new: Vec<u32> = (0..16).map(|k| 0x0b00 + k).collect();
+        // The new values as the copy's source: 16 dwords 64 bytes apart.
+        let mut source = vec![0u32; 16 * 16];
+        for (k, value) in new.iter().enumerate() {
+            source[16 * k] = *value;
+        }
+        for split in [false, true] {
+            for (k, value) in old.iter().enumerate() {
+                // SAFETY: inside the title buffer.
+                unsafe { ((at + 64 * k as u64) as *mut u32).write(*value) };
+            }
+            let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+            record(&lists[0], 0);
+            lists[0].close();
+            lists[1].title_copies(at as usize, 4 * source.len());
+            lists[1].defer_copy(at as *mut u8, source.as_ptr().cast(), 4 * source.len());
+            record(&lists[1], 1);
+            lists[1].close();
+            let parts = if split {
+                crate::host::copy_order_parts(lists.to_vec())
+            } else {
+                vec![lists.to_vec()]
+            };
+            assert_eq!(parts.len(), if split { 2 } else { 1 }, "split {split}");
+            for part in &parts {
+                let runs: Vec<&HostList> = part.iter().map(|l| &**l).collect();
+                host.execute(&runs);
+            }
+            let read = |k: usize| copies[k].read_host(out_bytes[k], 16);
+            assert_eq!(read(1), new, "the dispatch after the copy, split {split}");
+            assert_eq!(read(0), if split { &old } else { &new }[..], "the dispatch before the copy, split {split}");
+        }
+    }
+
     /// A compute shader with a root signature of `params`.
     fn compile_cs(source: &str, params: &[Param]) -> (ID3D12RootSignature, ID3D12PipelineState) {
         crate::compute::pipeline(source, s!("root"), 0, params).unwrap()

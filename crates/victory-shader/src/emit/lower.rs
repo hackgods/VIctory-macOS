@@ -345,7 +345,7 @@ struct Lower<'a> {
     /// IR phi location by value.
     phi_at: Map<Value, (usize, usize)>,
     mask_phis: Map<Atom, V>,
-    pending_masks: Vec<(V, usize, usize, Option<(Value, Value)>)>,
+    pending_masks: Vec<PendingMask>,
     data_phis: Vec<(V, usize, usize)>,
     /// Phis that code reads. Left a std set: [`Lower::live_edges`] starts
     /// its walk in this set's iteration order, and few phis are read.
@@ -587,6 +587,11 @@ enum MaskData {
     /// console's, so the first lane and the count below a lane are refused.
     None,
 }
+
+/// A lane-mask phi made before its inputs: the phi, its IR block and phi
+/// index, and in literal halves the (low, high) halves of a 64-lane mask
+/// whose per-edge lanes come from `mask_inputs`.
+type PendingMask = (V, usize, usize, Option<(Value, Value)>);
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";

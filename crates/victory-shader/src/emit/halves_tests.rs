@@ -1075,6 +1075,7 @@ fn differences_with(
 /// [`differences_with`] for a program of console waves of 64 lanes
 /// (`wave64`) or of 32, which a host of any wave size runs as it is.
 #[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
 fn differences_in(
     wave64: bool,
     words: &[u32],

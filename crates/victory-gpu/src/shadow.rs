@@ -2216,6 +2216,8 @@ pub(crate) fn near(va: u64) -> String {
 }
 
 #[cfg(test)]
+mod copy_bench;
+#[cfg(test)]
 mod parallel_copy_tests;
 #[cfg(test)]
 mod widened_bench;

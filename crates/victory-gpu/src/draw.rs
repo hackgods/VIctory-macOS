@@ -4162,12 +4162,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             &res,
             Options {
                 view_marks: true,
-                atomic_locks: false,
-                atomic_lock_rounds: false,
-                atomic_umax: false,
-                bias_as_gradients: false,
-                host_wave32: false,
-                narrow_waves: false,
+                ..Options::default()
             },
         )
         .unwrap();

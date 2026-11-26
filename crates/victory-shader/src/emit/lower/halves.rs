@@ -52,7 +52,8 @@
 //! wave. A group of 33 to 64 threads with LDS (two host waves sharing what
 //! the console's one wave ordered by itself) is refused; groups of several
 //! console waves order their LDS with barriers, and those of 32 threads or
-//! fewer are one host wave.
+//! fewer are one host wave. [`super::lds_order`] finds an exact order for some of
+//! the refused ones (`emit::Options::lds_order`).
 //!
 //! Approach after DexNom's fork (DexNom/Victory 5f4c3df, `set_host_max_wave`
 //! and the thread relabelling into halves) and upstream PR #2176

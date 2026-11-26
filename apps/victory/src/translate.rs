@@ -158,6 +158,9 @@ struct Checks {
     /// and one-wave groups share LDS between the halves without sync
     /// (`VICTORY_HALVES_SHARED_LDS=1`).
     halves_local: [bool; 2],
+    /// One-wave groups that share LDS get its exact order where there is
+    /// one (`VICTORY_HALVES_LDS_ORDER=1`, as `run`).
+    lds_order: bool,
 }
 
 pub fn run(
@@ -202,6 +205,10 @@ pub fn run(
     if halves_local[1] {
         println!("halves       share one-wave LDS without sync (VICTORY_HALVES_SHARED_LDS=1)");
     }
+    let lds_order = victory_gpu::shader_cache::halves_lds_order();
+    if lds_order {
+        println!("LDS          of one-wave groups ordered exactly where it can be (VICTORY_HALVES_LDS_ORDER=1)");
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -245,6 +252,7 @@ pub fn run(
                                     .flatten(),
                                 wave32,
                                 halves_local,
+                                lds_order,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -601,6 +609,7 @@ fn translate(
                         host_wave32: checks.wave32,
                         halves_local: checks.halves_local[0],
                         halves_shared_lds: checks.halves_local[1],
+                        lds_order: checks.lds_order,
                         ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {

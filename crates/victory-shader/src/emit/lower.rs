@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod bvh;
 mod f64_sum;
 mod halves;
+pub(crate) mod lds_order;
 mod mac;
 mod mesh;
 pub(crate) use mesh::{KeptOutputs, plan_merge};
@@ -741,6 +742,15 @@ impl<'a> Lower<'a> {
                     synced = true;
                 }
             }
+            // Mac: a finer order where that gives up (`lds_order`).
+            let mut unordered = None;
+            if !synced {
+                match lds_order::wanted(x, group, s.lds_dwords) {
+                    Some(Ok(b)) => (split_barriers, synced) = (b, true),
+                    Some(Err(why)) => unordered = Some(why),
+                    None => {}
+                }
+            }
             // A host whose waves are narrower than WaveSize(64) does not run
             // the dispatch (D3DMetal: nothing written): ask for the console's
             // width only where wave operations need it, or LDS is not synced.
@@ -750,7 +760,8 @@ impl<'a> Lower<'a> {
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
             if halves && !synced {
-                halves_refused = Self::halves_lds(x, group, s.lds_dwords);
+                halves_refused =
+                    Self::halves_lds(x, group, s.lds_dwords).map(|w| unordered.unwrap_or(w));
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });

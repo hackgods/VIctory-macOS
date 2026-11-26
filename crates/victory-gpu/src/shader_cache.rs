@@ -160,6 +160,13 @@ pub fn halves_shared_lds() -> bool {
     })
 }
 
+/// Whether one-wave groups that share LDS get the exact order of
+/// `victory_shader::emit::Options::lds_order` where there is one
+/// (`VICTORY_HALVES_LDS_ORDER=1`; the rule is in `mac_switches`).
+pub fn halves_lds_order() -> bool {
+    crate::mac_switches::lds_order()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -252,6 +259,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         early_depth: crate::mac_switches::early_depth(under_wine()),
         atomic_lock_helpers: lock_writers[0],
         atomic_lock_keys: lock_writers[1],
+        lds_order: crate::mac_switches::lds_order(),
     }
 }
 
@@ -281,6 +289,7 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         build,
         options.early_depth,
         [options.atomic_lock_helpers, options.atomic_lock_keys],
+        options.lds_order,
     );
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),

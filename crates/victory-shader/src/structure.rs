@@ -345,6 +345,50 @@ impl Bools {
         }
     }
 
+    /// Whether `b` is the same whatever `atom` is, in every lane where
+    /// `unless` does not hold (`emit::lower::lds_order`: a compare result
+    /// that only means something where its guard holds).
+    pub(crate) fn ignores(&self, b: Bool, atom: Atom, unless: Bool) -> bool {
+        let Some(&a) = self.ids.get(&atom) else {
+            return true;
+        };
+        self.ignores_in(b, a, unless, &mut HashSet::new())
+    }
+
+    fn ignores_in(&self, b: Bool, a: u32, g: Bool, seen: &mut HashSet<(Bool, Bool)>) -> bool {
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        // Variables grow downwards: below `a`'s level `b` has no `a`.
+        if g == Bool::TRUE || top(b) > a || !seen.insert((b, g)) {
+            return true;
+        }
+        if top(b) == a && top(g) > a {
+            let (lo, hi) = self.split(b, a);
+            return self.same_unless(lo, hi, g, &mut HashSet::new());
+        }
+        let v = top(b).min(top(g));
+        // `unless` itself turning on the atom: not followed.
+        if v == a {
+            return false;
+        }
+        let ((b0, b1), (g0, g1)) = (self.split(b, v), self.split(g, v));
+        self.ignores_in(b0, a, g0, seen) && self.ignores_in(b1, a, g1, seen)
+    }
+
+    /// Whether `x` and `y` agree in every lane where `g` does not hold.
+    fn same_unless(&self, x: Bool, y: Bool, g: Bool, seen: &mut HashSet<(Bool, Bool, Bool)>) -> bool {
+        if g == Bool::TRUE || x == y || !seen.insert((x, y, g)) {
+            return true;
+        }
+        let top = |x: Bool| self.nodes[x.0 as usize].0;
+        let v = top(x).min(top(y)).min(top(g));
+        if v == TERMINAL {
+            // Two different constants, and `g` is false.
+            return false;
+        }
+        let ((x0, x1), (y0, y1), (g0, g1)) = (self.split(x, v), self.split(y, v), self.split(g, v));
+        self.same_unless(x0, y0, g0, seen) && self.same_unless(x1, y1, g1, seen)
+    }
+
     fn implies(&mut self, a: Bool, b: Bool) -> bool {
         let nb = self.not(b);
         self.and(a, nb) == Bool::FALSE
@@ -1587,6 +1631,32 @@ mod tests {
     fn build(words: &[u32], wave64: bool) -> Program {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         ir::build(&code, wave64, 256).unwrap()
+    }
+
+    /// `ignores`: a condition that has an atom only together with a guard
+    /// is the same without the guard, whatever the atom; one that has it
+    /// beside the guard is not.
+    #[test]
+    fn a_condition_ignores_an_atom_it_only_has_under_a_guard() {
+        let mut b = Bools::new();
+        let atoms = [Atom::Lane(Value(1)), Atom::Lane(Value(2)), Atom::Lane(Value(3))];
+        let [g, c, h] = atoms.map(|a| b.atom(a, 0));
+        let both = b.and(g, c);
+        let not_both = b.not(both);
+        let saved = b.and(h, not_both);
+        let either = b.or(g, c);
+        let other = b.and(h, c);
+        for (cond, ignored) in [(both, true), (saved, true), (h, true), (either, false), (other, false)] {
+            assert_eq!(b.ignores(cond, atoms[1], g), ignored);
+        }
+        // Under the guard itself everything may turn on the atom; with no
+        // guard at all nothing that has it may.
+        assert!(b.ignores(either, atoms[1], Bool::TRUE));
+        assert!(!b.ignores(both, atoms[1], Bool::FALSE));
+        // The guard ordered below the atom is followed too.
+        let late = b.and(c, h);
+        assert!(b.ignores(late, atoms[1], h));
+        assert!(!b.ignores(late, atoms[2], g));
     }
 
     fn guarded(s: &Structured) -> usize {

@@ -111,6 +111,10 @@ pub(crate) struct Mac {
     /// the texel's stays out of the lock loop
     /// (`emit::Options::atomic_lock_keys`).
     pub lock_keys: bool,
+    /// LDS that a group of one console wave shares gets the finer order of
+    /// [`super::lds_order`] where [`split_wave_barriers`] finds none
+    /// (`emit::Options::lds_order`).
+    pub lds_order: bool,
 }
 
 /// `DB_SHADER_CONTROL`: the program exports depth (`Z_EXPORT_ENABLE`).

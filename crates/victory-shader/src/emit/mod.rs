@@ -229,6 +229,8 @@ mod halves_local_tests;
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(test)]
+mod lds_order_tests;
 mod lower;
 #[cfg(test)]
 mod mac_tests;
@@ -451,6 +453,13 @@ pub struct Options {
     /// a high dword below the texel's stays out of the lock loop (the
     /// same notes). The shader cache keys on it.
     pub atomic_lock_keys: bool,
+    /// A compute group of one console wave that shares LDS in a way
+    /// [`Options::narrow_waves`]' barriers cannot order (and that a host of
+    /// 32-lane waves therefore refuses) gets the finer order of
+    /// `lower::lds_order`: barriers where every lane runs, and between them
+    /// only accesses whose order changes nothing. Exact, or the program
+    /// stays as it was. The shader cache keys on it.
+    pub lds_order: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -850,6 +859,7 @@ fn emit_pruned(
             early_depth: options.early_depth,
             lock_helpers: options.atomic_lock_helpers,
             lock_keys: options.atomic_lock_keys,
+            lds_order: options.lds_order,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

@@ -16,9 +16,9 @@
 //! can be far above the count, and the records between never run.
 //!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
-//! groups per dimension and 2^20 per dispatch, one-dimensional mesh
-//! dispatches, the budget) cut legitimate work beyond them; raise them if
-//! the title needs more.
+//! groups per dimension except in x where [`widest`] allows more, 2^20
+//! per dispatch, one-dimensional mesh dispatches, the budget) cut
+//! legitimate work beyond them; raise them if the title needs more.
 
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -30,6 +30,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = include_str!("indirect-clamp.hlsl");
+
+/// The most groups in x the clamp lets a dispatch run (2^20 groups in all
+/// still bound it). The title's tile passes are dispatches of one group per
+/// 8x4 tile of the picture, 67,440 and 47,760 for its two tile classes in a
+/// frame at 2560x1440 (measured on Windows in VIctory-7900XTX, 84eae35);
+/// cut to 65,535, the last tiles, the lowest of the picture, never run.
+/// The console runs what it is asked, and so does D3DMetal: an M5 Pro ran
+/// every group of indirect dispatches up to 2^20 wide. D3D12's own limit,
+/// 65,535, stays for other hosts. `VICTORY_INDIRECT_WIDE=0` or `1`
+/// overrides.
+pub(crate) fn widest() -> u32 {
+    static WIDEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WIDEST.get_or_init(|| {
+        let wide = match std::env::var("VICTORY_INDIRECT_WIDE").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => crate::shader_cache::under_wine(),
+        };
+        if wide { 1 << 20 } else { 65_535 }
+    })
+}
 
 struct Clamp {
     root: ID3D12RootSignature,
@@ -94,7 +115,7 @@ fn precompiled() -> windows::core::Result<Clamp> {
 /// of the same buffers, and one thread charging the records in order
 /// instead of a group of 64. The results are the same.
 const WORDS_SOURCE: &str = r#"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; uint widest; };
 StructuredBuffer<uint> argWords : register(t0);
 RWByteAddressBuffer budget : register(u1);
 RWByteAddressBuffer dest : register(u0);
@@ -116,8 +137,9 @@ uint clamped(uint at) {
             dest.Store2(at + 8, uint2(argWords[at / 4 + 2], argWords[at / 4 + 3]));
         }
     } else if (kind == 2) {
-        uint3 g = min(load3(at), uint3(65535, 65535, 65535));
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = load3(at);
+        g = uint3(g.x <= widest ? g.x : 65535u, min(g.y, 65535u), min(g.z, 65535u));
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
@@ -156,7 +178,7 @@ void main() {
 fn make_words() -> windows::core::Result<Clamp> {
     use crate::compute::Param;
     let params = [
-        Param::Constants { register: 0, count: 4 },
+        Param::Constants { register: 0, count: 5 },
         Param::Srv { register: 0, space: 0 },
         Param::Uav { register: 1 },
         Param::Uav { register: 0 },
@@ -270,7 +292,7 @@ fn bound_with(
     }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
-    let constants = [kind, stride, records, u32::from(count.is_some())];
+    let constants = [kind, stride, records, u32::from(count.is_some()), widest()];
     // SAFETY: an open list; our root signature, pipeline and buffers, and
     // title buffers' copies the caller's list holds.
     unsafe {
@@ -281,7 +303,7 @@ fn bound_with(
         ]);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
-        l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, constants.len() as u32, constants.as_ptr().cast(), 0);
         l.SetComputeRootShaderResourceView(1, gpu);
         l.SetComputeRootUnorderedAccessView(2, budget);
         l.SetComputeRootUnorderedAccessView(3, out.GetGPUVirtualAddress());
@@ -544,7 +566,7 @@ mod tests {
                     out.Map(0, None, Some(&mut p)).unwrap();
                     p.cast::<[u32; 3]>().read_volatile()
                 };
-                assert_eq!(clamped, [65_535, 1, 1]);
+                assert_eq!(clamped, [70_000.min(super::widest()), 1, 1]);
             }
             // SAFETY: as above.
             assert_eq!(unsafe { data.cast::<[u32; 3]>().read_volatile() }, [70_000, 1, 1], "the title's copy as written");
@@ -592,5 +614,120 @@ mod tests {
         assert_eq!(twice[0], 1 << 24);
         let spent = clamped(0, &[u32::MAX], 128, 2).unwrap();
         assert!(spent.iter().all(|&count| count == 0));
+    }
+
+    /// The groups of one indirect dispatch of `groups` x 1 x 1 that run on
+    /// the host, through the clamp when `clamped`, else straight from the
+    /// record. Each group marks its own word. `None` without a host GPU.
+    fn groups_that_run(groups: u32, clamped: bool) -> Option<usize> {
+        use super::*;
+        use crate::compute::Param;
+        const MARK: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    marks.Store(g.x * 4, 1);
+}
+"#;
+        let host = host()?;
+        let (root, pso) =
+            crate::compute::pipeline(MARK, s!("marks"), 0, &[Param::Uav { register: 0 }]).unwrap();
+        let (record, words) = host.shared_buffer(12).unwrap();
+        let (marks, seen) = host.shared_buffer(u64::from(groups) * 4).unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let list = host.new_list().unwrap();
+        // SAFETY: our mapped buffers, written before the list runs and read
+        // after it has; our pipeline, signature and buffers.
+        unsafe {
+            let mut signature: Option<ID3D12CommandSignature> = None;
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .unwrap();
+            let signature = signature.unwrap();
+            words.cast::<[u32; 3]>().write_volatile([groups, 1, 1]);
+            std::ptr::write_bytes(seen, 0, groups as usize * 4);
+            let arguments = if clamped {
+                bound(&list, record.GetGPUVirtualAddress(), (2, 12, 1), None).unwrap()
+            } else {
+                list.list.ResourceBarrier(&[transition(
+                    &record,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                )]);
+                record.clone()
+            };
+            let l = &list.list;
+            l.SetComputeRootSignature(&root);
+            l.SetPipelineState(&pso);
+            l.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+            l.ExecuteIndirect(&signature, 1, &arguments, 0, None, 0);
+            if clamped {
+                done(&list, &arguments);
+            } else {
+                l.ResourceBarrier(&[transition(
+                    &record,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    D3D12_RESOURCE_STATE_COMMON,
+                )]);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let seen = seen.cast::<u32>();
+            Some(
+                (0..groups as usize)
+                    .filter(|&i| seen.add(i).read_volatile() != 0)
+                    .count(),
+            )
+        }
+    }
+
+    /// A tile pass of the title (67,440 groups, one class of its 8x4 tiles at
+    /// 2560x1440) runs every group where the host runs dispatches that wide,
+    /// and its first 65,535 elsewhere. The host runs the widest dispatch the
+    /// clamp lets through, so a host that stops running them fails here.
+    #[test]
+    fn a_wide_tile_pass_runs_every_group_the_host_runs() {
+        let Some(ran) = groups_that_run(67_440, true) else {
+            return; // no host GPU here
+        };
+        let widest = super::widest();
+        assert_eq!(ran, 67_440.min(widest) as usize);
+        assert_eq!(
+            groups_that_run(widest, false).unwrap(),
+            widest as usize,
+            "the host runs the widest dispatch"
+        );
+        assert_eq!(
+            groups_that_run(widest, true).unwrap(),
+            widest as usize,
+            "the clamp lets it through"
+        );
+    }
+
+    /// Dispatches wider than [`super::widest`] are cut to 65,535 groups in x
+    /// as before, and one whose groups pass 2^20 in all runs empty, also
+    /// where x times y would wrap 32 bits.
+    #[test]
+    fn dispatches_past_the_bounds_are_cut() {
+        let widest = super::widest();
+        let Some(past) = clamped(2, &[widest + 1, 1, 1], 1, 1) else {
+            return; // no host GPU here
+        };
+        assert_eq!(past, [65_535]);
+        assert_eq!(clamped(2, &[widest, 1, 1], 1, 1).unwrap(), [widest]);
+        // Past 2^20 groups in all: 65,535 by 17, 2^10 by 2^10 by 2, and
+        // 2^20 by 4,096, whose x * y wraps 32 bits to zero.
+        assert_eq!(clamped(2, &[65_535, 17, 1], 1, 1).unwrap(), [0]);
+        assert_eq!(clamped(2, &[1 << 10, 1 << 10, 2], 1, 1).unwrap(), [0]);
+        assert_eq!(clamped(2, &[1 << 20, 4_096, 1], 1, 1).unwrap(), [0]);
     }
 }

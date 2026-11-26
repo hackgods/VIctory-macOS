@@ -1285,7 +1285,13 @@ fn image_words(resource: &[u32; 14], desc: Option<&[u32; 10]>, unordered: bool) 
             let ty = [0, 0, 8, 12, 9, 13, 14, 15, 10, 11, 11].get(d[1] as usize).copied().unwrap_or(0);
             match (unordered, d[1]) {
                 (_, 6 | 7) => (ty, 0, 1),
-                (true, _) => (ty, d[4], 1),
+                // An unordered view's one level is its third word (its
+                // union starts at byte 8: `MipSlice` of every texture
+                // member, as `uav_desc` hands it to the host); a shader
+                // view's first level and count are words 4 and 5 (its union
+                // starts at byte 16). Word 4 of an unordered view is an
+                // array's size or a 3D view's depth.
+                (true, _) => (ty, d[2], 1),
                 (false, _) => (ty, d[4], if d[5] == u32::MAX { mips.saturating_sub(d[4]) } else { d[5] }),
             }
         }
@@ -2830,11 +2836,49 @@ mod tests {
         (view[4], view[5]) = (1, u32::MAX);
         assert_eq!(image_words(&texture, Some(&view), false)[3], 0xFAC | 1 << 12 | 9 << 16 | 9 << 28);
         // An unordered view of level 3: that level alone.
-        let uav = [0, 4, 0, 0, 3, 0, 0, 0, 0, 0];
+        let uav = [0, 4, 3, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(image_words(&texture, Some(&uav), true)[3], 0xFAC | 3 << 12 | 3 << 16 | 9 << 28);
+        // An unordered view of level 2 of six array slices: the level is
+        // not the slice count (word 4).
+        let uav = [0, 5, 2, 0, 6, 0, 0, 0, 0, 0];
+        assert_eq!(image_words(&array, Some(&uav), true)[3], 0xFAC | 2 << 12 | 2 << 16 | 13 << 28);
         // The array's own view: a 2D array, levels 0-10.
         let words = image_words(&array, None, false);
         assert_eq!(words[1..], [3 << 30, 255 | 599 << 14, 0xFAC | 10 << 16 | 13 << 28]);
+    }
+
+    /// The words `image_words` reads are where the host's view descriptions
+    /// have their levels: an unordered view's `MipSlice` in word 2, a shader
+    /// view's `MostDetailedMip` and `MipLevels` in words 4 and 5.
+    #[test]
+    fn view_description_words_hold_the_levels_where_image_words_reads_them() {
+        let words = |uav: &D3D12_UNORDERED_ACCESS_VIEW_DESC| -> [u32; 10] {
+            // SAFETY: 40 plain bytes.
+            unsafe { std::ptr::from_ref(uav).cast::<[u32; 10]>().read_unaligned() }
+        };
+        assert_eq!(std::mem::size_of::<D3D12_UNORDERED_ACCESS_VIEW_DESC>(), 40);
+        assert_eq!(std::mem::size_of::<D3D12_SHADER_RESOURCE_VIEW_DESC>(), 40);
+        let mut uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        uav.Anonymous.Texture2D = D3D12_TEX2D_UAV { MipSlice: 3, PlaneSlice: 0 };
+        assert_eq!(words(&uav)[1..5], [4, 3, 0, 0]);
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+        uav.Anonymous.Texture2DArray =
+            D3D12_TEX2D_ARRAY_UAV { MipSlice: 2, FirstArraySlice: 1, ArraySize: 6, PlaneSlice: 0 };
+        assert_eq!(words(&uav)[1..5], [5, 2, 1, 6]);
+        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+        uav.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 1, FirstWSlice: 0, WSize: 32 };
+        assert_eq!(words(&uav)[1..5], [8, 1, 0, 32]);
+        let mut srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            ..Default::default()
+        };
+        srv.Anonymous.Texture2D = D3D12_TEX2D_SRV { MostDetailedMip: 2, MipLevels: 3, ..Default::default() };
+        // SAFETY: 40 plain bytes.
+        let w = unsafe { std::ptr::from_ref(&srv).cast::<[u32; 10]>().read_unaligned() };
+        assert_eq!((w[1], w[4], w[5]), (4, 2, 3));
     }
 
     fn placed_memory() -> u64 {

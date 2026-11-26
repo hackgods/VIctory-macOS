@@ -17,6 +17,9 @@ pub(crate) mod host;
 // Also built for tests, which run where `host` cannot.
 #[cfg(any(windows, test))]
 mod paged;
+// mac: plain std too.
+#[cfg(any(windows, test))]
+pub(crate) mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -230,6 +233,8 @@ pub(crate) fn sync_heaps_ahead(ran: &dyn Fn() -> bool) {
 
 #[cfg(windows)]
 fn sync(ran: Option<&dyn Fn() -> bool>) {
+    // mac: lock waits and made slots are counted as a sync's (`slots`).
+    let _syncing = slots::Syncing::enter();
     // Held throughout: a heap is not dropped while its slots are made.
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     for &(start, _, at) in heaps.iter() {

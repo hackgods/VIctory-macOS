@@ -3798,6 +3798,8 @@ impl Meter {
             unwaited::log(report_frames);
             crate::ray_skip::log(report_frames);
             crate::texback::log(report_frames);
+            // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
+            crate::descriptor::slots::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(
@@ -4315,7 +4317,9 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+    // mac: taken as before; counted, and tried again first, with
+    // `VICTORY_HEAP_LOCKS` (`crate::descriptor::slots`).
+    crate::descriptor::slots::locked(&RETIRED, crate::descriptor::slots::RETIRED).push(resource);
 }
 
 /// After a submission has run, with none running: the retired resources go.

@@ -151,7 +151,8 @@ impl Viewed {
     /// [`Viewed::set`] with what the slot's view reads already worked out
     /// (`crate::descriptor::host`, "quick").
     pub(crate) fn set_seen(&self, index: u32, seen: Option<Seen>) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        // mac: a wait for it is counted with `VICTORY_HEAP_LOCKS`.
+        let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
         }

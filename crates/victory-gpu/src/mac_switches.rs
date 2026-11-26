@@ -261,6 +261,18 @@ pub(crate) fn heap_sync_pause(value: Option<&str>) -> Option<u64> {
     }
 }
 
+/// `VICTORY_HEAP_LOCKS`'s rule (`crate::descriptor::slots`): whether a host
+/// heap's slots get locks of their own, and whether lock waits and made
+/// slots are counted. Unset, empty or `0`: neither, as before; `count`:
+/// the one lock as before, counted; anything else: both.
+pub(crate) fn heap_locks(value: Option<&str>) -> [bool; 2] {
+    match value {
+        None | Some("" | "0") => [false, false],
+        Some("count") => [false, true],
+        Some(_) => [true, true],
+    }
+}
+
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -319,7 +331,7 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, heap_sync_pause, key, quick, setting, uav_size, writers};
+    use super::{copy_order, heap_locks, heap_sync_pause, key, quick, setting, uav_size, writers};
 
     /// How many tests have the copy-order split forced on right now.
     pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -377,6 +389,16 @@ pub(crate) mod tests {
         assert_eq!(heap_sync_pause(Some("yes")), Some(8));
         assert_eq!(heap_sync_pause(Some("4")), Some(4));
         assert_eq!(heap_sync_pause(Some("1000")), Some(1000));
+    }
+
+    #[test]
+    fn the_heap_locks_are_one_and_uncounted_unless_asked() {
+        assert_eq!(heap_locks(None), [false, false]);
+        assert_eq!(heap_locks(Some("")), [false, false]);
+        assert_eq!(heap_locks(Some("0")), [false, false]);
+        assert_eq!(heap_locks(Some("count")), [false, true]);
+        assert_eq!(heap_locks(Some("1")), [true, true]);
+        assert_eq!(heap_locks(Some("yes")), [true, true]);
     }
 
     #[test]

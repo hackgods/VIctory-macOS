@@ -238,18 +238,19 @@ impl HostHeap {
     fn show(&self, host: &Host, index: u32, handle: u64, resolved: &Resolved) -> bool {
         let Resolved { record, view, made: from } = resolved;
         let key = u64::from(record[2]) << 32 | u64::from(record[1]);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let mut made = self.made.lock(index);
         // SAFETY: as the caller's read.
         if unsafe { (handle as *const [u32; 3]).read_unaligned() } != *record {
             return false;
         }
-        if made[index as usize] == key {
+        if made.get(index) == key {
             return true;
         }
         self.ready[index as usize].store(0, Ordering::Relaxed);
         self.write_stride(index, from.stride);
         self.note_address(index, Some(view));
-        made[index as usize] = key;
+        made.set(index, key);
+        crate::descriptor::slots::made();
         // SAFETY: a live buffer (held by `from`) and a slot of our heap.
         unsafe {
             host.device

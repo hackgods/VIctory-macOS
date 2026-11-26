@@ -1031,6 +1031,8 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use crate::backend::HostGpu;
     use crate::object::slot;
 
     /// A lock another thread holds is waited for, and the wait is counted
@@ -1151,6 +1153,108 @@ mod tests {
             slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence),
             7
         );
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
+    }
+
+    /// A queue's Signal behind a submission the GPU still runs moves the
+    /// title's fence, and wakes the event waiting for it, only once the
+    /// submission's results are in title memory: what its shaders wrote and
+    /// its bottom-of-pipe write. With `VICTORY_ASYNC_SUBMIT` as without.
+    #[cfg(windows)]
+    #[test]
+    fn a_signal_behind_a_running_submission_moves_after_its_results() {
+        use crate::host::overlap;
+        use crate::watch::PAGE;
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (spin, n) = overlap::tests::long_draw(host);
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        for (round, on) in [(1u64, true), (2, false)] {
+            let mut fence = null;
+            assert_eq!(
+                crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
+                S_OK
+            );
+            // SAFETY: plain auto-reset event.
+            let event = unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+            let wait = slot::<extern "system" fn(This, u64, *mut std::ffi::c_void) -> HRESULT>(
+                fence, 0x48,
+            );
+            assert_eq!(wait(fence, 3, event), S_OK);
+            let pool = crate::watch::tests::pool(1);
+            // SAFETY: our pool, not guarded yet.
+            unsafe { (pool as *mut u8).write_volatile(0x11) };
+            crate::shadow::register(pool, pool as u64, PAGE as u64);
+            let copy = crate::shadow::find(pool as u64, PAGE as u64).unwrap();
+            let word = Box::new(AtomicU64::new(0));
+            let word_at = std::ptr::from_ref(&*word) as usize;
+            let list = host.new_list().unwrap();
+            let tag = 0x516 + round as u32;
+            spin.record(&list, n, tag);
+            copy.refresh(&list, pool as u64, 16);
+            copy.gpu_writes(&list, pool as u64, 16, false);
+            let writer = copy.clone();
+            list.defer_host(move || writer.write_host(pool as u64, &[0x22]));
+            list.defer_write(word_at as *mut u8, Written::Value(9), 8);
+            list.close();
+            // SAFETY: our pool's byte, our word, our event.
+            let state = move || unsafe {
+                (
+                    crate::fence::value(fence),
+                    WaitForSingleObject(event, 0) == WAIT_OBJECT_0,
+                    (pool as *const u8).read_volatile(),
+                    (word_at as *const u64).read_volatile(),
+                )
+            };
+            overlap::force(Some(on));
+            let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+            let during = seen.clone();
+            overlap::during(move || during.set(Some(state())));
+            {
+                let mut held = held();
+                held.push(
+                    q as usize,
+                    Item::Segment(std::sync::Arc::new(list), Vec::new()),
+                );
+                crate::fence::keep(fence);
+                held.push(q as usize, Item::Signal(fence as usize, 3));
+                pump(&mut held, Why::Submission);
+            }
+            overlap::force(None);
+            assert_eq!(
+                seen.get(),
+                Some((0, false, 0x11, 0)),
+                "nothing moved while the GPU ran (switch {on})"
+            );
+            assert_eq!(
+                state(),
+                (3, true, 0x22, 9),
+                "the fence moved with the results in place (switch {on})"
+            );
+            assert_eq!(spin.ran(tag), 256 * 256);
+            // SAFETY: as above; the event was taken.
+            assert_eq!(unsafe { WaitForSingleObject(event, 0) }, WAIT_TIMEOUT);
+            // SAFETY: ours.
+            unsafe { CloseHandle(event) };
+            assert_eq!(
+                slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence),
+                0
+            );
+            crate::shadow::unregister(pool, pool as u64);
+            drop(copy);
+            crate::watch::tests::free(pool);
+        }
         assert_eq!(slot::<extern "system" fn(This) -> u32>(q, 0x10)(q), 0);
     }
 

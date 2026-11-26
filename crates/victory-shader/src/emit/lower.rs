@@ -104,6 +104,9 @@ pub(crate) struct Lowered {
     /// Barriers added for narrow host waves ([`split_wave_barriers`]).
     #[cfg(test)]
     pub split_barriers: usize,
+    /// Group barriers written, of every kind.
+    #[cfg(test)]
+    pub barriers: usize,
     /// Exchanges across the halves (`exchange`), and those of them that
     /// hand over lane values.
     #[cfg(test)]
@@ -1670,6 +1673,8 @@ impl<'a> Lower<'a> {
             },
             #[cfg(test)]
             split_barriers: self.split_barriers.len(),
+            #[cfg(test)]
+            barriers: self.s.m.written_calls("dx.op.barrier"),
             #[cfg(test)]
             exchanges: self.exchange.made,
             #[cfg(test)]
@@ -7290,6 +7295,10 @@ impl<'a> Lower<'a> {
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
+                    if self.first_alone(inst) {
+                        let a = s(self, 0)?;
+                        return int(self, a);
+                    }
                     // Mac (`exchange`): lane 0's value handed over.
                     if self.exchange_first_at(inst) {
                         let (a, zero) = (s(self, 0)?, self.s.m.i32(0));

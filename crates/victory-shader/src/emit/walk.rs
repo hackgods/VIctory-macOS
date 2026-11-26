@@ -47,7 +47,7 @@ use super::*;
 use crate::gfx10::Fields;
 use crate::ir::walk::Skip;
 use crate::ir::{EXEC, Reg};
-use crate::structure::{Bool, Structured};
+use crate::structure::{Atom, Bool, Structured};
 
 /// How often a program is opened further before it is left as it was.
 const ROUNDS: usize = 4;
@@ -145,16 +145,26 @@ pub(super) fn open<T>(
 /// Whether, in the program `p` that [`ir::walk::walked`] made, a lane
 /// outside the EXEC a left-out skip tested does nothing in the skip's
 /// region (the module notes, 2).
+///
+/// A loop in the region joins EXEC at its head, and the join is a mask of
+/// its own to the structure pass. Such joins are taken by induction over
+/// the lane's steps ([`inside`]): a join holds no lane outside the tested
+/// EXEC if no mask it takes in does, the other joins being granted.
 fn idle(p: &ir::Program, st: &Structured, skips: &[Skip]) -> bool {
-    let mask = |v| st.masks.get(&v).or_else(|| st.other.get(&v)).copied();
+    let mask = |v| {
+        let known = st.masks.get(&v).or_else(|| st.other.get(&v));
+        known.or_else(|| st.joined.get(&v)).copied()
+    };
     skips.iter().all(|s| {
         let Some(tested) = mask(s.exec) else {
             return false;
         };
+        let joins = inside(p, st, s, tested, &mask);
         // Whether a lane at block `at` can meet `runs` outside that EXEC.
         let outside = |at: usize, runs: Bool| {
-            st.bools
-                .meet(&[(st.reach[at], true), (runs, true), (tested, false)])
+            let mut all = vec![(st.reach[at], true), (runs, true), (tested, false)];
+            all.extend(joins.iter().map(|j| (*j, false)));
+            st.bools.meet(&all)
         };
         for (x, block) in p.blocks.iter().enumerate().filter(|(x, _)| s.inside[*x]) {
             for (i, inst) in block.insts.iter().enumerate() {
@@ -180,4 +190,47 @@ fn idle(p: &ir::Program, st: &Structured, skips: &[Skip]) -> bool {
             .iter()
             .all(|&(x, e)| mask(e).is_some_and(|m| !outside(x, m)))
     })
+}
+
+/// The lane-mask joins in the region of `s` (each as its own mask, an
+/// [`Atom::Phi`]) that hold no lane outside `tested`: all of them taken to
+/// hold first, then those taken out one of whose incoming masks is unknown
+/// or can, on its edge and with the others still granted, hold a lane
+/// outside `tested`, until none is. What is left holds at every step of a
+/// lane: a join's value is one of its incoming masks, made of masks that
+/// held it before.
+fn inside(
+    p: &ir::Program,
+    st: &Structured,
+    s: &Skip,
+    tested: Bool,
+    mask: &dyn Fn(ir::Value) -> Option<Bool>,
+) -> Vec<Bool> {
+    let own = |f: &ir::Phi| {
+        mask(f.value).filter(|m| {
+            matches!(st.bools.node(*m), Some((Atom::Phi(v), Bool::FALSE, Bool::TRUE)) if v == f.value)
+        })
+    };
+    let mut joins: Vec<(usize, &ir::Phi, Bool)> = (0..p.blocks.len())
+        .filter(|b| s.inside[*b])
+        .flat_map(|b| p.blocks[b].phis.iter().map(move |f| (b, f)))
+        .filter_map(|(b, f)| own(f).map(|m| (b, f, m)))
+        .collect();
+    loop {
+        let granted: Vec<(Bool, bool)> = joins.iter().map(|j| (j.2, false)).collect();
+        let holds = |(b, f, _): &(usize, &ir::Phi, Bool)| {
+            p.blocks[*b].preds.iter().zip(&f.args).all(|(&q, &a)| {
+                mask(a).is_some_and(|m| {
+                    let mut all = vec![(st.reach[q], true), (m, true), (tested, false)];
+                    all.extend(&granted);
+                    !st.bools.meet(&all)
+                })
+            })
+        };
+        let kept: Vec<_> = joins.iter().filter(|j| holds(j)).copied().collect();
+        if kept.len() == joins.len() {
+            return joins.iter().map(|j| j.2).collect();
+        }
+        joins = kept;
+    }
 }

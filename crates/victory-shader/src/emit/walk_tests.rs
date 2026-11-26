@@ -374,6 +374,244 @@ fn every_lane_reaches_the_count_and_runs_nothing_there() {
     assert!(guarded("buffer_store_dword"));
 }
 
+// ---- Loops the group goes round together, and the thread that runs alone ----
+//
+// The shape of the title's tile-list programs (`CS_CalcRasterClassificationListCounts`,
+// `CS_WriteRasterClassificationResults`): behind an early-out, a loop on a
+// scalar count in which a mask of the wave's lanes is counted each round;
+// and thread 0 alone summing up through first-lane reads.
+
+/// `s_mov_b32 s20, 0`; and the loop's end: `s_add_u32 s20, s20, 1`,
+/// `s_cmp_lt_u32 s20, 2`, `s_cbranch_scc1` back over `body` words.
+const S20_IS_0: u32 = sop1(20, 0x03, 128);
+fn twice(body: u32) -> [u32; 3] {
+    [0x8014_8114, 0xBF0A_8214, scc1(0x1_0000 - (body + 3))]
+}
+
+/// Behind the early-out, twice round a loop: the lanes left count those of
+/// them above 40 and keep the count. The values of [`behind_an_early_out`].
+fn in_a_loop_behind_an_early_out() -> Vec<u32> {
+    let mut w = start();
+    w.extend([INSIDE, execz(9), S20_IS_0, ABOVE_40, COUNT, V1_IS_S12]);
+    w.extend(twice(3));
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// The same loop counted to the first lane's thread id (at least once): a
+/// count the host waves do not share, so they go round apart.
+fn in_a_loop_each_wave_counts() -> Vec<u32> {
+    let mut w = start();
+    w.extend([S20_IS_0, 0x7E2A_0500, ABOVE_40, COUNT, V1_IS_S12]);
+    w.extend([0x8014_8114, 0xBF0A_1514, scc1(0x1_0000 - 6)]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// Thread 0 alone (`v_cmp_eq_u32 vcc, 0, v0`, `s_and_saveexec_b64 s[2:3],
+/// vcc`) reads the first lane of a value that differs by lane (its thread
+/// id plus 5) and stores it: 5 in thread 0, the 0 from before elsewhere.
+/// (`v_mbcnt` makes it a program of console lanes, as the lane operations
+/// around such a read do.)
+fn thread_0_reads_its_first_lane() -> Vec<u32> {
+    let mut w = start();
+    w.extend([
+        0xD765_0003,
+        0x0001_00C1,         // v_mbcnt_lo_u32_b32 v3, -1, 0
+        0x7D84_0080,         // v_cmp_eq_u32 vcc, 0, v0
+        0x4A04_0085,         // v_add_nc_u32 v2, 5, v0
+        sop1(2, 0x24, VCC),  // s_and_saveexec_b64 s[2:3], vcc
+        execz(2),
+        0x7E18_0502,         // v_readfirstlane_b32 s12, v2
+        V1_IS_S12,
+        RESTORE,
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_loop_programs_are_what_their_comments_say() {
+    for (words, wants) in [
+        (
+            in_a_loop_behind_an_early_out(),
+            &[
+                "s_cbranch_execz label_0050",
+                "s_mov_b32 s20, 0\nlabel_0030\nv_cmp_lt_u32 vcc, 40, v0\ns_bcnt1_i32_b64 s12, vcc",
+                "s_add_u32 s20, s20, 1\ns_cmp_lt_u32 s20, 2\ns_cbranch_scc1 label_0030",
+            ][..],
+        ),
+        (
+            in_a_loop_each_wave_counts(),
+            &["v_readfirstlane_b32 s21, v0", "s_cmp_lt_u32 s20, s21\ns_cbranch_scc1 label_002C"][..],
+        ),
+        (
+            thread_0_reads_its_first_lane(),
+            &[
+                "v_cmp_eq_u32 vcc, 0, v0\nv_add_nc_u32 v2, 5, v0\ns_and_saveexec_b64 s[2:3], vcc\ns_cbranch_execz label_0044",
+                "v_readfirstlane_b32 s12, v2\nv_mov_b32 v1, s12\nlabel_0044\ns_mov_b64 exec, s[2:3]",
+            ][..],
+        ),
+    ] {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let insts = gfx10::decode(&code).expect("decodes");
+        let targets: Vec<String> = insts
+            .iter()
+            .filter_map(|i| i.text(true).split("label_").nth(1).map(str::to_owned))
+            .collect();
+        let all: Vec<String> = insts
+            .iter()
+            .flat_map(|i| {
+                let at = format!("{:04X}", i.offset);
+                let label = targets.contains(&at).then(|| format!("label_{at}"));
+                label.into_iter().chain([i.text(true)])
+            })
+            .collect();
+        let all = all.join("\n");
+        for want in wants {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A count in a loop the whole group goes round together is handed over
+/// each round, with a second barrier after the loads (the next round stores
+/// to the same slots): refused with the exchange alone, exact with the
+/// walk, the same translation with half-local reads. The count outside a
+/// loop has the one barrier.
+#[test]
+fn a_count_in_a_loop_the_group_goes_round_together_is_handed_over() {
+    let words = in_a_loop_behind_an_early_out();
+    let off = halves(&words, false, exchange()).err().expect("refused");
+    assert!(off.to_string().contains(REFUSAL), "{off}");
+    let on = halves(&words, false, walking()).expect("handed over");
+    assert_eq!((on.wave_size, on.exchanges, on.barriers), (Some(32), 1, 2));
+    assert_eq!(halves(&words, true, walking()).expect("handed over").dxil, on.dxil);
+    let once = halves(&behind_an_early_out(), false, walking()).expect("handed over");
+    assert_eq!((once.exchanges, once.barriers), (1, 1));
+    let two = translated(&words, 128, true, false, walking()).expect("two console waves");
+    assert_eq!((two.exchanges, two.barriers), (1, 2));
+    #[cfg(windows)]
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut on.dxil.clone())
+            .unwrap_or_else(|e| panic!("DXIL validation failed: {e}"));
+    }
+}
+
+/// A loop each host wave counts for itself is not gone round together: no
+/// barrier can go in it, and the program stays as it was.
+#[test]
+fn a_loop_each_wave_counts_for_itself_stays_as_it_was() {
+    let words = in_a_loop_each_wave_counts();
+    for mac in [exchange(), walking()] {
+        assert!(halves(&words, false, mac).is_err());
+    }
+    let dxil = |mac| halves(&words, true, mac).expect("half-local").dxil;
+    assert_eq!(dxil(walking()), dxil(exchange()));
+}
+
+/// A first-lane read that only thread 0 can run is that thread's own value:
+/// refused with the exchange alone (the first lane may be in the other
+/// half), translated with the walk without a hand-over, and not on a host
+/// of 64-lane waves or where the compare is not of the thread id.
+#[test]
+fn a_first_lane_read_only_one_thread_runs_is_its_own_value() {
+    let words = thread_0_reads_its_first_lane();
+    let off = halves(&words, false, exchange()).err().expect("refused");
+    assert!(off.to_string().contains("a first-lane read of a value that may differ"), "{off}");
+    let on = halves(&words, false, walking()).expect("its own value");
+    assert_eq!((on.wave_size, on.exchanges, on.barriers), (Some(32), 0, 0));
+    assert_eq!(halves(&words, true, walking()).expect("its own value").dxil, on.dxil);
+    // Compared with a value that is not the thread id (v2): refused.
+    let mut other = words.clone();
+    let at = other.iter().position(|w| *w == 0x7D84_0080).expect("the compare");
+    other.swap(at, at + 1);
+    other[at + 1] = 0x7D84_0480; // v_cmp_eq_u32 vcc, 0, v2
+    for mac in [exchange(), walking()] {
+        assert!(halves(&other, false, mac).is_err());
+    }
+}
+
+// ---- A model of the hand-over in a loop ----
+//
+// Host waves as units, every order of their steps. Each round every wave
+// stores its value in its slot, the group meets, every wave loads its
+// partner's slot; with `two` the group meets again before the next round.
+
+/// Every result of `rounds` rounds: per round and wave the value loaded.
+fn looped(waves: usize, rounds: usize, two: bool) -> Vec<Vec<u32>> {
+    #[derive(Clone, PartialEq, Eq, Hash)]
+    struct State {
+        /// Per wave: the round, and 0 stores, 1 waits, 2 loads, 3 waits again.
+        pcs: Vec<(usize, u8)>,
+        slots: Vec<u32>,
+        got: Vec<u32>,
+    }
+    let value = |round: usize, w: usize| (10 * (round + 1) + w) as u32;
+    let start = State {
+        pcs: vec![(0, 0); waves],
+        slots: vec![7; waves],
+        got: vec![0; rounds * waves],
+    };
+    let (mut seen, mut stack, mut ends) = (std::collections::HashSet::new(), vec![start], Vec::new());
+    while let Some(s) = stack.pop() {
+        if !seen.insert(s.clone()) {
+            continue;
+        }
+        if s.pcs.iter().all(|pc| pc.0 == rounds) {
+            ends.push(s.got.clone());
+            continue;
+        }
+        // A barrier lets the group on when every wave has arrived at it.
+        let (round, step) = s.pcs[0];
+        if (step == 1 || step == 3) && s.pcs.iter().all(|pc| *pc == (round, step)) {
+            let mut next = s.clone();
+            next.pcs = vec![if step == 1 { (round, 2) } else { (round + 1, 0) }; waves];
+            stack.push(next);
+            continue;
+        }
+        for w in 0..waves {
+            let (round, step) = s.pcs[w];
+            let mut next = s.clone();
+            match step {
+                0 if round < rounds => {
+                    next.slots[w] = value(round, w);
+                    next.pcs[w] = (round, 1);
+                }
+                2 => {
+                    next.got[round * waves + w] = s.slots[w ^ 1];
+                    next.pcs[w] = if two { (round, 3) } else { (round + 1, 0) };
+                }
+                _ => continue,
+            }
+            stack.push(next);
+        }
+    }
+    ends.sort();
+    ends.dedup();
+    ends
+}
+
+/// With the second barrier every order gives each wave its partner's value
+/// of the round; with one barrier alone some order gives a wave the value
+/// its partner has already stored for the next round.
+#[test]
+fn a_hand_over_in_a_loop_needs_the_second_barrier() {
+    for waves in [2, 4] {
+        let want: Vec<u32> = (0..3)
+            .flat_map(|r| (0..waves).map(move |w| (10 * (r + 1) + (w ^ 1)) as u32))
+            .collect();
+        assert_eq!(looped(waves, 3, true), [want.clone()]);
+        let one = looped(waves, 3, false);
+        assert!(one.len() > 1 && one.contains(&want));
+    }
+}
+
 // ---- A model of the hand-over in walked code ----
 //
 // A group of host waves of 32 lanes, each a unit that runs its lanes in
@@ -578,7 +816,6 @@ mod gpu {
     /// lane whose dword is not `want`'s.
     fn differences(what: &str, words: &[u32], threads: u32, want: &[u32]) -> Vec<String> {
         let l = translated(words, threads, true, false, walking()).expect("handed over");
-        assert!(l.exchanges > 0, "{what}");
         let shader = super::super::HostShader {
             stage: HwStage::Cs,
             dxil: l.dxil,
@@ -671,6 +908,21 @@ mod gpu {
             let what = format!("{what}, two waves");
             failed.extend(differences(&what, &words, 128, &two));
         }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// The count in a loop behind an early-out is the console's in both
+    /// halves each round (two hand-overs through the same slots), and the
+    /// thread that runs alone reads its own first lane.
+    #[test]
+    fn a_count_in_a_loop_is_the_consoles_in_both_halves_on_every_gpu() {
+        let one: Vec<u32> = (0..64).map(|l| if l < 30 { 0 } else { 23 }).collect();
+        let two: Vec<u32> = one.iter().copied().chain([64; 64]).collect();
+        let words = in_a_loop_behind_an_early_out();
+        let mut failed = differences("loop", &words, 64, &one);
+        failed.extend(differences("loop, two waves", &words, 128, &two));
+        let alone: Vec<u32> = (0..64).map(|l| if l == 0 { 5 } else { 0 }).collect();
+        failed.extend(differences("thread 0", &thread_0_reads_its_first_lane(), 64, &alone));
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 

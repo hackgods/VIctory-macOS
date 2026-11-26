@@ -137,7 +137,7 @@ pub(super) struct State {
     once: Option<Vec<bool>>,
     /// Blocks a thread group runs together ([`together`]), when first
     /// asked.
-    together: Option<Vec<bool>>,
+    together: Option<together::Together>,
     /// The slots: two sets of one dword per thread of the group (rounded
     /// up to whole console waves), group-shared.
     slots: Option<V>,
@@ -282,17 +282,29 @@ impl Lower<'_> {
     }
 
     /// Whether IR block `b` is one a thread group runs together (every
-    /// thread once, or none: [`together`]), in a program in halves asked to
-    /// exchange there too ([`Mac::walk`]). A half's answer has slots of its
-    /// own, so the module notes' 5 holds for it there as in a block every
-    /// lane runs: the group's threads all store, meet and load, or none
-    /// does.
+    /// thread as often as every other, or none: [`together`]), in a program
+    /// in halves asked to exchange there too ([`Mac::walk`]). A half's
+    /// answer has slots of its own, so the module notes' 5 holds for it
+    /// there as in a block every lane runs: the group's threads all store,
+    /// meet and load, or none does; on a cycle they do so each round
+    /// ([`Lower::exchange_again`]).
     fn exchange_together(&mut self, b: usize) -> bool {
         let x = self.x;
         self.halves
             && x.mac.exchange
             && x.mac.walk
-            && self.exchange.together.get_or_insert_with(|| together::blocks(x))[b]
+            && self.exchange.together.get_or_insert_with(|| together::blocks(x)).blocks[b]
+    }
+
+    /// Whether the hand-over written in DXIL block `at` is in an IR block on
+    /// a cycle, so that the group stores to its slots again next round (a
+    /// block run together; one every lane runs once is on none). `at` is
+    /// the block being lowered or the last block of the IR block that wrote
+    /// the mask ([`Lower::mask_dword`]).
+    fn exchange_again(&self, at: usize) -> bool {
+        let ir = self.tail.iter().position(|t| *t == Some(at));
+        let ir = ir.unwrap_or(self.cur_ir);
+        (self.exchange.together.as_ref()).is_some_and(|t| t.looped[ir])
     }
 
     /// `x`, a dword every lane of a host wave holds alike (the half's
@@ -332,6 +344,11 @@ impl Lower<'_> {
         } else {
             hi
         };
+        // In a loop the next round stores to these slots again: no thread
+        // may get there while another still loads this round's.
+        if self.exchange_again(at) {
+            self.exchange_barrier(at);
+        }
         (lo, hi)
     }
 

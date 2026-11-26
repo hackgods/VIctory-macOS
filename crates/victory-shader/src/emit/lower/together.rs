@@ -25,17 +25,30 @@
 //!   program that stores to no memory by address, and for a buffer whose
 //!   descriptor no store or atomic of the program uses.
 //!
-//! A join of two group values is not one (which of them a thread holds
-//! depends on its path), so a group value has no history: its instruction
-//! gives the same result each time it runs.
+//! A join of group values is one only where the group arrives as one: in a
+//! block run together, every way into which comes from a block run together
+//! (a loop's counter, joined at the loop's head from the count before the
+//! loop and the count the last round left). All threads then come the same
+//! way and take the same value. Any other join is each thread's own: which
+//! value it holds depends on its path.
 //!
-//! Then a block is run together ([`blocks`]) when no cycle goes through it
-//! and every branch that can go round it is decided by a group value. Why:
-//! take two threads of a group, one that reaches the block and one that
-//! does not. Their paths part at a branch. A decided branch sends both the
-//! same way, so it is another one, from which the block is reachable; by
-//! the rule the block is then on every way from that branch to the end of
-//! the program, also on the second thread's.
+//! Then a block is run together ([`blocks`]) when every branch that can go
+//! round it is decided by a group value, and every branch of every cycle
+//! through it is: the group goes round such a loop as one, each thread as
+//! often as the others (the title's list programs count the tiles of 25
+//! classes in a loop of 25 rounds). Why: take two threads of a group
+//! and the first block run together that one of them reaches and the other
+//! does not reach next. Their paths part at a branch before it. A decided
+//! branch sends both the same way (its SCC is a group value, by the rule
+//! above the same in both at the same round), so it is another one, from
+//! which the block is reachable; by the rule the block is then on every way
+//! from that branch to the end of the program, also on the second
+//! thread's, and no cycle of undecided branches leads past it first. The
+//! two rules lean on each other (a loop's counter is a group value because
+//! the loop's head is run together, which it is because the loop's exit is
+//! decided by the counter), so [`blocks`] starts from every block and takes
+//! away until nothing changes: what is left holds by induction over the
+//! group's steps.
 //!
 //! What this rests on, beyond the exchange's own premises: that the memory
 //! a scalar load reads does not change while the group runs. The program's
@@ -48,15 +61,37 @@
 //! ([`Lower::exchange_halves_in`]): it has slots of its own. Lane values
 //! share two sets of slots in turn, which is right only when every
 //! exchange runs ([`super::exchange`], 3), so they stay with the blocks
-//! every lane runs.
+//! every lane runs. In a block on a cycle the same slots are stored again
+//! each round, so the hand-over there ends with a second barrier
+//! ([`Together::looped`], [`Lower::exchanged_halves`]).
 
 use super::*;
 
 /// Scalar values that are the same in every thread of a group (the module
-/// notes).
-fn values(x: &Parts) -> Set<Value> {
+/// notes), given the blocks taken to be run together.
+fn values(x: &Parts, together: &[bool]) -> Set<Value> {
     let p = x.p;
-    let mut same: Set<Value> = Set::default();
+    // Joins where the group arrives as one, all taken to hold first.
+    let whole = |b: usize| together[b] && p.blocks[b].preds.iter().all(|&q| together[q]);
+    let scalar = |r: Reg| matches!(r, Reg::Scc) || matches!(r, Reg::S(c) if c < crate::ir::VCC);
+    let mut joins: Vec<&Phi> = (0..p.blocks.len())
+        .filter(|&b| whole(b))
+        .flat_map(|b| p.blocks[b].phis.iter().filter(|f| scalar(f.reg)))
+        .collect();
+    loop {
+        let same = values_with(x, &joins);
+        let held = joins.len();
+        joins.retain(|f| f.args.iter().all(|a| same.contains(a)));
+        if joins.len() == held {
+            return same;
+        }
+    }
+}
+
+/// [`values`] with `joins` taken as group values.
+fn values_with(x: &Parts, joins: &[&Phi]) -> Set<Value> {
+    let p = x.p;
+    let mut same: Set<Value> = joins.iter().map(|f| f.value).collect();
     for &(reg, v) in &p.inputs {
         let info = x
             .io
@@ -87,7 +122,7 @@ fn values(x: &Parts) -> Set<Value> {
             .all(|d| !written.contains(&&d.source))
     };
     // Reverse postorder: a value's instruction comes before its uses, but
-    // for joins, which are no group values.
+    // for joins.
     for b in crate::ir::reverse_postorder(&p.blocks) {
         for (i, inst) in p.blocks[b].insts.iter().enumerate() {
             let name = inst.name();
@@ -134,13 +169,24 @@ fn decided(x: &Parts, same: &Set<Value>, b: usize) -> bool {
         })
 }
 
-/// For each block, whether a thread group runs it together: every thread
-/// exactly once, or none (the module notes).
-pub(super) fn blocks(x: &Parts) -> Vec<bool> {
+/// What a thread group runs together.
+pub(super) struct Together {
+    /// Per block: every thread of the group runs it as often as every
+    /// other, in step, or none does.
+    pub blocks: Vec<bool>,
+    /// Per block: it is on a cycle (run more than once).
+    pub looped: Vec<bool>,
+}
+
+/// The blocks a thread group runs together (the module notes).
+pub(super) fn blocks(x: &Parts) -> Together {
     let p = x.p;
     let n = p.blocks.len();
     if p.blocks.iter().any(|b| b.exit == Exit::Indirect) {
-        return vec![false; n];
+        return Together {
+            blocks: vec![false; n],
+            looped: vec![false; n],
+        };
     }
     let succ = |b: usize| p.blocks[b].exit.successors();
     let reach = |from: usize, stop: &dyn Fn(usize) -> bool| {
@@ -181,17 +227,85 @@ pub(super) fn blocks(x: &Parts) -> Vec<bool> {
             }
         }
     }
-    let same = values(x);
-    let mut together: Vec<bool> = (0..n).map(|b| !reach(b, &|_| false)[b]).collect();
-    for d in 0..n {
-        if !matches!(p.blocks[d].exit, Exit::Branch { .. }) || decided(x, &same, d) {
-            continue;
+    let branches: Vec<usize> = (0..n)
+        .filter(|&d| matches!(p.blocks[d].exit, Exit::Branch { .. }))
+        .collect();
+    // Per branch: the blocks it can go round, and those on a cycle with it.
+    let after: Vec<Vec<bool>> = branches.iter().map(|&d| reach(d, &|_| false)).collect();
+    let round: Vec<Vec<bool>> = branches
+        .iter()
+        .map(|&d| reach(d, &|b| pdom[d][b / 64] >> (b % 64) & 1 == 1))
+        .collect();
+    let looped: Vec<bool> = (0..n).map(|b| reach(b, &|_| false)[b]).collect();
+    let before: Vec<Vec<bool>> = (0..n)
+        .map(|b| if looped[b] { reach(b, &|_| false) } else { Vec::new() })
+        .collect();
+    // From every block, down to what holds (the module notes).
+    let mut together = vec![true; n];
+    loop {
+        let same = values(x, &together);
+        let mut next = vec![true; n];
+        for (k, &d) in branches.iter().enumerate() {
+            if decided(x, &same, d) {
+                continue;
+            }
+            for b in 0..n {
+                // (`d` on a cycle through `b`: each reaches the other)
+                if round[k][b] || looped[b] && after[k][b] && before[b][d] {
+                    next[b] = false;
+                }
+            }
         }
-        // The blocks this branch can go round.
-        let round = reach(d, &|b| pdom[d][b / 64] >> (b % 64) & 1 == 1);
-        for (t, r) in together.iter_mut().zip(round) {
-            *t &= !r;
+        if next == together {
+            return Together { blocks: together, looped };
         }
+        together = next;
     }
-    together
+}
+
+impl Lower<'_> {
+    /// Whether the first-lane read `inst` (of the block being lowered) can
+    /// only run in one thread of the group ([`Mac::walk`]): the group is one
+    /// row of threads, and every lane that reaches the read passed a compare
+    /// of the thread id with a constant (`v_cmp_eq_u32 vcc, 0, v0`, with EXEC
+    /// narrowed to it), and runs it without a further guard. EXEC there is
+    /// that one lane on the console too, so the first lane is the reader
+    /// and the read is its own value: the title's list programs let thread
+    /// 0 sum the group's counts this way.
+    pub(super) fn first_alone(&self, inst: &Inst) -> bool {
+        let (x, b) = (self.x, self.cur_ir);
+        let (p, st) = (x.p, x.st);
+        let row = self.s.threads.is_some_and(|t| t[1] * t[2] == 1);
+        let i = p.blocks[b].insts.iter().position(|q| std::ptr::eq(q, inst));
+        if !(x.mac.walk && row && i.is_some_and(|i| st.guards[b][i].is_none())) {
+            return false;
+        }
+        // The thread id's x on entry.
+        let id = p.inputs.iter().find(|r| r.0 == Reg::V(0)).map(|r| r.1);
+        let is_id = |v: Value| {
+            Some(v) == id
+                && x.io
+                    .inputs
+                    .iter()
+                    .any(|n| n.0 == v && matches!(n.1, Input::ThreadIdInGroup(0)))
+        };
+        let reach = [(st.reach[b], true)];
+        p.blocks.iter().flat_map(|q| &q.insts).any(|c| {
+            let Fields::Valu(v) = &c.fields else {
+                return false;
+            };
+            let with_id = match v.src[..] {
+                [Operand::Const(_), Operand::Vector { reg, .. }]
+                | [Operand::Vector { reg, .. }, Operand::Const(_)] => {
+                    c.read(Reg::V(reg)).is_some_and(is_id)
+                }
+                _ => false,
+            };
+            matches!(c.name(), "v_cmp_eq_u32" | "v_cmp_eq_i32")
+                && with_id
+                && c.writes.iter().any(|w| {
+                    matches!(w.0, Reg::S(_)) && st.bools.decides(&reach, Atom::Lane(w.1)) == Some(true)
+                })
+        })
+    }
 }

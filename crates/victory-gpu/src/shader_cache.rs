@@ -142,11 +142,29 @@ pub fn halves_local() -> bool {
     })
 }
 
-/// Whether such programs run that way here: asked for, on a host of
-/// 32-lane waves (elsewhere the setting changes no translation).
+/// Whether translations for a host of 32-lane waves let a group of one
+/// console wave64 share LDS between its two halves with nothing ordering
+/// them, instead of refusing it
+/// (`victory_shader::emit::Options::halves_shared_lds`): only with
+/// `VICTORY_HALVES_SHARED_LDS=1`. The halves race, so a test, not a fix.
+pub fn halves_shared_lds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_HALVES_SHARED_LDS");
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_SHARED_LDS=1: one-wave64 groups share LDS between their two 32-lane halves without sync"
+            );
+        }
+        on
+    })
+}
+
+/// Whether programs run in either of those ways here: asked for, on a host
+/// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
 pub(crate) fn halves_local_here() -> bool {
-    halves_local() && host_wave32()
+    (halves_local() || halves_shared_lds()) && host_wave32()
 }
 
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
@@ -169,20 +187,27 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, narrow waves, half-local reads): their own cache entries,
-/// one per combination.
-fn options_build(locks: bool, bias: bool, narrow: bool, local: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+/// as gradients, narrow waves, half-local reads and shared LDS in halves,
+/// `local`): their own cache entries, one per combination.
+fn options_build(locks: bool, bias: bool, narrow: bool, local: [bool; 2]) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 32] = [const { OnceLock::new() }; 32];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
-        | usize::from(local) << 3;
+        | usize::from(local[0]) << 3
+        | usize::from(local[1]) << 4;
     BUILDS[n].get_or_init(|| options_key(build(), locks, bias, narrow, local))
 }
 
 /// [`options_build`]'s key over the build `build`. A setting that is off
 /// adds nothing, so the entries made without it stay the ones read.
-fn options_key(build: &[u8; 32], locks: bool, bias: bool, narrow: bool, local: bool) -> [u8; 32] {
+fn options_key(
+    build: &[u8; 32],
+    locks: bool,
+    bias: bool,
+    narrow: bool,
+    local: [bool; 2],
+) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(build);
     if locks {
@@ -194,8 +219,11 @@ fn options_key(build: &[u8; 32], locks: bool, bias: bool, narrow: bool, local: b
     if narrow {
         h.update(b"narrow waves");
     }
-    if local {
+    if local[0] {
         h.update(b"halves local");
+    }
+    if local[1] {
+        h.update(b"halves shared lds");
     }
     *h.finalize().as_bytes()
 }
@@ -213,6 +241,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
         halves_local: halves_local(),
+        halves_shared_lds: halves_shared_lds(),
     }
 }
 
@@ -226,12 +255,13 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         || options.bias_as_gradients
         || options.narrow_waves
         || options.halves_local
+        || options.halves_shared_lds
     {
         options_build(
             options.atomic_locks,
             options.bias_as_gradients,
             options.narrow_waves,
-            options.halves_local,
+            [options.halves_local, options.halves_shared_lds],
         )
     } else {
         build()
@@ -645,21 +675,22 @@ mod tests {
                 host_wave32()
             )
         );
-        // Half-local reads (`VICTORY_HALVES_LOCAL=1`) are entries of their
-        // own in every combination; off, the key is what it was without
-        // the setting.
+        // Half-local reads (`VICTORY_HALVES_LOCAL=1`) and shared LDS in
+        // halves (`VICTORY_HALVES_SHARED_LDS=1`) are entries of their own
+        // in every combination; off, the key is what it was without them.
         for n in 0..8u8 {
             let (l, b, w) = (n & 1 != 0, n & 2 != 0, n & 4 != 0);
-            assert_ne!(
-                options_key(&k, l, b, w, true),
-                options_key(&k, l, b, w, false)
-            );
+            let keys: std::collections::HashSet<[u8; 32]> =
+                [[false, false], [true, false], [false, true], [true, true]]
+                    .map(|local| options_key(&k, l, b, w, local))
+                    .into();
+            assert_eq!(keys.len(), 4);
         }
         let mut narrow = blake3::Hasher::new();
         narrow.update(&k);
         narrow.update(b"narrow waves");
         assert_eq!(
-            options_key(&k, false, false, true, false),
+            options_key(&k, false, false, true, [false, false]),
             *narrow.finalize().as_bytes()
         );
         // The encoding part is this file as built.

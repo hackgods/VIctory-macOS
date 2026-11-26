@@ -127,7 +127,7 @@ pub(crate) fn runs() -> bool {
             if open {
                 "runs"
             } else if halves {
-                "held back: its 64-lane programs would run as 32-lane halves on their own (VICTORY_HALVES_LOCAL=1)"
+                "held back: its 64-lane programs would run as 32-lane halves on their own (VICTORY_HALVES_LOCAL, VICTORY_HALVES_SHARED_LDS)"
             } else {
                 "held back: not all its pipelines are made"
             }
@@ -145,7 +145,8 @@ fn all_made(states: &[Option<bool>]) -> bool {
 
 /// Whether the builder runs: every pipeline made, and its 64-lane programs
 /// not run as two 32-lane halves that each act as a wave (`halves`:
-/// `VICTORY_HALVES_LOCAL=1` on a host of 32-lane waves). The builder's
+/// `VICTORY_HALVES_LOCAL=1` or `VICTORY_HALVES_SHARED_LDS=1` on a host of
+/// 32-lane waves). The builder's
 /// programs exchange across the halves; run that way they hung the GPU
 /// within two minutes on an RTX 4070 SUPER (upstream PR #2711, from which
 /// this rule is taken, keyed there on the host's wave size alone).

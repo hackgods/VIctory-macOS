@@ -424,6 +424,11 @@ pub struct Options {
     /// Approximate where the console's wave exchanged across its halves.
     /// The translation differs, so the shader cache keys on it.
     pub halves_local: bool,
+    /// With [`Options::host_wave32`]: a group of one console wave64 that
+    /// shares LDS no barrier syncs is translated all the same, its two
+    /// 32-lane host waves racing on that memory, instead of being refused
+    /// (`lower::halves`). A test, not a fix. The shader cache keys on it.
+    pub halves_shared_lds: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -804,6 +809,7 @@ fn emit_pruned(
         narrow_waves: options.narrow_waves,
         halves_local: lower::HalvesLocal {
             reads: options.halves_local,
+            lds: options.halves_shared_lds,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

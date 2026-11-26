@@ -720,7 +720,7 @@ impl<'a> Lower<'a> {
             let needs_wave = console_lanes || one_wave && s.lds_dwords > 0 && !fits;
             halves = Self::halves_wanted(x, needs_wave);
             if halves && !synced {
-                halves_refused = Self::halves_lds(group, s.lds_dwords);
+                halves_refused = Self::halves_lds(x, group, s.lds_dwords);
             }
             if needs_wave {
                 s.wave_size = Some(if halves { 32 } else { wave });

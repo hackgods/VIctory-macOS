@@ -77,6 +77,11 @@ pub(crate) struct Local {
     /// (`emit::Options::halves_local`; the module notes, "Half-local
     /// reads").
     pub reads: bool,
+    /// LDS a group of one console wave64 shares is left as it is: the two
+    /// host waves read and write it with nothing ordering them, where the
+    /// console's one wave ran its lanes in step
+    /// (`emit::Options::halves_shared_lds`). A race, so a test, not a fix.
+    pub lds: bool,
 }
 
 impl Lower<'_> {
@@ -87,9 +92,10 @@ impl Lower<'_> {
     }
 
     /// Why a program in halves cannot run: LDS a group of one console wave
-    /// shares without barriers, split across two host waves.
-    pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
+    /// shares without barriers, split across two host waves (unless asked
+    /// to run it so, [`Local::lds`]).
+    pub(super) fn halves_lds(x: &Parts, group: u32, lds_dwords: u32) -> Option<Why> {
+        (lds_dwords > 0 && group > HALF && group <= 64 && !x.halves_local.lds)
             .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
     }
 

@@ -303,6 +303,21 @@ fn lowered(
     host_wave32: bool,
     local: bool,
 ) -> Result<lower::Lowered, crate::ShaderError> {
+    let local = lower::HalvesLocal {
+        reads: local,
+        lds: false,
+    };
+    lowered_with(words, threads, lds_bytes, host_wave32, local)
+}
+
+/// [`lowered`] with each of the halves' settings as given.
+fn lowered_with(
+    words: &[u32],
+    threads: u32,
+    lds_bytes: u32,
+    host_wave32: bool,
+    local: lower::HalvesLocal,
+) -> Result<lower::Lowered, crate::ShaderError> {
     let native = native(words, threads, lds_bytes);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let st = structure::structure(&p).expect("structure");
@@ -322,7 +337,7 @@ fn lowered(
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
-        halves_local: lower::HalvesLocal { reads: local },
+        halves_local: local,
         host_wave32,
     })
 }
@@ -497,6 +512,32 @@ fn shared_lds_of_a_one_wave64_group_stays_refused_with_the_setting() {
     }
 }
 
+/// With its own setting such a group translates, in waves of 32 and with
+/// no barrier added; that setting lifts no refusal of a read across the
+/// halves, and changes nothing in a program without such LDS.
+#[test]
+fn shared_lds_of_a_one_wave64_group_runs_unsynced_with_its_own_setting() {
+    let lds = |reads| lower::HalvesLocal { reads, lds: true };
+    for reads in [false, true] {
+        let l = lowered_with(&shared_lds(), 64, 256, true, lds(reads)).expect("shared LDS");
+        assert_eq!(l.wave_size, Some(32));
+        assert_eq!(l.split_barriers, 0);
+    }
+    for (what, words, refusal) in across() {
+        let why = lowered_with(&words, 64, 0, true, lds(false))
+            .err()
+            .unwrap_or_else(|| panic!("{what}: translated"))
+            .to_string();
+        assert!(why.contains(refusal), "{what}: {why}");
+    }
+    let dxil = |local| {
+        lowered_with(&within_halves(), 64, 0, true, local)
+            .expect("in halves")
+            .dxil
+    };
+    assert_eq!(dxil(lds(false)), dxil(lower::HalvesLocal::default()));
+}
+
 /// What each half answers on its own, per lane `l` of the group of 64.
 #[cfg(windows)]
 mod gpu {
@@ -527,7 +568,24 @@ mod gpu {
     /// adapter (an adapter of 64-lane waves runs the two waves of 32 the
     /// program declares). A line per lane whose dwords differ from `want`.
     fn differences(what: &str, words: &[u32], per_lane: usize, want: &[u32]) -> Vec<String> {
-        let shader = shader(lowered(words, 64, 0, true, true).expect("half-local"));
+        let reads = lower::HalvesLocal {
+            reads: true,
+            lds: false,
+        };
+        differences_with(what, words, 0, reads, per_lane, want)
+    }
+
+    /// [`differences`] for a program with `lds_bytes` of LDS, with the
+    /// halves' settings as given.
+    fn differences_with(
+        what: &str,
+        words: &[u32],
+        lds_bytes: u32,
+        local: lower::HalvesLocal,
+        per_lane: usize,
+        want: &[u32],
+    ) -> Vec<String> {
+        let shader = shader(lowered_with(words, 64, lds_bytes, true, local).expect("in halves"));
         let views = [
             View::Texture(1, 1, &[[0.0; 4]]),
             View::Buffer {
@@ -613,6 +671,21 @@ mod gpu {
         failed.extend(differences("sum", &wave_sum(), 1, &want));
         let want = lanes(&|l| vec![(l & !31..l).sum()]);
         failed.extend(differences("prefix sum", &wave_prefix_sum(), 1, &want));
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// Shared LDS run without sync, in the one case with a sure answer:
+    /// each lane reads back the dword it wrote itself (the lanes below it
+    /// in the mask's low dword: `l`, and 32 from lane 32 on, as on the
+    /// console), so no order between the halves matters.
+    #[test]
+    fn unsynced_shared_lds_keeps_what_a_lane_wrote_itself_on_every_gpu() {
+        let lds = lower::HalvesLocal {
+            reads: false,
+            lds: true,
+        };
+        let want: Vec<u32> = (0..64u32).map(|l| l.min(32)).collect();
+        let failed = differences_with("shared LDS", &shared_lds(), 256, lds, 1, &want);
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }

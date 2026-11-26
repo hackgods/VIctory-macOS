@@ -154,8 +154,10 @@ struct Checks {
     /// `--pipelines` makes them on).
     wave32: bool,
     /// With `wave32`: programs that read across the halves are translated
-    /// with each half as its own wave (`VICTORY_HALVES_LOCAL=1`, as `run`).
-    halves_local: bool,
+    /// with each half as its own wave (`VICTORY_HALVES_LOCAL=1`, as `run`),
+    /// and one-wave groups share LDS between the halves without sync
+    /// (`VICTORY_HALVES_SHARED_LDS=1`).
+    halves_local: [bool; 2],
 }
 
 pub fn run(
@@ -190,9 +192,15 @@ pub fn run(
     if wave32 {
         println!("waves        of 32 lanes at most (wave64 programs in halves)");
     }
-    let halves_local = victory_gpu::shader_cache::halves_local();
-    if halves_local {
+    let halves_local = [
+        victory_gpu::shader_cache::halves_local(),
+        victory_gpu::shader_cache::halves_shared_lds(),
+    ];
+    if halves_local[0] {
         println!("halves       answer reads across them on their own (VICTORY_HALVES_LOCAL=1)");
+    }
+    if halves_local[1] {
+        println!("halves       share one-wave LDS without sync (VICTORY_HALVES_SHARED_LDS=1)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -591,7 +599,8 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         host_wave32: checks.wave32,
-                        halves_local: checks.halves_local,
+                        halves_local: checks.halves_local[0],
+                        halves_shared_lds: checks.halves_local[1],
                         ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {

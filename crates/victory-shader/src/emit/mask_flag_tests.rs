@@ -140,7 +140,7 @@ fn a_select_on_the_flag_a_lane_loop_ended_with_translates() {
 }
 
 /// A select on that flag inside the loop reads what each round left: no
-/// lane has that value, and the program is refused as before.
+/// lane has that value, and the program is refused, by the flag's name.
 #[test]
 fn a_select_on_the_flag_inside_the_loop_stays_refused() {
     for (what, l) in [
@@ -154,7 +154,7 @@ fn a_select_on_the_flag_inside_the_loop_stays_refused() {
 }
 
 /// What the flag of a lane-mask operation read as a number stops with.
-const REFUSAL: &str = "a lane mask read as data";
+const REFUSAL: &str = "the flag of a lane-mask operation read as data";
 
 #[cfg(windows)]
 mod gpu {

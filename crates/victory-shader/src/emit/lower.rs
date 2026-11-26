@@ -488,6 +488,11 @@ enum MaskData {
 
 /// What a value holding a lane mask read as a number stops with.
 const LANE_MASK: Why = "a lane mask read as data";
+/// And the SCC such an operation writes ("some lane is set"): the wave's
+/// one bit, which a lane that left the wave's path does not have. Branches
+/// on it go by the lane's own bit and a select after the lane loop it
+/// closed takes it as clear (`structure`); any other read stops with this.
+const MASK_FLAG: Why = "the flag of a lane-mask operation read as data";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -3786,7 +3791,10 @@ impl<'a> Lower<'a> {
             Ok(()) => Ok(()),
             Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
-                for &(_, v) in &inst.writes {
+                for &(reg, v) in &inst.writes {
+                    // What a lane-mask operation leaves in SCC is no mask.
+                    let flag = reg == Reg::Scc && why == LANE_MASK;
+                    let why = if flag { MASK_FLAG } else { why };
                     self.vals.insert(v, Val::Missing(why));
                 }
                 Ok(())

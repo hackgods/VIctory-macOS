@@ -40,6 +40,13 @@ const GREATER_EQUAL: u32 = 7;
 const ALWAYS: u32 = 8;
 
 impl ValueWait {
+    /// Whether the value it tests lies in the `bytes` bytes at `at` (even
+    /// in part): a write there can change what it sees.
+    pub(crate) fn reads(&self, at: u64, bytes: u64) -> bool {
+        at < self.address.saturating_add(u64::from(self.bytes))
+            && self.address < at.saturating_add(bytes)
+    }
+
     /// Whether it holds with `read` giving the memory's value: `None` for a
     /// comparison we do not know (counted by the caller, taken as holding)
     /// and for memory that cannot be read (taken as not holding).
@@ -326,6 +333,21 @@ mod tests {
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");
         assert_eq!(w(9, 5).holds(&read), None);
         assert_eq!(w(EQUAL, 5).holds(&|_, _| None), None, "unreadable memory");
+    }
+
+    #[test]
+    fn a_wait_reads_the_bytes_of_its_value_only() {
+        let w = ValueWait { address: 0x100, bytes: 4, comparison: EQUAL, reference: 1, mask: 0xffff_ffff };
+        assert!(w.reads(0x100, 4));
+        assert!(w.reads(0x100, 8), "a 64-bit write over a 32-bit value");
+        assert!(w.reads(0xfc, 8), "a write that ends inside it");
+        assert!(w.reads(0x103, 1));
+        assert!(!w.reads(0xfc, 4), "the word before");
+        assert!(!w.reads(0x104, 4), "the word after");
+        assert!(!w.reads(0x100, 0));
+        let last = ValueWait { address: u64::MAX - 3, ..w };
+        assert!(last.reads(u64::MAX - 7, 8));
+        assert!(!last.reads(0, 8));
     }
 
     /// The compute queue's list waits for a value the graphics queue's list

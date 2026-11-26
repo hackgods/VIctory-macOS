@@ -208,11 +208,11 @@ fn pump(held: &mut Holding, why: Why) {
     // In host submissions, and waiting for one the host GPU was left with
     // (`crate::host::unwaited`).
     let ran = std::cell::Cell::new(std::time::Duration::ZERO);
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
+    let mut run = |queue: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
         let at = std::time::Instant::now();
         // The lists that have run: these, unless the host GPU was left
         // with them (then they come back with a later piece).
-        let done = host.execute_title(segments);
+        let done = host.execute_title(queue, segments);
         ran.set(ran.get() + at.elapsed());
         done.into_iter().for_each(crate::list::recycle);
     };
@@ -228,9 +228,9 @@ fn pump(held: &mut Holding, why: Why) {
     // A wait may be for a bottom-of-pipe write of a submission the host
     // GPU was left with: that one is finished before a head is held.
     let mut seen = unwaited::finished();
-    let mut owed = |_: &[crate::hold::ValueWait]| {
+    let mut owed = |waits: &[crate::hold::ValueWait]| {
         let at = std::time::Instant::now();
-        let finished = unwaited::settle_since(unwaited::By::Wait, &mut seen);
+        let finished = unwaited::settle_waits(waits, &mut seen);
         if finished {
             ran.set(ran.get() + at.elapsed());
         }
@@ -404,8 +404,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
         } else {
-            // Work the host GPU was left with has run first.
-            unwaited::settle(unwaited::By::Signal);
+            // The queue's work the host GPU was left with has run first.
+            unwaited::settle_signal(this as usize);
             crate::fence::set(fence, value);
         }
         // Another queue may wait for this fence.

@@ -1479,10 +1479,10 @@ impl Host {
         self.run(runs, None);
     }
 
-    /// [`Host::execute`]. `title`: the lists are the title's own, held so,
-    /// and may be left to the host GPU without waiting for it
-    /// ([`unwaited`]): whether they were.
-    fn run(&self, runs: &[&HostList], title: Option<&[std::sync::Arc<HostList>]>) -> bool {
+    /// [`Host::execute`]. `title`: the lists are the title's own, held so
+    /// (with the queue they are of), and may be left to the host GPU
+    /// without waiting for it ([`unwaited`]): whether they were.
+    fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         // The one before, if the host GPU was not waited for, is finished

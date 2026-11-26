@@ -18,9 +18,11 @@
 //!   ([`Host::submissions`]): one submission at a time from preparation to
 //!   copy-back, as before, and ours always wait, as they read or free what
 //!   they made as soon as they return;
-//! - a queue's Signal, before the title's fence moves (`crate::queue`);
-//! - a queue's head whose wait does not hold, as the value may be a
-//!   bottom-of-pipe write still owed (`crate::hold::World::owed`);
+//! - a queue's Signal, before the title's fence moves (`crate::queue`),
+//!   if the submission is that queue's ([`settle_signal`]);
+//! - a queue's head whose wait does not hold, if the submission owes a
+//!   bottom-of-pipe write where the wait reads (`crate::hold::World::owed`,
+//!   [`settle_waits`]);
 //! - a present, before the picture is looked at (`crate::queue`);
 //! - a queue's page mapping (`CopyPageMappingsBatchX`), which the console
 //!   does after the queue's work before it: what that work owes title
@@ -70,6 +72,23 @@ pub(crate) fn on() -> bool {
     })
 }
 
+/// Whether every Signal and every wait that does not hold finishes the
+/// submission left, whatever queue it is of and whatever it owes
+/// (`VICTORY_ASYNC_SETTLE_ALL=1`): the fork's rule, to compare with.
+fn all() -> bool {
+    static ALL: OnceLock<bool> = OnceLock::new();
+    *ALL.get_or_init(|| {
+        let all = crate::switch::on("VICTORY_ASYNC_SETTLE_ALL");
+        if all {
+            tracing::info!(
+                "VICTORY_ASYNC_SETTLE_ALL: every queue Signal and every wait that does not hold \
+                 finishes the submission left to the host GPU"
+            );
+        }
+        all
+    })
+}
+
 /// Whether a prepared submission of the title's may be left: not one whose
 /// lists run one by one (`VICTORY_GPU_TIMING`), nor in a listed frame, nor
 /// while frames are captured (diagnostics builds; the dumps submit lists of
@@ -116,6 +135,8 @@ struct Left {
     stood: bool,
     /// The title's lists, held until it is finished.
     lists: Vec<std::sync::Arc<HostList>>,
+    /// Where their bottom-of-pipe writes go (address, bytes).
+    writes: Vec<(u64, u64)>,
     ran: Ran,
 }
 
@@ -124,6 +145,13 @@ static LEFT: Mutex<Option<Left>> = Mutex::new(None);
 
 /// Its fence value while it is not finished, else 0: read without a lock.
 static VALUE: AtomicU64 = AtomicU64::new(0);
+
+/// The title queue it is of (meaningful while [`VALUE`] is not 0).
+static QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Since the last frame line: Signals of other queues, and waits it owed
+/// no write to, that went on without finishing it.
+static SPARED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// Lists of finished submissions, to give back (`crate::list::recycle`) by
 /// a thread that does not hold the submission lock, as before.
@@ -142,7 +170,7 @@ fn take_done() -> Vec<std::sync::Arc<HostList>> {
     std::mem::take(&mut *DONE.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
-/// Submissions left and finished so far ([`settle_since`]).
+/// Submissions left and finished so far ([`settle_waits`]).
 pub(crate) fn finished() -> u64 {
     FINISHED.load(Acquire)
 }
@@ -160,11 +188,49 @@ pub(crate) fn settle(by: By) -> bool {
     true
 }
 
-/// [`settle`]; whether any submission left was finished since `seen`
-/// ([`finished`], brought up to date), by this call or by another thread:
-/// what a caller read before may have changed.
-pub(crate) fn settle_since(by: By, seen: &mut u64) -> bool {
-    settle(by);
+/// Before `queue`'s Signal moves the title's fence: [`settle`], if the
+/// submission left is that queue's. A fence says the queue's own work
+/// before the Signal has run, and all of it but the submission left has
+/// been finished; another queue's is not what the fence is about.
+pub(crate) fn settle_signal(queue: usize) -> bool {
+    if VALUE.load(Acquire) == 0 {
+        return false;
+    }
+    // Read after the value: a submission of `queue` cannot be left
+    // meanwhile, as its Signal and its submissions come one at a time.
+    if QUEUE.load(Acquire) != queue && !all() {
+        SPARED[0].fetch_add(1, Relaxed);
+        return false;
+    }
+    settle(By::Signal)
+}
+
+/// For a queue's head whose `waits` do not all hold: [`settle`], if the
+/// submission left owes a bottom-of-pipe write where one of them reads.
+/// Whether any submission left was finished since `seen` ([`finished`],
+/// brought up to date), by this call or by another thread: the waits are
+/// then to be looked at again.
+///
+/// A wait for memory the submission changes some other way (what its
+/// shaders write, a read-back) is not seen here: its head is held until
+/// the submission is finished by something else ([`idle`] at the latest),
+/// and runs at the queues' next look (their timer's, within 2 ms).
+pub(crate) fn settle_waits(waits: &[crate::hold::ValueWait], seen: &mut u64) -> bool {
+    if VALUE.load(Acquire) != 0 {
+        let owed = match LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(left) => left
+                .writes
+                .iter()
+                .any(|&(at, n)| waits.iter().any(|w| w.reads(at, n))),
+            // Being finished right now: `settle` waits for that.
+            None => true,
+        };
+        if owed || all() {
+            settle(By::Wait);
+        } else {
+            SPARED[1].fetch_add(1, Relaxed);
+        }
+    }
     let now = finished();
     std::mem::replace(seen, now) != now
 }
@@ -217,12 +283,14 @@ pub(super) fn log(frames: f64) {
     let by: [f64; WAYS] = std::array::from_fn(|i| FINISHES[i].swap(0, Relaxed) as f64 / frames);
     let ms: [f64; WAYS] =
         std::array::from_fn(|i| WAITED_US[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
+    let spared: [f64; 2] = std::array::from_fn(|i| SPARED[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "unwaited submissions: {left:.1}/frame left to the host GPU; finished by (the title's next submission, \
          one of ours, a queue's signal, a held queue's wait, the present, a page mapping, a view heap being made, \
          nothing but our thread once it had run): \
          {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the host GPU (the frame line's GPU time is their sum, \
-         with our own submissions' waits)"
+         with our own submissions' waits); {spared:.1?} per frame went on without finishing it \
+         (Signals of other queues, waits it owed no write to)"
     );
 }
 
@@ -242,6 +310,7 @@ impl Host {
     /// waited for, else those of submissions finished since.
     pub(crate) fn execute_title(
         &self,
+        queue: usize,
         lists: Vec<std::sync::Arc<HostList>>,
     ) -> Vec<std::sync::Arc<HostList>> {
         let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
@@ -250,7 +319,7 @@ impl Host {
             drop(runs);
             return lists;
         }
-        let left = self.run(&runs, Some(&lists));
+        let left = self.run(&runs, Some((queue, &lists)));
         drop(runs);
         let mut done = take_done();
         if !left {
@@ -266,7 +335,7 @@ impl Host {
         submitted: &mut u64,
         lists: &[Option<ID3D12CommandList>],
         mark: Option<&Mark>,
-        title: &[std::sync::Arc<HostList>],
+        (title_queue, title): (usize, &[std::sync::Arc<HostList>]),
         ran: Ran,
     ) {
         *submitted += 1;
@@ -298,13 +367,25 @@ impl Host {
             Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
         }
         LEAVES.fetch_add(1, Relaxed);
+        let writes = title
+            .iter()
+            .flat_map(|l| {
+                let writes = &l.deferred().writes;
+                writes
+                    .iter()
+                    .map(|&(at, _, bytes)| (at as u64, bytes as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
         *LEFT.lock().unwrap_or_else(|e| e.into_inner()) = Some(Left {
             value: *submitted,
             signalled: signalled.is_ok(),
             stood: false,
             lists: title.to_vec(),
+            writes,
             ran,
         });
+        QUEUE.store(title_queue, Release);
         VALUE.store(*submitted, Release);
         if let Some(idler) = idler() {
             idler.unpark();
@@ -376,6 +457,7 @@ impl Host {
             stood,
             lists,
             mut ran,
+            ..
         } = left;
         if signalled && !stood {
             ran.gpu = self.wait_left(value);
@@ -427,7 +509,7 @@ mod tests {
         let list = std::sync::Arc::new(host.new_list().unwrap());
         list.defer_write(word.as_ptr().cast(), crate::queue::Written::Value(7), 8);
         list.close();
-        let back = host.execute_title(vec![list.clone()]);
+        let back = host.execute_title(1, vec![list.clone()]);
         // Left (or waited for, in a diagnostics build that captures): a
         // Signal finishes it, if another test's submission has not.
         settle(By::Signal);

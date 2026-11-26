@@ -117,21 +117,56 @@ pub(crate) fn exchange() -> bool {
     })
 }
 
-/// Whether a size query on a writable image asks for level 0
-/// (`victory_shader::emit::Options::uav_size_level0`): only with
-/// `VICTORY_UAV_SIZE_LEVEL0=1`. It makes the title's shadow min/max
-/// program right under D3DMetal, and the TAA disocclusion mask then comes
-/// out white outside one rectangle (skin speckles), which is why it is off
-/// (`notes/PLAN.md`, 26 November 15:15 and 16:00).
+/// Whether a size query on a writable image asks for level 0 in every
+/// program (`victory_shader::emit::Options::uav_size_level0`): only with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
+/// writes with a size of 0 (measured: `uav_size_tests` in `victory-shader`),
+/// so the title's 35 programs that compute with such a size are wrong
+/// without it (`notes/uav-size.md`). Off by default until the picture with
+/// it is checked. A list of shader hashes instead of `1` turns it on for
+/// those programs only ([`uav_size_level0_for`]).
 pub(crate) fn uav_size_level0() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = setting(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref(), false);
-        if on {
+    uav_size_rule().0
+}
+
+/// Whether the program in `container` gets the level-0 size query: with
+/// `VICTORY_UAV_SIZE_LEVEL0=1`, or when the variable lists its hash (16
+/// digits, as `shader translated` lines print it; several with commas), to
+/// try the change on one program at a time.
+pub(crate) fn uav_size_level0_for(container: &[u8]) -> bool {
+    let (all, only) = uav_size_rule();
+    *all || (!only.is_empty() && only.contains(&blake3::hash(container).to_hex()[..16].to_owned()))
+}
+
+fn uav_size_rule() -> &'static (bool, Vec<String>) {
+    static RULE: OnceLock<(bool, Vec<String>)> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = uav_size(std::env::var("VICTORY_UAV_SIZE_LEVEL0").ok().as_deref());
+        if rule.0 {
             tracing::info!("VICTORY_UAV_SIZE_LEVEL0=1: size queries on writable images ask for level 0");
+        } else if !rule.1.is_empty() {
+            tracing::info!(
+                programs = ?rule.1,
+                "VICTORY_UAV_SIZE_LEVEL0: size queries on writable images ask for level 0 in these programs only"
+            );
         }
-        on
+        rule
     })
+}
+
+/// `VICTORY_UAV_SIZE_LEVEL0`'s rule: `1` is every program; a list of
+/// 16-digit shader hashes is those programs; anything else is off.
+fn uav_size(value: Option<&str>) -> (bool, Vec<String>) {
+    let value = value.unwrap_or_default().trim();
+    if value == "1" {
+        return (true, Vec::new());
+    }
+    let hashes: Vec<String> = value.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+    if hashes.iter().all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
+        (false, hashes)
+    } else {
+        (false, Vec::new())
+    }
 }
 
 /// [`lock_writers`]' rule: helper lanes, low keys.
@@ -201,7 +236,20 @@ pub(crate) fn key(
 
 #[cfg(test)]
 mod tests {
-    use super::{heap_sync_pause, key, quick, setting, writers};
+    use super::{heap_sync_pause, key, quick, setting, uav_size, writers};
+
+    #[test]
+    fn the_size_query_switch_is_all_programs_or_a_list_of_hashes() {
+        assert_eq!(uav_size(None), (false, vec![]));
+        assert_eq!(uav_size(Some("")), (false, vec![]));
+        assert_eq!(uav_size(Some("0")), (false, vec![]));
+        assert_eq!(uav_size(Some("1")), (true, vec![]));
+        assert_eq!(uav_size(Some("yes")), (false, vec![]));
+        let two = vec!["07f451a14b13fecb".to_owned(), "11eeb27c2d15980d".to_owned()];
+        assert_eq!(uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")), (false, two));
+        // A list with a wrong entry is no list: nothing is turned on.
+        assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
 
     #[test]
     fn the_heap_sync_ahead_is_off_unless_asked_and_takes_its_pause() {

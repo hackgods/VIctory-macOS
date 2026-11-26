@@ -276,7 +276,9 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let options = runtime_options();
+    let mut options = runtime_options();
+    // One program at a time, if the switch lists hashes (mac).
+    options.uav_size_level0 = crate::mac_switches::uav_size_level0_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = if options.atomic_locks

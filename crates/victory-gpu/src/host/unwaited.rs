@@ -1147,6 +1147,57 @@ mod tests {
         drop(take_done());
     }
 
+    /// mac: with flights, a step of ours that writes only the list's own
+    /// memory (`Step::Own`) does not finish the one left; one that reads
+    /// what the one left writes (here its bottom-of-pipe word) waits for it.
+    #[test]
+    fn with_flights_a_step_on_the_lists_own_memory_does_not_wait() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let flights = Flights::on();
+        settle(By::Signal);
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let word = Box::new(AtomicU64::new(0));
+        let at = word.as_ptr() as usize;
+        for reads_the_word in [false, true] {
+            order.lock().unwrap().clear();
+            let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+            let log = order.clone();
+            lists[0].defer_after(move || log.lock().unwrap().push("the first has run"));
+            lists[0].defer_write(word.as_ptr().cast(), crate::queue::Written::Value(9), 8);
+            let log = order.clone();
+            let (from, len) = if reads_the_word { (at, 8) } else { (0, 0) };
+            lists[1].defer_own(from, len, move || {
+                // SAFETY: the test's word, alive until the end.
+                let seen = unsafe { (*(at as *const AtomicU64)).load(Acquire) };
+                log.lock().unwrap().push(if seen == 9 { "the second's step, after" } else { "the second's step, before" });
+            });
+            lists.iter().for_each(|l| l.close());
+            let before = flights::finished_for(flights::Why::Host);
+            let mut back = host.execute_title(1, vec![lists[0].clone()]);
+            back.extend(host.execute_title(1, vec![lists[1].clone()]));
+            settle(By::Signal);
+            let order = order.lock().unwrap().clone();
+            if reads_the_word {
+                // Finished first (for the step, or as its GPU work was
+                // done): the word is there when the step reads it.
+                assert_eq!(order, ["the first has run", "the second's step, after"]);
+            } else {
+                assert!(order.contains(&"the first has run") && order.len() == 2, "{order:?}");
+                assert_eq!(
+                    flights::finished_for(flights::Why::Host),
+                    before,
+                    "a step on the list's own memory does not finish the one left"
+                );
+            }
+            word.store(0, Release);
+            drop(back);
+            drop(take_done());
+        }
+        drop(flights);
+    }
+
     /// mac: with flights, a step of the next submission that could see
     /// what the one left owes (here a step of ours) finishes it first.
     #[test]

@@ -503,6 +503,9 @@ struct Lower<'a> {
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
+    /// Pixel: the console tests depth and stencil before the shader runs
+    /// (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, HLSL `[earlydepthstencil]`).
+    depth_before_shader: bool,
     /// The program uses title memory (addresses it computes, the BVH
     /// instruction, root parameters through the user-data pointer): its root
     /// SRVs and UAVs are read there too ([`Lower::raw_view`]).
@@ -1098,6 +1101,8 @@ impl<'a> Lower<'a> {
             },
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
+            depth_before_shader: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
+                if db_shader_control & 1 << 12 != 0),
             root_memory,
             flat: None,
             no_barrier,
@@ -1834,16 +1839,32 @@ impl<'a> Lower<'a> {
         // only UAV is VIctory's own read-mark bitmap (`mark_view_read`):
         // without ForceEarlyDepthStencil, the injected UAV forces late-Z and
         // shades occluded pixels behind closer geometry.
+        let exports_depth = (self.s.flags & flags::STENCIL_REF) != 0
+            || self
+                .s
+                .outputs
+                .iter()
+                .any(|o| matches!(o.kind, 14 | 17..=20));
         if self.s.pixel
             && self.s.view_writes.is_some()
             && self.s.root_uavs.is_empty()
             && self.s.memory_dirty.is_none()
             && !self.uav_handle
             && !self.pops
-            && (self.s.flags & (flags::ROVS | flags::STENCIL_REF)) == 0
+            && (self.s.flags & flags::ROVS) == 0
             && !self.has_discard
-            && !self.s.outputs.iter().any(|o| matches!(o.kind, 14 | 17..=20))
+            && !exports_depth
         {
+            self.s.flags |= flags::EARLY_DEPTH_STENCIL;
+        }
+        // The console tests depth before such a shader runs: pixels behind
+        // closer geometry never run it, so what it writes through views or
+        // title memory stays as the console leaves it. The host tests depth
+        // after any shader that writes, and there those pixels' writes land
+        // (GTA VI's alpha prepass wrote the window's velocity over the
+        // player in front of it). A shader exporting depth cannot test it
+        // first; the console does not combine the two either.
+        if self.s.pixel && self.depth_before_shader && !exports_depth {
             self.s.flags |= flags::EARLY_DEPTH_STENCIL;
         }
         #[cfg(test)]

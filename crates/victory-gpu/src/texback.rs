@@ -463,13 +463,61 @@ impl Target {
 /// go.
 #[cfg(windows)]
 pub(crate) struct Back {
-    buffer: ID3D12Resource,
+    /// Given back to [`FREE`] when it goes.
+    buffer: Option<ID3D12Resource>,
     data: usize,
     bytes: u64,
     subs: Vec<Sub>,
     mips: u32,
     layout: victory_formats::texture::Layout,
     ticket: Arc<Ticket>,
+}
+
+/// Read-back buffers of copies that are done with, for the next copy of the
+/// same bytes (lists copy the same textures every frame, and a buffer is a
+/// committed resource of its own): bytes, buffer, mapping.
+#[cfg(windows)]
+struct Free(Vec<(u64, ID3D12Resource, usize)>);
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are persistent
+// mappings of the buffers.
+#[cfg(windows)]
+unsafe impl Send for Free {}
+
+#[cfg(windows)]
+static FREE: Mutex<Free> = Mutex::new(Free(Vec::new()));
+
+/// Buffers kept free at most (a few per kind).
+#[cfg(windows)]
+const KEPT: usize = 32;
+
+/// A read-back buffer of `bytes` and its mapping: a free one, or new.
+#[cfg(windows)]
+fn read_back_buffer(host: &crate::host::Host, bytes: u64) -> Option<(ID3D12Resource, usize)> {
+    {
+        let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = free.0.iter().position(|f| f.0 == bytes) {
+            let (_, buffer, data) = free.0.swap_remove(i);
+            return Some((buffer, data));
+        }
+    }
+    let (buffer, data) = host.readback_buffer(bytes)?;
+    crate::host::name(&buffer, || format!("texture copy-back {bytes:#x}"));
+    Some((buffer, data as usize))
+}
+
+#[cfg(windows)]
+impl Drop for Back {
+    /// Its list was reset or let go, so the GPU is done with the buffer
+    /// (it ran the list, or never will).
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let mut free = FREE.lock().unwrap_or_else(|e| e.into_inner());
+            if free.0.len() < KEPT {
+                free.0.push((self.bytes, buffer, self.data));
+            }
+        }
+    }
 }
 
 /// Records into open list `list` the copy of `target`'s host texture (in
@@ -513,8 +561,7 @@ pub(crate) fn record(list: &crate::host::HostList, target: Target) -> Option<Bac
     if total == 0 || total == u64::MAX {
         return None;
     }
-    let (buffer, data) = host.readback_buffer(total)?;
-    crate::host::name(&buffer, || format!("texture copy-back {total:#x}"));
+    let (buffer, data) = read_back_buffer(host, total)?;
     #[cfg(feature = "diagnostics")]
     list.note_op(|| {
         format!(
@@ -545,7 +592,7 @@ pub(crate) fn record(list: &crate::host::HostList, target: Target) -> Option<Bac
         .zip(&rows)
         .map(|(f, &rows)| Sub { offset: f.Offset, pitch: f.Footprint.RowPitch, rows, depth: f.Footprint.Depth })
         .collect();
-    Some(Back { buffer, data: data as usize, bytes: total, subs, mips, layout: target.layout, ticket: target.ticket })
+    Some(Back { buffer: Some(buffer), data, bytes: total, subs, mips, layout: target.layout, ticket: target.ticket })
 }
 
 /// Which of copies `keys` (texture, title address; in the order their lists
@@ -615,7 +662,6 @@ fn land(back: &Back) {
     } else {
         count(STALE, 1);
     }
-    let _ = &back.buffer;
 }
 
 /// Writes `bytes` into title memory at `at` as the layer writes its other

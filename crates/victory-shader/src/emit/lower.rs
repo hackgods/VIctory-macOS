@@ -86,6 +86,10 @@ pub(crate) struct Lowered {
     /// Whether it forces the early depth-stencil test (`mac`).
     #[cfg(test)]
     pub early_depth: bool,
+    /// Written helper-lane tests, texel loads and 32-bit exchanges (`mac`,
+    /// "Lock writers").
+    #[cfg(test)]
+    pub lock_calls: [usize; 3],
     /// Written typed-buffer calls, for structural tests of the dynamic path.
     #[cfg(test)]
     pub typed_buffer_calls: TypedBufferCalls,
@@ -1587,6 +1591,13 @@ impl<'a> Lower<'a> {
             rovs: self.s.flags & flags::ROVS != 0,
             #[cfg(test)]
             early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
+            #[cfg(test)]
+            lock_calls: [
+                "dx.op.isHelperLane.i1",
+                "dx.op.textureLoad.i32",
+                "dx.op.atomicCompareExchange.i32",
+            ]
+            .map(|f| self.s.m.written_calls(f)),
             #[cfg(test)]
             typed_buffer_calls: TypedBufferCalls {
                 loads: [
@@ -9029,7 +9040,8 @@ impl<'a> Lower<'a> {
                 let compare = (code == u32::MAX).then(|| value_at(self, 1));
                 let h = self.handle(site, src, false, (kind | 0x1000 | 0x4000, 0x205))?;
                 let at = self.begin_guarded(guard);
-                let (lo, hi) = self.locked_atomic64(h, &cs, coords, op, value, compare);
+                let (lo, hi) =
+                    self.atomic64_of_writers(h, &cs, coords, op, value, compare, cache.glc);
                 let r = self.end_guarded(at, &[(lo, old[0]), (hi, old[1])]);
                 if cache.glc {
                     for (k, x) in (0..).zip(r) {

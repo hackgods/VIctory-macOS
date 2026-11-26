@@ -436,6 +436,15 @@ pub struct Options {
     /// that fail the test never run it (`lower::mac`). The translation
     /// differs, so the shader cache keys on it.
     pub early_depth: bool,
+    /// With [`Options::atomic_locks`]: helper lanes of a pixel program,
+    /// whose writes the host drops, stay out of a 64-bit image atomic's
+    /// lock loop (`lower::mac`, "Lock writers"). The shader cache keys on
+    /// it.
+    pub atomic_lock_helpers: bool,
+    /// With [`Options::atomic_locks`]: a lane whose 64-bit `umax` value has
+    /// a high dword below the texel's stays out of the lock loop (the
+    /// same notes). The shader cache keys on it.
+    pub atomic_lock_keys: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -833,6 +842,8 @@ fn emit_pruned(
         },
         mac: lower::Mac {
             early_depth: options.early_depth,
+            lock_helpers: options.atomic_lock_helpers,
+            lock_keys: options.atomic_lock_keys,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

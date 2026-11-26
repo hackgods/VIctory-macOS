@@ -1689,6 +1689,17 @@ fn lower_cs32_with(
     validate: bool,
     atomic_locks: bool,
 ) -> HostShader {
+    lower_cs32_mac(words, used, validate, atomic_locks, Default::default())
+}
+
+/// [`lower_cs32_with`], with the Mac line's settings `mac`.
+fn lower_cs32_mac(
+    words: &[u32],
+    used: &[(u8, ResourceType, u32, u8)],
+    validate: bool,
+    atomic_locks: bool,
+    mac: lower::Mac,
+) -> HostShader {
     let param = |root, user_data, slot| RootParam {
         root,
         table_offset_dwords: 0,
@@ -1746,7 +1757,7 @@ fn lower_cs32_with(
         host_wave32: false,
         narrow_waves: false,
         halves_local: Default::default(),
-        mac: Default::default(),
+        mac,
         view_marks: false,
     })
     .expect("lower");
@@ -2041,6 +2052,110 @@ fn image_atomics_of_64_bits() {
             if locks {
                 assert!(out[1].iter().all(|&w| w == 0), "{label}: a lock left taken or a page marked");
             }
+        }
+    }
+}
+
+/// 64-bit unsigned maxima under locks with the lanes that cannot change
+/// the texel left out of the lock loop (`lower::mac`, "Lock writers"):
+/// the texels are what the lock loop alone leaves. 32 lanes; all write
+/// `a` to texel (0, 0), where lanes of four high dwords meet, eight lanes
+/// with each and different low dwords; lane `l` writes `a` then `b` to
+/// (l, 1) and `b` then `a` to (l, 2), so in each of those rows the second
+/// value has the lower high dword in some lanes. Compute has no helper
+/// lanes: that setting is covered by the translation tests only
+/// (`mac_tests`).
+#[test]
+fn image_maxima_of_64_bits_lock_only_where_they_can_change_the_texel() {
+    let (v0, v5) = (vgpr(0), vgpr(5));
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    // s_load_dwordx8 s[8:15], s[4:5], 0: the texture's descriptor.
+    words.extend([0x3D << 26 | 0x03 << 18 | 8 << 6 | 4 >> 1, 125 << 25]);
+    words.extend([
+        0x1B << 25 | 5 << 17 | (v0 as u32 & 0xFF) << 9 | 131, // v_and_b32 v5, 3, v0
+        0x26 << 25 | 1 << 17 | (v0 as u32 & 0xFF) << 9 | 159, // v_sub_nc_u32 v1, 31, v0
+        0x1A << 25 | 2 << 17 | (v5 as u32 & 0xFF) << 9 | 158, // v_lshlrev_b32 v2, 30, v5
+        vop1(0x001, 14, 128),
+        vop1(0x001, 15, 128),
+        vop1(0x001, 3, v0),
+        vop1(0x001, 4, 129),
+        vop1(0x001, 8, v0),
+        vop1(0x001, 9, 129),
+    ]);
+    // a = (31 - l) | (l & 3) << 62 into texel (0, 0), then a and b = l |
+    // 1 << 32 into (l, 1), then b and a into (l, 2).
+    words.extend(image_atomic(0x17, 1, 14, 8, 3, false));
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.extend(image_atomic(0x17, 8, 3, 8, 3, false));
+    words.push(vop1(0x001, 4, 130));
+    words.extend(image_atomic(0x17, 8, 3, 8, 3, false));
+    words.extend(image_atomic(0x17, 1, 3, 8, 3, false));
+    words.push(S_ENDPGM);
+    let key = |lo: u32, hi: u32| u64::from(lo) | u64::from(hi) << 32;
+    let a = |l: u32| key(31 - l, (l & 3) << 30);
+    let b = |l: u32| key(l, 1);
+    let mut want = vec![0u64; 32 * 4];
+    want[0] = (0..32).map(a).max().unwrap();
+    for l in 0..32 {
+        want[32 + l as usize] = a(l).max(b(l));
+        want[64 + l as usize] = a(l).max(b(l));
+    }
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let settings = [
+        ("lock loop", lower::Mac::default()),
+        (
+            "low keys stay out",
+            lower::Mac {
+                lock_keys: true,
+                ..Default::default()
+            },
+        ),
+        (
+            "low keys and helper lanes stay out",
+            lower::Mac {
+                lock_keys: true,
+                lock_helpers: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (setting, mac) in settings {
+        let shader = lower_cs32_mac(&words, &[(4, ResourceType::Uav, 0, 8)], true, true, mac);
+        assert!(shader.view_marks, "the lock words' buffer");
+        for (label, warp) in [("hardware", false), ("warp", true)] {
+            let Ok(host) = Host::new(warp) else {
+                eprintln!("no SM 6.6 {label} device; skipped");
+                continue;
+            };
+            let label = format!("{label}, {setting}");
+            let (root, pso) = host
+                .compute_pipeline(&shader)
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                assert_eq!((u.root, u.slot), (RootType::Table, 1), "user data {u:?}");
+                ud[u.index as usize] = 0;
+            }
+            let roots = vec![
+                (0, Root::Constants(ud)),
+                (1, Root::View { srv: true, data: vec![super::VIEW_MARK_NONE, 0] }),
+                (2, Root::Uav(super::VIEW_WRITES_BYTES / 4)),
+            ];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots,
+                        views: &[View::Uint2TextureUav(32, 4)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            let got: Vec<u64> = out[0].chunks(2).map(|t| key(t[0], t[1])).collect();
+            assert_eq!(got, want, "{label}");
+            assert!(out[1].iter().all(|&w| w == 0), "{label}: a lock left taken or a page marked");
         }
     }
 }

@@ -234,6 +234,13 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     // Under Wine (D3DMetal), 64-bit image atomics run under locks: its own
     // leave the texels untouched (`emit`, "Atomic locks"). On a host of
     // 32-lane waves, wave64 programs run in halves (`build` keys on it).
+    // Which lanes take those locks matters only where there are locks: off
+    // elsewhere, so that the switch then makes no cache entries of its own.
+    let lock_writers = if atomic_locks() {
+        crate::mac_switches::lock_writers(under_wine())
+    } else {
+        [false; 2]
+    };
     victory_shader::emit::Options {
         view_marks: true,
         atomic_locks: atomic_locks(),
@@ -243,6 +250,8 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         halves_local: halves_local(),
         halves_shared_lds: halves_shared_lds(),
         early_depth: crate::mac_switches::early_depth(under_wine()),
+        atomic_lock_helpers: lock_writers[0],
+        atomic_lock_keys: lock_writers[1],
     }
 }
 
@@ -268,7 +277,11 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
         build()
     };
     // The Mac line's settings, over whichever of those it is.
-    let build = &crate::mac_switches::key(build, options.early_depth);
+    let build = &crate::mac_switches::key(
+        build,
+        options.early_depth,
+        [options.atomic_lock_helpers, options.atomic_lock_keys],
+    );
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),

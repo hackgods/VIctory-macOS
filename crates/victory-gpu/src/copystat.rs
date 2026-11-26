@@ -158,8 +158,12 @@ pub(crate) enum C {
     SyncCheckNs,
     SyncMakeNs,
     ViewsForgot,
+    /// Of the slots a heap sync made again, those left without a view (their
+    /// record holds none); the time it waited for heaps' slot locks.
+    SyncUnmade,
+    SyncSlotLockNs,
 }
-const COUNTERS: usize = C::ViewsForgot as usize + 1;
+const COUNTERS: usize = C::SyncSlotLockNs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -471,7 +475,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  heap sync per frame: {:.0} pages, {:.0} slots: {:.0} made from their record already, {:.0} no view, \
          {:.0} checked ({:.0} in blocks not verified) in {:.1} ms, {:.0} made again in {:.1} ms; pages read in \
-         {:.1} ms, {:.1} ms waiting for the heaps' lock; {:.1} releases forgot views",
+         {:.1} ms, {:.1} ms waiting for the heaps' lock; {:.1} releases forgot views; of those made again {:.0} left \
+         without a view, {:.1} ms waiting for slot locks",
         c[C::SyncPages as usize],
         c[C::SyncSlots as usize],
         c[C::SyncFast as usize],
@@ -484,6 +489,8 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncReadNs as usize] / 1e6,
         c[C::SyncLockNs as usize] / 1e6,
         c[C::ViewsForgot as usize],
+        c[C::SyncUnmade as usize],
+        c[C::SyncSlotLockNs as usize] / 1e6,
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

@@ -1117,7 +1117,14 @@ impl HostHeap {
         }
         let mut again = Vec::new();
         {
+            #[cfg(feature = "diagnostics")]
+            let waited = crate::watch::TimedNs(
+                std::time::Instant::now(),
+                crate::copystat::C::SyncSlotLockNs,
+            );
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             // Whether each view is still current, as `mirror` asks under the lock.
             let records: Vec<[u32; 3]> = entries.iter().map(|&(_, record, _)| record).collect();
             let mut current = Vec::with_capacity(records.len());
@@ -1130,7 +1137,11 @@ impl HostHeap {
                     continue;
                 }
                 match view.as_deref().filter(|_| current) {
-                    None => self.unmake_locked(&mut made, index),
+                    None => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::SyncUnmade, 1);
+                        self.unmake_locked(&mut made, index);
+                    }
                     Some(view) => {
                         let [_, i, generation] = *record;
                         let key = u64::from(generation) << 32 | u64::from(i);

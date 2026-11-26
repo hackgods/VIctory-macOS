@@ -4174,7 +4174,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 used: used_entries,
             },
         );
-        let hp = HostPipeline::new(&[shader], None).expect("compute host pipeline");
+        let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("compute host pipeline");
         assert!(hp.marks.is_some());
 
         // 16-bit console depth-stencil texture (`format = 118`) whose twin

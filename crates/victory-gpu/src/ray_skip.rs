@@ -307,7 +307,7 @@ mod tests {
         for (_, name) in NAMES {
             assert_eq!(estimate::role_of(name), 0, "{}", String::from_utf8_lossy(name));
         }
-        for name in [estimate::RADIANCE_PROGRAM] {
+        for name in [estimate::RADIANCE_PROGRAM, estimate::AIR_PROGRAM] {
             assert_eq!(kind_of(name), 0, "{}", String::from_utf8_lossy(name));
         }
     }

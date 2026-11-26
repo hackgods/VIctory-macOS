@@ -47,9 +47,31 @@ pub(crate) fn left(value: Option<&str>) -> f32 {
 pub(crate) const RADIANCE_PROGRAM: &[u8] = b"CS_CacheScreenSpaceRadiance";
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 
+/// The program that adds the lamps' light to what the air scatters (the
+/// last that writes that volume before it is summed up along the view), by
+/// the start of its name, and where the volume is (R11G11B10_FLOAT, three
+/// dimensions; the program reads and writes it through one view). One
+/// program of that name in the title's shader database
+/// (`b7de1a805fbbac3c`), with that place.
+pub(crate) const AIR_PROGRAM: &[u8] = b"CS_AccumulateLocalLightInscatteringVolume";
+pub(crate) const AIR: (u8, u32) = (1, 32);
+
 /// What a program is to the estimate, beside `crate::ambient_set`'s bits
 /// (`RESOLVES` and its siblings).
 pub(crate) const KEEPS: u8 = 8;
+pub(crate) const LIGHTS_AIR: u8 = 16;
+
+/// `VICTORY_AMBIENT_AIR=<multiple>`: the most the air scatters, as a
+/// multiple of the light around; unset or 0: what the title has.
+///
+/// The air of a room is lit by the same probes: without rays they hold the
+/// sky's light indoors too, a brown veil at sunset.
+pub(crate) fn air(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|m: &f32| m.is_finite() && *m > 0.0)
+        .unwrap_or(0.0)
+}
 
 /// What the program of shader container `container` is to the estimate
 /// alone (the resolve is `crate::ambient_set`'s).
@@ -59,6 +81,9 @@ pub(crate) fn role_of(container: &[u8]) -> u8 {
     if has(RADIANCE_PROGRAM) {
         role |= KEEPS;
     }
+    if has(AIR_PROGRAM) {
+        role |= LIGHTS_AIR;
+    }
     role
 }
 
@@ -66,6 +91,7 @@ pub(crate) fn role_of(container: &[u8]) -> u8 {
 pub(crate) fn role_name(role: u8) -> &'static str {
     match role {
         KEEPS => "keeps the light visible surfaces send out",
+        LIGHTS_AIR => "adds the lamps' light to what the air scatters",
         _ => "several",
     }
 }
@@ -119,7 +145,7 @@ pub(crate) const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float strength; float radius; float near_z;
     float tan_y; float follow; float most; uint width;
-    uint height; uint flat;
+    uint height; uint flat; float air; uint slices;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are. Read through the structured view, written
@@ -303,6 +329,25 @@ void main(uint3 at : SV_DispatchThreadID) {
     light[at.xy] = pack(written);
 }
 #endif
+
+#ifdef AIR
+RWTexture3D<float3> scattered : register(u0);
+// No more than a multiple of the light around: of the room as the last
+// seconds showed it, and of the surface seen in this direction (towards a
+// window the air outside may be as bright as the sky is).
+[numthreads(8, 8, 2)]
+void main(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height || at.z >= slices) return;
+    uint2 q = min((uint2)(((float2)at.xy + 0.5) / float2(width, height) * float2(PX, PY)), uint2(PX - 1, PY - 1));
+    uint at0 = (q.y * PX + q.x) * 3;
+    float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    float away = (float)at.z / (float)slices;
+    float cap = air * lerp(luma(cells[CELLS].rgb), luma(seen_there), away);
+    float3 c = scattered[at];
+    float has = luma(c);
+    if (has > cap) scattered[at] = c * (cap / has);
+}
+#endif
 "#;
 
 /// The passes of [`SOURCE`], by the `#define` that chooses each.
@@ -311,6 +356,7 @@ pub(crate) const MEAN: &str = "MEAN";
 pub(crate) const PLACE: &str = "PLACE";
 pub(crate) const GATHER: &str = "GATHER";
 pub(crate) const RAISE: &str = "RAISE";
+pub(crate) const AIR_PASS: &str = "AIR";
 
 /// The source of pass `pass`: [`SOURCE`] after the `#define`s that choose
 /// its `main` and the helpers it uses.
@@ -339,10 +385,13 @@ pub(crate) struct Pass {
     pub(crate) size: [u32; 2],
     /// No depth image: the slow mean alone is written.
     pub(crate) flat: bool,
+    /// [`air`], and the slices of the volume the air's pass bounds.
+    pub(crate) air: f32,
+    pub(crate) slices: u32,
 }
 
 /// Dwords of the passes' constant buffer.
-pub(crate) const CONSTANTS: usize = 10;
+pub(crate) const CONSTANTS: usize = 12;
 
 /// A pass's root constants, in the order the constant buffer declares them
 /// (all scalars, so four to a row whatever the compiler's packing).
@@ -353,22 +402,27 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
     for (to, f) in out.iter_mut().zip(floats) {
         *to = f.to_bits();
     }
-    out[7..].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat)]);
+    out[7..].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat), p.air.to_bits(), p.slices]);
     out
 }
 
 /// The line logged once at start when the estimate is on.
-pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32) -> String {
+pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32, air: f32) -> String {
     let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
     let left = if most > 0.0 {
         format!("what the title's resolve left counts up to {most} times it")
     } else {
         "what the title's resolve left is replaced".to_owned()
     };
+    let air = if air > 0.0 {
+        format!("the air scatters no more than {air} times the light around (VICTORY_AMBIENT_AIR)")
+    } else {
+        "what the air scatters is left alone".to_owned()
+    };
     format!(
         "VICTORY_AMBIENT=estimate: the screen probes' indirect diffuse light is replaced by an \
          estimate from the light visible surfaces send out ({share} of it; {CX}x{CY} cells, \
-         {PX}x{PY} points), {shaded}; {left}"
+         {PX}x{PY} points), {shaded}; {left}; {air}"
     )
 }
 
@@ -392,8 +446,8 @@ pub(crate) fn over_the_picture(points: impl Iterator<Item = [f32; 3]>) -> [f32; 
 /// The line logged with the frame line: the slow mean of the light around
 /// and the points' luminance (`seen`; `None`: nothing kept yet), and the
 /// keepings and raisings recorded a frame.
-pub(crate) fn frame_line(share: f32, seen: Option<([f32; 3], [f32; 3])>, per_frame: [f64; 2]) -> String {
-    let [keeps, raises] = per_frame;
+pub(crate) fn frame_line(share: f32, seen: Option<([f32; 3], [f32; 3])>, per_frame: [f64; 3]) -> String {
+    let [keeps, raises, airs] = per_frame;
     let what = match seen {
         Some(([r, g, b], [mean, least, most])) => format!(
             "the light around (slow mean) is {r:.4} {g:.4} {b:.4}, luminance {:.4}; the picture's \
@@ -409,8 +463,8 @@ pub(crate) fn frame_line(share: f32, seen: Option<([f32; 3], [f32; 3])>, per_fra
         ),
     };
     format!(
-        "ambient estimate (VICTORY_AMBIENT=estimate): {what}; {keeps:.1} keepings and {raises:.1} \
-         raisings/frame"
+        "ambient estimate (VICTORY_AMBIENT=estimate): {what}; {keeps:.1} keepings, {raises:.1} \
+         raisings and {airs:.1} bounds of the air/frame"
     )
 }
 
@@ -649,6 +703,17 @@ pub(crate) mod reference {
         }
     }
 
+    /// The `AIR` pass: what the air scatters at a place a share `away` of
+    /// the volume's depth, `c`, bounded by `air` times the light around
+    /// (the slow mean `around` near the eye, the light of the point seen in
+    /// that direction, `seen_there`, far away).
+    pub(crate) fn bound_air(c: V3, air: f32, around: V3, seen_there: V3, away: f32) -> V3 {
+        let (near, far) = (luma(around), luma(seen_there));
+        let cap = air * (near + (far - near) * away);
+        let has = luma(c);
+        if has > cap { c.map(|v| v * (cap / has)) } else { c }
+    }
+
     /// R9G9B9E5 as the shader packs it.
     pub(crate) fn pack(c: V3) -> u32 {
         let c = c.map(|v| v.clamp(0.0, 65408.0));
@@ -698,6 +763,28 @@ mod tests {
         }
     }
 
+    /// The air is left alone unless a multiple above 0 is set; then it
+    /// scatters no more than that many times the light around: the slow
+    /// mean near the eye, what is seen in its direction far away.
+    #[test]
+    fn the_air_is_bounded_by_the_light_around() {
+        for unset in [None, Some(""), Some("0"), Some("-2"), Some("x"), Some("inf")] {
+            assert_eq!(air(unset), 0.0, "{unset:?}");
+        }
+        assert_eq!(air(Some(" 3 ")), 3.0);
+        use super::reference::bound_air;
+        let (around, window) = ([0.1f32; 3], [2.0f32; 3]);
+        // Near the eye: three times the room's light, its colour kept.
+        let veil = bound_air([3.0, 2.0, 1.0], 3.0, around, window, 0.0);
+        assert!(near(luma(veil), 0.3, 1e-4) && near(veil[0] / veil[2], 3.0, 1e-4), "{veil:?}");
+        // Toward the window, far away: three times the window's.
+        assert_eq!(bound_air([3.0, 2.0, 1.0], 3.0, around, window, 1.0), [3.0, 2.0, 1.0]);
+        let half = bound_air([9.0; 3], 3.0, around, window, 0.5);
+        assert!(near(half[0], 3.0 * 1.05, 1e-4), "{half:?}");
+        // Darker air is not raised.
+        assert_eq!(bound_air([0.01; 3], 3.0, around, window, 0.0), [0.01; 3]);
+    }
+
     #[test]
     fn what_the_resolve_left_is_replaced_by_default() {
         assert_eq!(left(None), 0.0);
@@ -712,11 +799,13 @@ mod tests {
     fn programs_are_known_by_name() {
         assert_eq!(role_of(b"..tiled_lighting:CS_CacheScreenSpaceRadiance_eed2fc35_Wrapped.."), KEEPS);
         assert_eq!(role_of(b"CS_CacheScreenSpaceRadianc"), 0);
+        assert_eq!(role_of(b"scattering_transmittance_system:CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), LIGHTS_AIR);
         assert_eq!(role_of(b"CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped"), 0);
         assert_eq!(role_of(b""), 0);
         use crate::ambient_set as constant;
-        assert_eq!(constant::role_of(RADIANCE_PROGRAM), 0);
-        assert_eq!(KEEPS & (constant::RESOLVES | constant::ENDS_REFLECTIONS | constant::DRAWS_SKY), 0);
+        assert_eq!(constant::role_of(RADIANCE_PROGRAM) | constant::role_of(AIR_PROGRAM), 0);
+        assert_eq!((KEEPS | LIGHTS_AIR) & (constant::RESOLVES | constant::ENDS_REFLECTIONS | constant::DRAWS_SKY), 0);
+        assert_eq!(KEEPS & LIGHTS_AIR, 0);
         assert_eq!(role_of(constant::PROGRAM) | role_of(constant::REFLECTED) | role_of(constant::SKY), 0);
     }
 
@@ -740,15 +829,17 @@ mod tests {
             most: 4.0,
             size: [2560, 1440],
             flat: true,
+            air: 3.0,
+            slices: 64,
         };
         let c = constants(&p);
         let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
         assert_eq!(floats, [0.8, 1.0, 0.6, 0.1, 0.45, 0.04, 4.0]);
-        assert_eq!(c[7..], [2560, 1440, 1]);
+        assert_eq!(c[7..], [2560, 1440, 1, 3.0f32.to_bits(), 64]);
         let declared = declared(SOURCE);
         assert_eq!(
             declared,
-            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat"]
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices"]
         );
         assert_eq!(declared.len(), CONSTANTS);
     }
@@ -781,8 +872,8 @@ mod tests {
             }
         }
         assert!(SOURCE.is_ascii());
-        assert_eq!(SOURCE.matches("void main(").count(), 5);
-        for pass in [KEEP, MEAN, PLACE, GATHER, RAISE] {
+        assert_eq!(SOURCE.matches("void main(").count(), 6);
+        for pass in [KEEP, MEAN, PLACE, GATHER, RAISE, AIR_PASS] {
             let source = part(pass);
             assert!(source.starts_with(&format!("#define {pass}\n")), "{pass}");
             assert!(SOURCE.contains(&format!("#ifdef {pass}\n")), "{pass}");
@@ -797,23 +888,24 @@ mod tests {
 
     #[test]
     fn the_start_line_says_what_is_on() {
-        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0);
+        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0, 0.0);
         assert!(line.starts_with("VICTORY_AMBIENT=estimate: "), "{line}");
         assert!(line.contains("(1 of it; 64x36 cells, 160x90 points), shaded from depth"), "{line}");
-        assert!(line.ends_with("what the title's resolve left is replaced"), "{line}");
-        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0);
+        assert!(line.ends_with("what the title's resolve left is replaced; what the air scatters is left alone"), "{line}");
+        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0, 3.0);
         assert!(line.contains("(0.5 of it;") && line.contains("not shaded"), "{line}");
-        assert!(line.ends_with("counts up to 4 times it"), "{line}");
+        assert!(line.contains("counts up to 4 times it; "), "{line}");
+        assert!(line.ends_with("the air scatters no more than 3 times the light around (VICTORY_AMBIENT_AIR)"), "{line}");
     }
 
     #[test]
     fn the_frame_line_says_what_the_estimate_is() {
-        let line = frame_line(0.5, Some(([0.2, 0.1, 0.05], [0.3, 0.01, 2.0])), [1.0, 2.0]);
+        let line = frame_line(0.5, Some(([0.2, 0.1, 0.05], [0.3, 0.01, 2.0])), [1.0, 2.0, 0.0]);
         assert!(line.starts_with("ambient estimate (VICTORY_AMBIENT=estimate): the light around (slow mean) is 0.2000 0.1000 0.0500, luminance 0.1177;"), "{line}");
         assert!(line.contains("160x90 points hold a luminance of 0.3000 on average (least 0.0100, most 2.0000)"), "{line}");
         assert!(line.contains("texels are written about 0.1500, the share 0.5 of it"), "{line}");
-        assert!(line.ends_with("; 1.0 keepings and 2.0 raisings/frame"), "{line}");
-        let line = frame_line(1.0, None, [0.0, 0.0]);
+        assert!(line.ends_with("; 1.0 keepings, 2.0 raisings and 0.0 bounds of the air/frame"), "{line}");
+        let line = frame_line(1.0, None, [0.0, 0.0, 0.0]);
         assert!(line.contains("nothing kept yet: no dispatch of CS_CacheScreenSpaceRadiance seen"), "{line}");
         // The points' luminance: mean, least and most, without what is no number.
         let points = [[1.0f32; 3], [3.0; 3], [f32::NAN, 0.0, 0.0], [2.0; 3]];
@@ -875,7 +967,16 @@ mod tests {
         move |_, _| 0.1 / metres
     }
 
-    const SET: Pass = Pass { level: 1.0, shade: [1.0, 0.6, 0.1, 0.45], follow: FOLLOW, most: 0.0, size: [640, 360], flat: false };
+    const SET: Pass = Pass {
+        level: 1.0,
+        shade: [1.0, 0.6, 0.1, 0.45],
+        follow: FOLLOW,
+        most: 0.0,
+        size: [640, 360],
+        flat: false,
+        air: 0.0,
+        slices: 0,
+    };
 
     /// Texels are placed by their depth: the picture's middle straight
     /// ahead, its edges where the field of view puts them.

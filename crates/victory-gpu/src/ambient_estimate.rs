@@ -26,6 +26,13 @@
 //!   those at its own depth first, turned by its normal, a fifth of it the
 //!   slow mean, darker in creases ([`raise`]).
 //!
+//! - With `VICTORY_AMBIENT_AIR=<multiple>` (from avatarmanz 7da523a9; off
+//!   by default), right after the program that adds the lamps' light to
+//!   what the air scatters (`CS_AccumulateLocalLightInscatteringVolume`),
+//!   that volume is bounded by a multiple of the light around ([`air`]):
+//!   without rays the air of a room is lit by the sky's light, a brown veil
+//!   at sunset.
+//!
 //! What it assumes: what is not on screen sends out what is (with the slow
 //! mean, so that turning into a dark corner is not black at once). No
 //! occlusion but the creases'.
@@ -64,7 +71,7 @@ use crate::host::{Host, HostList, host};
 use crate::object::This;
 use crate::resource::HostTexture;
 
-pub(crate) use set::{KEEPS, RADIANCE, role_name};
+pub(crate) use set::{AIR, KEEPS, LIGHTS_AIR, RADIANCE, role_name};
 
 fn var(name: &str) -> Option<String> {
     std::env::var(name).ok()
@@ -85,7 +92,7 @@ pub(crate) fn on() -> bool {
 /// The roles the estimate follows programs in beside the constant
 /// stand-in's (bits; 0 while it is off).
 pub(crate) fn roles() -> u8 {
-    if on() { KEEPS } else { 0 }
+    if on() { KEEPS | LIGHTS_AIR } else { 0 }
 }
 
 /// What the program of shader container `container` is to the estimate
@@ -108,10 +115,17 @@ fn left() -> f32 {
     *SET.get_or_init(|| set::left(var("VICTORY_AMBIENT_LEFT").as_deref()))
 }
 
+/// The most the air scatters, as a multiple of the light around
+/// (`VICTORY_AMBIENT_AIR`, `set::air`; 0: what the title has).
+fn air_bound() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| set::air(var("VICTORY_AMBIENT_AIR").as_deref()))
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
     if let Some(share) = share() {
-        tracing::info!("{}", set::start_line(share, shade(), left()));
+        tracing::info!("{}", set::start_line(share, shade(), left(), air_bound()));
     }
 }
 
@@ -132,6 +146,7 @@ struct Pass {
     place: Stage,
     gather: Stage,
     raise: Stage,
+    air: Stage,
     /// The cells' light, the slow mean and the cells' places
     /// (`set::CELL_BYTES`), and where the CPU sees them.
     cells: ID3D12Resource,
@@ -173,6 +188,7 @@ fn make(host: &Host) -> windows::core::Result<Pass> {
     let place = stage(set::PLACE, s!("ambient estimate: place"))?;
     let gather = stage(set::GATHER, s!("ambient estimate: gather"))?;
     let raise = stage(set::RAISE, s!("ambient estimate: raise"))?;
+    let air = stage(set::AIR_PASS, s!("ambient estimate: air"))?;
     // Buffers the CPU sees too (`log` reads them), all zero to begin with:
     // nothing kept, no light.
     let buffer = |bytes: u64, what: &'static str| {
@@ -202,6 +218,7 @@ fn make(host: &Host) -> windows::core::Result<Pass> {
             place,
             gather,
             raise,
+            air,
             cells,
             cells_at,
             points,
@@ -251,6 +268,8 @@ fn viewed_as(copy: &HostTexture, own: DXGI_FORMAT, wanted: DXGI_FORMAT) -> bool 
 struct Image<'a> {
     image: &'a ID3D12Resource,
     format: DXGI_FORMAT,
+    /// Slices of a volume written through `u0`; 0: two dimensions.
+    slices: u32,
 }
 
 impl Pass {
@@ -273,11 +292,15 @@ impl Pass {
             let cpu = self.views.GetCPUDescriptorHandleForHeapStart();
             let gpu = self.views.GetGPUDescriptorHandleForHeapStart();
             let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + (slot * self.step) as usize };
-            let view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            let mut view = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                 Format: written.map_or(DXGI_FORMAT_R32_UINT, |w| w.format),
                 ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
                 ..Default::default()
             };
+            if let Some(slices) = written.map(|w| w.slices).filter(|&slices| slices > 0) {
+                view.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+                view.Anonymous.Texture3D = D3D12_TEX3D_UAV { MipSlice: 0, FirstWSlice: 0, WSize: slices };
+            }
             host.device.CreateUnorderedAccessView(
                 written.map(|w| w.image),
                 None::<&ID3D12Resource>,
@@ -376,12 +399,34 @@ impl Pass {
     }
 }
 
+impl Pass {
+    /// The air's bound: the volume `scattered` (of `size` texels and
+    /// `slices` slices, in the unordered-access state in `list` now) holds
+    /// no more than a multiple of the light around.
+    fn air(&self, host: &Host, list: &HostList, scattered: Image, size: [u32; 2], given: &set::Pass) {
+        list.keep(&self.cells);
+        list.keep(&self.points);
+        list.keep(&self.views);
+        let l = &list.list;
+        let constants = set::constants(&set::Pass { size, slices: scattered.slices, ..*given });
+        uav_barrier(l);
+        // SAFETY: an open list; a live texture the caller's list keeps, in
+        // the unordered-access state.
+        unsafe {
+            let table = self.table(host, l, Some(scattered), None);
+            let groups = [size[0].div_ceil(8), size[1].div_ceil(8), scattered.slices.div_ceil(2)];
+            self.run(l, &self.air, &constants, table, groups);
+        }
+    }
+}
+
 /// Whether the light of a frame has been kept: the estimate has something
 /// to begin with.
 static KEPT: AtomicBool = AtomicBool::new(false);
 
-/// Keepings and raisings recorded since the last frame line.
-static RECORDED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Keepings, raisings and bounds of the air recorded since the last frame
+/// line.
+static RECORDED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// With the frame line, over `frames` frames: what the estimate is, to
 /// compare with the constant stand-in's level in a run log. Read from the
@@ -392,7 +437,7 @@ pub(crate) fn log(frames: f64) {
     let Some(share) = share() else {
         return;
     };
-    let [keeps, raises] = [0, 1].map(|i| RECORDED[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let per_frame = [0, 1, 2].map(|i| RECORDED[i].swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
     let made = KEPT.load(Ordering::Relaxed).then(|| host().and_then(pass)).flatten();
     let seen = made.map(|pass| {
         // SAFETY: inside the buffers' mappings, which live as the passes do.
@@ -401,12 +446,21 @@ pub(crate) fn log(frames: f64) {
         let points = (0..set::PX * set::PY).map(|i| [0, 1, 2].map(|colour| float4(pass.points_at, i * 3 + colour)[3]));
         ([mean[0], mean[1], mean[2]], set::over_the_picture(points))
     });
-    tracing::info!("{}", set::frame_line(share, seen, [keeps, raises]));
+    tracing::info!("{}", set::frame_line(share, seen, per_frame));
 }
 
 /// What the passes are given now.
 fn settings(share: f32) -> set::Pass {
-    set::Pass { level: share, shade: shade(), follow: set::FOLLOW, most: left(), size: [0, 0], flat: false }
+    set::Pass {
+        level: share,
+        shade: shade(),
+        follow: set::FOLLOW,
+        most: left(),
+        size: [0, 0],
+        flat: false,
+        air: air_bound(),
+        slices: 0,
+    }
 }
 
 /// After the title's program that keeps the light visible surfaces send
@@ -453,7 +507,7 @@ pub(crate) fn keep(list: &HostList, radiance: This) -> bool {
         // SAFETY: an open list and a live texture the list keeps.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
-    let radiance = Image { image: &copy.texture, format };
+    let radiance = Image { image: &copy.texture, format, slices: 0 };
     pass.keep(host, list, radiance, [d.Width as u32, d.Height], &settings(share));
     KEPT.store(true, Ordering::Relaxed);
     RECORDED[0].fetch_add(1, Ordering::Relaxed);
@@ -521,10 +575,61 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
     if let Some(depth) = &depth {
         list.keep(depth);
     }
-    let image = Image { image: &light.texture, format: DXGI_FORMAT_R32_UINT };
-    let depth = depth.as_ref().map(|d| Image { image: d, format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS });
+    let image = Image { image: &light.texture, format: DXGI_FORMAT_R32_UINT, slices: 0 };
+    let depth = depth.as_ref().map(|d| Image { image: d, format: DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, slices: 0 });
     pass.raise(host, list, image, depth, [d.Width as u32, d.Height], &settings(share));
     RECORDED[1].fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// After the title's program that adds the lamps' light to what the air
+/// scatters, in `list`: the volume it wrote, `scattered`, is bounded by a
+/// multiple of the light around (`VICTORY_AMBIENT_AIR`; nothing while that
+/// is unset). Whether it recorded anything (the list's heaps, compute root
+/// signature and pipeline are then ours).
+pub(crate) fn air(list: &HostList, scattered: This) -> bool {
+    let (Some(share), Some(host)) = (share(), host()) else {
+        return false;
+    };
+    if air_bound() <= 0.0 || !KEPT.load(Ordering::Relaxed) {
+        return false;
+    }
+    let Some(copy) = crate::resource::host_copy(scattered) else {
+        return false;
+    };
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    let format = DXGI_FORMAT_R11G11B10_FLOAT;
+    if d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D || !viewed_as(&copy, d.Format, format) {
+        static REFUSED: std::sync::Once = std::sync::Once::new();
+        REFUSED.call_once(|| {
+            tracing::warn!(
+                format = d.Format.0,
+                dimension = d.Dimension.0,
+                "the air is not bounded: what it scatters is not an R11G11B10_FLOAT volume"
+            );
+        });
+        return false;
+    }
+    let Some(pass) = pass(host) else {
+        return false;
+    };
+    let slices = u32::from(d.DepthOrArraySize);
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| {
+        tracing::info!(
+            bound = air_bound(),
+            width = d.Width,
+            height = d.Height,
+            slices,
+            format = d.Format.0,
+            "ambient estimate: the first volume of air it bounds"
+        );
+    });
+    list.keep(&copy.texture);
+    let scattered = Image { image: &copy.texture, format, slices };
+    pass.air(host, list, scattered, [d.Width as u32, d.Height], &settings(share));
+    RECORDED[2].fetch_add(1, Ordering::Relaxed);
     true
 }
 
@@ -690,12 +795,12 @@ mod tests {
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
             &mut keep,
         );
-        pass.keep(host, &run, Image { image: &radiance, format: DXGI_FORMAT_R11G11B10_FLOAT }, RADIANCE, given);
+        pass.keep(host, &run, Image { image: &radiance, format: DXGI_FORMAT_R11G11B10_FLOAT, slices: 0 }, RADIANCE, given);
         pass.raise(
             host,
             &run,
-            Image { image: &light, format: DXGI_FORMAT_R32_UINT },
-            depth.then_some(Image { image: &scene_depth, format: DXGI_FORMAT_R32_FLOAT }),
+            Image { image: &light, format: DXGI_FORMAT_R32_UINT, slices: 0 },
+            depth.then_some(Image { image: &scene_depth, format: DXGI_FORMAT_R32_FLOAT, slices: 0 }),
             LIGHT,
             given,
         );
@@ -717,6 +822,17 @@ mod tests {
         (cells, mean, places, points, written)
     }
 
+    const BASE: set::Pass = set::Pass {
+        level: 0.75,
+        shade: [1.0, 0.6, 0.1, 0.45],
+        follow: 0.25,
+        most: 0.0,
+        size: [0, 0],
+        flat: false,
+        air: 0.0,
+        slices: 0,
+    };
+
     /// The passes on the GPU give what the arithmetic on the CPU gives
     /// (`set::reference`): the cells' light and places, the slow mean, the
     /// points, and the light image, with and without what the resolve left.
@@ -727,7 +843,7 @@ mod tests {
         };
         let pass = make(host).expect("the passes");
         let scene = Scene { depth: &depth_at, size: LIGHT, near: 0.1, tan_y: 0.45 };
-        let base = set::Pass { level: 0.75, shade: [1.0, 0.6, 0.1, 0.45], follow: 0.25, most: 0.0, size: [0, 0], flat: false };
+        let base = BASE;
         let want_cells = reference::keep(&radiance_at, RADIANCE);
         let want_places = scene.place();
         let want_points = scene.gather(&want_cells, &want_places);
@@ -781,6 +897,111 @@ mod tests {
             let most = LIGHT[0] * LIGHT[1] / 100;
             assert!(odd <= most, "{odd} texels differ (most {most}), shade {}", given.shade[0]);
         }
+    }
+
+    /// The air's pass reads and writes an R11G11B10_FLOAT volume through
+    /// one unordered view, as the title's own program before it does, and
+    /// bounds every texel as the arithmetic on the CPU does: by the slow
+    /// mean near the eye, by the light of the point seen far away.
+    #[test]
+    fn the_air_is_bounded_on_the_gpu() {
+        let Some(host) = host() else {
+            return;
+        };
+        let pass = make(host).expect("the passes");
+        // The light around, as a keeping and a raising leave it.
+        let (_, mean, _, points, _) = run(host, &pass, &BASE, [0.0; 3], true);
+        let size = [40u32, 24, 6];
+        let scattered_at = |x: u32, y: u32, z: u32| -> V3 {
+            match (x + y + z) % 3 {
+                0 => [64.0, 32.0, 16.0],
+                1 => [0.5, 0.25, 0.125],
+                _ => [0.03125, 0.0625, 0.03125],
+            }
+        };
+        let mut volume: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                        Width: size[0].into(),
+                        Height: size[1],
+                        DepthOrArraySize: size[2] as u16,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R11G11B10_FLOAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut volume,
+                )
+                .unwrap();
+        }
+        let volume = volume.unwrap();
+        let pitch = (size[0] * 4).next_multiple_of(256);
+        let bytes = u64::from(pitch) * u64::from(size[1]) * u64::from(size[2]);
+        let (upload, data) = host.upload_buffer(bytes).unwrap();
+        let (back, read) = host.readback_buffer(bytes).unwrap();
+        let at = |x: u32, y: u32, z: u32| ((z * size[1] + y) * pitch + x * 4) as usize;
+        let slices = |buffer: &ID3D12Resource| {
+            let mut rows = rows(buffer, DXGI_FORMAT_R11G11B10_FLOAT, [size[0], size[1]], pitch);
+            rows.Anonymous.PlacedFootprint.Footprint.Depth = size[2];
+            rows
+        };
+        let list = host.new_list().unwrap();
+        let l = &list.list;
+        let given = set::Pass { air: 3.0, ..BASE };
+        // SAFETY: mapped buffers written and read in bounds; an open list
+        // and copy locations naming live resources.
+        unsafe {
+            for z in 0..size[2] {
+                for y in 0..size[1] {
+                    for x in 0..size[0] {
+                        data.add(at(x, y, z)).cast::<u32>().write(r11g11b10(scattered_at(x, y, z)));
+                    }
+                }
+            }
+            l.CopyTextureRegion(&whole(&volume), 0, 0, 0, &slices(&upload), None);
+            l.ResourceBarrier(&[transition(&volume, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            let scattered = Image { image: &volume, format: DXGI_FORMAT_R11G11B10_FLOAT, slices: size[2] };
+            pass.air(host, &list, scattered, [size[0], size[1]], &given);
+            l.ResourceBarrier(&[transition(&volume, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            l.CopyTextureRegion(&slices(&back), 0, 0, 0, &whole(&volume), None);
+        }
+        list.close();
+        host.execute(&[&list]);
+        let part = |word: u32, shift: u32, bits: u32| {
+            let v = word >> shift & ((1 << (5 + bits)) - 1);
+            let (e, m) = (v >> bits, v & ((1 << bits) - 1));
+            if e == 0 { m as f32 / (1 << bits) as f32 * 2f32.powi(-14) } else { (1.0 + m as f32 / (1 << bits) as f32) * 2f32.powi(e as i32 - 15) }
+        };
+        let (mut bounded, mut kept) = (0, 0);
+        for z in 0..size[2] {
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    // SAFETY: the copy has run; inside the mapped buffer.
+                    let word = unsafe { read.add(at(x, y, z)).cast::<u32>().read_volatile() };
+                    let got = [part(word, 0, 6), part(word, 11, 6), part(word, 22, 5)];
+                    let q = [0, 1].map(|k| {
+                        (((([x, y][k] as f32 + 0.5) / size[k] as f32) * [set::PX, set::PY][k] as f32) as u32).min([set::PX, set::PY][k] - 1)
+                    });
+                    let point = ((q[1] * set::PX + q[0]) * 3) as usize;
+                    let seen_there = [points[point][3], points[point + 1][3], points[point + 2][3]];
+                    let was = scattered_at(x, y, z);
+                    let want = reference::bound_air(was, 3.0, [mean[0], mean[1], mean[2]], seen_there, z as f32 / size[2] as f32);
+                    // (6 and 5 bits of each part are kept.)
+                    assert!((0..3).all(|k| near(got[k], want[k], 0.04)), "air at {x},{y},{z}: {got:?} {want:?} (was {was:?})");
+                    if want == was { kept += 1 } else { bounded += 1 }
+                }
+            }
+        }
+        assert!(bounded > 0 && kept > 0, "{bounded} bounded, {kept} kept");
     }
 
     /// Two packed lights within a fiftieth of the brighter one's top part

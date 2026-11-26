@@ -1287,6 +1287,12 @@ impl State {
                         false
                     }
                 }
+            } else if role & estimate::LIGHTS_AIR != 0 {
+                // (Nothing unless `VICTORY_AMBIENT_AIR` is set.)
+                match &image(ResourceType::Uav, estimate::AIR) {
+                    Some((_, scattered)) => estimate::air(list, *scattered),
+                    None => false,
+                }
             } else if role & crate::ambient::RESOLVES != 0 {
                 let light = image(ResourceType::Uav, crate::ambient::LIGHT);
                 let depth = image(ResourceType::Srv, crate::ambient::DEPTH);

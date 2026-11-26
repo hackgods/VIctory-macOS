@@ -159,6 +159,18 @@ impl Made {
     }
 }
 
+/// Whether a heap sync has a slot to make again: its record now (`current`:
+/// it names a view that is current; the view's index and generation)
+/// against the record the host slot was last made from (none: no host
+/// slot). A record that is no current view is stale where a view is shown.
+pub(crate) fn stale(current: bool, view: u32, generation: u32, made: Option<u64>) -> bool {
+    match made {
+        Some(m) if current => m != u64::from(generation) << 32 | u64::from(view),
+        Some(m) => m != 0,
+        None => true,
+    }
+}
+
 /// A slot's lock, held ([`Made::lock`]): the records it covers can be read
 /// and set.
 pub(crate) struct Slot<'a> {
@@ -449,6 +461,18 @@ mod tests {
             let same = (0..100_000u32).filter(|&i| split.lock_of(i) == split.lock_of(i + step)).count();
             assert!(same < 100, "{same} of 100,000 slots share a lock with the slot {step} on");
         }
+    }
+
+    #[test]
+    fn a_slot_is_stale_when_its_record_is_not_what_it_was_made_from() {
+        let key = 3u64 << 32 | 7;
+        assert!(!stale(true, 7, 3, Some(key)), "made from it");
+        assert!(stale(true, 7, 4, Some(key)), "another generation");
+        assert!(stale(true, 8, 3, Some(key)), "another view");
+        assert!(stale(true, 7, 3, Some(0)), "never made");
+        assert!(stale(false, 7, 3, Some(key)), "no view any more where one is shown");
+        assert!(!stale(false, 7, 3, Some(0)), "no view, none shown");
+        assert!(stale(true, 7, 3, None) && stale(false, 0, 0, None), "past the host heap: `mirror` says so");
     }
 
     #[test]

@@ -21,6 +21,8 @@ mod paged;
 #[cfg(any(windows, test))]
 pub(crate) mod pool;
 #[cfg(any(windows, test))]
+pub(crate) mod reports;
+#[cfg(any(windows, test))]
 pub(crate) mod slots;
 
 const HEAP_IIDS: [Iid; 4] = [
@@ -248,12 +250,30 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
             continue;
         };
         let step = u64::from(step);
+        // mac: the heap whose slots the title's own stores report
+        // (`VICTORY_HEAP_REPORTS`, `reports`; `No` without the switch).
+        let told = reports::told(start, heap.desc.count);
+        if told == reports::Told::Use {
+            // The told slots in place of the written pages; what rounds
+            // ahead left first, as below.
+            if ahead::on() && ran.is_none() {
+                host.sync_left(start, step);
+            }
+            if !sync_told(heap, host, start, step, ran) {
+                return;
+            }
+            // The fallback, in the sync before a submission every so many
+            // frames: the watch asked and its pages looked at whole, below.
+            if ran.is_some() || !reports::ask_due(crate::frame::current()) {
+                continue;
+            }
+        }
         let mut runs = written.take(start as usize, usize::MAX);
         // mac: what rounds ahead left comes first, the slots only before a
         // submission.
         if ahead::on() {
             runs = host.with_left(runs);
-            if ran.is_none() {
+            if ran.is_none() && told != reports::Told::Use {
                 host.sync_left(start, step);
             }
         }
@@ -280,10 +300,65 @@ fn sync(ran: Option<&dyn Fn() -> bool>) {
                     crate::copystat::C::SyncSlots,
                     last.min(u64::from(heap.desc.count)).saturating_sub(first),
                 );
-                host.sync_slots(first as u32, last.min(u64::from(heap.desc.count)) as u32, start, step);
+                let (first, last) = (first as u32, last.min(u64::from(heap.desc.count)) as u32);
+                if told == reports::Told::No {
+                    host.sync_slots(first, last, start, step);
+                    continue;
+                }
+                // mac: what the look finds changed is sorted by what told
+                // of it (`reports`), then made as ever.
+                let stale = host.stale_slots(first, last, start, step);
+                // SAFETY: records on a page of the heap found mapped above.
+                let is_view = |i: u32| unsafe { ((start + u64::from(i) * step) as *const u32).read_unaligned() } == VIEW_TAG;
+                reports::looked(start, first, last, &stale, is_view);
+                host.make_stale(stale, start, step);
             }
         }
+        if told == reports::Told::Check && ran.is_none() {
+            reports::clear_rest(start);
+        }
     }
+}
+
+/// mac: a heap sync of the slots the title's own stores told of
+/// (`VICTORY_HEAP_REPORTS=1`, [`reports`]) in place of the written pages:
+/// the same look and the same making ([`host::HostHeap::sync_slots`]), of
+/// those slots alone. By 64 KiB page of the title's heap, as the look at
+/// written pages goes: a page with nothing mapped holds no records, and a
+/// round ahead of a submission (`ran`) ends at the next page once the GPU
+/// has run it. False for a round that ended so: the slots it took and did
+/// not look at are told again.
+#[cfg(windows)]
+fn sync_told(heap: &Heap, host: &host::HostHeap, start: u64, step: u64, ran: Option<&dyn Fn() -> bool>) -> bool {
+    let runs = reports::take(start);
+    let page = crate::watch::PAGE as u64;
+    for (k, &(first, n)) in runs.iter().enumerate() {
+        let end = (first + n).min(heap.desc.count);
+        let mut at = first;
+        while at < end {
+            let address = start + u64::from(at) * step;
+            // The slots that start on this page.
+            let next_page = (address / page + 1) * page;
+            let to = end.min((next_page - start).div_ceil(step) as u32);
+            if ran.is_some_and(|ran| ran()) {
+                reports::put_back(start, at, first + n - at);
+                for &(first, n) in &runs[k + 1..] {
+                    reports::put_back(start, first, n);
+                }
+                ahead::cut();
+                return false;
+            }
+            if crate::host::read_into(address as *const u8, &mut [0u8; 4]) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncSlots, u64::from(to - at));
+                let stale = host.stale_slots(at, to, start, step);
+                reports::changed(stale.len());
+                host.make_stale(stale, start, step);
+            }
+            at = to;
+        }
+    }
+    true
 }
 
 /// Makes the views of slots `slots` that were left null (textures the title
@@ -397,6 +472,8 @@ impl Drop for Heap {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         unregister_heap(&mut heaps, at);
+        // mac: its slots are told no more (`VICTORY_HEAP_REPORTS`).
+        reports::let_go(self.start);
         // Nothing can find the heap by now. The table's lock is taken
         // inside the heaps' lock (`memory::bind`), never the other way
         // round, so it is taken here after the heaps' lock is let go.
@@ -957,6 +1034,12 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // mac: the title's own stores tell this heap's slots
+    // (`VICTORY_HEAP_REPORTS`; nothing without it).
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        reports::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     let at = std::ptr::from_ref::<Heap>(&heap) as usize;
     #[cfg(not(windows))]

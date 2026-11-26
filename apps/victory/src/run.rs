@@ -145,6 +145,32 @@ pub fn run(
             victory_loader::masked::patch(image.base() as u64, image.info(), &original, &wanted);
         println!("masked stores  {n} patched to plain stores");
     }
+    // macOS port: the title's stores of descriptor records tell the layer
+    // the slots they write (victory_loader::descriptor_sites,
+    // victory_gpu::heap_reports); off unless asked for.
+    #[cfg(windows)]
+    if victory_gpu::heap_reports::wanted() {
+        use victory_loader::descriptor_sites::{MARKS_LEN, SITES, SWITCH, apply};
+        const _: () = assert!(MARKS_LEN == victory_gpu::heap_reports::MARKS_LEN);
+        let form = match victory_gpu::heap_reports::mode() {
+            victory_gpu::heap_reports::Mode::Check => "check",
+            _ => "1",
+        };
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped, nothing of it has run yet, and
+        // the cells are a static.
+        let done = unsafe { apply(image.base(), size, victory_gpu::heap_reports::marks_address(), &SITES) };
+        match done {
+            Ok(n) => println!(
+                "heap reports   on ({SWITCH}={form}): {n} of {} descriptor record stores of the title tell the layer their slots; its memcpy and memmove are bound to tell too",
+                SITES.len()
+            ),
+            Err(why) => println!(
+                "heap reports   on ({SWITCH}={form}), but the title's descriptor record stores are not patched: {why}; heap syncs look at the written pages as before"
+            ),
+        }
+        victory_gpu::heap_reports::hooked(image.base(), size, done.unwrap_or(0), SITES.len());
+    }
     // macOS port: a way out of a title lookup that can loop forever
     // (victory_loader::probe_guard); off unless asked for.
     let guard_lookup = std::env::var("VICTORY_GUARD_LOOKUP").as_deref() == Ok("1");

@@ -92,6 +92,14 @@ mod twin;
 #[cfg(windows)]
 mod watch;
 
+/// mac: the title's descriptor stores report the slots they write
+/// (`VICTORY_HEAP_REPORTS`, `descriptor::reports`): what the launcher and
+/// the import resolver need of it.
+#[cfg(windows)]
+pub mod heap_reports {
+    pub use crate::descriptor::reports::{MARKS_LEN, Mode, hooked, import, marks_address, mode, wanted};
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;
 #[cfg(windows)]

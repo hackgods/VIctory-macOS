@@ -774,6 +774,15 @@ impl HostHeap {
     /// would, with one lock of each kind for them all instead of two per slot
     /// (a world frame looks at ~700,000 slots, run perf3: ~75 ms).
     pub(crate) fn sync_slots(&self, first: u32, last: u32, start: u64, step: u64) {
+        let stale = self.stale_slots(first, last, start, step);
+        self.make_stale(stale, start, step);
+    }
+
+    /// The look of [`HostHeap::sync_slots`]: the slots of `first..last`
+    /// whose record differs from what the slot holds (mac: apart, for the
+    /// syncs that compare what they find with what was told,
+    /// `super::reports`).
+    pub(crate) fn stale_slots(&self, first: u32, last: u32, start: u64, step: u64) -> Vec<u32> {
         let at = |i: u32| start + u64::from(i) * step;
         // SAFETY: records in title heap memory the caller found mapped.
         let records: Vec<[u32; 3]> =
@@ -790,14 +799,19 @@ impl HostHeap {
             let _held = (!self.made.split()).then(|| self.made.lock(first));
             (first..last)
                 .zip(records.iter().zip(current))
-                .filter(|&(i, (&[_, view, generation], current))| match self.made.peek(i) {
-                    Some(m) if current => m != u64::from(generation) << 32 | u64::from(view),
-                    Some(m) => m != 0,
-                    None => true,
+                .filter(|&(i, (&[_, view, generation], current))| {
+                    super::slots::stale(current, view, generation, self.made.peek(i))
                 })
                 .map(|(i, _)| i)
                 .collect()
         };
+        stale
+    }
+
+    /// The making of [`HostHeap::sync_slots`]: [`HostHeap::mirror`] of each
+    /// slot of `stale`, in order.
+    pub(crate) fn make_stale(&self, stale: Vec<u32>, start: u64, step: u64) {
+        let at = |i: u32| start + u64::from(i) * step;
         if super::ahead::on() {
             super::ahead::changed(stale.len());
         }

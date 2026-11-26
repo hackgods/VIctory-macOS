@@ -1164,6 +1164,9 @@ fn install() {
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            // mac: who wrote a block of the title's view heap last
+            // (`VICTORY_HEAP_REPORTS`; one load without it).
+            crate::descriptor::reports::faulted(at, r.ExceptionAddress as usize);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {

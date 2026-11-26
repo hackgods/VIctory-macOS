@@ -256,6 +256,8 @@ mod image_store_tests;
 mod lower;
 #[cfg(test)]
 mod mark_tests;
+#[cfg(test)]
+mod mesh_index_tests;
 mod deltas;
 mod rect;
 pub use container::sign as sign_container;

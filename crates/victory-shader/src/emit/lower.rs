@@ -864,6 +864,9 @@ impl<'a> Lower<'a> {
                 max_vertices = max_vertices.min(ms.threads);
                 max_primitives = max_primitives.min(ms.threads);
             }
+            if max_vertices == 0 {
+                max_primitives = 0;
+            }
             s.mesh = Some(super::shader::Mesh {
                 max_vertices,
                 max_primitives,
@@ -11262,32 +11265,6 @@ impl<'a> Lower<'a> {
                 &args,
             );
         }
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
-    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
-    /// and 29), which only the console's edge-flag rasterisation reads and
-    /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area).
-    fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
-        let v = e.values[0].ok_or("a primitive export without its indices")?;
-        let x = self.i32_of(v)?;
-        let at = self.begin_guarded(guard);
-        let c = self.cur;
-        let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
-        }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }

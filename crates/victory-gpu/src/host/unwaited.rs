@@ -19,7 +19,9 @@
 //!   copy-back, as before, and ours always wait, as they read or free what
 //!   they made as soon as they return;
 //! - a queue's Signal, before the title's fence moves (`crate::queue`),
-//!   if the submission is that queue's ([`settle_signal`]);
+//!   if the submission is that queue's ([`settle_signal`]); or, with
+//!   `VICTORY_ASYNC_SIGNALS=1`, the Signal returns and the fence moves when
+//!   the submission is finished by something else ([`signal_behind`]);
 //! - a queue's head whose wait does not hold, if the submission owes a
 //!   bottom-of-pipe write where the wait reads (`crate::hold::World::owed`,
 //!   [`settle_waits`]); with `VICTORY_ASYNC_SETTLE_ALL=1` every Signal and
@@ -110,6 +112,27 @@ pub(crate) fn prewarms() -> bool {
     })
 }
 
+/// Whether a queue's Signal behind a submission left to the host GPU
+/// returns at once, the title's fence moving when that submission is
+/// finished ([`signal_behind`]; `VICTORY_ASYNC_SIGNALS=1`, off by default,
+/// and nothing without `VICTORY_ASYNC_SUBMIT=1`, nor with
+/// `VICTORY_ASYNC_SETTLE_ALL=1`, which asks for every Signal to wait).
+/// Needs our thread: with nothing else waiting, it is what finishes the
+/// submission.
+fn signals() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    on() && *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_ASYNC_SIGNALS") && !all() && idler().is_some();
+        if on {
+            tracing::info!(
+                "VICTORY_ASYNC_SIGNALS: a queue's Signal does not wait for the submission left to the host GPU; \
+                 its fence moves when that submission is finished"
+            );
+        }
+        on
+    })
+}
+
 /// Whether a prepared submission of the title's may be left: not one whose
 /// lists run one by one (`VICTORY_GPU_TIMING`), nor in a listed frame, nor
 /// while frames are captured (diagnostics builds; the dumps submit lists of
@@ -156,8 +179,12 @@ struct Left {
     stood: bool,
     /// The title's lists, held until it is finished.
     lists: Vec<std::sync::Arc<HostList>>,
-    /// Where their bottom-of-pipe writes go (address, bytes).
+    /// Where their bottom-of-pipe writes go (address, bytes), and where
+    /// the fences of `signals` are.
     writes: Vec<(u64, u64)>,
+    /// Signals of the title's that follow it, in order: the fence (held),
+    /// its value, and since when ([`signal_behind`]).
+    signals: Vec<(usize, u64, Instant)>,
     /// Whether one of them runs programs that use title memory, which
     /// write host copies at addresses they compute (`crate::memory`).
     memory: bool,
@@ -237,6 +264,50 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
     settle(By::Signal)
 }
 
+/// `queue`'s Signal of `fence` to `value`, when the queue holds nothing:
+/// if the submission left to the host GPU is that queue's, the Signal is
+/// put behind it and the call returns (true): the fence, held meanwhile,
+/// moves when the submission is finished ([`Host::finish_left`]), by the
+/// next thing that waits for it or, with nothing waiting, by our thread
+/// once the GPU has run it. As on the console, where a Signal does not
+/// wait for the queue's work either. False (nothing done) with the switch
+/// off, with nothing of the queue's left, or while it is being finished.
+pub(crate) fn signal_behind(queue: usize, fence: usize, value: u64) -> bool {
+    if !signals() || VALUE.load(Acquire) == 0 || QUEUE.load(Acquire) != queue {
+        return false;
+    }
+    crate::fence::keep(fence as crate::object::This);
+    if signal_after(fence, value) {
+        return true;
+    }
+    crate::fence::let_go(fence as crate::object::This);
+    false
+}
+
+/// A Signal the queues deliver (it stood behind held work, which has been
+/// given to the host GPU by now), its fence held already: put behind the
+/// submission left, whichever queue's, as [`signal_behind`] puts one.
+pub(crate) fn signal_after(fence: usize, value: u64) -> bool {
+    if !signals() || VALUE.load(Acquire) == 0 {
+        return false;
+    }
+    let mut left = LEFT.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(left) = left.as_mut() else {
+        // Being finished right now.
+        return false;
+    };
+    left.signals.push((fence, value, Instant::now()));
+    // A list's wait may read the fence's value in memory.
+    left.writes
+        .push((crate::fence::address(fence as crate::object::This), 8));
+    SIGNALS[0].fetch_add(1, Relaxed);
+    true
+}
+
+/// Since the last frame line: Signals put behind a submission left, and
+/// the microseconds until their fences moved, summed.
+static SIGNALS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// For a queue's head whose `waits` do not all hold: [`settle`], if the
 /// submission left owes a bottom-of-pipe write where one of them reads
 /// (`next`: the lists that run once the waits hold, if asked for).
@@ -290,9 +361,23 @@ fn idler() -> Option<&'static std::thread::Thread> {
         .as_ref()
 }
 
+/// An event of our thread's own on the host fence, asked for each
+/// submission left while Signals stand behind them (`signals`): the thread
+/// is then what moves the title's fences, and a millisecond's sleep would
+/// be added to each. None if it could not be made (the thread sleeps).
+fn idle_event() -> Option<HANDLE> {
+    static EVENT: OnceLock<usize> = OnceLock::new();
+    let event = *EVENT.get_or_init(|| {
+        // SAFETY: a plain auto-reset event, kept for the run.
+        let made = unsafe { CreateEventW(None, false, false, None) };
+        made.map_or(0, |e| e.0 as usize)
+    });
+    (event != 0).then_some(HANDLE(event as *mut core::ffi::c_void))
+}
+
 /// [`idler`]'s work: sleeps while no submission is left; while one is,
-/// looks at the host fence every millisecond and finishes the submission
-/// once the GPU has run it.
+/// looks at the host fence every millisecond (or when its event wakes it)
+/// and finishes the submission once the GPU has run it.
 fn idle() {
     loop {
         let value = VALUE.load(Acquire);
@@ -305,6 +390,9 @@ fn idle() {
         // SAFETY: a plain query of our fence.
         if unsafe { host.fence.GetCompletedValue() } >= value {
             settle(By::Idle);
+        } else if let Some(event) = idle_event().filter(|_| signals()) {
+            // SAFETY: our event; the fence decides, above.
+            unsafe { WaitForSingleObject(event, 1) };
         } else {
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -405,6 +493,15 @@ pub(super) fn log(frames: f64) {
          the giving, and our own submissions' waits); {spared:.1?} per frame went on without finishing it \
          (Signals of other queues, waits it owed no write to)"
     );
+    if signals() {
+        let [n, us] = [0, 1].map(|i| SIGNALS[i].swap(0, Relaxed) as f64);
+        tracing::info!(
+            "signals: {:.1}/frame returned without waiting for the submission left to the host GPU; their fences \
+             moved {:.1} ms later on average, when it was finished",
+            n / frames,
+            if n > 0.0 { us / n / 1000.0 } else { 0.0 },
+        );
+    }
     crate::descriptor::ahead::log(frames);
     if !prewarms() {
         return;
@@ -502,6 +599,13 @@ impl Host {
                 if let Err(e) = asked {
                     tracing::warn!(error = %e, "no event for a host submission: its fence is polled");
                 }
+                // Our thread's wake-up too, if Signals may stand behind it.
+                if signals()
+                    && let Some(event) = idle_event()
+                {
+                    // SAFETY: the fence and event are ours.
+                    let _ = unsafe { self.fence.SetEventOnCompletion(*submitted, event) };
+                }
             }
             Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
         }
@@ -534,6 +638,7 @@ impl Host {
             stood: false,
             lists: title.to_vec(),
             writes,
+            signals: Vec::new(),
             memory,
             ran,
         });
@@ -755,6 +860,7 @@ impl Host {
             signalled,
             stood,
             lists,
+            signals,
             mut ran,
             ..
         } = left;
@@ -779,6 +885,13 @@ impl Host {
         {
             let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
             self.finish(None, &runs, ran);
+        }
+        // The Signals behind it: the work before them has run, and what it
+        // owes title memory is there.
+        for (fence, value, since) in signals {
+            crate::fence::set(fence as crate::object::This, value);
+            crate::fence::let_go(fence as crate::object::This);
+            SIGNALS[1].fetch_add(since.elapsed().as_micros() as u64, Relaxed);
         }
         // What copies took early while it ran is as anything else now.
         crate::shadow::forget_early();

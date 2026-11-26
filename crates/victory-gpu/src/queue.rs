@@ -218,6 +218,11 @@ fn pump(held: &mut Holding, why: Why) {
     };
     // The title's fence moves once the work before the Signal has run.
     let mut signal = |f: usize, value: u64| {
+        // Left to whoever finishes the submission the host GPU has, with
+        // the hold on the fence (`VICTORY_ASYNC_SIGNALS`).
+        if unwaited::signal_after(f, value) {
+            return;
+        }
         let at = std::time::Instant::now();
         if unwaited::settle(unwaited::By::Signal) {
             ran.set(ran.get() + at.elapsed());
@@ -404,6 +409,10 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
+        } else if unwaited::signal_behind(this as usize, fence as usize, value) {
+            // The fence moves when the queue's work the host GPU was left
+            // with is finished, by whoever finishes it
+            // (`VICTORY_ASYNC_SIGNALS`).
         } else {
             // The queue's work the host GPU was left with has run first.
             unwaited::settle_signal(this as usize);

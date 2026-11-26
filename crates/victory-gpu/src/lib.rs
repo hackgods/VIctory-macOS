@@ -73,6 +73,7 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+mod mac_switches;
 mod switch;
 #[cfg(windows)]
 mod tdr;

@@ -228,6 +228,8 @@ mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(test)]
+mod mac_tests;
 mod rect;
 pub use container::sign as sign_container;
 pub use rect::{rectangle_gs, right_angle};
@@ -429,6 +431,11 @@ pub struct Options {
     /// 32-lane host waves racing on that memory, instead of being refused
     /// (`lower::halves`). A test, not a fix. The shader cache keys on it.
     pub halves_shared_lds: bool,
+    /// A pixel program whose `DB_SHADER_CONTROL` asks for the depth test
+    /// before the shader gets DXIL's early depth-stencil flag, so fragments
+    /// that fail the test never run it (`lower::mac`). The translation
+    /// differs, so the shader cache keys on it.
+    pub early_depth: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -823,6 +830,9 @@ fn emit_pruned(
         halves_local: lower::HalvesLocal {
             reads: options.halves_local,
             lds: options.halves_shared_lds,
+        },
+        mac: lower::Mac {
+            early_depth: options.early_depth,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

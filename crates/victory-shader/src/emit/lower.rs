@@ -22,9 +22,13 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod bvh;
 mod halves;
+mod mac;
 mod mesh;
 pub(crate) use mesh::{KeptOutputs, plan_merge};
 pub(crate) use halves::Local as HalvesLocal;
+pub(crate) use mac::Mac;
+#[cfg(test)]
+pub(crate) use mac::early_depth as early_depth_rule;
 use mesh::prune_signature;
 
 type Why = &'static str;
@@ -79,6 +83,9 @@ pub(crate) struct Lowered {
     /// Whether it declares rasterizer-ordered views.
     #[cfg(test)]
     pub rovs: bool,
+    /// Whether it forces the early depth-stencil test (`mac`).
+    #[cfg(test)]
+    pub early_depth: bool,
     /// Written typed-buffer calls, for structural tests of the dynamic path.
     #[cfg(test)]
     pub typed_buffer_calls: TypedBufferCalls,
@@ -122,6 +129,8 @@ pub(crate) struct Parts<'a> {
     /// What a program in halves does across them in place of a refusal
     /// ([`Options::halves_local`](super::Options)).
     pub halves_local: HalvesLocal,
+    /// The Mac line's settings (`mac`).
+    pub mac: Mac,
 }
 
 enum Stop {
@@ -1547,6 +1556,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.early_depth_flag();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1575,6 +1585,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             rovs: self.s.flags & flags::ROVS != 0,
+            #[cfg(test)]
+            early_depth: self.s.flags & flags::EARLY_DEPTH_STENCIL != 0,
             #[cfg(test)]
             typed_buffer_calls: TypedBufferCalls {
                 loads: [

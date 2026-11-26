@@ -414,6 +414,7 @@ fn build_wave32_cs(pattern: MaskPattern, div: Divergence, op_words: &[u32]) -> H
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: Default::default(),
+        mac: Default::default(),
         host_wave32: false,
         view_marks: false,
     })

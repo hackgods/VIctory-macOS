@@ -114,6 +114,7 @@ fn lowered() -> lower::Lowered {
         bias_as_gradients: false,
         narrow_waves: false,
         halves_local: Default::default(),
+        mac: Default::default(),
         host_wave32: false,
         view_marks: false,
     })

@@ -203,6 +203,7 @@ fn build(
         host_wave32: false,
         narrow_waves: false,
         halves_local: Default::default(),
+        mac: Default::default(),
         view_marks: false,
     })
     .expect("lower");

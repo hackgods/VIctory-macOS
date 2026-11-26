@@ -242,6 +242,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         narrow_waves: narrow_waves(),
         halves_local: halves_local(),
         halves_shared_lds: halves_shared_lds(),
+        early_depth: crate::mac_switches::early_depth(under_wine()),
     }
 }
 
@@ -266,6 +267,8 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     } else {
         build()
     };
+    // The Mac line's settings, over whichever of those it is.
+    let build = &crate::mac_switches::key(build, options.early_depth);
     match CACHE.get() {
         Some(cache) => cached(cache, build, container, translate),
         None => (translate(container), false),

@@ -155,6 +155,7 @@ fn lowered_with(
         bias_as_gradients: false,
         narrow_waves,
         halves_local: Default::default(),
+        mac: Default::default(),
         host_wave32,
     })
 }

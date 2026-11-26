@@ -680,6 +680,7 @@ impl<'a> Lower<'a> {
             if x.native.stage == HwStage::Ps {
                 prune_signature(&mut s.inputs, keep);
                 mesh::merge_rows(&mut s.inputs, keep);
+                mesh::soft_clip_inputs(&mut s.inputs, keep);
             } else if x.native.stage == HwStage::Ms {
                 prune_signature(&mut s.outputs, keep);
                 mesh::merge_rows(&mut s.outputs, keep);
@@ -1519,6 +1520,7 @@ impl<'a> Lower<'a> {
 
     fn run(mut self) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        self.soft_clip();
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -10915,10 +10917,12 @@ impl<'a> Lower<'a> {
                     if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
                         return Err("render-target or viewport index exports");
                     }
+                    // (Softened clip distances are still the clip distances:
+                    // `mesh::distance`.)
                     let mut dists: Vec<usize> = (0..outputs.len())
-                        .filter(|&i| matches!(outputs[i].kind, 6 | 7))
+                        .filter(|&i| mesh::distance(&outputs[i]).is_some())
                         .collect();
-                    dists.sort_by_key(|&i| (outputs[i].kind, outputs[i].index));
+                    dists.sort_by_key(|&i| mesh::distance(&outputs[i]));
                     let flat: Vec<(usize, u8)> = dists
                         .iter()
                         .flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c)))

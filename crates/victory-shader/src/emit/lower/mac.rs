@@ -159,6 +159,9 @@ impl Lower<'_> {
             && self.x.mac.early_depth
             && self.s.pixel
             && early_depth(db_shader_control, input_addr, &self.s.outputs)
+            // A discard that stands in for the clipper must come before
+            // the depth write (`Lower::soft_clip`).
+            && !self.s.inputs.iter().any(|e| e.kind == 0 && e.name == super::mesh::CLIP_NAME)
         {
             self.s.flags |= flags::EARLY_DEPTH_STENCIL;
         }

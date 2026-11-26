@@ -293,6 +293,8 @@ pub(crate) const MEASURED: &[(&str, u32, u32)] = &[
     ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 f2@17 f1@17.3", 252, 0),
     ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f2@8 f2@9 f1@9.3 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f3@17", 252, 0),
     ("P C3 C1 f4", 80, 0),
+    ("# the second as VICTORY_MERGE_MESH_ROWS=7 makes it", 0, 0),
+    ("P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f3@6 f3@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f4@14 f4@15 f2@16 f2@17 f1@17.3", 244, 0),
 ];
 
 #[cfg(test)]

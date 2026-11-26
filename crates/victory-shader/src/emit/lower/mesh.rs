@@ -1,6 +1,6 @@
 //! Mesh shader output signatures, counts and lane indices.
 
-use super::{Attr, HashMap, Lower, SigElement, V, Why, pred};
+use super::{Attr, Bin, HashMap, Lower, SigElement, V, Why, pred};
 use crate::emit::mesh_size;
 use crate::emit::shader::Mesh;
 
@@ -49,6 +49,13 @@ const SPLIT_KEY: &str = "\u{0}split-row";
 /// The semantic of a part of a split element; its index is four times the
 /// row plus the part's first column.
 const PART_NAME: &str = "VPART";
+/// The reserved [`KeptOutputs`] key under which a linked translation carries
+/// the rows whose clip distances the pixel shader clips by ([`soften_clip`]);
+/// the value is the element's column mask.
+const CLIP_KEY: &str = "\u{0}soft-clip";
+/// The semantic of clip distances passed as an ordinary element; its index
+/// is four times the row plus the element's first column.
+pub(super) const CLIP_NAME: &str = "VCLIP";
 
 /// macOS port (Metal's 32 KiB mesh output limit): marks in `keep` the rows
 /// of `outputs` that hold two or more arbitrary elements once pruned, all of
@@ -81,6 +88,14 @@ const PART_NAME: &str = "VPART";
 /// which drops 4 bytes for each component nothing reads, and the rows,
 /// those of distances alone among them, take the order in which the rule's
 /// size of a vertex is smallest ([`fitted_order`]).
+///
+/// With `soft_clip` (the bytes a vertex may take) as well, a pair that is
+/// still over them gives up the clipper: D3DMetal adds 16 bytes to a
+/// vertex with clip distances, so the distances go out as an ordinary
+/// element and the pixel shader discards where one is negative
+/// ([`soften_clip`], [`Lower::soft_clip`]). Not exact as the rest is: see
+/// there.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_merge(
     keep: &mut KeptOutputs,
     outputs: &[SigElement],
@@ -89,6 +104,7 @@ pub(crate) fn plan_merge(
     distances_last: bool,
     xyz_first: bool,
     fitted: bool,
+    soft_clip: Option<u32>,
 ) {
     let mut pruned = outputs.to_vec();
     prune_signature(&mut pruned, keep);
@@ -165,7 +181,27 @@ pub(crate) fn plan_merge(
             let free: Vec<Vec<u8>> = rows.iter().map(|&(r, _)| members(r)).collect();
             let slots: Vec<Option<Vec<u8>>> =
                 all.iter().map(|r| (!registers.contains(r)).then(|| members(*r))).collect();
-            let order = fitted_order(mesh_size::fixed_bytes(&pruned), &slots, &free);
+            let fixed = mesh_size::fixed_bytes(&pruned);
+            let mut order = fitted_order(fixed, &slots, &free);
+            // Still over: without the clipper's 16 bytes, where every clip
+            // distance element has a row to itself.
+            let clips: Vec<(u32, u8)> = pruned
+                .iter()
+                .filter(|e| e.kind == 6)
+                .filter_map(|e| Some((e.row?, ((1u8 << e.cols) - 1) << e.col)))
+                .collect();
+            let alone = clips.iter().all(|&(r, _)| pruned.iter().filter(|e| e.row == Some(r)).count() == 1);
+            if let Some(most) = soft_clip
+                && !clips.is_empty()
+                && alone
+                && order.len() == rows.len()
+                && laid_out(fixed, &slots, &free, &order) > most
+            {
+                for (r, mask) in clips {
+                    keep.insert((CLIP_KEY.to_string(), r), mask);
+                }
+                order = fitted_order(fixed - 16, &slots, &free);
+            }
             if order.len() == rows.len() {
                 rows = order.into_iter().map(|i| rows[i]).collect();
             }
@@ -245,6 +281,76 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
     for (i, e) in slots.into_iter().zip(moved) {
         elements[i] = e;
     }
+    soften_clip(elements, keep);
+}
+
+/// Declares the clip distance elements of the rows [`plan_merge`] marked for
+/// it as ordinary elements, in their places and registers, in both stages:
+/// the mesh shader writes the distances to them as before, and the pixel
+/// shader discards by them ([`Lower::soft_clip`]).
+fn soften_clip(elements: &mut [SigElement], keep: &KeptOutputs) {
+    for e in elements.iter_mut().filter(|e| e.kind == 6) {
+        let Some(r) = e.row else { continue };
+        if keep.contains_key(&(CLIP_KEY.to_string(), r)) {
+            e.name = CLIP_NAME.to_string();
+            e.index = 4 * r + u32::from(e.col);
+            e.kind = 0;
+            // Clip distances are interpolated with perspective.
+            e.interp = 2;
+        }
+    }
+}
+
+/// The pixel shader's inputs get the softened clip distances it did not
+/// declare (a pixel shader need not declare `SV_ClipDistance` to be
+/// clipped by it).
+pub(super) fn soft_clip_inputs(inputs: &mut Vec<SigElement>, keep: &KeptOutputs) {
+    let mut rows: Vec<(u32, u8)> =
+        keep.iter().filter(|(k, _)| k.0 == CLIP_KEY).map(|(k, &mask)| (k.1, mask)).collect();
+    rows.sort_unstable();
+    for (r, mask) in rows {
+        let col = mask.trailing_zeros() as u8;
+        let index = 4 * r + u32::from(col);
+        if mask == 0 || inputs.iter().any(|e| e.name == CLIP_NAME && e.index == index) {
+            continue;
+        }
+        inputs.push(SigElement {
+            name: CLIP_NAME.to_string(),
+            index,
+            kind: 0,
+            comp: 9,
+            interp: 2,
+            row: Some(r),
+            col,
+            cols: 8 - mask.leading_zeros() as u8 - col,
+            usage: 0,
+            half: false,
+        });
+    }
+}
+
+/// Where an element stands among the clip then cull distances the position
+/// exports carry, softened clip distances with the others; `None` for
+/// other elements.
+pub(super) fn distance(e: &SigElement) -> Option<(u8, u32)> {
+    match e.kind {
+        6 => Some((0, e.index)),
+        7 => Some((1, e.index)),
+        0 if e.name == CLIP_NAME => Some((0, e.index)),
+        _ => None,
+    }
+}
+
+/// The offset after the rows of `slots`, those that move in `order`.
+fn laid_out(start: u32, slots: &[Option<Vec<u8>>], free: &[Vec<u8>], order: &[usize]) -> u32 {
+    let mut next = order.iter();
+    slots.iter().fold(start, |at, slot| {
+        let row = match slot {
+            Some(row) => Some(row),
+            None => next.next().and_then(|&i| free.get(i)),
+        };
+        row.map_or(at, |row| row.iter().fold(at, |at, &cols| mesh_size::after(at, cols)))
+    })
 }
 
 /// Declares each arbitrary element of a row [`plan_merge`] marked for it as
@@ -386,6 +492,43 @@ fn fitted_order(start: u32, slots: &[Option<Vec<u8>>], free: &[Vec<u8>]) -> Vec<
 }
 
 impl Lower<'_> {
+    /// Pixel: the discard that stands in for the clipper where the pair's
+    /// clip distances are an ordinary element ([`soften_clip`]): first
+    /// thing, a pixel with a negative distance is discarded.
+    ///
+    /// Not exact as the clipper is. The distances are the same and are
+    /// interpolated the same way, so the pixels kept are the clipper's but
+    /// for rounding where a distance passes zero; a multisampled target
+    /// loses a pixel whole where the clipper would cut through it; the
+    /// pixel shader runs for what the clipper would have removed; and the
+    /// depth test cannot be moved before the shader
+    /// ([`Lower::early_depth_flag`] leaves such a program alone).
+    pub(super) fn soft_clip(&mut self) {
+        if !self.s.pixel {
+            return;
+        }
+        let ids: Vec<usize> =
+            (0..self.s.inputs.len()).filter(|&i| self.s.inputs[i].kind == 0 && self.s.inputs[i].name == CLIP_NAME).collect();
+        let e = self.s.entry;
+        let (zero, f32t, i32t, void) = (self.s.m.f32(0), self.s.t.f32, self.s.t.i32, self.s.t.void);
+        let mut kill: Option<V> = None;
+        for id in ids {
+            for col in 0..self.s.inputs[id].cols {
+                self.s.inputs[id].usage |= 1 << col;
+                let args = [self.s.m.i32(id as u32), self.s.m.i32(0), self.s.m.i8(col), self.s.m.undef(i32t)];
+                let d = self.s.op(e, "loadInput.f32", Attr::ReadNone, f32t, 4, &args);
+                let out = self.s.m.cmp(e, pred::OLT, d, zero);
+                kill = Some(match kill {
+                    Some(k) => self.s.m.bin(e, Bin::Or, k, out),
+                    None => out,
+                });
+            }
+        }
+        if let Some(kill) = kill {
+            self.s.op(e, "discard", Attr::NoUnwind, void, 82, &[kill]);
+        }
+    }
+
     /// Mesh: the counts and the primitives no lane exports. The console's
     /// counts come from one lane's allocation request, which DXIL cannot
     /// express (one call, dominating every output write).
@@ -482,7 +625,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, false, false, false, false);
+        plan_merge(&mut keep, &outputs, false, false, false, false, false, None);
         let mut mesh = outputs.clone();
         merge_rows(&mut mesh, &keep);
         let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -508,7 +651,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, true, false, false, false, false);
+        plan_merge(&mut keep, &outputs, true, false, false, false, false, None);
         let mut wide = outputs.clone();
         merge_rows(&mut wide, &keep);
         assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
@@ -530,7 +673,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, true, false, false, false);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false, None);
         let finish = |mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>, u8)> {
             merge_rows(&mut els, &keep);
             renumber_rows(&mut els, &keep);
@@ -577,7 +720,7 @@ mod tests {
             els.iter().map(|e| (e.name.clone(), e.row)).collect()
         };
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, true, false, false);
+        plan_merge(&mut keep, &outputs, false, true, true, false, false, None);
         let mesh = shape(&keep, outputs.clone());
         let row = |name: &str, r: u32| (name.to_string(), Some(r));
         assert_eq!(
@@ -608,7 +751,7 @@ mod tests {
         assert_eq!(shape(&keep, pixel), mesh[1..]);
         // Level 3 leaves the clip distance at its register.
         let mut keep = reads();
-        plan_merge(&mut keep, &outputs, false, true, false, false, false);
+        plan_merge(&mut keep, &outputs, false, true, false, false, false, None);
         assert_eq!(shape(&keep, outputs.clone())[1], row("SV_ClipDistance", 1));
     }
 
@@ -630,7 +773,7 @@ mod tests {
             for e in outputs.iter().filter(|e| e.kind == 0) {
                 keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
             }
-            plan_merge(&mut keep, outputs, false, true, true, xyz_first, false);
+            plan_merge(&mut keep, outputs, false, true, true, xyz_first, false, None);
             keep
         };
         let shape = |keep: &KeptOutputs, mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>)> {
@@ -716,7 +859,7 @@ mod tests {
         };
         let plan = |seven: bool, level: u8| {
             let (outputs, mut keep) = ground_shape(seven);
-            plan_merge(&mut keep, &outputs, false, true, level >= 4, level == 5, level == 6);
+            plan_merge(&mut keep, &outputs, false, true, level >= 4, level == 5, level >= 6, (level == 7).then_some(256));
             let mesh = finish(&keep, outputs.clone());
             (outputs, keep, mesh)
         };
@@ -753,6 +896,57 @@ mod tests {
         assert_eq!(mesh_size::struct_bytes(&mesh), 260);
     }
 
+    /// Level 7 on the two ground shapes: the first fits at level 6 and is
+    /// made as there; the second gives up the clipper, its distances an
+    /// ordinary element in both stages (also in a pixel shader that did
+    /// not declare them), and is 244 bytes by the rule and by the probe.
+    #[test]
+    fn a_pair_still_over_gives_up_the_clipper() {
+        use crate::emit::mesh_probe_tests::line;
+        let made = |seven: bool, level: u8| {
+            let (outputs, mut keep) = ground_shape(seven);
+            plan_merge(&mut keep, &outputs, false, true, true, false, true, (level == 7).then_some(256));
+            let finish = |mut els: Vec<SigElement>, pixel: bool| {
+                prune_signature(&mut els, &keep);
+                merge_rows(&mut els, &keep);
+                if pixel {
+                    soft_clip_inputs(&mut els, &keep);
+                }
+                renumber_rows(&mut els, &keep);
+                els
+            };
+            let mesh = finish(outputs.clone(), false);
+            let pixel = finish(outputs[1..].iter().rev().cloned().collect(), true);
+            // A pixel shader that declares no clip distances.
+            let bare = finish(outputs[2..].to_vec(), true);
+            (mesh, pixel, bare)
+        };
+        let shape = |els: &[SigElement]| -> Vec<(String, u32, u8, Option<u32>, u8, u8)> {
+            let mut s: Vec<_> = els.iter().map(|e| (e.name.clone(), e.index, e.kind, e.row, e.col, e.cols)).collect();
+            s.sort();
+            s
+        };
+        let (mesh, ..) = made(false, 7);
+        assert_eq!(line(&mesh), FITTED);
+        assert!(mesh.iter().any(|e| e.kind == 6));
+        let (mesh, pixel, bare) = made(true, 7);
+        assert_eq!(line(&mesh), SOFT, "the signature the probe measured");
+        assert_eq!(mesh_size::struct_bytes(&mesh), 244);
+        assert!(!mesh.iter().any(|e| e.kind == 6));
+        let clip: Vec<&SigElement> = mesh.iter().filter(|e| e.name == CLIP_NAME).collect();
+        assert_eq!(clip.len(), 1);
+        assert_eq!((clip[0].index, clip[0].kind, clip[0].cols, clip[0].interp), (4, 0, 4, 2));
+        assert_eq!(distance(clip[0]), Some((0, 4)));
+        assert_eq!(shape(&pixel), shape(&mesh[1..]));
+        assert_eq!(shape(&bare), shape(&mesh[1..]));
+        // Level 6 keeps the clipper whatever the size.
+        assert!(made(true, 6).0.iter().any(|e| e.kind == 6));
+    }
+
+    /// The second ground shape as level 7 makes it.
+    const SOFT: &str =
+        "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f3@6 f3@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f4@14 f4@15 f2@16 f2@17 f1@17.3";
+
     /// The first ground shape as level 6 makes it, in the probe's notation.
     const FITTED: &str =
         "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f2@6 f2@7 f1@7.3 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 C4@17";
@@ -764,13 +958,7 @@ mod tests {
     /// left in their slots, and equal rows keep their order.
     #[test]
     fn the_fitted_order_is_the_smallest() {
-        let size = |start: u32, slots: &[Option<Vec<u8>>], free: &[Vec<u8>], order: &[usize]| {
-            let mut next = order.iter();
-            slots.iter().fold(start, |at, slot| {
-                let row = slot.as_ref().unwrap_or_else(|| &free[*next.next().expect("a row for each slot")]);
-                row.iter().fold(at, |at, &cols| mesh_size::after(at, cols))
-            })
-        };
+        let size = laid_out;
         // Every order of up to seven rows, by Heap's algorithm.
         fn orders(n: usize) -> Vec<Vec<usize>> {
             fn go(k: usize, a: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {

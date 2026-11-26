@@ -400,13 +400,39 @@ pub(crate) struct HostPipeline {
 
 /// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
 /// the DXIL each stage of a pipeline of the title's containers `stages`
-/// (stage and container) gets from this build with this run's switches,
-/// and whether it is one made for the pipeline alone. Not adapted to this
-/// line's pipelines yet: every stage is refused.
+/// (stage and container) gets from this build with this run's switches, as
+/// [`HostPipeline::new`] chooses it: the stage's own translation or, for a
+/// mesh pipeline over the output mark, the one made for the pair
+/// (`super::translate_linked`, with `VICTORY_MERGE_MESH_ROWS` as this run
+/// has it); and whether it is one made for the pipeline alone.
 pub(crate) fn retranslated(stages: &[(&'static str, &[u8])]) -> Vec<(Result<Vec<u8>, String>, bool)> {
-    stages
+    let shaders: Vec<Arc<Shader>> = stages
         .iter()
-        .map(|_| (Err("--retranslate is not adapted to this line's pipelines yet".to_owned()), false))
+        .map(|(stage, bytes)| super::shader(stage, bytes))
+        .collect();
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    // The same test and the same call as in `HostPipeline::new`.
+    let linked = find("mesh").filter(|_| super::link_mesh_outputs()).and_then(|ms| {
+        let bytes = victory_shader::emit::mesh_outputs(&ms.translated()?.host.dxil)?.bytes();
+        if bytes <= super::link_mesh_over() {
+            return None;
+        }
+        super::translate_linked(ms, find("pixel").map(Arc::as_ref))
+    });
+    shaders
+        .iter()
+        .map(|s| {
+            let alone = match (&linked, s.stage) {
+                (Some((ms, _)), "mesh") => Some(ms),
+                (Some((_, Some(ps))), "pixel") => Some(ps),
+                _ => None,
+            };
+            let dxil = alone.unwrap_or(s).translated().map(|t| t.host.dxil.clone());
+            (
+                dxil.ok_or_else(|| "it does not translate (the log says why)".to_owned()),
+                alone.is_some(),
+            )
+        })
         .collect()
 }
 

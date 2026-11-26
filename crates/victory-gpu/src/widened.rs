@@ -168,13 +168,17 @@ struct Group {
     kind: GroupKind,
 }
 
-/// Refreshes the widened views touched by writes before a buffer barrier.
-/// History is replayed for new views and views touched by this barrier, so a
-/// partial patch keeps widened-only bytes from earlier barriers.
+/// Refreshes the widened views touched by writes before a buffer barrier:
+/// `new`, the writes since the last one, after `history`, those of the
+/// list's earlier barriers (two slices, not one list made of both: in the
+/// world each barrier copied a history of ~90,000 writes and grew the copy,
+/// ~55 blocks of 2-4 MB a frame). History is replayed for new views and
+/// views touched by this barrier, so a partial patch keeps widened-only
+/// bytes from earlier barriers.
 pub(crate) fn sync(
     list: &HostList,
-    writes: &[(Arc<Shadow>, usize, usize)],
-    synced: usize,
+    history: &[(Arc<Shadow>, usize, usize)],
+    new: &[(Arc<Shadow>, usize, usize)],
     ready: &HashSet<usize>,
 ) -> Option<Vec<usize>> {
     let views = crate::shadow::widened_all();
@@ -191,8 +195,7 @@ pub(crate) fn sync(
     for view in &views {
         list.keep(&view.buffer);
     }
-    let synced = synced.min(writes.len());
-    let pending_keys: HashSet<_> = writes[synced..]
+    let pending_keys: HashSet<_> = new
         .iter()
         .flat_map(|(_, from, len)| {
             let to = from.saturating_add(*len);
@@ -210,19 +213,24 @@ pub(crate) fn sync(
         })
         .cloned()
         .collect();
+    // With no view to replay it to, the history makes no job.
+    let replayed = if history_views.is_empty() {
+        &[][..]
+    } else {
+        history
+    };
+    let writes = replayed
+        .iter()
+        .map(|write| (write, &history_views))
+        .chain(new.iter().map(|write| (write, &views)));
     let mut jobs = Vec::new();
-    for (index, (shadow, from, len)) in writes.iter().enumerate() {
+    for ((shadow, from, len), candidates) in writes {
         let to = from.saturating_add(*len);
         if *from >= to {
             continue;
         }
         let (start, size) = shadow.range();
         let end = start.saturating_add(size);
-        let candidates = if index < synced {
-            &history_views
-        } else {
-            &views
-        };
         for view in candidates {
             let Some((first, last)) = view.overlap(*from, to) else {
                 continue;

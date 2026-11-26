@@ -183,8 +183,34 @@ fn floor_share() -> f32 {
     *SET.get_or_init(|| set::floor(var("VICTORY_AMBIENT_FLOOR").as_deref()))
 }
 
+/// The probe: how many frame lines each of its steps lasts
+/// (`VICTORY_AMBIENT_PROBE`, `set::probe`; `None`: no probe).
+fn probe() -> Option<u32> {
+    static SET: OnceLock<Option<u32>> = OnceLock::new();
+    *SET.get_or_init(|| set::probe(var("VICTORY_AMBIENT_PROBE").as_deref()))
+}
+
+/// Frame lines logged so far: the probe's clock.
+static LINES: AtomicU64 = AtomicU64::new(0);
+
+/// The passes the probe leaves out now (bits of `set::NO_GATHER` and its
+/// siblings; 0 without the probe).
+fn left_out() -> u8 {
+    match probe() {
+        Some(each) => set::PROBE[set::probe_step(LINES.load(Ordering::Relaxed), each)].0,
+        None => 0,
+    }
+}
+
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
+    if let Some(each) = probe().filter(|_| on()) {
+        tracing::info!(
+            each,
+            "VICTORY_AMBIENT_PROBE: the estimate's passes are left out in turn, each step for this many \
+             frame lines; the estimate's line says which step the frame line above it was measured with"
+        );
+    }
     if let Some(share) = share() {
         tracing::info!(
             "{}",
@@ -411,12 +437,20 @@ impl Pass {
     /// An open list with the passes' view heap set (`Pass::table`).
     unsafe fn run(
         &self,
-        list: &ID3D12GraphicsCommandList,
+        host_list: &HostList,
+        name: &str,
         stage: &Stage,
         constants: &[u32; set::CONSTANTS],
         table: D3D12_GPU_DESCRIPTOR_HANDLE,
         groups: [u32; 3],
     ) {
+        // The pass is named among the list's pipelines (the slow
+        // submission line, the device-removed report), and noted as a
+        // command of its own in diagnostics builds.
+        host_list.bind_pipeline(&format!("[ambient estimate: {name}]"), &stage.pso, &stage.root);
+        #[cfg(feature = "diagnostics")]
+        host_list.note_op(|| format!("estimate [ambient estimate: {name}] {}x{}x{}", groups[0], groups[1], groups[2]));
+        let list = &host_list.list;
         // SAFETY: the caller's; buffers that live as the passes do.
         unsafe {
             list.SetComputeRootSignature(&stage.root);
@@ -453,8 +487,8 @@ impl Pass {
         // a shader-resource state.
         unsafe {
             let table = self.table(host, l, None, Some(radiance), sky);
-            self.run(l, &self.keep, &constants, table, [set::CX / 8, set::CY / 4, 1]);
-            self.run(l, &self.mean, &constants, table, [1, 1, 1]);
+            self.run(list, "keep", &self.keep, &constants, table, [set::CX / 8, set::CY / 4, 1]);
+            self.run(list, "mean", &self.mean, &constants, table, [1, 1, 1]);
         }
     }
 
@@ -481,11 +515,12 @@ impl Pass {
         // the states named.
         unsafe {
             let table = self.table(host, l, Some(light), depth, None);
-            if depth.is_some() {
-                self.run(l, &self.place, &constants, table, [set::CX / 8, set::CY / 4, 1]);
-                self.run(l, &self.gather, &constants, table, [set::PX / 8, set::PY / 2, 1]);
+            // (The probe may leave the gather out: the points stay.)
+            if depth.is_some() && left_out() & set::NO_GATHER == 0 {
+                self.run(list, "place", &self.place, &constants, table, [set::CX / 8, set::CY / 4, 1]);
+                self.run(list, "gather", &self.gather, &constants, table, [set::PX / 8, set::PY / 2, 1]);
             }
-            self.run(l, &self.raise, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
+            self.run(list, "raise", &self.raise, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
         }
     }
 }
@@ -506,7 +541,7 @@ impl Pass {
         unsafe {
             let table = self.table(host, l, Some(scattered), None, None);
             let groups = [size[0].div_ceil(8), size[1].div_ceil(8), scattered.slices.div_ceil(2)];
-            self.run(l, &self.air, &constants, table, groups);
+            self.run(list, "air", &self.air, &constants, table, groups);
         }
     }
 
@@ -524,7 +559,7 @@ impl Pass {
         // the unordered-access state.
         unsafe {
             let table = self.table(host, l, Some(image), None, None);
-            self.run(l, &self.hold, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
+            self.run(list, "hold", &self.hold, &constants, table, [size[0].div_ceil(8), size[1].div_ceil(8), 1]);
         }
     }
 }
@@ -564,14 +599,21 @@ pub(crate) fn log(frames: f64) {
         let (points, written, under) = set::over_the_picture(points, share, luminance);
         set::Seen { mean, floor, points, written, under }
     });
-    tracing::info!("{}", set::frame_line(share, floor_share(), seen, per_frame));
+    // The probe: the frames of the line above were recorded with the step
+    // that is on now; the next lines' with the next, if this one is over.
+    let step = probe().map(|each| set::probe_step(LINES.fetch_add(1, Ordering::Relaxed), each));
+    tracing::info!("{}", set::frame_line(share, floor_share(), seen, per_frame, step));
 }
 
 /// What the passes are given now.
 fn settings(share: f32) -> set::Pass {
+    let mut shade = shade();
+    if left_out() & set::NO_SHADE != 0 {
+        shade[0] = 0.0;
+    }
     set::Pass {
         level: share,
-        shade: shade(),
+        shade,
         follow: set::FOLLOW,
         most: left(),
         size: [0, 0],
@@ -597,6 +639,9 @@ pub(crate) fn keep(list: &HostList, radiance: This) -> bool {
     let (Some(share), Some(host)) = (share(), host()) else {
         return false;
     };
+    if left_out() & set::NO_KEEP != 0 {
+        return false;
+    }
     let Some(copy) = crate::resource::host_copy(radiance) else {
         return false;
     };
@@ -697,7 +742,7 @@ pub(crate) fn raise(list: &HostList, light: This, depth: Option<This>) -> bool {
         return false;
     };
     // Nothing kept yet: the title's own output for a frame.
-    if !KEPT.load(Ordering::Relaxed) {
+    if !KEPT.load(Ordering::Relaxed) || left_out() & set::NO_RAISE != 0 {
         return false;
     }
     let Some(light) = crate::resource::host_copy(light) else {
@@ -819,7 +864,7 @@ pub(crate) fn hold(list: &HostList, image: This) -> bool {
         return false;
     };
     // The points' light is of the last raising: none before one.
-    if reflect_part() <= 0.0 || RAISED.load(Ordering::Relaxed) == 0 {
+    if reflect_part() <= 0.0 || RAISED.load(Ordering::Relaxed) == 0 || left_out() & set::NO_HOLD != 0 {
         return false;
     }
     let Some(copy) = crate::resource::host_copy(image) else {
@@ -1355,6 +1400,85 @@ mod tests {
             }
         }
         assert!(held > 0 && kept > 0, "{held} held, {kept} kept");
+    }
+
+    /// What each pass costs on this GPU at the title's sizes (the light
+    /// image 2560x1440, the radiance image 1280x720), each alone in lists
+    /// of its own, eight to a list, on a dark and on a bright picture.
+    /// Prints the milliseconds; run by name with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement: run by name"]
+    fn the_passes_cost() {
+        let Some(host) = host() else {
+            return;
+        };
+        let pass = make(host).expect("the passes");
+        const SIZE: [u32; 2] = [2560, 1440];
+        const HALF: [u32; 2] = [1280, 720];
+        const EACH: u32 = 8;
+        let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        let depth_at = |_: u32, y: u32| {
+            let down = ((y as f32 + 0.5) / SIZE[1] as f32 * 2.0 - 1.0) * 0.45;
+            (0.1 / if down > 0.0 { (0.6 / down).min(3.0) } else { 3.0 }).to_bits()
+        };
+        let texels = |size: [u32; 2], at: &dyn Fn(u32, u32) -> u32| -> Vec<u32> {
+            (0..size[0] * size[1]).map(|i| at(i % size[0], i / size[0])).collect()
+        };
+        let mut keep = Vec::new();
+        let setup = host.new_list().unwrap();
+        let depth = texture(host, &setup.list, DXGI_FORMAT_R32_FLOAT, SIZE, &texels(SIZE, &depth_at), read, &mut keep);
+        let light = texture(host, &setup.list, DXGI_FORMAT_R32_UINT, SIZE, &texels(SIZE, &|_, _| 0), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mut keep);
+        let dark = texture(host, &setup.list, DXGI_FORMAT_R11G11B10_FLOAT, HALF, &texels(HALF, &|_, _| r11g11b10([0.001953125; 3])), read, &mut keep);
+        let bright = texture(host, &setup.list, DXGI_FORMAT_R11G11B10_FLOAT, HALF, &texels(HALF, &|x, y| r11g11b10(radiance_at(x % 128, y % 72))), read, &mut keep);
+        setup.close();
+        host.execute(&[&setup]);
+        let light = Image { image: &light, format: DXGI_FORMAT_R32_UINT, slices: 0 };
+        let depth = Image { image: &depth, format: DXGI_FORMAT_R32_FLOAT, slices: 0 };
+        // The milliseconds one recording of `record` takes, `EACH` to a list.
+        let time = |record: &dyn Fn(&HostList)| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let list = host.new_list().unwrap();
+                for _ in 0..EACH {
+                    record(&list);
+                }
+                list.close();
+                let started = std::time::Instant::now();
+                host.execute(&[&list]);
+                best = best.min(started.elapsed().as_secs_f64() * 1e3 / f64::from(EACH));
+            }
+            best
+        };
+        let empty = time(&|_| {});
+        let constants = |given: &set::Pass| set::constants(&set::Pass { size: SIZE, ..*given });
+        let unshaded = set::Pass { shade: [0.0, 0.6, 0.1, 0.45], ..BASE };
+        for (name, radiance) in [("dark", &dark), ("bright", &bright)] {
+            let radiance = Image { image: radiance, format: DXGI_FORMAT_R11G11B10_FLOAT, slices: 0 };
+            let keeping = time(&|list| pass.keep(host, list, radiance, HALF, None, &BASE));
+            // SAFETY (the three below): an open list; live textures in the
+            // states the passes need.
+            let placing = time(&|list| unsafe {
+                let table = pass.table(host, &list.list, None, Some(depth), None);
+                pass.run(list, "place", &pass.place, &constants(&BASE), table, [set::CX / 8, set::CY / 4, 1]);
+            });
+            let gathering = time(&|list| unsafe {
+                let table = pass.table(host, &list.list, None, Some(depth), None);
+                pass.run(list, "gather", &pass.gather, &constants(&BASE), table, [set::PX / 8, set::PY / 2, 1]);
+            });
+            let raise = |given: set::Pass| {
+                time(&|list| unsafe {
+                    let table = pass.table(host, &list.list, Some(light), Some(depth), None);
+                    pass.run(list, "raise", &pass.raise, &constants(&given), table, [SIZE[0] / 8, SIZE[1] / 8, 1]);
+                })
+            };
+            let (shaded, plain) = (raise(BASE), raise(unshaded));
+            let holding = time(&|list| pass.hold(host, list, light, SIZE, &BASE));
+            println!(
+                "ambient estimate cost, {name} picture, ms a recording (an empty list: {empty:.2}): keep and mean \
+                 {keeping:.2}, place {placing:.2}, gather {gathering:.2}, raise {shaded:.2} (without the creases' \
+                 shade {plain:.2}), hold {holding:.2}"
+            );
+        }
     }
 
     /// Two packed lights within a fiftieth of the brighter one's top part

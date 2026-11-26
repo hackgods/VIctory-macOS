@@ -69,6 +69,41 @@ pub(crate) fn mix(value: Option<&str>) -> [f32; 4] {
     mix
 }
 
+/// The parts of the estimate the probe leaves out in turn
+/// (`VICTORY_AMBIENT_PROBE`), by step: bits of what is not recorded, and
+/// what the frame line calls the step.
+pub(crate) const NO_GATHER: u8 = 1;
+pub(crate) const NO_SHADE: u8 = 2;
+pub(crate) const NO_HOLD: u8 = 4;
+pub(crate) const NO_KEEP: u8 = 8;
+pub(crate) const NO_RAISE: u8 = 16;
+pub(crate) const PROBE: [(u8, &str); 7] = [
+    (0, "nothing"),
+    (NO_GATHER, "the gather (the cells' places and the points' light: the points stay as they were)"),
+    (NO_SHADE, "the creases' shade"),
+    (NO_HOLD, "the reflections' hold"),
+    (NO_KEEP, "the keeping (the cells and the slow mean stay as they were)"),
+    (NO_RAISE, "the raising with its gather (the title's own light image stays)"),
+    (NO_GATHER | NO_HOLD | NO_KEEP | NO_RAISE, "every pass"),
+];
+
+/// `VICTORY_AMBIENT_PROBE=<n>`: how many frame lines each step of the probe
+/// lasts (a whole number above 0; unset, 0 or unreadable: no probe).
+///
+/// To find which of the estimate's passes costs GPU time in a scene, in one
+/// run of a normal build: the passes are left out in turn ([`PROBE`]), each
+/// step for `n` frame lines, and the estimate's own line says which step
+/// the frame line above it was measured with. The picture changes with the
+/// steps: a diagnostic, not a way to play.
+pub(crate) fn probe(value: Option<&str>) -> Option<u32> {
+    value.and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0)
+}
+
+/// The probe's step after `lines` frame lines, each step lasting `each`.
+pub(crate) fn probe_step(lines: u64, each: u32) -> usize {
+    (lines / u64::from(each.max(1)) % PROBE.len() as u64) as usize
+}
+
 /// What `VICTORY_AMBIENT_FLOOR` is when unset.
 pub(crate) const FLOOR: f32 = 0.3;
 
@@ -721,8 +756,22 @@ pub(crate) fn over_the_picture(points: impl Iterator<Item = [f32; 3]>, share: f3
 /// The line logged with the frame line: the slow mean of the light around,
 /// the floor and the points' luminance (`seen`; `None`: nothing kept yet),
 /// and the keepings and raisings recorded a frame.
-pub(crate) fn frame_line(share: f32, floor: f32, seen: Option<Seen>, per_frame: [f64; 4]) -> String {
+pub(crate) fn frame_line(
+    share: f32,
+    floor: f32,
+    seen: Option<Seen>,
+    per_frame: [f64; 4],
+    probe: Option<usize>,
+) -> String {
     let [keeps, raises, airs, holds] = per_frame;
+    let probe = match probe {
+        Some(step) => format!(
+            "; probe (VICTORY_AMBIENT_PROBE) step {step} of {}: these frames were recorded without {}",
+            PROBE.len(),
+            PROBE[step % PROBE.len()].1
+        ),
+        None => String::new(),
+    };
     let what = match seen {
         Some(Seen { mean: [r, g, b], floor: least_light, points: [mean, least, most], written, under }) => format!(
             "the light around (slow mean) is {r:.4} {g:.4} {b:.4}, luminance {:.4}; the picture's \
@@ -741,7 +790,7 @@ pub(crate) fn frame_line(share: f32, floor: f32, seen: Option<Seen>, per_frame: 
     };
     format!(
         "ambient estimate (VICTORY_AMBIENT=estimate): {what}; {keeps:.1} keepings, {raises:.1} \
-         raisings, {holds:.1} holds of reflections and {airs:.1} bounds of the air/frame"
+         raisings, {holds:.1} holds of reflections and {airs:.1} bounds of the air/frame{probe}"
     )
 }
 
@@ -1162,6 +1211,26 @@ mod tests {
         assert_eq!(mix(Some("3,-1,5,nan")), [1.0, 1.2, 5.0, 5.0]);
     }
 
+    /// The probe leaves the passes out in turn, each step for as many frame
+    /// lines as it is told, and starts with nothing left out.
+    #[test]
+    fn the_probe_leaves_parts_out_in_turn() {
+        for off in [None, Some(""), Some("0"), Some("x"), Some("-2"), Some("1.5")] {
+            assert_eq!(probe(off), None, "{off:?}");
+        }
+        assert_eq!(probe(Some(" 2 ")), Some(2));
+        let steps: Vec<usize> = (0..16).map(|lines| probe_step(lines, 2)).collect();
+        assert_eq!(steps, [0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 0, 0]);
+        assert_eq!(probe_step(9, 0), 2);
+        assert_eq!(PROBE[0].0, 0);
+        // Each part is left out alone once, and the last step leaves out
+        // every pass that is recorded.
+        for part in [NO_GATHER, NO_SHADE, NO_HOLD, NO_KEEP, NO_RAISE] {
+            assert_eq!(PROBE.iter().filter(|(out, _)| *out == part).count(), 1, "{part}");
+        }
+        assert_eq!(PROBE[6].0 & (NO_KEEP | NO_RAISE | NO_HOLD), NO_KEEP | NO_RAISE | NO_HOLD);
+    }
+
     /// The floor: a share of the constant stand-in's light, by default 0.3,
     /// its sky part cut to the share and the least level whole.
     #[test]
@@ -1384,13 +1453,16 @@ mod tests {
     #[test]
     fn the_frame_line_says_what_the_estimate_is() {
         let seen = Seen { mean: [0.2, 0.1, 0.05], floor: [0.25; 3], points: [0.3, 0.01, 2.0], written: 0.31, under: 0.6 };
-        let line = frame_line(0.5, 0.3, Some(seen), [1.0, 2.0, 0.0, 1.0]);
+        let line = frame_line(0.5, 0.3, Some(seen), [1.0, 2.0, 0.0, 1.0], None);
         assert!(line.starts_with("ambient estimate (VICTORY_AMBIENT=estimate): the light around (slow mean) is 0.2000 0.1000 0.0500, luminance 0.1177;"), "{line}");
         assert!(line.contains("160x90 points hold a luminance of 0.3000 on average (least 0.0100, most 2.0000)"), "{line}");
         assert!(line.contains("the floor (VICTORY_AMBIENT_FLOOR=0.3) is 0.2500, and 60% of the points are under it; texels are written about 0.3100 (the share 0.5 of the estimate, or the floor;"), "{line}");
         assert!(line.ends_with("; 1.0 keepings, 2.0 raisings, 1.0 holds of reflections and 0.0 bounds of the air/frame"), "{line}");
-        let line = frame_line(1.0, 0.3, None, [0.0; 4]);
+        let line = frame_line(1.0, 0.3, None, [0.0; 4], None);
         assert!(line.contains("nothing kept yet: no dispatch of CS_CacheScreenSpaceRadiance seen"), "{line}");
+        // With the probe, the line says what the frames above it lacked.
+        let line = frame_line(0.5, 0.3, Some(seen), [1.0, 0.0, 0.0, 1.0], Some(5));
+        assert!(line.ends_with("bounds of the air/frame; probe (VICTORY_AMBIENT_PROBE) step 5 of 7: these frames were recorded without the raising with its gather (the title's own light image stays)"), "{line}");
         // The points' luminance: mean, least and most, without what is no
         // number; what is written is the share of each or the floor.
         let points = [[1.0f32; 3], [3.0; 3], [f32::NAN, 0.0, 0.0], [2.0; 3]];

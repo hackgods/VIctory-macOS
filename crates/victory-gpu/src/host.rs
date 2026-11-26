@@ -1628,9 +1628,19 @@ impl Host {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .len();
+                // macOS port: GPU timestamps read 0 under D3DMetal, so the list's own
+                // pipelines are the only way to tell which work a slow list did.
+                let pipelines: std::collections::BTreeSet<String> = runs[i]
+                    .pipelines
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone()
+                    .into_iter()
+                    .collect();
                 tracing::warn!(
                     ms = started.elapsed().as_millis(),
                     commands,
+                    ?pipelines,
                     "slow host list"
                 );
                 match runs[i].slowest(frequency, 6) {

@@ -13,6 +13,10 @@
 //! - two rectangles of the colour target cleared through an unordered-access
 //!   view of it, one in the first submission and one in the last (as the
 //!   host layer clears for a title's `ClearUnorderedAccessView`);
+//! - four more draws by arguments the host layer clamps
+//!   (`crate::indirect`): three in the list before theirs, two of those in
+//!   one batch and one alone (as it records the clamps of a title's runs of
+//!   indirect draws with `VICTORY_BATCH_CLAMPS=1`), and one in place;
 //! - a buffer the CPU writes anew before every submission, read by a
 //!   compute pass that writes another, which the draws read;
 //! - a view slot whose view is replaced between two submissions, and one
@@ -23,8 +27,10 @@
 //!   layers, volumes), filled once: what a capture must take of the GPU's
 //!   memory, and a replay put back, whatever the host makes of each.
 //!
-//! Every frame is the same, so what any frame leaves is what a replay of
-//! one of them must leave.
+//! Every frame is the same but for the vertices of the draws by arguments
+//! (three in every fifth frame, six in the others), so what a frame leaves
+//! is what a replay of one like it must leave, and arguments left from the
+//! frame before are not the frame's own.
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
@@ -189,12 +195,14 @@ struct Program {
 
 /// How a rectangle is drawn.
 #[derive(Clone, Copy)]
-enum How {
+enum How<'a> {
     Plain,
     /// With indices from the inputs' buffer.
     Indexed,
     /// With its arguments from the inputs' buffer.
     Indirect,
+    /// With its arguments from where the host layer's clamp put them.
+    Clamped(&'a ID3D12Resource, u64),
 }
 
 /// The slot of `views` with the colour target's unordered-access view.
@@ -881,21 +889,26 @@ impl Program {
     }
 
     /// What the CPU writes before a submission.
-    fn write_inputs(&self, round: u32) {
+    fn write_inputs(&self, round: u32, number: u64) {
         for i in 0..WORDS {
             let v = (i as u32 * 7 + 1) * (round + 1) + round * 1000;
             // SAFETY: inside the buffer's mapping; no list in flight reads
             // it (every submission was waited for).
             unsafe { self.inputs.1.cast::<u32>().add(i).write(v) };
         }
-        // A draw's arguments (six vertices, one instance) and six indices.
+        // A draw's arguments (six vertices and one instance; three in
+        // every fifth frame, so that arguments left from the frame before
+        // are not this frame's: tests/replay.rs records such a frame, the
+        // ninth, and ends with another, as it compares with the last
+        // frame's picture) and six indices.
+        let vertices = if number % 5 == 4 { 3 } else { 6 };
         // SAFETY: as above.
         unsafe {
             self.inputs
                 .1
                 .add(ARGUMENTS)
                 .cast::<[u32; 4]>()
-                .write([6, 1, 0, 0]);
+                .write([vertices, 1, 0, 0]);
             self.inputs
                 .1
                 .add(INDICES)
@@ -935,7 +948,7 @@ impl Program {
         tint: [f32; 4],
         depth: f32,
         slot: usize,
-        how: How,
+        how: How<'_>,
     ) {
         let Some(host) = host() else { return };
         let (rtv, dsv) = (host.rtv(&self.target, None), host.dsv(&self.depth, None));
@@ -982,8 +995,20 @@ impl Program {
                     None::<&ID3D12Resource>,
                     0,
                 ),
+                How::Clamped(arguments, at) => {
+                    l.ExecuteIndirect(&self.signature, 1, arguments, at, None::<&ID3D12Resource>, 0)
+                }
             }
         }
+    }
+
+    /// Where the inputs' buffer holds the draw's arguments, for the host
+    /// layer's clamp: the buffer's start and the address, and a plain draw
+    /// of one record.
+    fn arguments(&self) -> ((u64, u64), (u32, u32, u32)) {
+        // SAFETY: a plain query on a live buffer.
+        let base = unsafe { self.inputs.0.GetGPUVirtualAddress() };
+        ((base, base + ARGUMENTS as u64), (0, 16, 1))
     }
 
     /// Records a clear of the rectangle `rect` of the colour target to
@@ -1017,7 +1042,7 @@ impl Program {
         let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
         // The first submission: clears, a pass, a rectangle of the first
         // texture.
-        self.write_inputs(0);
+        self.write_inputs(0, number);
         self.view(2, &self.first);
         self.no_view(3);
         a.reset();
@@ -1049,24 +1074,48 @@ impl Program {
         a.close();
         host.execute(&[a]);
         // The second: other inputs, a view where there was none; two lists.
-        self.write_inputs(1);
+        self.write_inputs(1, number);
         self.view(3, &self.second);
         b.reset();
         self.pass(&b.list, 9);
-        b.close();
         c.reset();
+        // Three draws by arguments the host layer clamps in the list before
+        // their own, as it does for a title's runs of them: two in one
+        // batch, then one alone.
+        let (at, spec) = self.arguments();
+        let hoisted: Vec<(ID3D12Resource, u64)> = [true, true, false]
+            .into_iter()
+            .filter_map(|batched| crate::indirect::bound_before_as(b, c, at, spec, None, batched))
+            .collect();
+        c.clamp_end(b);
+        b.close();
         let pink = [1.0, 0.6, 0.8, 1.0];
         self.rectangle(&c.list, [-0.3, -0.5, 1.1, 1.0], pink, 0.4, 3, How::Indexed);
+        let places = [
+            ([-0.95, 0.3, 0.5, 0.6], [0.5, 0.7, 1.0, 1.0], 0.3),
+            ([0.45, -0.95, 0.5, 0.4], [1.0, 0.6, 0.2, 1.0], 0.35),
+            ([-0.2, 0.55, 0.4, 0.4], [0.8, 0.5, 1.0, 1.0], 0.25),
+        ];
+        for ((arguments, at), (place, tint, depth)) in hoisted.iter().zip(places) {
+            self.rectangle(&c.list, place, tint, depth, 3, How::Clamped(arguments, *at));
+        }
         c.close();
         host.execute(&[b, c]);
         // The third: the view the first one drew with replaced, a
         // rectangle between the two, and the picture copied out.
-        self.write_inputs(2);
+        self.write_inputs(2, number);
         self.view(2, &self.second);
         d.reset();
         self.pass(&d.list, 1);
         let green = [0.7, 1.0, 0.5, 1.0];
         self.rectangle(&d.list, [-0.6, -0.2, 1.5, 0.9], green, 0.5, 2, How::Indirect);
+        // And one the host layer clamps in place, just before it.
+        let (at, spec) = self.arguments();
+        if let Some(arguments) = crate::indirect::bound(d, at.1, spec, None) {
+            let yellow = [1.0, 0.9, 0.3, 1.0];
+            self.rectangle(&d.list, [0.2, 0.4, 0.7, 0.5], yellow, 0.2, 2, How::Clamped(&arguments, 0));
+            crate::indirect::done(d, &arguments);
+        }
         // A corner cleared the same way over everything drawn, part of it
         // over the strip.
         let corner = RECT {

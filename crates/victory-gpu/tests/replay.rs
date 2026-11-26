@@ -115,12 +115,23 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
         ("in pieces", Options { detail: Detail::Pieces, loops: 2, ..Default::default() }),
         ("stamps", Options { detail: Detail::Stamps, loops: 2, ..Default::default() }),
         ("paced", Options { pace: 2.0, loops: 2, ..Default::default() }),
+        // Without the host layer's clamps that run one by one (the one in
+        // place and the one in the list before its call's), their calls
+        // reading the arguments kept from a run with them; the batch of
+        // two stays. And the frame after it.
+        ("without clamps", Options { keep_clamps: true, loops: 2, ..Default::default() }),
+        ("after it", Options { loops: 2, ..Default::default() }),
     ] {
         let report = player.run(&o).unwrap();
         println!("{}", report.text(what));
         assert_eq!(report.picture, Some((f64::INFINITY, true)), "{what}");
         assert!(picture(&mut player) == made.picture, "{what}");
         assert_eq!(results(&mut player), made.results, "{what}");
+        if o.keep_clamps {
+            for starts in ["2 argument clamps were left out", "batches of clamps"] {
+                assert!(report.notes.iter().any(|n| n.starts_with(starts)), "{starts}: {:?}", report.notes);
+            }
+        }
         if o.detail != Detail::Off {
             let kinds: Vec<&str> = report.categories.iter().map(|c| c.0.as_str()).collect();
             for kind in ["draws", "indirect draws", "dispatches", "clears"] {
@@ -151,7 +162,8 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     let report = player.run(&skipped).unwrap();
     println!("{}", report.text("without the draws"));
     assert!(report.picture.is_some_and(|p| !p.1));
-    assert!(report.notes.iter().any(|n| n == "--skip-shader left out 3 commands"), "{:?}", report.notes);
+    // Three draws, and the four by arguments the host layer clamps.
+    assert!(report.notes.iter().any(|n| n == "--skip-shader left out 7 commands"), "{:?}", report.notes);
     let cleared = picture(&mut player);
     let colours: std::collections::HashSet<&[u8]> = cleared.chunks(4).collect();
     assert_eq!(colours.len(), 3, "the three clears' colours");
@@ -198,5 +210,6 @@ fn a_frame_recorded_through_the_host_layer_is_replayed() {
     )
     .unwrap();
     assert_eq!(with[0].1.picture, Some((f64::INFINITY, true)));
-    assert!(with[0].1.notes.iter().any(|n| n.starts_with("0 of 2 pipelines made with shaders of")), "{:?}", with[0].1.notes);
+    // The frame's draws and its pass, the host layer's clamp and its batch.
+    assert!(with[0].1.notes.iter().any(|n| n.starts_with("0 of 4 pipelines made with shaders of")), "{:?}", with[0].1.notes);
 }

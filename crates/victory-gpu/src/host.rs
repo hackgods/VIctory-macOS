@@ -57,6 +57,8 @@ impl Drop for Holding {
     }
 }
 
+pub(crate) mod unwaited;
+
 /// What the end of a submission ([`Host::finish`]) needs from its start:
 /// how long the host GPU was waited for, the list the device was removed
 /// in (when lists run one by one), what its refreshes and heaps hold until
@@ -1467,14 +1469,26 @@ impl Host {
             return None;
         }
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // A submission the host GPU was not waited for has run too.
+        self.stand();
         Some(Quiet { _holding: Holding::enter(), _held: held })
     }
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
+        self.run(runs, None);
+    }
+
+    /// [`Host::execute`]. `title`: the lists are the title's own, held so,
+    /// and may be left to the host GPU without waiting for it
+    /// ([`unwaited`]): whether they were.
+    fn run(&self, runs: &[&HostList], title: Option<&[std::sync::Arc<HostList>]>) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        // The one before, if the host GPU was not waited for, is finished
+        // first.
+        let by = if title.is_some() { unwaited::By::Next } else { unwaited::By::Ours };
+        let mut submitted = self.submissions(by);
         let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1590,6 +1604,16 @@ impl Host {
         let groups = [&lists[..]];
         let mut removed_in = None;
         let mark = self.mark();
+        // The title's own lists, as one group: given to the host GPU and
+        // left there, to be finished when something waits for them.
+        if let Some(title) = title
+            && unwaited::may(groups.len(), traced)
+        {
+            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            let ran = Ran { gpu: Duration::ZERO, removed_in, batch, heaps, traced };
+            self.leave(&mut submitted, groups[0], mark, title, ran);
+            return true;
+        }
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -1688,12 +1712,14 @@ impl Host {
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         self.finish(Some(submitted), runs, Ran { gpu, removed_in, batch, heaps, traced });
+        false
     }
 
     /// After a submission has run: the device is checked, what its shaders
     /// wrote goes back into title memory, then its lists' work for after
     /// and their bottom-of-pipe writes. `submitted`: the submission lock,
-    /// given up before a listed frame's dumps (diagnostics), if given.
+    /// given up before a listed frame's dumps (diagnostics); none for a
+    /// submission finished later ([`unwaited`]), whose finisher keeps it.
     fn finish(&self, submitted: Option<std::sync::MutexGuard<'_, u64>>, runs: &[&HostList], ran: Ran) {
         let Ran { gpu, removed_in, batch, heaps, traced } = ran;
         // The host resets a device whose submission runs for about 2 s.
@@ -3527,6 +3553,7 @@ impl Meter {
                  max records {records:.0}/frame ({counted:.0} under a count)",
                 making = crate::pipeline::making()
             );
+            unwaited::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

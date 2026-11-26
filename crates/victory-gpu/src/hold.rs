@@ -117,6 +117,12 @@ pub(crate) struct World<'a, S> {
     pub(crate) run: &'a mut dyn FnMut(usize, Vec<S>),
     /// Signals a fence.
     pub(crate) signal: &'a mut dyn FnMut(usize, u64),
+    /// Finishes what `run` left unfinished (a piece given to the host GPU
+    /// and not waited for still owes its bottom-of-pipe writes), which may
+    /// be what a segment's waits are for: whether anything was finished
+    /// since they were tested. Always `false` where `run` runs every piece
+    /// to completion.
+    pub(crate) owed: &'a mut dyn FnMut(&[ValueWait]) -> bool,
 }
 
 impl<S> Held<S> {
@@ -148,6 +154,12 @@ impl<S> Held<S> {
                                     Some(false) => ok = false,
                                     None => done.unknown += 1,
                                 }
+                            }
+                            // What they wait for may be owed by a piece not
+                            // waited for: that is finished first, and they
+                            // are looked at again.
+                            if !ok && (w.owed)(waits.as_slice()) {
+                                ok = waits.iter().all(|wait| wait.holds(w.read) != Some(false));
                             }
                             if !ok {
                                 *fresh = false;
@@ -257,6 +269,9 @@ mod tests {
         log: Vec<String>,
         /// Bottom-of-pipe writes of each segment: (address, value).
         writes: HashMap<&'static str, Vec<(u64, u64)>>,
+        /// Pieces are not waited for: their writes are owed until finished.
+        unwaited: bool,
+        owed: Vec<(u64, u64)>,
     }
 
     fn ge(address: u64, reference: u64) -> ValueWait {
@@ -270,17 +285,32 @@ mod tests {
             let mut f = fake.borrow_mut();
             for s in &segments {
                 for (a, v) in f.writes.get(s).cloned().unwrap_or_default() {
-                    f.memory.insert(a, v);
+                    if f.unwaited {
+                        f.owed.push((a, v));
+                    } else {
+                        f.memory.insert(a, v);
+                    }
                 }
             }
             f.log.push(format!("q{q}: {}", segments.join(" ")));
+        };
+        let mut owed = |_: &[ValueWait]| {
+            let mut f = fake.borrow_mut();
+            let owed = std::mem::take(&mut f.owed);
+            for &(a, v) in &owed {
+                f.memory.insert(a, v);
+            }
+            if !owed.is_empty() {
+                f.log.push("finished".into());
+            }
+            !owed.is_empty()
         };
         let mut signal = |fence: usize, value: u64| {
             let mut f = fake.borrow_mut();
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed })
     }
 
     #[test]
@@ -315,6 +345,42 @@ mod tests {
         assert_eq!((p.pieces, p.segments, p.waited.len()), (2, 2, 1));
         assert_eq!(p.waited[0].0, 2);
         assert!(!held.holds_work(2));
+    }
+
+    /// The graphics piece was not waited for, so its write is still owed
+    /// when the compute queue's wait is tested: it is finished first, and
+    /// the compute list runs in the same pump without counting as held.
+    #[test]
+    fn a_wait_for_what_an_unwaited_piece_owes_finishes_it_first() {
+        let fake = RefCell::new(Fake { unwaited: true, ..Fake::default() });
+        fake.borrow_mut().writes.insert("draw", vec![(0x100, 7)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("draw", vec![]));
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished", "q2: depth"]);
+        assert_eq!((p.pieces, p.segments, p.waited.len()), (2, 2, 0));
+        assert!(held.is_empty());
+    }
+
+    /// Nothing is owed that could meet the wait: the list is held as
+    /// before, and runs (counted as having waited) once the value is there.
+    #[test]
+    fn a_wait_nothing_owed_meets_holds_its_queue() {
+        let fake = RefCell::new(Fake { unwaited: true, ..Fake::default() });
+        fake.borrow_mut().writes.insert("draw", vec![(0x200, 1)]);
+        let mut held = Held::default();
+        held.push(1, Item::Segment("draw", vec![]));
+        held.push(2, Item::Segment("depth", vec![ge(0x100, 7)]));
+        let p = pump(&mut held, &fake);
+        // The piece's write was finished for the test, and did not meet it.
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished"]);
+        assert_eq!((p.pieces, p.segments), (1, 1));
+        assert!(held.holds_work(2));
+        fake.borrow_mut().memory.insert(0x100, 7);
+        let p = pump(&mut held, &fake);
+        assert_eq!(fake.borrow().log, ["q1: draw", "finished", "q2: depth"]);
+        assert_eq!(p.waited.len(), 1);
     }
 
     #[test]

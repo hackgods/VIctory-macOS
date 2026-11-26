@@ -151,6 +151,8 @@ pub(crate) enum Why {
 
 #[cfg(windows)]
 use crate::hold::Item;
+#[cfg(windows)]
+use crate::host::unwaited;
 
 /// Every queue's held work.
 #[cfg(windows)]
@@ -203,25 +205,45 @@ fn pump(held: &mut Holding, why: Why) {
     }
     let fence = |f: usize| crate::fence::value(f as This);
     let started = std::time::Instant::now();
-    let mut ran = std::time::Duration::ZERO;
+    // In host submissions, and waiting for one the host GPU was left with
+    // (`crate::host::unwaited`).
+    let ran = std::cell::Cell::new(std::time::Duration::ZERO);
     let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
         let at = std::time::Instant::now();
-        host.execute(&lists);
-        ran += at.elapsed();
-        drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+        // The lists that have run: these, unless the host GPU was left
+        // with them (then they come back with a later piece).
+        let done = host.execute_title(segments);
+        ran.set(ran.get() + at.elapsed());
+        done.into_iter().for_each(crate::list::recycle);
     };
+    // The title's fence moves once the work before the Signal has run.
     let mut signal = |f: usize, value: u64| {
+        let at = std::time::Instant::now();
+        if unwaited::settle(unwaited::By::Signal) {
+            ran.set(ran.get() + at.elapsed());
+        }
         crate::fence::set(f as This, value);
         crate::fence::let_go(f as This);
+    };
+    // A wait may be for a bottom-of-pipe write of a submission the host
+    // GPU was left with: that one is finished before a head is held.
+    let mut seen = unwaited::finished();
+    let mut owed = |_: &[crate::hold::ValueWait]| {
+        let at = std::time::Instant::now();
+        let finished = unwaited::settle_since(unwaited::By::Wait, &mut seen);
+        if finished {
+            ran.set(ran.get() + at.elapsed());
+        }
+        finished
     };
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
         run: &mut run,
         signal: &mut signal,
+        owed: &mut owed,
     });
+    let ran = ran.get();
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
         a.pump += started.elapsed().saturating_sub(ran);
@@ -382,6 +404,8 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
         } else {
+            // Work the host GPU was left with has run first.
+            unwaited::settle(unwaited::By::Signal);
             crate::fence::set(fence, value);
         }
         // Another queue may wait for this fence.
@@ -618,6 +642,9 @@ extern "system" fn present(
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
     pump_held(Why::Present);
+    // What ran is finished, before the picture and its state are looked at.
+    #[cfg(windows)]
+    unwaited::settle(unwaited::By::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     #[cfg(windows)]
     account_frame(frame);
@@ -803,6 +830,10 @@ extern "system" fn copy_page_mappings(
     if held().holds_work(this as usize) {
         account().mappings += 1;
     }
+    // The queue's work before it has run: what it owes title memory goes
+    // where the pages still are.
+    #[cfg(windows)]
+    unwaited::settle(unwaited::By::Mapping);
     #[cfg(not(windows))]
     let _ = this;
     let batches = (count > 0).then(|| {

@@ -10,9 +10,44 @@
 # build with the diagnostics feature (the one a recording run uses). The
 # VICTORY_* switches of the translator are passed on (for --retranslate).
 # The GPU is shared: do not run this while a title runs.
+#
+# In a checkout that has ../shared/wine-cx beside it (several checkouts with
+# one Wine and one title run at a time, started by ../shared/run-game.sh):
+# WINE defaults to that Wine, WINEPREFIX to ../state/<checkout>/wineprefix-replay
+# (outside target/, which `cargo clean` empties), and the build and the
+# replay run under the lock a title's run holds (../shared/game.lock): a
+# replay of a title's frame takes most of the memory a title's run does. It
+# waits for a run that is going on, and a run started meanwhile waits for it
+# (not for --summary or --listing, which need no GPU).
 set -e
 cd "$(dirname "$0")/../.."
 ROOT="$PWD"
+SHARED="$(dirname "$ROOT")/shared"
+if [ -x "$SHARED/wine-cx/bin/wine" ]; then
+    WINE="${WINE:-$SHARED/wine-cx/bin/wine}"
+    WINEPREFIX="${WINEPREFIX:-$(dirname "$ROOT")/state/$(basename "$ROOT")/wineprefix-replay}"
+    mkdir -p "$(dirname "$WINEPREFIX")"
+    export WINE WINEPREFIX
+    # A summary or a listing reads the capture without a GPU: no lock.
+    case " $* " in
+        *" --summary "* | *" --listing "*) VICTORY_REPLAY_LOCKED=1 ;;
+    esac
+    if [ -z "$VICTORY_REPLAY_LOCKED" ] && [ -f "$SHARED/game.lock" ] && command -v zsh > /dev/null; then
+        # The lock is the starting shell's (zsh closes it in what it starts)
+        # and goes when that shell ends.
+        export VICTORY_REPLAY_LOCKED=1
+        # shellcheck disable=SC2016
+        exec zsh -c '
+            zmodload zsh/system || exit 2
+            if ! zsystem flock -t 0 -f fd "$1" 2> /dev/null; then
+                print -u2 "replay.sh: the lock of a title run is held ($(cat "$2" 2> /dev/null || print "owner unknown")). Waiting for it..."
+                zsystem flock -f fd "$1" || exit 2
+            fi
+            print -r -- "replay (pid $$) since $(date "+%Y-%m-%d %H:%M:%S")" > "$2"
+            shift 2
+            "$@"' replay "$SHARED/game.lock" "$SHARED/game.owner" "$ROOT/tools/macos/replay.sh" "$@"
+    fi
+fi
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 WINE="${WINE:-$HOME/Library/Caches/victory-macos/target/wine-cx/bin/wine}"
 [ -x "$WINE" ] || { echo "no Wine at $WINE: run tools/macos/build-crossover-wine.sh first" >&2; exit 1; }

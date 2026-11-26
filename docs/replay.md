@@ -92,6 +92,11 @@ submissions it still made, which replays (without the picture to compare
 with); one that is ended from outside during the first submission leaves
 none.
 
+Where the build has `VICTORY_NO_HANG_WATCHDOG=1` (docs/macos.md), set it for
+a recording run: the title's own watchdog ends it after 30 checks a second
+apart without a finished frame, and a capture of some 15 GB written to an
+external drive can take that long.
+
 ## Running it
 
     victory replay <folder> [--loops 5] [--timing detailed] [experiments]
@@ -99,7 +104,10 @@ none.
 On a Mac: `tools/macos/replay.sh <folder> ...`, which runs it under Wine in
 a prefix of its own. `<folder>` is the one given as `VICTORY_RECORD` (its
 last capture) or a capture. Do not run it while a title runs: they share the
-GPU, and the numbers are of both.
+GPU, and the numbers are of both. (In a checkout with `../shared/wine-cx`
+and `../shared/run-game.sh` beside it, the script uses that Wine, keeps its
+prefix in `../state/<checkout>/wineprefix-replay` and takes the lock a
+title's run holds, so the two wait for each other.)
 
 Each loop puts back what the one before changed, then runs the frame as the
 runtime does: one submission after the other, each waited for, and between

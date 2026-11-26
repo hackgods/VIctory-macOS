@@ -53,7 +53,19 @@ const MERGED_NAME: &str = "VROW";
 /// Metal lays the rows out in register order, a `float4` on a 16-byte
 /// boundary and three components packed in 12 bytes, so a `float4` after an
 /// odd number of `xyz` rows costs 4 bytes of padding (notes/mesh-size.md).
-pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: bool, reorder: bool) {
+///
+/// With `distances_last` as well, rows that hold only clip or cull distances
+/// take the last registers, after the arbitrary rows. D3DMetal keeps the clip
+/// distances where their register puts them and Metal counts them there as
+/// one 4-byte slot: before a `float4` that slot costs 16 bytes, at the end 4
+/// (measured, notes/mesh-size.md, "The last four").
+pub(crate) fn plan_merge(
+    keep: &mut KeptOutputs,
+    outputs: &[SigElement],
+    widen: bool,
+    reorder: bool,
+    distances_last: bool,
+) {
     let mut pruned = outputs.to_vec();
     prune_signature(&mut pruned, keep);
     let arbitrary = |r: u32| pruned.iter().filter(move |e| e.kind == 0 && e.row == Some(r));
@@ -79,24 +91,42 @@ pub(crate) fn plan_merge(keep: &mut KeptOutputs, outputs: &[SigElement], widen: 
         }
         rows.retain(|&(_, cols)| cols != 0);
         let mut registers: Vec<u32> = rows.iter().map(|&(r, _)| r).collect();
-        registers.sort_unstable();
         rows.sort_by_key(|&(r, cols)| (std::cmp::Reverse(cols), r));
+        if distances_last {
+            // Rows of distances alone, in their order (pos1 and pos2 find
+            // them by kind and index, not by row).
+            let distance = |e: &SigElement| matches!(e.kind, 6 | 7);
+            let mut dists: Vec<u32> =
+                pruned.iter().filter(|e| distance(e)).filter_map(|e| e.row).collect();
+            dists.sort_unstable();
+            dists.dedup();
+            dists.retain(|&r| pruned.iter().all(|e| e.row != Some(r) || distance(e)));
+            registers.extend(&dists);
+            rows.extend(dists.iter().map(|&r| (r, 0)));
+        }
+        registers.sort_unstable();
         for (&(r, _), register) in rows.iter().zip(registers) {
             keep.insert((ORDER_KEY.to_string(), r), register as u8);
         }
     }
 }
 
-/// The host register [`plan_merge`] gave the arbitrary element at console
-/// row `row`, if it moved it.
+/// The host register [`plan_merge`] gave the arbitrary (or distance) element
+/// at console row `row`, if it moved it.
 fn host_row(keep: &KeptOutputs, row: u32) -> Option<u32> {
     keep.get(&(ORDER_KEY.to_string(), row)).map(|&r| u32::from(r))
 }
 
-/// Gives the arbitrary elements the registers [`plan_merge`] chose. Last:
-/// lowering finds an element by its console row.
+/// The elements [`plan_merge`] may give other registers: arbitrary ones, and
+/// clip and cull distances.
+fn movable(e: &SigElement) -> bool {
+    matches!(e.kind, 0 | 6 | 7)
+}
+
+/// Gives the elements the registers [`plan_merge`] chose. Last: lowering
+/// finds an element by its console row.
 pub(super) fn renumber_rows(elements: &mut [SigElement], keep: &KeptOutputs) {
-    for e in elements.iter_mut().filter(|e| e.kind == 0) {
+    for e in elements.iter_mut().filter(|e| movable(e)) {
         if let Some(register) = e.row.and_then(|r| host_row(keep, r)) {
             e.row = Some(register);
         }
@@ -139,10 +169,10 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
         e.usage = usage;
         at += 1;
     }
-    // The signature lists the arbitrary elements in the order of their host
-    // registers, in the places arbitrary elements had.
+    // The signature lists the elements that move in the order of their host
+    // registers, in the places those elements had.
     let slots: Vec<usize> = (0..elements.len())
-        .filter(|&i| elements[i].kind == 0 && elements[i].row.is_some_and(|r| host_row(keep, r).is_some()))
+        .filter(|&i| movable(&elements[i]) && elements[i].row.is_some_and(|r| host_row(keep, r).is_some()))
         .collect();
     let mut moved: Vec<SigElement> = slots.iter().map(|&i| elements[i].clone()).collect();
     moved.sort_by_key(|e| e.row.and_then(|r| host_row(keep, r)));
@@ -248,7 +278,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, false);
+        plan_merge(&mut keep, &outputs, false, false, false);
         let mut mesh = outputs.clone();
         merge_rows(&mut mesh, &keep);
         let shape = |els: &[SigElement]| -> Vec<(String, u32, Option<u32>, u8, u8)> {
@@ -274,7 +304,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, true, false);
+        plan_merge(&mut keep, &outputs, true, false, false);
         let mut wide = outputs.clone();
         merge_rows(&mut wide, &keep);
         assert_eq!(shape(&wide)[2], ("VROW".to_string(), 6, Some(6), 0, 4));
@@ -296,7 +326,7 @@ mod tests {
         for e in outputs.iter().filter(|e| e.kind == 0) {
             keep.insert((e.name.clone(), e.index), 0xF);
         }
-        plan_merge(&mut keep, &outputs, false, true);
+        plan_merge(&mut keep, &outputs, false, true, false);
         let finish = |mut els: Vec<SigElement>| -> Vec<(String, u32, Option<u32>, u8)> {
             merge_rows(&mut els, &keep);
             renumber_rows(&mut els, &keep);
@@ -315,5 +345,66 @@ mod tests {
         );
         let pixel = finish(vec![outputs[5].clone(), outputs[3].clone(), outputs[4].clone(), outputs[1].clone(), outputs[2].clone()]);
         assert_eq!(pixel, mesh[1..]);
+    }
+
+    /// With distances last, a row of clip distances takes the last register
+    /// in both stages, the arbitrary rows the ones before it (widest first),
+    /// and the signature lists them in that order; without, it stays.
+    #[test]
+    fn clip_distances_take_the_last_register() {
+        let outputs = vec![
+            element("SV_Position", 0, 3, 9, 0, 0, 4),
+            element("SV_ClipDistance", 0, 6, 9, 1, 0, 4),
+            element("TEXCOORD", 0, 0, 9, 2, 0, 4),
+            element("TEXCOORD", 1, 0, 9, 3, 0, 3),
+            element("TEXCOORD", 2, 0, 9, 4, 0, 4),
+            element("TEXCOORD", 3, 0, 9, 5, 0, 2),
+        ];
+        let reads = || {
+            let mut keep = KeptOutputs::new();
+            for e in outputs.iter().filter(|e| e.kind == 0) {
+                keep.insert((e.name.to_ascii_uppercase(), e.index), 0xF);
+            }
+            keep
+        };
+        let shape = |keep: &KeptOutputs, mut els: Vec<SigElement>| -> Vec<(String, Option<u32>)> {
+            merge_rows(&mut els, keep);
+            renumber_rows(&mut els, keep);
+            els.iter().map(|e| (e.name.clone(), e.row)).collect()
+        };
+        let mut keep = reads();
+        plan_merge(&mut keep, &outputs, false, true, true);
+        let mesh = shape(&keep, outputs.clone());
+        let row = |name: &str, r: u32| (name.to_string(), Some(r));
+        assert_eq!(
+            mesh,
+            vec![
+                row("SV_Position", 0),
+                row("TEXCOORD", 1),
+                row("TEXCOORD", 2),
+                row("TEXCOORD", 3),
+                row("TEXCOORD", 4),
+                row("SV_ClipDistance", 5),
+            ]
+        );
+        let registers = |els: &[SigElement]| -> Vec<(u32, Option<u32>)> {
+            let mut els = els.to_vec();
+            merge_rows(&mut els, &keep);
+            renumber_rows(&mut els, &keep);
+            els.iter().map(|e| (e.index, e.row)).collect()
+        };
+        // The float4 rows first, then xyz, then xy.
+        assert_eq!(
+            registers(&outputs[2..]),
+            vec![(0, Some(1)), (2, Some(2)), (1, Some(3)), (3, Some(4))]
+        );
+        // The pixel shader declares the clip distance and its inputs in
+        // another order and without the position: the same registers.
+        let pixel = vec![outputs[4].clone(), outputs[1].clone(), outputs[2].clone(), outputs[5].clone(), outputs[3].clone()];
+        assert_eq!(shape(&keep, pixel), mesh[1..]);
+        // Level 3 leaves the clip distance at its register.
+        let mut keep = reads();
+        plan_merge(&mut keep, &outputs, false, true, false);
+        assert_eq!(shape(&keep, outputs.clone())[1], row("SV_ClipDistance", 1));
     }
 }

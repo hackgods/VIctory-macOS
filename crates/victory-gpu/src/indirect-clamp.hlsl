@@ -1,5 +1,6 @@
-#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
-cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; };
+#define RS "RootConstants(num32BitConstants=5, b0), SRV(t0), UAV(u1), UAV(u0), SRV(t1)"
+// `widest`: the most groups in x a dispatch runs (`indirect::widest`).
+cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint counted; uint widest; };
 // The title's records, read only; the clamped ones go to the list's own.
 ByteAddressBuffer args : register(t0);
 RWByteAddressBuffer dest : register(u0);
@@ -28,9 +29,12 @@ uint clamped(uint at) {
             dest.Store2(at + 8, args.Load2(at + 8));
         }
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
-        // x * y fits 32 bits; the whole count may not.
-        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+        uint3 g = args.Load3(at);
+        // Up to `widest` groups in x run as asked; a wider record is cut to
+        // D3D12's 65,535 as before.
+        g = uint3(g.x <= widest ? g.x : 65535u, min(g.y, 65535u), min(g.z, 65535u));
+        // x * y fits 32 bits where it is looked at; the whole count may not.
+        if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;

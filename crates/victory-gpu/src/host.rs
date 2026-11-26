@@ -3,7 +3,7 @@
 //!
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
-//! `VICTORY_ASYNC_SUBMIT=1` overlaps one part so far: the waits do the heap
+//! `VICTORY_SYNC_IN_WAIT=1` overlaps one part so far: the waits do the heap
 //! syncs of later submissions ([`overlap`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2266,7 +2266,7 @@ impl Host {
                 .collect();
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
-        // `VICTORY_ASYNC_SUBMIT`: the wait does later submissions' heap
+        // `VICTORY_SYNC_IN_WAIT`: the wait does later submissions' heap
         // syncs (`overlap`); not while lists are timed one by one.
         let overlapped = groups.len() == 1 && overlap::enabled();
         for (i, group) in groups.iter().enumerate() {

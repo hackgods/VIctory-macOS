@@ -1,5 +1,5 @@
 //! The submitting thread's wait for the host GPU, and what it does meanwhile
-//! with `VICTORY_ASYNC_SUBMIT=1` (off by default): stage 1 of overlapping
+//! with `VICTORY_SYNC_IN_WAIT=1` (off by default): stage 1 of overlapping
 //! CPU and GPU work.
 //!
 //! Every submission is still waited for before [`Host::execute`] returns:
@@ -40,7 +40,7 @@ const POLL_MS: u32 = 2;
 /// ([`Host::wait_for`]), which reports a hang.
 const WORK_FOR: Duration = Duration::from_millis(250);
 
-/// Whether waits do heap syncs (`VICTORY_ASYNC_SUBMIT=1`).
+/// Whether waits do heap syncs (`VICTORY_SYNC_IN_WAIT=1`).
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
     if let Some(on) = FORCED.with(Cell::get) {
@@ -48,10 +48,10 @@ pub(crate) fn enabled() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = switch(std::env::var("VICTORY_ASYNC_SUBMIT").ok().as_deref());
+        let on = switch(std::env::var("VICTORY_SYNC_IN_WAIT").ok().as_deref());
         if on {
             tracing::info!(
-                "VICTORY_ASYNC_SUBMIT=1: heap syncs run while the host GPU runs each submission"
+                "VICTORY_SYNC_IN_WAIT=1: heap syncs run while the host GPU runs each submission"
             );
         }
         on
@@ -173,7 +173,7 @@ pub(super) fn log(frames: f64) {
     tracing::info!(
         "GPU waits per frame: {:.1} submissions; the submitting thread slept {:.1} ms waiting for the GPU; \
          work done meanwhile: heap syncs {:.1} ms while the GPU ran, {:.1} ms more in syncs it finished during, \
-         {:.1} syncs (VICTORY_ASYNC_SUBMIT={})",
+         {:.1} syncs (VICTORY_SYNC_IN_WAIT={})",
         waits as f64 / frames,
         ms(blocked),
         ms(working),

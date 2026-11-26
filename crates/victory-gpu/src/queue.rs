@@ -1159,7 +1159,7 @@ mod tests {
     /// A queue's Signal behind a submission the GPU still runs moves the
     /// title's fence, and wakes the event waiting for it, only once the
     /// submission's results are in title memory: what its shaders wrote and
-    /// its bottom-of-pipe write. With `VICTORY_ASYNC_SUBMIT` as without.
+    /// its bottom-of-pipe write. With `VICTORY_SYNC_IN_WAIT` as without.
     #[cfg(windows)]
     #[test]
     fn a_signal_behind_a_running_submission_moves_after_its_results() {

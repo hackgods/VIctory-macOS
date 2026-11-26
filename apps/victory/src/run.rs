@@ -154,6 +154,20 @@ pub fn run(
             Err(why) => println!("lookup guard   not applied: {why}"),
         }
     }
+    // macOS port: on a Series S the title's upscaler choice returns its own
+    // upscaler (type 6), not FSR 4, whose passes show nothing here
+    // (victory_loader::upscaler_patch); `VICTORY_UPSCALER_PATCH=0` leaves it.
+    if let Some(line) = victory_loader::upscaler_patch::at_start(
+        matches!(console, Console::SeriesS),
+        std::env::var(victory_loader::upscaler_patch::SWITCH).ok().as_deref(),
+        &hash,
+        // In the registry only when the host's FidelityFX serves.
+        victory_hle::registry().iter().any(|m| m.serves("amd_fidelityfx_loader_xbox.dll")),
+        image.base() as u64,
+        image.info().size_of_image,
+    ) {
+        println!("upscaler       {line}");
+    }
     let resolver = HleResolver::new(if strict {
         HostPolicy::none()
     } else {

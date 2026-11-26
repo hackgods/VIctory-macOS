@@ -28,6 +28,7 @@ pub mod probe_guard;
 pub mod prepare;
 pub(crate) mod publish;
 pub mod resolve;
+pub mod upscaler_patch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]

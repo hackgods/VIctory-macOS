@@ -614,6 +614,16 @@ fn last_of_each(keys: &[(usize, usize)]) -> Vec<bool> {
 /// Once a submission's lists have run (`Host::finish`): the copies `backs`
 /// of their textures (in list order) land in title memory, of a texture
 /// several lists wrote the last list's alone.
+/// mac: the title memory a copy lands in once its list has run (`[at,
+/// end)`), for a submission prepared while that list still runs
+/// (`crate::host::unwaited::flights`).
+#[cfg(windows)]
+impl Back {
+    pub(crate) fn lands(&self) -> (usize, usize) {
+        (self.ticket.at, self.ticket.end)
+    }
+}
+
 #[cfg(windows)]
 pub(crate) fn land_all(backs: &[Arc<Back>]) {
     if backs.is_empty() {

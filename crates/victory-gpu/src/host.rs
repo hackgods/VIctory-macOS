@@ -1515,6 +1515,9 @@ struct Deferred {
     back_wanted: Vec<crate::texback::Target>,
     /// Those copies, which land in title memory once the list has run.
     texture_backs: Vec<std::sync::Arc<crate::texback::Back>>,
+    /// mac: title memory the list's work for after writes (address, bytes):
+    /// textures read back into buffers ([`HostList::note_landing`]).
+    lands: Vec<(usize, usize)>,
 }
 
 /// Features reported by the D3D12 device used for rendering. A failed
@@ -1831,7 +1834,15 @@ impl Host {
     /// heap the lists bound (VIctory-macOS issue #31). Nothing on a thread
     /// that holds the submission lock already, nor off Wine.
     pub(crate) fn quiet(&self) -> Option<Quiet<'_>> {
-        if !crate::under_wine() || HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+        if !crate::under_wine() {
+            return None;
+        }
+        if HOLDS_SUBMISSIONS.with(std::cell::Cell::get) {
+            // mac: with flights the submission left may still run while
+            // the next one is prepared under the lock: the GPU first.
+            if unwaited::flights::on() {
+                self.stand_beside();
+            }
             return None;
         }
         let held = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
@@ -1856,7 +1867,15 @@ impl Host {
         let by = if title.is_some() { unwaited::By::Next } else { unwaited::By::Ours };
         // (The title's lists are next: their buffer copies may be brought
         // up to date while it still runs, `unwaited::Host::prewarm`.)
-        let mut submitted = self.submissions(by, if title.is_some() { runs } else { &[] });
+        // mac: with flights, the title's lists are prepared while it runs,
+        // and it is finished at the first step that could see what it owes
+        // (`beside`, `unwaited::flights`), at the latest before they go to
+        // the GPU.
+        let (mut submitted, mut beside) = if title.is_some() && unwaited::flights::on() {
+            self.submissions_beside(runs)
+        } else {
+            (self.submissions(by, if title.is_some() { runs } else { &[] }), None)
+        };
         let _holding = Holding::enter();
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -1867,16 +1886,25 @@ impl Host {
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        if beside.is_some() && crate::resource::evict_due() {
+            self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Evict);
+        }
         crate::resource::evict_unused();
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
+            self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Remake);
             crate::descriptor::remake_unordered();
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
+        // mac: beside a submission still running only as the rounds ahead
+        // sync (`VICTORY_ASYNC_HEAP_SYNC=1`).
+        if !crate::descriptor::ahead::on() {
+            self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Heaps);
+        }
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
@@ -1909,6 +1937,10 @@ impl Host {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // mac: one upload list and one staging pool, reset per submission.
+        if (!heaps.is_empty() || !textures.is_empty()) && self.beside_uploads(&beside) {
+            self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Uploads);
+        }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = (!heaps.is_empty() || !textures.is_empty())
@@ -1955,7 +1987,13 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
-            list.run_deferred(&mut batch);
+            self.poll_beside(&mut submitted, &mut beside);
+            if beside.as_ref().is_some_and(unwaited::flights::Beside::running) {
+                let mut gate = |step: &Step| self.beside_step(&mut submitted, &mut beside, step);
+                list.run_deferred(&mut batch, Some(&mut gate));
+            } else {
+                list.run_deferred(&mut batch, None);
+            }
             firsts.push(lists.len());
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
@@ -1967,9 +2005,25 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        // mac: with flights, while the submission left still runs, the
+        // refreshes of copies it can neither write nor land in are made
+        // early; then it is finished, and the others are made.
+        if let Some(held) = self.beside_refreshes(&mut beside, &mut batch.refreshes) {
+            batch.early = true;
+            batch.flush();
+            batch.early = false;
+            if !held.is_empty() {
+                self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Flush);
+                batch.refreshes = held;
+            }
+        }
         batch.flush();
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
+        // mac: one submission on the host GPU at a time.
+        self.finish_beside(&mut submitted, &mut beside, unwaited::flights::Why::Give);
+        // Time finishing it is not this one's preparing.
+        let aside = beside.as_ref().map_or(Duration::ZERO, |b| b.finishing);
         let prepared = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
@@ -2047,9 +2101,9 @@ impl Host {
             && native_boundaries.is_empty()
             && unwaited::may(groups.len(), traced)
         {
-            SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+            SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(aside).as_micros() as u64, Ordering::Relaxed);
             let ran = Ran { gpu: Duration::ZERO, removed_in, batch, heaps, traced };
-            self.leave(&mut submitted, groups[0], mark, title, ran);
+            self.leave(&mut submitted, groups[0], mark, title, ran, uploads.is_some());
             return true;
         }
         for (i, group) in groups.iter().enumerate() {
@@ -2167,7 +2221,7 @@ impl Host {
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
-        SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
+        SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(aside).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
         self.finish(Some(submitted), runs, Ran { gpu, removed_in, batch, heaps, traced });
         false
@@ -3427,6 +3481,16 @@ impl HostList {
         self.deferred().after.push(Box::new(work));
     }
 
+    /// mac: work for after the list (a texture read back into a buffer)
+    /// writes title memory `[at, at + len)`: what a submission prepared
+    /// while the list still runs must not read before it is there
+    /// (`unwaited::flights`).
+    pub(crate) fn note_landing(&self, at: usize, len: usize) {
+        if len > 0 {
+            self.deferred().lands.push((at, len));
+        }
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.count_write();
@@ -3771,10 +3835,15 @@ impl HostList {
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges).
-    fn run_deferred(&self, batch: &mut Batch) {
+    /// `gate`: called before each step (mac: `unwaited::flights`, which
+    /// may finish the submission before first).
+    fn run_deferred(&self, batch: &mut Batch, mut gate: Option<&mut dyn FnMut(&Step)>) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
+            if let Some(gate) = gate.as_mut() {
+                gate(step);
+            }
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
@@ -3954,6 +4023,9 @@ pub(crate) fn copy_order_parts(
 struct Batch {
     /// The ranges still to bring up to date, by copy.
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    /// mac: the refreshes are made while the submission before still runs
+    /// (`unwaited::flights`; `Shadow::update_early`).
+    early: bool,
     /// Where each copy's refreshes are in `refreshes`, by copy.
     pending: std::collections::HashMap<usize, usize>,
     /// The ranges of each copy brought up to date since the last write that
@@ -3982,6 +4054,20 @@ struct Batch {
 /// what copying this much does at the 6-7 GB/s testers saw (a guess, not
 /// measured).
 const JOIN: usize = crate::watch::PAGE;
+
+/// [`crate::shadow::Shadow::update`], or with `early` its form for a
+/// submission prepared while the one before still runs (mac:
+/// `unwaited::flights`; a copy it refuses, which the flights' rules leave
+/// out, is counted and brought up to date the ordinary way).
+fn refresh(shadow: &crate::shadow::Shadow, address: usize, len: usize, early: bool) -> usize {
+    if !early {
+        return shadow.update(address, len);
+    }
+    shadow.update_early(address, len).unwrap_or_else(|| {
+        unwaited::flights::refused();
+        shadow.update(address, len)
+    })
+}
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
@@ -4069,12 +4155,13 @@ impl Batch {
             type RefreshOut = Vec<(usize, usize, usize, u64)>;
             let results: Vec<Mutex<RefreshOut>> =
                 (0..work.len()).map(|_| Mutex::default()).collect();
+            let early = self.early;
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
                 let mut out = Vec::new();
                 for (from, to) in ranges.iter() {
                     let started = std::time::Instant::now();
-                    let copied = shadow.update(from, to - from);
+                    let copied = refresh(shadow, from, to - from, early);
                     let us = started.elapsed().as_micros() as u64;
                     out.push((from, to, copied, us));
                 }
@@ -4112,7 +4199,7 @@ impl Batch {
             let (start, len) = shadow.range();
             for (from, to) in ranges.iter() {
                 let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
+                let copied = refresh(&shadow, from, to - from, self.early);
                 let us = started.elapsed().as_micros() as u64;
                 #[cfg(feature = "diagnostics")]
                 {
@@ -5806,7 +5893,7 @@ mod batch {
         batch.add(&b, pb, 4 * PAGE);
         let list = super::host().unwrap().new_list().unwrap();
         list.defer_move((pa + PAGE) as *mut u8, pa as *const u8, 2 * PAGE);
-        list.run_deferred(&mut batch);
+        list.run_deferred(&mut batch, None);
         batch.add(&a, pa, 4 * PAGE);
         batch.add(&b, pb, 4 * PAGE);
         assert_eq!(

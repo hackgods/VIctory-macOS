@@ -57,6 +57,18 @@ impl Drop for Holding {
     }
 }
 
+/// What the end of a submission ([`Host::finish`]) needs from its start:
+/// how long the host GPU was waited for, the list the device was removed
+/// in (when lists run one by one), what its refreshes and heaps hold until
+/// it has run, and whether its frame is listed (diagnostics).
+struct Ran {
+    gpu: Duration,
+    removed_in: Option<usize>,
+    batch: Batch,
+    heaps: Vec<std::sync::Arc<crate::bindless::Viewed>>,
+    traced: bool,
+}
+
 /// Submissions held off ([`Host::quiet`]).
 pub(crate) struct Quiet<'a> {
     // Dropped in this order: the mark, then the lock.
@@ -1527,6 +1539,8 @@ impl Host {
         // notes them).
         #[cfg(feature = "diagnostics")]
         let traced = crate::capture::listed(crate::queue::presented() + 1);
+        #[cfg(not(feature = "diagnostics"))]
+        let traced = false;
         #[cfg(feature = "diagnostics")]
         if traced {
             for (i, r) in runs.iter().enumerate() {
@@ -1673,6 +1687,15 @@ impl Host {
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
         SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        self.finish(Some(submitted), runs, Ran { gpu, removed_in, batch, heaps, traced });
+    }
+
+    /// After a submission has run: the device is checked, what its shaders
+    /// wrote goes back into title memory, then its lists' work for after
+    /// and their bottom-of-pipe writes. `submitted`: the submission lock,
+    /// given up before a listed frame's dumps (diagnostics), if given.
+    fn finish(&self, submitted: Option<std::sync::MutexGuard<'_, u64>>, runs: &[&HostList], ran: Ran) {
+        let Ran { gpu, removed_in, batch, heaps, traced } = ran;
         // The host resets a device whose submission runs for about 2 s.
         if gpu > std::time::Duration::from_millis(250) {
             let pipelines: std::collections::BTreeSet<String> = runs
@@ -1801,7 +1824,7 @@ impl Host {
         // A listed frame: what this submission's lists drew, as it is now
         // (the dumps submit lists of their own).
         #[cfg(feature = "diagnostics")]
-        if traced {
+        if traced && let Some(submitted) = submitted {
             let sub = *submitted;
             drop(submitted);
             let mut targets: Vec<(usize, String)> = Vec::new();
@@ -1814,6 +1837,8 @@ impl Host {
             }
             crate::capture::dump_submission(sub, &targets);
         }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = (submitted, traced);
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations

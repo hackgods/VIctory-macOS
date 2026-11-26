@@ -376,6 +376,12 @@ impl State {
         self.hoist = Some(Hoist { clamps, into: std::ptr::from_ref(into) as usize, writes: into.writes() });
     }
 
+    /// The host list the clamps of the run being recorded go to, if any.
+    #[cfg(test)]
+    pub(crate) fn hoist_clamps(&self) -> Option<std::sync::Arc<HostList>> {
+        self.hoist.as_ref().map(|h| h.clamps.clone())
+    }
+
     /// Ends the run whose clamps go to the host list before `list`, if
     /// any: that list closes, its clamped arguments readable.
     pub(crate) fn end_hoist(&mut self, list: &HostList) {
@@ -1957,7 +1963,11 @@ impl State {
             .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
             .flatten()
             .and_then(|clamps| {
-                let out = crate::indirect::bound_before(&clamps, list, args.gpu(arguments), (kind, stride, max), counted)?;
+                // (With the start of the buffer each is in: a batch of
+                // clamps reads them from there.)
+                let start = |s: &crate::shadow::Shadow, at: u64| (s.gpu(at) - s.offset(at), s.gpu(at));
+                let count = counter.as_ref().map(|(s, at)| start(s, *at));
+                let out = crate::indirect::bound_before(&clamps, list, start(&args, arguments), (kind, stride, max), count)?;
                 args.refresh(&clamps, arguments, len);
                 list.note_hoisted_read(arguments as usize, len.min(args.left(arguments)) as usize);
                 if let Some((s, at)) = &counter {

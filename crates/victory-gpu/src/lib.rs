@@ -21,6 +21,9 @@ mod ambient;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ambient_set;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod batch;
 #[cfg(windows)]
 mod bindless;
 #[cfg(all(windows, feature = "diagnostics"))]

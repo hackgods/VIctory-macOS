@@ -1012,6 +1012,9 @@ pub(crate) struct HostList {
     /// Clamped arguments of the list's indirect draws that the list before
     /// it writes ([`HostList::clamp_room`]).
     hoisted: Mutex<Hoisted>,
+    /// Clamps of the list after it recorded here but not yet run
+    /// (`crate::indirect`, batches): recorded where the run of clamps ends.
+    pub(crate) clamp_batch: Mutex<Option<crate::indirect::Pending>>,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1384,6 +1387,7 @@ impl Host {
                 arguments: Mutex::new(None),
                 writes: Default::default(),
                 hoisted: Mutex::default(),
+                clamp_batch: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2270,6 +2274,7 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        crate::indirect::flush(self);
         self.clamp_done();
         self.textures_back();
         #[cfg(feature = "diagnostics")]
@@ -2312,6 +2317,7 @@ impl HostList {
             let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
             (hoisted.used, hoisted.at, hoisted.readable) = (0, 0, false);
         }
+        *self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -2980,6 +2986,8 @@ impl HostList {
     /// Where `clamps` ends: the clamped arguments it wrote for this list
     /// become readable as indirect arguments.
     pub(crate) fn clamp_end(&self, clamps: &HostList) {
+        // The batch of clamps first: then its writes are made readable.
+        crate::indirect::flush(clamps);
         let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
         if hoisted.used == 0 || hoisted.readable {
             return;
@@ -3982,6 +3990,8 @@ impl Meter {
             let clamps = crate::indirect::take_dispatches() as f64 / report_frames;
             let hoisted = crate::indirect::take_hoisted() as f64 / report_frames;
             let hoists = crate::list::take_hoists() as f64 / report_frames;
+            let (batched, batches) = crate::indirect::take_batched();
+            let (batched, batches) = (batched as f64 / report_frames, batches as f64 / report_frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -3990,7 +4000,7 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
                  dispatches/frame ({hoisted:.0} clamps in the list before their draw's, \
-                 {hoists:.0} lists cut for them)",
+                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches)",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

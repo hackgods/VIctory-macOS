@@ -2319,6 +2319,110 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// The same records are cut with `VICTORY_BATCH_CLAMPS` as without, in
+    /// every order: five indirect executions of a title list (three draws
+    /// whose clamps are hoisted where a run allows, two dispatches clamped
+    /// in place, which end a run), which between them take more than a
+    /// budget. In each of their 120 orders, recorded through the list's own
+    /// cuts with the clamps alone and in batches, every execution's records
+    /// and the budget are what the clamps recorded each before its
+    /// execution in one host list give (the model's `alone`, which the host
+    /// GPU's clamps are compared with in `crate::indirect`).
+    #[cfg(windows)]
+    #[test]
+    fn the_same_records_are_cut_however_the_list_is_cut_for_runs() {
+        use crate::batch::tests::{FRESH, RECORD_BUFFERS, Spec, alone, draws, laid_out, orders};
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let dispatch = |words: [u32; 3], source| Spec { kind: 2, stride: 12, records: 1, words: words.to_vec(), count: None, source, counter: 0 };
+        // (Whether its clamp may be hoisted, the execution.)
+        let executions = [
+            (true, draws(0, 3, 3 << 18, 40, 0)),
+            (true, draws(1, 2, u32::MAX, u32::MAX, 1)),
+            (false, dispatch([64, 64, 4], 0)),
+            (true, Spec { kind: 10, stride: 12, records: 6, words: [70_000, 1, 1].repeat(6), count: Some(4), source: 2, counter: 1 }),
+            (false, dispatch([1 << 10, 1 << 9, 1], 2)),
+        ];
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: our list.
+        let state = unsafe { &(*list.cast::<List>()).state };
+        let (mut cuts, mut outcomes) = (0, std::collections::HashSet::new());
+        for (n, order) in orders(&executions).into_iter().enumerate() {
+            let batched = n % 2 == 0;
+            let specs: Vec<Spec> = order.iter().map(|(_, s)| s.clone()).collect();
+            let (contents, places, _) = laid_out(&specs);
+            let model = alone(&specs, 0, crate::indirect::widest());
+            assert_eq!(model.1, 1 << 27, "they take more than a budget");
+            let buffers: Vec<_> = contents.iter().map(|c| host.shared_buffer(c.len() as u64 * 4).unwrap()).collect();
+            // Where each execution's clamped records are (the buffer and the
+            // byte offset), and the last clamp in place of each host list,
+            // whose records its argument buffer still holds.
+            let mut outs = Vec::new();
+            let mut in_place = std::collections::HashMap::new();
+            // SAFETY: our mapped buffers, written before the lists run and
+            // read after they have; live buffers.
+            unsafe {
+                for (c, (_, data)) in contents.iter().zip(&buffers) {
+                    std::ptr::copy_nonoverlapping(c.as_ptr(), data.cast::<u32>(), c.len());
+                }
+                for (i, ((hoisted, s), &(from, count_at, _))) in order.iter().zip(&places).enumerate() {
+                    let base = buffers[s.source].0.GetGPUVirtualAddress();
+                    let counter = buffers[RECORD_BUFFERS + s.counter].0.GetGPUVirtualAddress();
+                    let counted = s.count.map(|_| (counter, counter + u64::from(count_at)));
+                    let spec = (s.kind, s.stride, s.records);
+                    let gpu = (base, base + u64::from(from));
+                    if *hoisted {
+                        // As `execute_indirect` and `State::execute_indirect` do.
+                        start_run(list, &mut state.lock().unwrap());
+                        let current = host_list(list).unwrap();
+                        assert!(state.lock().unwrap().hoists_into(current));
+                        let clamps = state.lock().unwrap().hoist_clamps().unwrap();
+                        outs.push(crate::indirect::bound_before_as(&clamps, current, gpu, spec, counted, batched).unwrap());
+                    } else {
+                        let current = host_list(list).unwrap();
+                        let out = crate::indirect::bound(current, gpu.1, spec, counted.map(|c| c.1)).unwrap();
+                        crate::indirect::done(current, &out);
+                        current.count_write();
+                        in_place.insert(out.as_raw() as usize, i);
+                        outs.push((out, 0));
+                    }
+                }
+                assert_eq!(close(list), S_OK);
+                let all = segments(list);
+                cuts += all.len() - 1;
+                host.execute(&all.iter().map(|s| &**s).collect::<Vec<_>>());
+                assert_eq!(all.last().unwrap().budget_spent(), model.1, "order {n}: the budget");
+                drop(all);
+                for (i, (((hoisted, s), (out, at)), &(_, _, to))) in order.iter().zip(&outs).zip(&places).enumerate() {
+                    if !*hoisted && in_place[&(out.as_raw() as usize)] != i {
+                        continue; // a later clamp in place wrote over it
+                    }
+                    let mut data = std::ptr::null_mut();
+                    out.Map(0, None, Some(&mut data)).unwrap();
+                    let data = data.cast::<u8>().add(*at as usize).cast::<u32>();
+                    for w in 0..(s.stride * s.records / 4) as usize {
+                        let expected = model.0[to as usize / 4 + w];
+                        if expected != FRESH {
+                            assert_eq!(data.add(w).read_volatile(), expected, "order {n} ({batched}): execution {i}, word {w}");
+                        }
+                    }
+                }
+            }
+            outcomes.insert(model.0);
+            assert_eq!(reset(list, allocator, null), S_OK);
+        }
+        assert!(outcomes.len() > 10, "the order decides what is cut");
+        assert!(cuts >= 120, "the lists were cut for runs: {cuts}");
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
     /// With `VICTORY_COPY_ORDER=split`, the arguments of an indirect draw
     /// whose clamp is hoisted are read by the list before the one that
     /// draws; they are noted in the drawing list too, so a title copy into
@@ -2348,7 +2452,7 @@ mod tests {
         // An indirect draw with 16 bytes of arguments at 0x100, as
         // `State::execute_indirect` records it with its clamp hoisted.
         let gpu = copy.gpu(at + 0x100);
-        let clamped = crate::indirect::bound_before(&hosts[0], &hosts[1], gpu, (0, 16, 1), None);
+        let clamped = crate::indirect::bound_before(&hosts[0], &hosts[1], (gpu - copy.offset(at + 0x100), gpu), (0, 16, 1), None);
         assert!(clamped.is_some());
         copy.refresh(&hosts[0], at + 0x100, 16);
         hosts[1].note_hoisted_read(at as usize + 0x100, 16);

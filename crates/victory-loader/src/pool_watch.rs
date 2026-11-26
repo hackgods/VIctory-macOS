@@ -52,6 +52,12 @@
 //!   the governor's mode word (+0xab44324), and how many requests wait in
 //!   each of the engine's 17 stage lists (heads at engine +0x167b0, a
 //!   request's next at +0x80), as `stage:count`.
+//! - `request lists`: the cutscene's streaming request lists
+//!   (crate::srl_slice): how many, their entries in the update, and how many
+//!   of those are time-sliced (entry byte +0x7f), which is what makes the
+//!   500 microseconds a frame apply; then per list its state and flags and
+//!   per entry its state, next step of its track's steps, the step asked
+//!   for, the look-ahead, and the two bytes that put it under the slice.
 //!
 //! That step (RVA 0x16cd4d0) was first read as the step of the whole map
 //! and paced by `VICTORY_MAPDATA_STEPS`; it is the state machine of the
@@ -627,6 +633,7 @@ pub fn watch(base: u64) -> Result<(), &'static str> {
                 }
                 let (budget, mode, stages) = reader.streaming(base);
                 tracing::info!("{}", streaming_line(budget, mode, &stages));
+                tracing::info!("{}", crate::srl_slice::line(&crate::srl_slice::seen(&mut reader, base)));
             }
         })
         .map(|_| ())

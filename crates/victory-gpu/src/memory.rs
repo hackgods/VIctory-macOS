@@ -377,7 +377,16 @@ pub(crate) fn log_frame() {
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
     uses.sort_by(|a, b| b.1.cmp(a.1));
     let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
-    let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
+    let missed: Vec<String> = s
+        .first_missed
+        .iter()
+        .map(|&a| {
+            #[cfg(feature = "diagnostics")]
+            return format!("{a:#x} {}", memory_kind(a));
+            #[cfg(not(feature = "diagnostics"))]
+            format!("{a:#x}")
+        })
+        .collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
@@ -392,6 +401,37 @@ pub(crate) fn log_frame() {
         s.missed_regions,
         missed.join(" ")
     );
+}
+
+/// What the memory at `at` is now, for the missed addresses of the frame
+/// line (diagnostics): whether a copy could be made of it (committed, and a
+/// view of a section or private memory) or the shaders read past what the
+/// title maps (reserved, free).
+#[cfg(feature = "diagnostics")]
+fn memory_kind(at: u64) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+        MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return "(not asked)".into();
+    }
+    let state = match info.State {
+        MEM_COMMIT => "committed",
+        MEM_RESERVE => "reserved",
+        MEM_FREE => "free",
+        _ => "?",
+    };
+    let kind = match info.Type {
+        MEM_MAPPED => " view",
+        MEM_PRIVATE => " private",
+        MEM_IMAGE => " image",
+        _ => "",
+    };
+    format!("({state}{kind}, protect {:#x})", info.Protect)
 }
 
 /// Our view heap for lists that bind none of the title's (dynamic slots
@@ -670,6 +710,16 @@ mod tests {
                 assert_eq!(stats(|_| true), expected);
             });
         }
+    }
+
+    /// The frame line names what a missed address is: committed private
+    /// memory here, nothing at all far above every mapping.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missed_addresses_are_named_by_their_memory() {
+        let ours = vec![0u8; 1 << 16];
+        assert!(memory_kind(ours.as_ptr() as u64).starts_with("(committed private"));
+        assert!(memory_kind(0x7ff0_0000_0000).starts_with("(free"));
     }
 
     /// Writes of lists using title memory are held back from a frame with a

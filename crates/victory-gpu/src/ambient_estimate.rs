@@ -57,7 +57,7 @@
 //!   are set again by the next draw (`State::host_state_lost`).
 //! - The light visible surfaces send out is read as a shader resource: its
 //!   host texture is moved to that state in the list
-//!   (`HostList::move_texture`) and back by the title's next use.
+//!   (`HostList::move_texture`) for the keeping and back after it.
 //! - An image is taken if a view of the format wanted can be made of its
 //!   host texture (one host texture per texture memory, castable).
 //! - What the title's resolve left is replaced unless
@@ -727,6 +727,13 @@ pub(crate) fn keep(list: &HostList, radiance: This) -> bool {
         ..settings(share)
     };
     pass.keep(host, list, radiance, [d.Width as u32, d.Height], dome, &given);
+    // And back to the state its program left it in: whatever comes after
+    // us, in this list or the next, finds the image as it does without the
+    // estimate.
+    if let Some(barrier) = list.move_texture(&copy, D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32) {
+        // SAFETY: an open list and a live texture the list keeps.
+        unsafe { list.list.ResourceBarrier(&[barrier]) };
+    }
     KEPT.store(true, Ordering::Relaxed);
     RECORDED[0].fetch_add(1, Ordering::Relaxed);
     true

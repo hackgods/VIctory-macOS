@@ -66,6 +66,9 @@ pub mod queue;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ranges;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ray_skip;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

@@ -1130,6 +1130,18 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out, and counted there, not as dropped.
+        if crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT dispatch {x}x{y}x{z} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(self.pipeline as This)
+                )
+            });
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1840,6 +1852,19 @@ impl State {
         if crate::pipeline::held_back(self.pipeline as This) {
             why("the BVH builder held back");
             return false;
+        }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out before its arguments are refreshed
+        // and clamped, and counted there, not as a dropped execution.
+        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT indirect kind {kind} max {max} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(pipeline)
+                )
+            });
+            return true;
         }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]

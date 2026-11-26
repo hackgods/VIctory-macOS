@@ -365,6 +365,7 @@ fn create() -> windows::core::Result<Host> {
         tracing::info!("host D3D12 device ready");
         crate::pipeline::note_skips();
         crate::ambient::announce();
+        crate::ray_skip::announce();
         // The console fuses its multiply-adds (`v_fma_f32`, `v_fmac_f32`,
         // `v_fma_mix*`); the lowering's DXIL `FMad` is fused only where the
         // host chooses (the RX 6700 XT does, WARP does not).
@@ -3634,6 +3635,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);
+            crate::ray_skip::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

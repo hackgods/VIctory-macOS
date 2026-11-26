@@ -853,6 +853,9 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+// Also built for tests, which run where `host` cannot.
+#[cfg(any(windows, test))]
+mod schedule;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 

@@ -243,6 +243,19 @@ pub fn run(
             Err(why) => println!("map budget     not applied: {why}"),
         }
     }
+    // macOS port: the time a frame the title's streaming request list may
+    // spend issuing requests, made larger (victory_loader::srl_slice); off
+    // unless asked for.
+    if let Some(k) = victory_loader::srl_slice::wanted(std::env::var(victory_loader::srl_slice::SWITCH).ok().as_deref())
+    {
+        match victory_loader::srl_slice::patch(image.base() as u64, k) {
+            Ok(us) => println!(
+                "request slice  on: {us} us a frame for a time-sliced request list (the title's 500; asked for times {k}, took times {})",
+                us / 500
+            ),
+            Err(why) => println!("request slice  not applied: {why}"),
+        }
+    }
     // macOS port: map pieces nobody asks for any more are put out when the
     // title's pool of buildings fills up (victory_loader::map_evict); off
     // unless asked for.

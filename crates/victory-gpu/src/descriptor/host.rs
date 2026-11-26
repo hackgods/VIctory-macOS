@@ -15,6 +15,8 @@ use super::paged::Paged;
 use super::{VIEW_TAG, View, ViewPin, view_at, views_current};
 use crate::host::host;
 
+mod quick;
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -754,6 +756,10 @@ impl HostHeap {
                 .map(|(i, _)| i)
                 .collect()
         };
+        // mac: a view heap's buffer shader views from one lookup per record.
+        if !self.sampler && quick::on() {
+            return self.sync_quick(&stale, at);
+        }
         for i in stale {
             self.mirror(i, at(i), false);
         }

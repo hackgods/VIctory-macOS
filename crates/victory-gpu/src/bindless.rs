@@ -21,7 +21,7 @@ use crate::shadow::Shadow;
 
 /// What a title heap slot views that title memory feeds.
 #[derive(Clone)]
-enum Seen {
+pub(crate) enum Seen {
     /// `len` bytes at `address` of a buffer's host copy; unordered access.
     Buffer(Arc<Shadow>, u64, u64, bool),
     /// A title texture (resource object) whose contents the title writes.
@@ -43,7 +43,7 @@ pub(crate) struct Viewed {
     inner: Mutex<Inner>,
 }
 
-type Range = (usize, u64, u64, bool);
+pub(crate) type Range = (usize, u64, u64, bool);
 
 /// A merged range: copy, start, bytes, unordered access, the copy's bit in
 /// the change tracker (`crate::watch::clean_bit`).
@@ -145,6 +145,12 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
+        self.set_seen(index, seen);
+    }
+
+    /// [`Viewed::set`] with what the slot's view reads already worked out
+    /// (`crate::descriptor::host`, "quick").
+    pub(crate) fn set_seen(&self, index: u32, seen: Option<Seen>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(&old, false);
@@ -155,11 +161,30 @@ impl Viewed {
         }
     }
 
+    /// The range slot `index` views of a buffer copy (the copy, the title
+    /// address, the bytes, unordered access), if it views one (tests).
+    #[cfg(test)]
+    pub(crate) fn range_at(&self, index: u32) -> Option<Range> {
+        match self.inner.lock().unwrap_or_else(|e| e.into_inner()).slots.get(&index) {
+            Some(Seen::Buffer(shadow, address, len, uav)) => Some((Arc::as_ptr(shadow) as usize, *address, *len, *uav)),
+            _ => None,
+        }
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+    }
+}
+
+impl Seen {
+    /// What [`seen`] finds for a made shader view of `len` bytes (not none)
+    /// at title address `address`, whose host copy is `shadow`.
+    pub(crate) fn shader_buffer(shadow: Arc<Shadow>, address: u64, len: u64) -> Self {
+        let len = len.min(shadow.left(address));
+        Seen::Buffer(shadow, address, len, false)
     }
 }
 

@@ -283,6 +283,52 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     written_before: BTreeSet::new(),
 });
 
+/// mac: since the last frame line, microseconds threads waited for the
+/// guard lock (in the title's write faults, elsewhere), microseconds in
+/// protection calls and their number ([`frame_line`]). A lock taken at once
+/// is not timed; a clock read costs a Wine call.
+static TIMES: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// mac: since the last frame line, the exceptions the write-fault handler
+/// (the first vectored handler) saw: write faults that opened a guarded
+/// block, that found it writable already (another thread's fault opened it),
+/// that were not ours, and every other exception.
+static FAULTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn fault(kind: usize) {
+    FAULTS[kind].fetch_add(1, Ordering::Relaxed);
+}
+
+thread_local! {
+    /// mac: whether this thread is in the write-fault handler ([`TIMES`]).
+    static IN_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A protection call `f`, timed and counted ([`TIMES`]).
+fn timed_protect(f: impl FnOnce() -> bool) -> bool {
+    let started = std::time::Instant::now();
+    let done = f();
+    TIMES[2].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+    TIMES[3].fetch_add(1, Ordering::Relaxed);
+    done
+}
+
+/// mac: the end of the frame line, per frame over `frames` frames: the
+/// guard lock's waits and the protection calls.
+pub(crate) fn frame_line(frames: f64) -> String {
+    let [faults, others, protect, calls] = TIMES.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    let [opened, writable, foreign, other] = FAULTS.each_ref().map(|t| t.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!(
+        "; guard lock waits {:.1} ms ({:.1} ms of it in write faults), protection calls {:.1} ms ({calls:.0}); \
+         exceptions {:.0}: write faults {opened:.0} opened a guarded block, {writable:.0} found it writable, \
+         {foreign:.0} not ours, {other:.0} others",
+        (faults + others) / 1e3,
+        faults / 1e3,
+        protect / 1e3,
+        opened + writable + foreign + other
+    )
+}
+
 thread_local! {
     /// Whether this thread holds the guard lock. A guarded block it faults
     /// on then is one the lock's own work touched (#50: an allocation made
@@ -333,7 +379,18 @@ struct Held {
 #[track_caller]
 fn guards() -> Held {
     use std::sync::atomic::Ordering::AcqRel;
-    let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+    // mac: a wait for the lock is timed ([`TIMES`]).
+    let guard = match GUARDS.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            let started = std::time::Instant::now();
+            let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+            let k = usize::from(!IN_FAULT.with(|f| f.get()));
+            TIMES[k].fetch_add(started.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            guard
+        }
+    };
     HOLDING.with(|h| h.set(true));
     let mut held = Held {
         guard: Some(guard),
@@ -577,7 +634,7 @@ fn open(g: &mut Guards, page: usize) -> bool {
     }
     let mut old = 0;
     // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    timed_protect(|| unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) } != 0);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::OpenPages, 1);
     true
@@ -592,7 +649,7 @@ fn open_run(g: &mut Guards, first: usize, last: usize) {
     }
     let mut old = 0;
     // SAFETY: blocks we made read-only.
-    if unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } == 0 {
+    if !timed_protect(|| unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } != 0) {
         for page in first..last {
             open(g, page);
         }
@@ -817,7 +874,7 @@ fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usiz
         tests::PROTECTS.with(|n| n.set(n.get() + 1));
         let mut old = 0;
         // SAFETY: title memory; only its protection changes.
-        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
+        timed_protect(|| unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 })
     };
     let unmapped = |page: usize| {
         // SAFETY: plain data filled in by the query.
@@ -1179,6 +1236,7 @@ fn install() {
             || r.NumberParameters < 2
             || r.ExceptionInformation[0] != WRITE
         {
+            fault(3);
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
@@ -1190,12 +1248,17 @@ fn install() {
         if HOLDING.with(|h| h.get()) {
             if read_only(at) {
                 open_under_lock(at / PAGE);
+                fault(0);
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
+            fault(2);
             return EXCEPTION_CONTINUE_SEARCH;
         }
+        IN_FAULT.with(|f| f.set(true));
         let mut g = guards();
+        IN_FAULT.with(|f| f.set(false));
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+            fault(0);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             // mac: who wrote a block of the title's view heap last
@@ -1204,8 +1267,10 @@ fn install() {
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
+            fault(1);
             EXCEPTION_CONTINUE_EXECUTION
         } else {
+            fault(2);
             EXCEPTION_CONTINUE_SEARCH
         }
     }

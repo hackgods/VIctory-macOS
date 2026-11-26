@@ -5018,6 +5018,8 @@ impl Meter {
             // With `VICTORY_ALIAS_BUFFERS` only (else empty): the same frames'
             // zero-copy and copy paths.
             let zero_copy = crate::alias::frame_line(report_frames);
+            // mac: the guard lock's waits and the protection calls, always.
+            let guards = crate::watch::frame_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5042,7 +5044,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}",
+                 batched){zero_copy}{guards}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

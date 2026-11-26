@@ -141,6 +141,17 @@ impl Viewed {
         }
     }
 
+    /// A slot whose unordered view reaches `len` bytes of `shadow` at
+    /// `address` (tests: no view or resource needed).
+    #[cfg(test)]
+    pub(crate) fn add_unordered(&self, shadow: &Arc<Shadow>, address: u64, len: u64) {
+        let seen = Seen::Buffer(shadow.clone(), address, len, true);
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .count(&seen, true);
+    }
+
     /// The buffer ranges views reach, merged per host copy and kind
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]

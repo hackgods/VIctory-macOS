@@ -15,8 +15,9 @@
 //! in both makes and cancel. A primitive's bytes come the same way from 256
 //! and 128 primitives, padded with vertex rows.
 //!
-//! No game and no game data. Run it with `tools/macos/mesh-probe.sh`
-//! (notes: "Measured with the probe" in the port's mesh-size notes).
+//! No game and no game data. Run it with `tools/macos/mesh-probe.sh`.
+//! What it measured, and the rule that gives all of it, are in
+//! `mesh_size`: the sweep is that table, measured again.
 //!
 //! A signature, one line: elements separated by spaces, in signature order.
 //!
@@ -251,231 +252,6 @@ fn total_in(text: &str) -> Option<u32> {
     text[at..at + end].parse().ok()
 }
 
-/// The built-in sweep; `VICTORY_MESH_PROBE_SIGS` names a file of lines
-/// to measure instead.
-const SWEEP: &[&str] = &[
-    "# the total is a * v + b * p: one signature at several counts",
-    "P f4*16 v=128",
-    "P f4*16 v=129",
-    "P f4*16 v=200",
-    "P f4*16 v=256",
-    "P f4*16 v=128 p=1",
-    "P f4*16 v=128 p=256",
-    "P f4*15 v=128",
-    "P f4*15 qf4 v=128 p=128",
-    "P f4*15 qf4 v=128 p=129",
-    "P f4*7 qf4*8 v=256 p=256",
-    "# what the pixel shader does with them",
-    "P f4*16 ps=decl",
-    "P f4*16 ps=none",
-    "P f3*16 ps=read",
-    "P f3*16 ps=none",
-    "# the position alone, and one row of each width after it",
-    "P",
-    "P f1",
-    "P f2",
-    "P f3",
-    "P f4",
-    "# runs of one width",
-    "P f1*2",
-    "P f1*3",
-    "P f1*4",
-    "P f1*5",
-    "P f2*2",
-    "P f2*3",
-    "P f2*4",
-    "P f3*2",
-    "P f3*3",
-    "P f3*4",
-    "P f3*5",
-    "P f3*8",
-    "P f4*2",
-    "P f4*3",
-    "P f4*8",
-    "# two widths, both orders",
-    "P f2 f4",
-    "P f4 f2",
-    "P f3 f4",
-    "P f4 f3",
-    "P f1 f4",
-    "P f4 f1",
-    "P f3 f1",
-    "P f1 f3",
-    "P f3 f2",
-    "P f2 f3",
-    "P f1 f2",
-    "P f2 f1",
-    "P f3 f4 f3 f4",
-    "P f3 f3 f4 f4",
-    "P f4 f4 f3 f3",
-    "P f3 f1 f3 f1",
-    "P f3 f3 f1 f1",
-    "P f2 f2 f4",
-    "P f2 f4 f2",
-    "P f1 f1 f1 f1 f4",
-    "P f1 f4 f1 f4",
-    "# registers: gaps, order in the signature against register order, the position's place",
-    "P f4@1 f4@2",
-    "P f4@1 f4@5",
-    "P f4@2 f4@1",
-    "P f3@2 f4@1",
-    "P f4@1 f3@2",
-    "f4@0 P@1 f3@2",
-    "f4@0 f3@1 P@2",
-    "f3@0 f4@1 P@2",
-    "P@2 f3@0 f4@1",
-    "# several elements in one register",
-    "P f3 +f1",
-    "P f2 +f2",
-    "P f1 +f1 +f1 +f1",
-    "P f1 +f2 +f1",
-    "P f2 +f1",
-    "P f3 +f1 f3 +f1",
-    "P f1@1.3 f3@1.0",
-    "P f3@1.1",
-    "P f1@1.3",
-    "P f2@1.2",
-    "# clip distances: how many, and in the first, a middle and the last register",
-    "P C1",
-    "P C2",
-    "P C3",
-    "P C4",
-    "P C4 f4",
-    "P C4 f3",
-    "P C1 f4",
-    "P C1 f3",
-    "P C4 f4*4",
-    "P f4*2 C4 f4*2",
-    "P f4*4 C4",
-    "P C4 f3*4",
-    "P f3*2 C4 f3*2",
-    "P f3*4 C4",
-    "P C1 f4*4",
-    "P f4*4 C1",
-    "P C4 f4*4 pd=0",
-    "P f4*4 C4 pd=0",
-    "C4@0 P@1 f4*4",
-    "P C4 C4 f4*2",
-    "# cull distances",
-    "P K4 f4*4",
-    "P f4*4 K4",
-    "P K1 f4*4",
-    "P C4 K4 f4*4",
-    "P C2 +K2 f4*4",
-    "# integers against floats, flat against interpolated",
-    "P u4",
-    "P u3",
-    "P u2",
-    "P u1",
-    "P i4",
-    "P i1",
-    "P u1 f4",
-    "P f4 u1",
-    "P u1 +u1 f4",
-    "P u1 +u1 +u1 f4",
-    "P u3 f4",
-    "P u3 u3",
-    "P c4",
-    "P c3",
-    "P c3 c3",
-    "P c3 f4",
-    "P n3 n3",
-    "P n3 f4",
-    "P f3 c3 f3 c3",
-    "P f3 f3 c3 c3",
-    "P f3 u3 f3 u3",
-    "P e3 e3",
-    "P s3 s3",
-    "P f3 +c1",
-    "P f2 +u2",
-    "# per-primitive rows",
-    "P f4 qf4",
-    "P f4 qf3",
-    "P f4 qf3*2",
-    "P f4 qf3 qf4",
-    "P f4 qf1",
-    "P f4 qu1",
-    "P f4 qf2 qf4",
-    "P f4 qf4*4",
-    "P f3*3 qf3*3",
-    "# the counts: vertices are rounded up to a multiple of 4, primitives are not",
-    "P f4*16 v=125",
-    "P f4*16 v=126",
-    "P f4*16 v=127",
-    "P f4*16 v=130",
-    "P f4*16 v=131",
-    "P f4*16 v=132",
-    "P f4*16 v=133",
-    "P f4*15 qf4 p=127",
-    "P f4*15 qf4 p=130",
-    "P f4*15 qf4 p=131",
-    "# where the 16 bytes of a shader with clip distances sit",
-    "P f1 C1",
-    "P f3 C1",
-    "P f2 C1",
-    "P f1 C4",
-    "P f3 C4",
-    "P f3 C4 f3",
-    "f3@0 P@1 C1@2",
-    "f3@0 C1@1 P@2",
-    "C1@0 f3@1 P@2",
-    "P f3 f3 C1 f1",
-    "P C1 C1",
-    "P C1 +C1",
-    "P C1 +C1 +C1 +C1",
-    "P C2 C2",
-    "P C4 C1",
-    "P C4 C4",
-    "P C4 C4 C4",
-    "P f3 K1",
-    "P f3 K4 f3",
-    "# clip distances: interpolation mode, and components never written (in another element, P f4!b, D3DMetal ends the process)",
-    "P C4^4 f4",
-    "P C4^1 f4",
-    "P C4^0 f4",
-    "P C4!1 f4",
-    "P C4!3 f4",
-    "P C4!0 f4",
-    "P f3 C4!1",
-    "# order: the signature's, the registers' or the names'",
-    "P f3:TEXCOORD0@2 f4:TEXCOORD1@1",
-    "P f3:TEXCOORD1@2 f4:TEXCOORD0@1",
-    "P f3:TEXCOORD1@1 f4:TEXCOORD0@2",
-    "P f4:TEXCOORD0@2 f3:TEXCOORD1@1",
-    "P f4:TEXCOORD1@2 f3:TEXCOORD0@1",
-    "P f4:TEXCOORD1@1 f3:TEXCOORD0@2",
-    "P f3:COLOR0 f4:TEXCOORD0",
-    "P f3:TEXCOORD0 f4:COLOR0",
-    "P f4:COLOR0 f3:TEXCOORD0",
-    "P f4:TEXCOORD0 f3:COLOR0",
-    "P f3:B5 f4:A7 f3:A2 f4:C0",
-    "P f3:A2 f3:B5 f4:A7 f4:C0",
-    "# one register, several elements",
-    "P f2@1 f1@1.3",
-    "P f2@1 f1@1.2",
-    "P f1@1 f2@1.2",
-    "P f2@1.2 f2@1.0",
-    "P f1@1.1 f1@1.3 f1@1.0 f1@1.2",
-    "# many small elements",
-    "P f1*52",
-    "P f1*60",
-    "P f2*30",
-    "P f1*16 f2*8 f3*4 f4*2",
-    "# shapes of 17 to 19 registers, each in three orders (the sizes a game on this port logged for them: 264 to 272, and 260 against a fit)",
-    "P@0 C4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f2@17",
-    "P@0 C4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f4@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f2@17",
-    "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f3@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 C4@17",
-    "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f2@16 C4@17",
-    "P@0 f3@1 f3@2 f3@3 f3@4 f3@5 f3@6 f3@7 f3@8 f3@9 f2@10 f4@11 f4@12 f4@13 f4@14 f4@15 f4@16 C4@17",
-    "P@0 f3@1 f3@2 f3@3 f3@4 f3@5 f3@6 f3@7 f3@8 f2@9 f4@10 f4@11 f4@12 f4@13 f4@14 f4@15 f4@16 C4@17",
-    "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f3@7 f3@8 f3@9 f3@10 f3@11 f3@12 f3@13 f3@14 f2@15 f1@16 C1@17",
-    "P@0 f3@1 f3@2 f3@3 f3@4 f3@5 f3@6 f3@7 f3@8 f2@9 f1@10 f4@11 f4@12 f4@13 f4@14 f4@15 f4@16 C1@17",
-    "C1@0 P@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f3@8 f3@10 f3@11 f3@12 f3@13 f3@14 f3@15 f3@16 f2@17.2 u1@18",
-    "f3@0 P@1 f3@2 f3@3 f3@4 f3@5 f3@6 f3@7 f3@8 f2@10.2 u1@11 f4@12 f4@13 f4@14 f4@15 f4@16 f4@17 C1@18",
-    "P@0 f4@1 f4@2 f4@3 f4@4 f4@5 f4@6 f4@7 f4@8 f4@9 f4@10 f4@11 f4@12 f3@13 f1@14.3 u1@15 C1@16",
-    "P@0 f3@1 f1@2.3 u1@3 f4@4 f4@5 f4@6 f4@7 f4@8 f4@9 f4@10 f4@11 f4@12 f4@13 f4@14 f4@15 C1@16",
-];
-
 #[cfg(windows)]
 mod gpu {
     use std::fmt::Write as _;
@@ -486,7 +262,8 @@ mod gpu {
     use super::super::container::SigElement;
     use super::super::host::{Draw, Host, Root};
     use super::super::shader::{Mesh, Shader};
-    use super::{LIMIT, Probe, SWEEP, parse, total_in};
+    use super::super::mesh_size;
+    use super::{LIMIT, Probe, parse, total_in};
 
     /// Makes each shader's bytes its own, so nothing D3DMetal or Metal cached
     /// for an earlier make (of this or another run) answers for it.
@@ -777,6 +554,19 @@ mod gpu {
                 }
             }
         }
+        // The rule, and the sweep's table, against the measurement.
+        let rule = (mesh_size::struct_bytes(&probe.vertex), mesh_size::struct_bytes(&probe.prims));
+        let measured = (m.vertex.map(|v| v.0), m.primitive.map(|p| p.0));
+        if measured.0.is_some_and(|a| a != f64::from(rule.0)) || measured.1.is_some_and(|b| b != f64::from(rule.1)) {
+            write!(m.note, " [the rule: {} a vertex, {} a primitive]", rule.0, rule.1).expect("a string");
+        }
+        if let Some(&(_, vertex, primitive)) = mesh_size::MEASURED.iter().find(|row| row.0 == text) {
+            let same = measured.0 == Some(f64::from(vertex))
+                && measured.1.unwrap_or(0.0) == f64::from(primitive);
+            if !same {
+                write!(m.note, " [measured before: {vertex} a vertex, {primitive} a primitive]").expect("a string");
+            }
+        }
         // The make as given against the measured sizes.
         if let Some((a, ..)) = m.vertex {
             let b = m.primitive.map_or(0.0, |(b, _)| b);
@@ -806,8 +596,10 @@ mod gpu {
         m.trim().to_string()
     }
 
-    /// Measures the sweep (or the lines of `VICTORY_MESH_PROBE_SIGS`) on the
-    /// hardware device and prints a table; `VICTORY_MESH_PROBE_OUT` names a
+    /// Measures the sweep (the lines of `mesh_size::MEASURED`, or those of
+    /// the file `VICTORY_MESH_PROBE_SIGS` names) on the hardware device and
+    /// prints a table, with a note at each row where the measured rule
+    /// (`mesh_size`) or the sweep's own table gives another size; `VICTORY_MESH_PROBE_OUT` names a
     /// file that gets it too. `VICTORY_MESH_PROBE_DRAW=1` also draws each line's
     /// own pipeline, to see that a refused one draws nothing and the others
     /// draw. Run by `tools/macos/mesh-probe.sh`, which sends the process's
@@ -849,7 +641,7 @@ mod gpu {
                 .lines()
                 .map(str::to_string)
                 .collect(),
-            None => SWEEP.iter().map(|l| l.to_string()).collect(),
+            None => mesh_size::MEASURED.iter().map(|m| m.0.to_string()).collect(),
         };
         let draw = std::env::var("VICTORY_MESH_PROBE_DRAW").is_ok_and(|v| v == "1");
         let started = std::time::Instant::now();
@@ -939,7 +731,7 @@ fn probe_lines_parse() {
     let e = &p.vertex[1];
     assert_eq!((e.name.as_str(), e.index, e.interp, e.usage, e.row), ("COLOR", 3, 1, 0xB, Some(2)));
     assert_eq!((p.vertex[2].interp, p.vertex[2].row), (4, Some(3)));
-    for line in SWEEP.iter().filter(|l| !l.starts_with('#')) {
+    for line in super::mesh_size::MEASURED.iter().map(|m| m.0).filter(|l| !l.starts_with('#')) {
         let p = parse(line).unwrap_or_else(|e| panic!("{line}: {e}"));
         assert!(p.vertex.iter().any(|e| e.kind == 3), "{line}");
         assert!(p.pixel <= 2 && (p.pixel_distances || !p.pixel_position), "{line}");

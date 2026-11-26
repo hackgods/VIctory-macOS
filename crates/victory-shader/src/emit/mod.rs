@@ -247,6 +247,7 @@ pub use rect::{rectangle_gs, right_angle};
 mod memory_tests;
 #[cfg(test)]
 mod mesh_probe_tests;
+mod mesh_size;
 mod sampler;
 #[cfg(all(test, windows))]
 mod semantics_tests;
@@ -479,28 +480,45 @@ pub struct Options {
 pub const METAL_MESH_OUTPUT_BYTES: u32 = 32768;
 
 /// A translated mesh shader's declared outputs per thread group: the counts
-/// it declares (the console program's maxima) and the signature components
-/// of a vertex and of a primitive.
+/// it declares (the console program's maxima), the signature components
+/// of a vertex and of a primitive, and their bytes as D3DMetal lays them
+/// out (`mesh_size`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeshOutputs {
     pub vertices: u32,
     pub primitives: u32,
     pub vertex_components: u32,
     pub primitive_components: u32,
+    /// The bytes of one vertex and of one primitive by the measured rule.
+    pub vertex_bytes: u32,
+    pub primitive_bytes: u32,
 }
 
 impl MeshOutputs {
-    /// The outputs' size as Metal counts it: 4 bytes per declared component
-    /// of each declared vertex and primitive (indices are not counted), not
-    /// 16 per signature row. Measured on an M4 with D3DMetal 4.0 beta 3: the
-    /// largest shape that draws is exactly [`METAL_MESH_OUTPUT_BYTES`], and
-    /// at 128 vertices 17 rows of 59 components draw, 17 of 65 do not.
+    /// The outputs' size as VIctory and the DXIL validator count it: 4
+    /// bytes per declared component of each declared vertex and primitive
+    /// (indices are not counted). This is not what Metal tests against its
+    /// limit, though it was taken for that until 26 November 2026:
+    /// [`MeshOutputs::metal_bytes`] is. It never exceeds Metal's count, so
+    /// outputs over the limit by this count are over it for Metal too; it
+    /// still decides which programs get their counts capped and which pairs
+    /// are linked, as before.
     pub fn bytes(&self) -> u32 {
         4 * (self.vertex_components * self.vertices + self.primitive_components * self.primitives)
     }
 
+    /// The outputs' size as Metal counts it behind D3DMetal, the number
+    /// compared with [`METAL_MESH_OUTPUT_BYTES`]: measured with the probe
+    /// (`mesh_probe_tests`), the rule in `mesh_size`. Elements cost 4 bytes
+    /// a component plus what their alignment wastes, clip distances 16
+    /// bytes more, and vertices count in fours.
+    pub fn metal_bytes(&self) -> u32 {
+        mesh_size::total_bytes(self.vertex_bytes, self.primitive_bytes, self.vertices, self.primitives)
+    }
+
     /// The outputs of a mesh shader being lowered: its declared counts and
-    /// the components of the signature elements that have a register.
+    /// the signature elements that have a register, in the signature's
+    /// order.
     pub(crate) fn of(
         outputs: &[container::SigElement],
         prims: &[container::SigElement],
@@ -518,13 +536,18 @@ impl MeshOutputs {
             primitives,
             vertex_components: components(outputs),
             primitive_components: components(prims),
+            vertex_bytes: mesh_size::struct_bytes(outputs),
+            primitive_bytes: mesh_size::struct_bytes(prims),
         }
     }
 }
 
 /// The declared outputs of a translated mesh shader: the counts from its
-/// `PSV0` part, the components from its `OSG1` and `PSG1`. None for other
-/// stages or a container without them.
+/// `PSV0` part, the elements from its `OSG1` and `PSG1`. None for other
+/// stages or a container without them. The parts list the elements by
+/// register, and D3DMetal lays them out in the order of the DXIL metadata:
+/// the two agree for the translator's own shaders, whose signatures are in
+/// register order (the console's are, and a linked pair's are made so).
 pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
     use crate::dxbc::u32_at;
     let c = Container::parse(dxil).ok()?;
@@ -537,26 +560,13 @@ pub fn mesh_outputs(dxil: &[u8]) -> Option<MeshOutputs> {
         return None;
     }
     let half = |at: usize| u32::from(u16::from_le_bytes([info[at], info[at + 1]]));
-    // The components of a signature's elements that have a register.
-    let components = |fourcc| -> Option<u32> {
-        let Some(part) = c.part(fourcc) else {
-            return Some(0);
-        };
-        let (count, base) = (u32_at(part.data, 0).ok()?, u32_at(part.data, 4).ok()?);
-        (0..count as usize).try_fold(0, |sum, i| {
-            let at = base as usize + 32 * i;
-            let register = u32_at(part.data, at + 20).ok()?;
-            let mask = *part.data.get(at + 24)?;
-            let counted = (register != u32::MAX).then(|| mask.count_ones());
-            Some(sum + counted.unwrap_or(0))
-        })
+    let elements = |fourcc| -> Option<Vec<container::SigElement>> {
+        match c.part(fourcc) {
+            Some(part) => signature(part.data).ok(),
+            None => Some(Vec::new()),
+        }
     };
-    Some(MeshOutputs {
-        vertices: half(12),
-        primitives: half(14),
-        vertex_components: components(FourCC::OSG1)?,
-        primitive_components: components(FourCC::PSG1)?,
-    })
+    Some(MeshOutputs::of(&elements(FourCC::OSG1)?, &elements(FourCC::PSG1)?, half(12), half(14)))
 }
 
 struct Prepared<'a> {
@@ -2133,12 +2143,14 @@ mod tests {
     ];
 
     /// A translated mesh shader's declared outputs come back from its
-    /// `PSV0` and signatures, and their size is Metal's count: 4 bytes per
-    /// component of each declared vertex and primitive. 17 full rows of
-    /// 128 vertices are 34816 bytes; 17 rows of 59 components are under
-    /// the limit. A shader over the limit has its counts capped at its 32
-    /// lanes, which export one vertex and one primitive each (the last two
-    /// columns). Other stages have none.
+    /// `PSV0` and signatures, with VIctory's count (4 bytes per component
+    /// of each declared vertex and primitive) and Metal's (`mesh_size`;
+    /// for whole rows the two are one). 17 full rows of 128 vertices are
+    /// 34816 bytes; 17 rows of 59 components are under the limit by
+    /// VIctory's count and exactly at it by Metal's, whose alignment wastes
+    /// 20 bytes a vertex there. A shader over the limit has its counts
+    /// capped at its 32 lanes, which export one vertex and one primitive
+    /// each (the last two columns). Other stages have none.
     #[test]
     fn mesh_outputs_are_counted_as_metal_counts_them() {
         for (v, p, vr, pr, ev, ep) in [
@@ -2157,9 +2169,12 @@ mod tests {
                     primitives: ep,
                     vertex_components: 4 * vr,
                     primitive_components: 4 * pr,
+                    vertex_bytes: 16 * vr,
+                    primitive_bytes: 16 * pr,
                 }
             );
             assert_eq!(o.bytes(), 4 * (4 * vr * ev + 4 * pr * ep), "{o:?}");
+            assert_eq!(o.metal_bytes(), o.bytes(), "{o:?}");
             if (ev, ep) == (v, p) {
                 assert!(o.bytes() <= METAL_MESH_OUTPUT_BYTES, "{o:?}");
             }
@@ -2167,6 +2182,12 @@ mod tests {
         let ms = shaped_mesh(128, 128, &HALF_FILLED, 0).unwrap();
         let o = mesh_outputs(&ms.dxil).unwrap();
         assert_eq!((o.vertex_components, o.bytes()), (59, 30208), "{o:?}");
+        assert_eq!((o.vertex_bytes, o.metal_bytes()), (256, METAL_MESH_OUTPUT_BYTES), "{o:?}");
+        // One component more in a row of its own: 260 bytes a vertex, and
+        // over the limit by either count (so the counts are capped).
+        let one_more: Vec<&[u8]> = [&[&[4u8][..]; 15][..], &[&[1]]].concat();
+        let o = mesh_outputs(&shaped_mesh(128, 128, &one_more, 0).unwrap().dxil).unwrap();
+        assert_eq!((o.vertex_components, o.vertex_bytes, o.vertices), (65, 260, 32), "{o:?}");
         assert_eq!(mesh_outputs(&[]), None);
         #[cfg(windows)]
         assert_eq!(mesh_outputs(&constant_color()), None);

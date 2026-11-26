@@ -363,7 +363,11 @@ pub(crate) fn translate_linked(
         merge_mesh_rows(),
     ) {
         Ok((ms_host, ps_host)) => {
-            let ms_bytes = victory_shader::emit::mesh_outputs(&ms_host.dxil).map(|o| o.bytes());
+            let outputs = victory_shader::emit::mesh_outputs(&ms_host.dxil);
+            let ms_bytes = outputs.map(|o| o.bytes());
+            // Metal's own count (`MeshOutputs::metal_bytes`, measured):
+            // what D3DMetal refuses the pipeline for when it is over.
+            let metal_bytes = outputs.map(|o| o.metal_bytes());
             let ms_used = ms.translated()?.used.clone();
             let mesh = ms.with_translation(Translated {
                 host: ms_host,
@@ -380,8 +384,17 @@ pub(crate) fn translate_linked(
                 mesh = %ms.hash,
                 pixel = ps.map_or("none", |p| p.hash.as_str()),
                 bytes = ms_bytes,
+                metal_bytes,
                 "mesh and pixel linked under 32 KiB output budget"
             );
+            if metal_bytes.is_some_and(|b| b > victory_shader::emit::METAL_MESH_OUTPUT_BYTES) {
+                tracing::warn!(
+                    mesh = %ms.hash,
+                    pixel = ps.map_or("none", |p| p.hash.as_str()),
+                    metal_bytes,
+                    "linked mesh outputs are over Metal's 32768 bytes: under D3DMetal the pipeline draws nothing"
+                );
+            }
             Some(LinkedPair { mesh, pixel })
         }
         Err(e) => {

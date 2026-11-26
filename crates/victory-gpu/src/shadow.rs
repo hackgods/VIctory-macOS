@@ -840,6 +840,75 @@ impl Shadow {
         // memory once it has: written, then guarded, all at once (each
         // opening and guarding is a Wine call and a guard-lock round trip,
         // ~1,000 pages a frame in #50's world).
+        // mac: with `VICTORY_COPY_BACK_SPLIT=1`, a long list of one copy's
+        // pages is looked at, and then written, on several threads
+        // ([`copy_back_split`]); else on this one, as before.
+        let long = copy_back_split() && pages.len() >= SPLIT_MIN_PAGES && !self.has_widened.load(Ordering::Acquire);
+        let split = long && !crate::watch::aliased(start, end - start);
+        if long {
+            split_said(split, pages.len());
+        }
+        #[cfg(test)]
+        MARKED_SPLIT.with(|taken| taken.set(Some(split)));
+        let (writes, taken) = if split {
+            let parts = pages.len().div_ceil(SPLIT_MIN_PAGES / 2).min(SPLIT_PARTS);
+            let each = pages.len().div_ceil(parts);
+            let done: Vec<Mutex<(crate::watch::Runs, Vec<usize>)>> = (0..parts).map(|_| Mutex::default()).collect();
+            crate::texture::in_parallel(parts, |k| {
+                let part = &pages[(k * each).min(pages.len())..((k + 1) * each).min(pages.len())];
+                *done[k].lock().unwrap_or_else(|e| e.into_inner()) = self.marked_pages(t, part, start, end);
+            });
+            let (mut writes, mut taken) = (Vec::new(), Vec::new());
+            for part in done {
+                let (w, p) = part.into_inner().unwrap_or_else(|e| e.into_inner());
+                writes.extend(w);
+                taken.extend(p);
+            }
+            (writes, taken)
+        } else {
+            self.marked_pages(t, pages, start, end)
+        };
+        let write = |(from, to): (usize, usize)| {
+            let len = to - from;
+            let _writing = crate::watch::writing(from, len);
+            // SAFETY: this run is inside the shadow. The GPU is done and
+            // widened_source keeps the merged bytes stable until the write.
+            let src = unsafe { self.data.add(from - start) };
+            crate::host::write_mapped(from as *mut u8, src, len);
+            len
+        };
+        let written = if split && writes.len() >= 2 {
+            // The runs do not overlap: each part writes its own.
+            let parts = writes.len().min(SPLIT_PARTS);
+            let each = writes.len().div_ceil(parts);
+            let total = std::sync::atomic::AtomicUsize::new(0);
+            crate::texture::in_parallel(parts, |k| {
+                let part = &writes[(k * each).min(writes.len())..((k + 1) * each).min(writes.len())];
+                let n: usize = part.iter().map(|&run| write(run)).sum();
+                total.fetch_add(n, Ordering::Relaxed);
+            });
+            total.into_inner()
+        } else {
+            writes.into_iter().map(write).sum()
+        };
+        if !taken.is_empty() {
+            t.taken(&taken);
+        }
+        written
+    }
+
+    /// [`Shadow::copy_back_marked`]'s look at `pages` (in order) of the
+    /// copy at `[start, end)`: the title ranges that go back (written
+    /// after, with the copy's bytes), and the pages that are then equal to
+    /// title memory. Pages of one copy are each looked at by one call, so
+    /// calls on disjoint lists may run at once (`VICTORY_COPY_BACK_SPLIT`).
+    fn marked_pages(
+        &self,
+        t: &crate::watch::Tracked,
+        pages: &[usize],
+        start: usize,
+        end: usize,
+    ) -> (crate::watch::Runs, Vec<usize>) {
         let mut writes: crate::watch::Runs = Vec::new();
         let mut taken = Vec::new();
         let mut title = Vec::new();
@@ -861,7 +930,8 @@ impl Shadow {
                 continue;
             }
             let n = to - from;
-            // SAFETY: inside the mapping; only the submitting thread writes it.
+            // SAFETY: inside the mapping; only the submitting thread writes
+            // it (mac: with the split, one thread each page).
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
             title.resize(n, 0);
             if !crate::host::read_into(from as *const u8, &mut title) {
@@ -890,20 +960,7 @@ impl Shadow {
                 taken.push(page / PAGE);
             }
         }
-        let mut written = 0;
-        for (from, to) in writes {
-            let len = to - from;
-            let _writing = crate::watch::writing(from, len);
-            // SAFETY: this run is inside the shadow. The GPU is done and
-            // widened_source keeps the merged bytes stable until the write.
-            let src = unsafe { self.data.add(from - start) };
-            crate::host::write_mapped(from as *mut u8, src, len);
-            written += len;
-        }
-        if !taken.is_empty() {
-            t.taken(&taken);
-        }
-        written
+        (writes, taken)
     }
 
     /// Whether the title wrote none of the copy's memory since the copy took
@@ -1521,6 +1578,59 @@ pub(crate) fn copy_back_ranges_disjoint(ranges: &[(u64, u64)]) -> bool {
 #[cfg(test)]
 thread_local! {
     static MARKED_COPY_BACK_PARALLEL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// mac: whether one copy's marked pages go back on several threads
+/// (`VICTORY_COPY_BACK_SPLIT=1`, off by default): the frame's big compute
+/// submission marks some 2,000 pages of one copy, which went back on one
+/// thread in 50 to 60 ms a frame ("marked pages: 2033 compared, 97.4 MB
+/// written back in 50.5 ms", diagnostics run of 26 November 23:29), with
+/// the next submission waiting. Not for a copy whose memory is shown at
+/// two addresses (a page written through one could be read through the
+/// other by another thread), nor one with widened readers.
+fn copy_back_split() -> bool {
+    #[cfg(test)]
+    if let Some(on) = SPLIT_FORCED.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_COPY_BACK_SPLIT");
+        if on {
+            tracing::info!(
+                "VICTORY_COPY_BACK_SPLIT: the marked pages of one copy go back on several threads ({SPLIT_PARTS} parts at most)"
+            );
+        }
+        on
+    })
+}
+
+/// The first split, and the first copy left to one thread as its memory
+/// is shown at two addresses, each said once (whether the split applies to
+/// the frame's big copy shows in the log of an A/B run).
+fn split_said(split: bool, pages: usize) {
+    static SAID: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+    SAID[usize::from(split)].call_once(|| {
+        if split {
+            tracing::info!("VICTORY_COPY_BACK_SPLIT: first split, {pages} marked pages of one copy");
+        } else {
+            tracing::info!(
+                "VICTORY_COPY_BACK_SPLIT: {pages} marked pages of a copy whose memory is shown at two addresses go back on one thread (said once)"
+            );
+        }
+    });
+}
+
+/// A copy's marked pages are split from this many on, in parts of half as many at least.
+const SPLIT_MIN_PAGES: usize = 64;
+/// Into this many parts at most (the texture workers take them).
+const SPLIT_PARTS: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice, whatever the environment says.
+    static SPLIT_FORCED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static MARKED_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
@@ -3065,6 +3175,58 @@ pub(crate) mod tests {
         assert_eq!(copy.copy_back_marked(&pages), 0);
         drop(copy);
         crate::watch::tests::free(base);
+    }
+
+    /// mac: `VICTORY_COPY_BACK_SPLIT`: a long list of one copy's marked
+    /// pages, looked at and written on several threads, goes back as on
+    /// one: the changed byte of each page it changed, nothing of the
+    /// others, and then nothing more (the pages equal title memory).
+    #[test]
+    fn a_long_list_of_marked_pages_goes_back_the_same_split() {
+        let Some(host) = host() else {
+            return;
+        };
+        let n = 2 * SPLIT_MIN_PAGES + 5;
+        let mut written = Vec::new();
+        for split in [false, true] {
+            let base = crate::watch::tests::pool(n);
+            let len = n * PAGE;
+            let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+            // SAFETY: a live D3D12 buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let copy = Shadow::new(buffer, data, gpu, base as u64, len as u64);
+            // SAFETY: a private allocation of `n` pages, untouched by the GPU.
+            unsafe { (base as *mut u8).write_bytes(0x11, len) };
+            copy.update(base, len);
+            // The shaders change a byte in two pages of every three.
+            let changed: Vec<(usize, u8)> = (0..n)
+                .filter(|i| i % 3 != 2)
+                .map(|i| (base + i * PAGE + (i * 37) % PAGE, 0x80 | (i % 127) as u8))
+                .collect();
+            for &(at, byte) in &changed {
+                copy.write_host(at as u64, &[byte]);
+            }
+            let pages: Vec<usize> = (0..n).map(|i| base + i * PAGE).collect();
+            SPLIT_FORCED.with(|f| f.set(Some(split)));
+            let back = copy.copy_back_marked(&pages);
+            let was = MARKED_SPLIT.with(std::cell::Cell::get);
+            SPLIT_FORCED.with(|f| f.set(None));
+            assert_eq!(was, Some(split), "split: {split}");
+            assert_eq!(back, changed.len() * PAGE, "split: {split}");
+            // SAFETY: all sampled addresses lie inside our allocation.
+            let read = |at: usize| unsafe { (at as *const u8).read_volatile() };
+            for &(at, byte) in &changed {
+                assert_eq!(read(at), byte, "split: {split}, at {:#x}", at - base);
+            }
+            for i in (0..n).filter(|i| i % 3 == 2) {
+                assert_eq!(read(base + i * PAGE + 5), 0x11, "split: {split}, page {i} unchanged");
+            }
+            assert_eq!(copy.copy_back_marked(&pages), 0, "split: {split}, nothing more");
+            drop(copy);
+            crate::watch::tests::free(base);
+            written.push(back);
+        }
+        assert_eq!(written[0], written[1]);
     }
 
     /// While a submission runs on the host GPU, a copy a submitted list's

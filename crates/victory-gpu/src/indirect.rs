@@ -24,6 +24,16 @@
 //! 131721b7): one thread walks a table of them in the order of the draws,
 //! with the results and the budget of one dispatch each.
 //!
+//! With `VICTORY_DISPATCH_CLAMPS=1` as well, the clamps of indirect
+//! dispatches go there too ([`hoisting_dispatches`]). A run of them does
+//! not end at the title's dispatches but at its next barrier, pipeline
+//! sync, copy, clear or immediate write: by D3D12's rules arguments a
+//! dispatch writes are read as such only after a barrier. The title's
+//! compute lists write a table of records, put a barrier, and run hundreds
+//! of indirect dispatches from it (a frame at the prison: 961 in 104 such
+//! runs by the barriers a frame capture holds, each clamp a dispatch of
+//! ours and three barriers before).
+//!
 //! shortcut: the bounds (2^24 vertices, 2^26 vertex instances, 65,535
 //! groups per dimension except in x where [`widest`] allows more, 2^20
 //! per dispatch, one-dimensional mesh dispatches, the budget) cut
@@ -447,6 +457,9 @@ fn bound_with(
     if count.is_some() {
         RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
     }
+    if kind == DISPATCH {
+        FOR_DISPATCHES[0].fetch_add(1, Ordering::Relaxed);
+    }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
     // SAFETY: an open list; our buffers, and title buffers' copies the
@@ -509,6 +522,14 @@ pub(crate) fn hoisting() -> bool {
     crate::mac_switches::batch_clamps()[0]
 }
 
+/// Whether the clamps of runs of indirect dispatches go to the host list
+/// before too (`VICTORY_DISPATCH_CLAMPS=1` with [`hoisting`],
+/// `crate::mac_switches::dispatch_clamps`); else each is recorded before
+/// its dispatch.
+pub(crate) fn hoisting_dispatches() -> bool {
+    crate::mac_switches::dispatch_clamps()
+}
+
 /// As [`bound`], recorded in `clamps`, the host list that runs before
 /// `into`, for an execution `into` records: the clamped records go to one
 /// of `into`'s own buffers ([`HostList::clamp_room`]), which the execution
@@ -554,11 +575,18 @@ pub(crate) fn bound_before_as(
         RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
     }
     HOISTED.fetch_add(1, Ordering::Relaxed);
+    if kind == DISPATCH {
+        FOR_DISPATCHES[0].fetch_add(1, Ordering::Relaxed);
+        FOR_DISPATCHES[1].fetch_add(1, Ordering::Relaxed);
+    }
     if batched
         && batch().is_some()
         && Pending::add(clamps, (base, gpu), count, (kind, stride, records), &out, at, budget).is_some()
     {
         BATCHED.fetch_add(1, Ordering::Relaxed);
+        if kind == DISPATCH {
+            FOR_DISPATCHES[2].fetch_add(1, Ordering::Relaxed);
+        }
         return Some((out, at));
     }
     // Alone, after the clamps batched before it: the budget is charged in
@@ -710,6 +738,17 @@ pub(crate) fn take_dispatches() -> u64 {
     DISPATCHES.swap(0, Ordering::Relaxed)
 }
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// The kind of an indirect dispatch's records (PC numbering).
+const DISPATCH: u32 = 2;
+
+/// Clamps of indirect dispatches since the last call (the frame line), of
+/// all the clamps: recorded, in the list before their dispatch's, in
+/// batches.
+pub(crate) fn take_for_dispatches() -> [u64; 3] {
+    FOR_DISPATCHES.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static FOR_DISPATCHES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Records the clamps were asked to walk (the maximum of each execution)
 /// since the last call, and the part of them under a count buffer, where

@@ -1251,6 +1251,13 @@ pub(crate) struct HostList {
     /// the reset: what may have written indirect arguments (hoisted clamps,
     /// `crate::indirect`).
     writes: std::sync::atomic::AtomicU64,
+    /// Title barriers, pipeline syncs, buffer copies, clears and immediate
+    /// writes recorded since the reset: what may make an earlier write
+    /// readable as indirect arguments (hoisted clamps of indirect
+    /// dispatches, `crate::indirect`). Not the title's dispatches: by
+    /// D3D12's rules what one writes is not read as arguments before a
+    /// barrier.
+    orders: std::sync::atomic::AtomicU64,
     /// Clamped arguments of the list's indirect draws that the list before
     /// it writes ([`HostList::clamp_room`]).
     hoisted: Mutex<Hoisted>,
@@ -1685,6 +1692,7 @@ impl Host {
                 budget_from: Mutex::new(None),
                 arguments: Mutex::new(None),
                 writes: Default::default(),
+                orders: Default::default(),
                 hoisted: Mutex::default(),
                 clamp_batch: Mutex::new(None),
                 #[cfg(feature = "diagnostics")]
@@ -2866,6 +2874,7 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.writes.store(0, Ordering::Relaxed);
+        self.orders.store(0, Ordering::Relaxed);
         self.own_budget();
         {
             let mut hoisted = self.hoisted.lock().unwrap_or_else(|e| e.into_inner());
@@ -3721,16 +3730,35 @@ impl HostList {
         Some(made)
     }
 
-    /// Counts a dispatch, buffer copy, clear or immediate write: what may
-    /// write indirect arguments.
+    /// Counts a buffer copy, clear, immediate write or clamp in the list:
+    /// what may write indirect arguments, and make them readable as such
+    /// at once.
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
+        self.orders.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a dispatch of the title's: it may write indirect arguments,
+    /// which are read as such only after a barrier ([`HostList::orders`]).
+    pub(crate) fn count_dispatch(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts a barrier or pipeline sync of the title's.
+    pub(crate) fn count_order(&self) {
+        self.orders.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Dispatches, buffer copies, clears and immediate writes since the
     /// reset.
     pub(crate) fn writes(&self) -> u64 {
         self.writes.load(Ordering::Relaxed)
+    }
+
+    /// Barriers, pipeline syncs, buffer copies, clears and immediate writes
+    /// since the reset: [`HostList::count_write`], [`HostList::count_order`].
+    pub(crate) fn orders(&self) -> u64 {
+        self.orders.load(Ordering::Relaxed)
     }
 
     /// Room for `bytes` of clamped arguments of one of this list's indirect
@@ -4991,6 +5019,9 @@ impl Meter {
             let hoists = crate::list::take_hoists() as f64 / report_frames;
             let (batched, batches) = crate::indirect::take_batched();
             let (batched, batches) = (batched as f64 / report_frames, batches as f64 / report_frames);
+            let [for_dispatches, dispatches_hoisted, dispatches_batched] =
+                crate::indirect::take_for_dispatches().map(|n| n as f64 / report_frames);
+            let dispatch_hoists = crate::list::take_dispatch_hoists() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -4999,7 +5030,10 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
                  dispatches/frame ({hoisted:.0} clamps in the list before their draw's, \
-                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches){zero_copy}",
+                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
+                 {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
+                 in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
+                 batched){zero_copy}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

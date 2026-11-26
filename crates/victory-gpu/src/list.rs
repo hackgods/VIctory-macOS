@@ -204,12 +204,24 @@ pub(crate) fn take_hoists() -> u64 {
 /// ([`hoist`]): each cut the title list once more.
 static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Of those cuts since the last call, the ones made at an indirect
+/// dispatch (the frame line).
+pub(crate) fn take_dispatch_hoists() -> u64 {
+    DISPATCH_HOISTS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+static DISPATCH_HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
 /// of the list's draws already go to the host list before it and nothing
 /// since may have written arguments, the title list goes on in a new host
 /// list here, as at a wait. The one it leaves stays open for the clamps of
 /// the draws to come, so that no dispatch of ours comes between the draws;
 /// it ends where the run does ([`end_hoist`]).
+///
+/// mac: the same before an indirect dispatch with
+/// `crate::indirect::hoisting_dispatches`, unless the clamps already go to
+/// the host list before and no barrier, sync, copy, clear or immediate
+/// write was recorded since (`State::hoists_dispatches_into`).
 #[cfg(windows)]
 fn hoist(this: This, kind: u32) {
     if !crate::indirect::hoisting() {
@@ -218,16 +230,28 @@ fn hoist(this: This, kind: u32) {
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
     let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
-    if state.hoistable(kind) {
-        start_run(this, &mut state);
+    let dispatch = kind == crate::draw::INDIRECT_DISPATCH;
+    let hoistable = if dispatch {
+        crate::indirect::hoisting_dispatches() && state.dispatch_hoistable()
+    } else {
+        state.hoistable(kind)
+    };
+    if hoistable {
+        start_run(this, &mut state, dispatch);
     }
 }
 
-/// [`hoist`] for a draw whose clamp can be hoisted, with the list's state.
+/// [`hoist`] for an indirect draw, or a `dispatch`, whose clamp can be
+/// hoisted, with the list's state.
 #[cfg(windows)]
-fn start_run(this: This, state: &mut crate::draw::State) {
+fn start_run(this: This, state: &mut crate::draw::State, dispatch: bool) {
     let Some(current) = host_list(this) else { return };
-    if state.hoists_into(current) {
+    let joins = if dispatch {
+        state.hoists_dispatches_into(current)
+    } else {
+        state.hoists_into(current)
+    };
+    if joins {
         return;
     }
     // SAFETY: the title passes one of our lists.
@@ -239,6 +263,9 @@ fn start_run(this: This, state: &mut crate::draw::State) {
     };
     let Some(next) = next_segment(this) else { return };
     HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if dispatch {
+        DISPATCH_HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     state.cut(next);
     // One budget on both sides of this cut, as without it.
     next.continue_budget(&clamps);
@@ -692,6 +719,8 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     if let Some(list) = host_list(this)
         && !barriers.is_null()
     {
+        // A run of hoisted clamps of indirect dispatches ends here.
+        list.count_order();
         // SAFETY: the title passes `count` barriers.
         let barriers = unsafe { std::slice::from_raw_parts(barriers, count as usize) };
         #[cfg(feature = "diagnostics")]
@@ -1371,8 +1400,16 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// Pipeline syncs: waits for earlier work and cache flushes, at the top or
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
-/// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// to do but end a run of hoisted clamps of indirect dispatches, as a
+/// barrier does.
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_order();
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -1871,6 +1908,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+        list.count_order();
         // Which kinds of barriers (0 global, 1 texture, 2 buffer) and how many.
         #[cfg(feature = "diagnostics")]
         if !_groups.is_null() {
@@ -2326,7 +2364,7 @@ mod tests {
         assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
         // SAFETY: our list.
         let state = unsafe { &(*list.cast::<List>()).state };
-        let start = || start_run(list, &mut state.lock().unwrap());
+        let start = || start_run(list, &mut state.lock().unwrap(), false);
         for _ in 0..2 {
             let viewport = windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT {
                 Width: 64.0,
@@ -2367,6 +2405,222 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
+    /// Hoisted clamps of indirect dispatches (`VICTORY_DISPATCH_CLAMPS`): the
+    /// first of a run cuts the title list as a draw's does. The title's
+    /// dispatches do not end the run (what they write is read as arguments
+    /// only after a barrier), though they end a run of draws; its next
+    /// barrier, enhanced barriers, pipeline sync, copy or clamp in the list
+    /// itself does. A run of draws takes the clamps of dispatches after it
+    /// until one of those. One budget across the cuts.
+    #[cfg(windows)]
+    #[test]
+    fn indirect_dispatches_cut_lists_for_hoisted_clamps() {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: our list.
+        let state = unsafe { &(*list.cast::<List>()).state };
+        let start = |dispatch| start_run(list, &mut state.lock().unwrap(), dispatch);
+        let joins = || state.lock().unwrap().hoists_dispatches_into(host_list(list).unwrap());
+        let draws_join = || state.lock().unwrap().hoists_into(host_list(list).unwrap());
+        let parts = || segments(list).len();
+        for _ in 0..2 {
+            start(true);
+            assert_eq!(parts(), 2);
+            assert!(joins());
+            assert_eq!(host_list(list).unwrap().budget(), segments(list)[0].budget(), "one budget across the cut");
+            host_list(list).unwrap().count_dispatch();
+            assert!(joins(), "a dispatch does not end the run");
+            start(true);
+            assert_eq!(parts(), 2, "the same run");
+            assert!(!draws_join(), "but it ends a run of draws");
+            barrier(list, 1, &UAV_BARRIER);
+            assert!(!joins(), "a barrier ends it");
+            start(true);
+            assert_eq!(parts(), 3);
+            sync(list, 0, 0, 0, 0);
+            assert!(!joins(), "a pipeline sync ends it");
+            start(true);
+            assert_eq!(parts(), 4);
+            barrier_groups(list, 1, std::ptr::null());
+            assert!(!joins(), "enhanced barriers end it");
+            start(true);
+            assert_eq!(parts(), 5);
+            host_list(list).unwrap().count_write();
+            assert!(!joins(), "a copy, clear, immediate write or clamp in place ends it");
+            // A run of draws, and a dispatch after its draws.
+            start(false);
+            assert_eq!(parts(), 6);
+            barrier(list, 1, &UAV_BARRIER);
+            assert!(draws_join() && !joins(), "a barrier ends only a run of dispatches");
+            start(false);
+            assert_eq!(parts(), 6);
+            start(true);
+            assert_eq!(parts(), 7);
+            start(false);
+            assert_eq!(parts(), 7, "draws join a run of dispatches with nothing written since");
+            host_list(list).unwrap().count_dispatch();
+            start(true);
+            assert_eq!(parts(), 7);
+            start(false);
+            assert_eq!(parts(), 8);
+            // A wait ends the run, with a budget of its own after it.
+            wait64(list, 0x1000, 0, 0, 0);
+            assert!(!joins());
+            assert_ne!(host_list(list).unwrap().budget(), segments(list)[6].budget(), "a budget of its own after a wait");
+            assert_eq!(close(list), S_OK);
+            let all = segments(list);
+            host.execute(&all.iter().map(|s| &**s).collect::<Vec<_>>());
+            drop(all);
+            assert_eq!(reset(list, allocator, null), S_OK);
+            assert_eq!(parts(), 1);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// The order with hoisted clamps of indirect dispatches, on the host
+    /// GPU: in one title list a dispatch writes two dispatch records into
+    /// a title buffer, a barrier, two indirect dispatches run from them;
+    /// then two dispatches write four more records and a count of 2, a
+    /// barrier, and an indirect dispatch runs up to 4 records under that
+    /// count. Every indirect dispatch runs the groups the dispatch before
+    /// it wrote, alone and batched: each run's clamps are recorded after
+    /// the barrier that began it, so after the writes. (Hoisted at the
+    /// first run's start, the last clamps would read the stale records the
+    /// CPU left: 6 groups; with no count, 9.)
+    #[cfg(windows)]
+    #[test]
+    fn hoisted_dispatch_clamps_read_what_an_earlier_dispatch_wrote() {
+        use crate::compute::Param;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+        const WRITE: &str = r#"
+cbuffer Words : register(b0) { uint4 a; uint4 b; uint4 c; };
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store4(0, a);
+    dst.Store4(16, b);
+    dst.Store4(32, c);
+}
+"#;
+        const MARK: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    marks.Store(g.x * 4, 1);
+}
+"#;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (write_root, write) =
+            crate::compute::pipeline(WRITE, s!("write"), 0, &[Param::Constants { register: 0, count: 12 }, Param::Uav { register: 0 }]).unwrap();
+        let (mark_root, mark) = crate::compute::pipeline(MARK, s!("marks"), 0, &[Param::Uav { register: 0 }]).unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &argument, NodeMask: 0 };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: a description of one argument; no root arguments.
+        unsafe { host.device.CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature) }.unwrap();
+        let signature = signature.unwrap();
+        let target = title_buffer(4096);
+        let at = crate::resource::buffer_bytes(target).unwrap().0 as u64;
+        let copy = crate::shadow::find(at, 4096).expect("the buffer's host copy");
+        let null = std::ptr::null();
+        let (mut allocator, mut list) = (null, null);
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        // SAFETY: our list.
+        let state = unsafe { &(*list.cast::<List>()).state };
+        for batched in [false, true] {
+            // What the CPU left: records of 6 groups everywhere.
+            // SAFETY: the title buffer's own bytes, before the list runs.
+            unsafe {
+                for i in 0..1024 {
+                    (at as *mut u32).add(i).write_volatile([6, 1, 1][i % 3]);
+                }
+            }
+            copy.refresh(host_list(list).unwrap(), at, 4096);
+            let marks: Vec<_> = (0..3).map(|_| host.shared_buffer(64 * 4).unwrap()).collect();
+            // SAFETY: our mapped buffers, before the lists run.
+            unsafe { marks.iter().for_each(|(_, m)| std::ptr::write_bytes(*m, 0, 64 * 4)) };
+            // A dispatch of the title's that writes 12 words at `to`.
+            let writes = |to: u64, words: [u32; 12]| {
+                let l = host_list(list).unwrap();
+                // SAFETY: an open list; our pipeline, the title buffer's copy.
+                unsafe {
+                    l.list.SetComputeRootSignature(&write_root);
+                    l.list.SetPipelineState(&write);
+                    l.list.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+                    l.list.SetComputeRootUnorderedAccessView(1, copy.gpu(to));
+                    l.list.Dispatch(1, 1, 1);
+                }
+                l.count_dispatch();
+                assert!(!state.lock().unwrap().hoists_into(l), "no run of draws past it");
+            };
+            // An indirect dispatch of `records` records at `from`, under the
+            // count at `count` if any, marking `into`, as `execute_indirect`
+            // and `State::execute_indirect` record it.
+            let runs = |from: u64, records: u32, count: Option<u64>, into: &ID3D12Resource| {
+                start_run(list, &mut state.lock().unwrap(), true);
+                let current = host_list(list).unwrap();
+                assert!(state.lock().unwrap().hoists_dispatches_into(current));
+                let clamps = state.lock().unwrap().hoist_clamps().unwrap();
+                let start = |a: u64| (copy.gpu(a) - copy.offset(a), copy.gpu(a));
+                let (out, offset) =
+                    crate::indirect::bound_before_as(&clamps, current, start(from), (2, 12, records), count.map(start), batched).unwrap();
+                current.count_dispatch();
+                // SAFETY: an open list; our pipeline and buffers, the title
+                // buffer's copy.
+                unsafe {
+                    current.list.SetComputeRootSignature(&mark_root);
+                    current.list.SetPipelineState(&mark);
+                    current.list.SetComputeRootUnorderedAccessView(0, into.GetGPUVirtualAddress());
+                    current.list.ExecuteIndirect(
+                        &signature,
+                        records,
+                        &out,
+                        offset,
+                        count.map(|_| &copy.buffer),
+                        count.map_or(0, |c| copy.offset(c)),
+                    );
+                }
+            };
+            writes(at, [3, 1, 1, 4, 1, 1, 0, 0, 0, 0, 0, 0]);
+            barrier(list, 1, &UAV_BARRIER);
+            runs(at, 1, None, &marks[0].0);
+            runs(at + 12, 1, None, &marks[1].0);
+            assert_eq!(segments(list).len(), 2, "one run");
+            writes(at + 0x40, [2, 1, 1, 5, 1, 1, 7, 1, 1, 9, 1, 1]);
+            writes(at + 0x100, [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            assert!(state.lock().unwrap().hoists_dispatches_into(host_list(list).unwrap()), "dispatches leave the run open");
+            barrier(list, 1, &UAV_BARRIER);
+            runs(at + 0x40, 4, Some(at + 0x100), &marks[2].0);
+            assert_eq!(segments(list).len(), 3, "a run of its own after the barrier");
+            assert_eq!(close(list), S_OK);
+            let all = segments(list);
+            host.execute(&all.iter().map(|s| &**s).collect::<Vec<_>>());
+            drop(all);
+            let ran: Vec<usize> = marks
+                .iter()
+                // SAFETY: our mapped buffers, after the lists ran.
+                .map(|(_, m)| (0..64).filter(|&i| unsafe { m.cast::<u32>().add(i).read_volatile() } != 0).count())
+                .collect();
+            // The last runs records of 2 and 5 groups: 5 words marked.
+            assert_eq!(ran, [3, 4, 5], "batched {batched}");
+            assert_eq!(reset(list, allocator, null), S_OK);
+        }
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
     /// The same records are cut with `VICTORY_BATCH_CLAMPS` as without, in
     /// every order: five indirect executions of a title list (three draws
     /// whose clamps are hoisted where a run allows, two dispatches clamped
@@ -2376,6 +2630,10 @@ mod tests {
     /// and the budget are what the clamps recorded each before its
     /// execution in one host list give (the model's `alone`, which the host
     /// GPU's clamps are compared with in `crate::indirect`).
+    ///
+    /// In half of the orders the dispatches' clamps are hoisted too
+    /// (`VICTORY_DISPATCH_CLAMPS`), every other one after a title barrier,
+    /// which ends the run there.
     #[cfg(windows)]
     #[test]
     fn the_same_records_are_cut_however_the_list_is_cut_for_runs() {
@@ -2402,6 +2660,7 @@ mod tests {
         let (mut cuts, mut outcomes) = (0, std::collections::HashSet::new());
         for (n, order) in orders(&executions).into_iter().enumerate() {
             let batched = n % 2 == 0;
+            let hoist_dispatches = n % 4 >= 2;
             let specs: Vec<Spec> = order.iter().map(|(_, s)| s.clone()).collect();
             let (contents, places, _) = laid_out(&specs);
             let model = alone(&specs, 0, crate::indirect::widest());
@@ -2418,15 +2677,28 @@ mod tests {
                 for (c, (_, data)) in contents.iter().zip(&buffers) {
                     std::ptr::copy_nonoverlapping(c.as_ptr(), data.cast::<u32>(), c.len());
                 }
+                let mut dispatches = 0;
                 for (i, ((hoisted, s), &(from, count_at, _))) in order.iter().zip(&places).enumerate() {
                     let base = buffers[s.source].0.GetGPUVirtualAddress();
                     let counter = buffers[RECORD_BUFFERS + s.counter].0.GetGPUVirtualAddress();
                     let counted = s.count.map(|_| (counter, counter + u64::from(count_at)));
                     let spec = (s.kind, s.stride, s.records);
                     let gpu = (base, base + u64::from(from));
-                    if *hoisted {
+                    let dispatch = s.kind == crate::draw::INDIRECT_DISPATCH;
+                    if dispatch && hoist_dispatches {
+                        dispatches += 1;
+                        if dispatches % 2 == 0 {
+                            barrier(list, 1, &UAV_BARRIER);
+                        }
+                        start_run(list, &mut state.lock().unwrap(), true);
+                        let current = host_list(list).unwrap();
+                        assert!(state.lock().unwrap().hoists_dispatches_into(current));
+                        let clamps = state.lock().unwrap().hoist_clamps().unwrap();
+                        outs.push(crate::indirect::bound_before_as(&clamps, current, gpu, spec, counted, batched).unwrap());
+                        current.count_dispatch();
+                    } else if *hoisted {
                         // As `execute_indirect` and `State::execute_indirect` do.
-                        start_run(list, &mut state.lock().unwrap());
+                        start_run(list, &mut state.lock().unwrap(), false);
                         let current = host_list(list).unwrap();
                         assert!(state.lock().unwrap().hoists_into(current));
                         let clamps = state.lock().unwrap().hoist_clamps().unwrap();
@@ -2446,8 +2718,8 @@ mod tests {
                 host.execute(&all.iter().map(|s| &**s).collect::<Vec<_>>());
                 assert_eq!(all.last().unwrap().budget_spent(), model.1, "order {n}: the budget");
                 drop(all);
-                for (i, (((hoisted, s), (out, at)), &(_, _, to))) in order.iter().zip(&outs).zip(&places).enumerate() {
-                    if !*hoisted && in_place[&(out.as_raw() as usize)] != i {
+                for (i, (((_, s), (out, at)), &(_, _, to))) in order.iter().zip(&outs).zip(&places).enumerate() {
+                    if in_place.get(&(out.as_raw() as usize)).is_some_and(|&last| last != i) {
                         continue; // a later clamp in place wrote over it
                     }
                     let mut data = std::ptr::null_mut();
@@ -2494,7 +2766,7 @@ mod tests {
         assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
         // SAFETY: our list.
         let state = unsafe { &(*list.cast::<List>()).state };
-        start_run(list, &mut state.lock().unwrap());
+        start_run(list, &mut state.lock().unwrap(), false);
         let hosts = segments(list);
         assert_eq!(hosts.len(), 2);
         // An indirect draw with 16 bytes of arguments at 0x100, as

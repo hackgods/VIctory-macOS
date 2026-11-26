@@ -233,6 +233,8 @@ mod lower;
 #[cfg(test)]
 mod mac_tests;
 #[cfg(test)]
+mod mask_flag_tests;
+#[cfg(test)]
 mod mask_join_tests;
 mod rect;
 pub use container::sign as sign_container;

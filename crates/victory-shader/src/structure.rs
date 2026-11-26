@@ -1208,9 +1208,13 @@ impl<'a> Lanes<'a> {
             "cselect" => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
                 let scc = inst.read(Reg::Scc)?;
-                let born = self.born(scc);
-                let u = self.b.atom(Atom::Uniform(scc), born);
-                (self.b.ite(u, a, c), None)
+                if self.clear_after_loop(scc) {
+                    (c, None)
+                } else {
+                    let born = self.born(scc);
+                    let u = self.b.atom(Atom::Uniform(scc), born);
+                    (self.b.ite(u, a, c), None)
+                }
             }
             _ => {
                 let (a, c) = (arg(0, self)?, arg(1, self)?);
@@ -1224,6 +1228,47 @@ impl<'a> Lanes<'a> {
             derived,
             scc,
         })
+    }
+
+    /// Whether SCC value `scc` is clear wherever it is read: the instruction
+    /// before an `s_cbranch_execnz` that closes a loop wrote it as "the EXEC
+    /// it leaves is not empty" (`s_andn2_wrexec`, say), and the wave leaves
+    /// `do { .. } while (EXEC)` with EXEC empty. A read inside the loop or
+    /// behind another way out of it sees a join of this value, not the
+    /// value itself.
+    fn clear_after_loop(&self, scc: Value) -> bool {
+        let Some(&(b, i)) = self.defs.get(&scc) else {
+            return false;
+        };
+        let block = &self.p.blocks[b];
+        let (Some(writer), Some(last)) = (block.insts.get(i), block.insts.last()) else {
+            return false;
+        };
+        // A lane-mask operation: its SCC is "the result is not zero".
+        let width = if self.p.wave64 { "_b64" } else { "_b32" };
+        let masks = writer
+            .name()
+            .strip_prefix("s_")
+            .and_then(|n| n.strip_suffix(width))
+            .map(|op| op.trim_end_matches("_saveexec").trim_end_matches("_wrexec"))
+            .is_some_and(|f| {
+                matches!(
+                    f,
+                    "and" | "or" | "xor" | "andn2" | "orn2" | "andn1" | "orn1" | "nand" | "nor" | "xnor"
+                )
+            });
+        let exec = writer.write(Reg::S(EXEC));
+        let back = match block.exit {
+            Exit::Branch { taken, .. } => self.index[taken] <= self.index[b],
+            _ => false,
+        };
+        masks
+            && back
+            && i + 2 == block.insts.len()
+            && exec.is_some()
+            && last.name() == "s_cbranch_execnz"
+            && last.read(Reg::S(EXEC)) == exec
+            && (!self.p.wave64 || last.read(Reg::S(EXEC + 1)) == writer.write(Reg::S(EXEC + 1)))
     }
 
     fn combine(&mut self, f: &str, a: Bool, c: Bool) -> Option<Bool> {
@@ -1882,6 +1927,88 @@ mod tests {
             s.bools.node(when),
             Some((Atom::Lane(_), Bool::TRUE, Bool::FALSE))
         ));
+    }
+
+    /// `s_cselect` on the SCC a lane loop ended with (the blend-shape skinning
+    /// programs): the loop is left when no lane remains, so the select takes
+    /// its second operand; it was a uniform atom whose value no lane has.
+    #[test]
+    fn a_select_on_the_condition_a_lane_loop_ended_with_takes_its_second_operand() {
+        let cnd = 256 | (256 << 9) | (3 << 18);
+        let p = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+                0xBF89_FFFC, // s_cbranch_execnz -> 8
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let select = p
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .find(|i| i.name() == "s_cselect_b32")
+            .expect("the select");
+        let mask = select.write(Reg::S(3)).unwrap();
+        assert_eq!(s.masks.get(&mask), Some(&Bool::FALSE));
+    }
+
+    /// Not so inside the loop, before its branch (the flag is what the
+    /// round left), nor on the flag of an operation that writes no EXEC.
+    #[test]
+    fn a_select_on_a_mask_operations_flag_elsewhere_keeps_the_flag() {
+        let cnd = 256 | (256 << 9) | (3 << 18);
+        let inside = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0xBE9C_471C, // s_andn2_wrexec_b32 s28, s28
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xBF89_FFFB, // s_cbranch_execnz -> 8
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let other = build(
+            &[
+                0xBE83_037E, // 0: s_mov_b32 s3, exec_lo
+                0xBE9C_037E, // s_mov_b32 s28, exec_lo
+                0x7E3A_0507, // 8: v_readfirstlane_b32 s29, v7
+                0x7DA4_0E1D, // v_cmpx_eq_u32 exec_lo, s29, v7
+                0x8A1C_7E1C, // s_andn2_b32 s28, s28, exec_lo
+                0xBEFE_031C, // s_mov_b32 exec_lo, s28
+                0xBF89_FFFB, // s_cbranch_execnz -> 8
+                0xBEFE_0303, // s_mov_b32 exec_lo, s3
+                0x8503_807E, // s_cselect_b32 s3, exec_lo, 0
+                0xD501_0001,
+                cnd, // v_cndmask_b32 v1, v0, v0, s3
+                S_ENDPGM,
+            ],
+            false,
+        );
+        for (p, writer) in [(inside, "s_andn2_wrexec_b32"), (other, "s_andn2_b32")] {
+            let s = structure(&p).unwrap();
+            let insts = || p.blocks.iter().flat_map(|b| &b.insts);
+            let select = insts().find(|i| i.name() == "s_cselect_b32").expect("select");
+            let scc = insts().find(|i| i.name() == writer).expect("the flag's writer");
+            assert_eq!(select.read(Reg::Scc), scc.write(Reg::Scc), "{writer}");
+            let mask = s.masks[&select.write(Reg::S(3)).unwrap()];
+            let flag = Atom::Uniform(select.read(Reg::Scc).unwrap());
+            assert!(s.bools.support(mask).contains(&flag), "{writer}");
+        }
     }
 
     #[test]

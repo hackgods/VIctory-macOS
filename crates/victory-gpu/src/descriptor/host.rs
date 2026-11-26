@@ -470,6 +470,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        let view_is_sampler = is_sampler(view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            self.make_null(index);
+            return;
+        }
         let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -980,6 +986,7 @@ impl HostHeap {
         if tag == VIEW_TAG
             && self.ready[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
+            && is_sampler(&view) == self.sampler
             && !self.needs_remake(index, &view, for_draw)
         {
             return Some(view);
@@ -996,6 +1003,18 @@ impl HostHeap {
             self.unmake_locked(&mut made, index);
             return None;
         };
+        let view_is_sampler = is_sampler(&view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Relaxed);
+                made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
+                self.make_null(index);
+                self.note_address(index, None);
+            }
+            return None;
+        }
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
         // (heap syncs revisit it at every submission). Also re-mirror if a
@@ -2059,6 +2078,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// Whether `view` is a sampler descriptor (must only be created on a sampler
+/// heap, never on a CBV/SRV/UAV heap).
+fn is_sampler(view: &View) -> bool {
+    matches!(view, View::Sampler(_) | View::ConsoleSampler(_))
+}
+
+fn warn_heap_mismatch(index: u32, sampler_heap: bool, sampler_view: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            index,
+            sampler_heap,
+            sampler_view,
+            "descriptor record kind mismatches host heap type; clearing slot"
+        );
     }
 }
 
@@ -3408,5 +3445,70 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    /// Mismatched descriptor kinds (a sampler record in a CBV/SRV/UAV heap or
+    /// a CBV/SRV record in a sampler heap) must be cleared/skipped instead of
+    /// calling `CreateSampler` / `CreateShaderResourceView` on the wrong heap
+    /// handle type.
+    #[test]
+    fn mismatched_heap_kind_views_are_cleared_not_created() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(view_heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(sampler_heap) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let sampler_desc: [u32; 13] = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut console_sampler = [0u32; 27];
+        console_sampler[6..9].copy_from_slice(&[3, 3, 3]);
+
+        // View heap: valid view in slot 0, then overwritten with sampler records.
+        let mut view_slots = [[0u32; 8]; 4];
+        let v0 = view_slots[0].as_mut_ptr() as u64;
+        let v1 = view_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], v0);
+        assert!(view_heap.mirror(0, v0, false).is_some());
+        assert!(view_heap.made(0));
+        assert!(view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler(null, &sampler_desc, v0);
+        assert!(view_heap.mirror(0, v0, false).is_none());
+        assert!(!view_heap.made(0));
+        assert!(!view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler_x(null, &console_sampler, v1);
+        assert!(view_heap.mirror(1, v1, true).is_none());
+        assert!(!view_heap.made(1));
+
+        let dyn_slot = view_heap.dynamic(1).expect("a dynamic slot");
+        view_heap.make_at(dyn_slot, &View::Sampler(sampler_desc));
+        assert!(!view_heap.kept(dyn_slot));
+        view_heap.release(dyn_slot, 1);
+
+        // Sampler heap: valid sampler in slot 0, then overwritten with CBV/SRV records.
+        let mut sampler_slots = [[0u32; 4]; 4];
+        let s0 = sampler_slots[0].as_mut_ptr() as u64;
+        let s1 = sampler_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_sampler(null, &sampler_desc, s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_some());
+        assert!(sampler_heap.made(0));
+        assert!(sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_none());
+        assert!(!sampler_heap.made(0));
+        assert!(!sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_srv(null, null, std::ptr::null(), s1);
+        assert!(sampler_heap.mirror(1, s1, true).is_none());
+        assert!(!sampler_heap.made(1));
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 }

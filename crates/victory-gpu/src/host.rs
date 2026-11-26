@@ -4305,10 +4305,14 @@ impl Meter {
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {
                     let (commit, working_set) = process_memory();
+                    let [views_total, views_live, views_cbv, views_placed] =
+                        crate::descriptor::views_kept();
                     tracing::info!(
                         "video memory: {local:.0} MB of a {budget:.0} MB budget on the card, \
                          {system:.0} MB of {system_budget:.0} MB in system memory; process commit {:.0} MB, \
-                         working set {:.0} MB; Rust heap {:.0} MB; placed textures made {:.0} MB; list upload memory {} blocks {:.0} MB",
+                         working set {:.0} MB; Rust heap {:.0} MB; placed textures made {:.0} MB; \
+                         views {views_live}/{views_total} (cbv {views_cbv}, placed {views_placed}); \
+                         list upload memory {} blocks {:.0} MB",
                         commit as f64 / 1e6,
                         working_set as f64 / 1e6,
                         crate::copystat::HEAP_BYTES.load(Ordering::Relaxed) as f64 / 1e6,

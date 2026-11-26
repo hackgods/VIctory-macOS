@@ -83,6 +83,7 @@ fn lowers(words: &[u32], rsrc2: u32) -> Result<(), crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
     .map(|_| ())
@@ -138,6 +139,7 @@ fn lower_wave(
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
 }
@@ -420,6 +422,7 @@ fn perm_features(selector: u32) -> u64 {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
     .unwrap();
@@ -1367,6 +1370,7 @@ fn ds_bpermute_wave64_preserves_32_lane_half() {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            halves_local: Default::default(),
             host_wave32: false,
             view_marks: false,
         })
@@ -1459,6 +1463,7 @@ fn lowered(words: &[u32], lanes: u32, narrow_waves: bool) -> super::Lowered {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves,
+        halves_local: Default::default(),
         host_wave32: false,
         view_marks: false,
     })

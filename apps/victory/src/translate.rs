@@ -153,6 +153,9 @@ struct Checks {
     /// Translate for a host of 32-lane waves (`--wave32`, or the GPU
     /// `--pipelines` makes them on).
     wave32: bool,
+    /// With `wave32`: programs that read across the halves are translated
+    /// with each half as its own wave (`VICTORY_HALVES_LOCAL=1`, as `run`).
+    halves_local: bool,
 }
 
 pub fn run(
@@ -186,6 +189,10 @@ pub fn run(
     };
     if wave32 {
         println!("waves        of 32 lanes at most (wave64 programs in halves)");
+    }
+    let halves_local = victory_gpu::shader_cache::halves_local();
+    if halves_local {
+        println!("halves       answer reads across them on their own (VICTORY_HALVES_LOCAL=1)");
     }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
@@ -229,6 +236,7 @@ pub fn run(
                                     .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                     .flatten(),
                                 wave32,
+                                halves_local,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -583,6 +591,7 @@ fn translate(
                     let marks = emit::Options {
                         view_marks: true,
                         host_wave32: checks.wave32,
+                        halves_local: checks.halves_local,
                         ..Default::default()
                     };
                     match emit::emit_with(&container, &p, &program, &s, &i, &r, marks) {

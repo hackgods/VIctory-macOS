@@ -124,6 +124,31 @@ fn narrow_waves() -> bool {
     })
 }
 
+/// Whether translations for a host of 32-lane waves let a wave64 program
+/// that reads across the two halves run with each half answering from its
+/// own lanes, instead of refusing it
+/// (`victory_shader::emit::Options::halves_local`): only with
+/// `VICTORY_HALVES_LOCAL=1`. An approximation, so never on by itself.
+pub fn halves_local() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_HALVES_LOCAL");
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_LOCAL=1: wave64 programs that read across 32-lane halves run with each half as its own wave"
+            );
+        }
+        on
+    })
+}
+
+/// Whether such programs run that way here: asked for, on a host of
+/// 32-lane waves (elsewhere the setting changes no translation).
+#[cfg(windows)]
+pub(crate) fn halves_local_here() -> bool {
+    halves_local() && host_wave32()
+}
+
 /// Whether this runs under Wine (on a Mac: D3DMetal's D3D12).
 #[cfg(windows)]
 pub(crate) fn under_wine() -> bool {
@@ -144,25 +169,35 @@ pub(crate) fn under_wine() -> bool {
 }
 
 /// [`build`] for translations with host workarounds (atomic locks, bias
-/// as gradients, narrow waves): their own cache entries, one per
-/// combination.
-fn options_build(locks: bool, bias: bool, narrow: bool) -> &'static [u8; 32] {
-    static BUILDS: [OnceLock<[u8; 32]>; 8] = [const { OnceLock::new() }; 8];
-    let n = usize::from(locks) | usize::from(bias) << 1 | usize::from(narrow) << 2;
-    BUILDS[n].get_or_init(|| {
-        let mut h = blake3::Hasher::new();
-        h.update(build());
-        if locks {
-            h.update(b"atomic locks");
-        }
-        if bias {
-            h.update(b"bias as gradients");
-        }
-        if narrow {
-            h.update(b"narrow waves");
-        }
-        *h.finalize().as_bytes()
-    })
+/// as gradients, narrow waves, half-local reads): their own cache entries,
+/// one per combination.
+fn options_build(locks: bool, bias: bool, narrow: bool, local: bool) -> &'static [u8; 32] {
+    static BUILDS: [OnceLock<[u8; 32]>; 16] = [const { OnceLock::new() }; 16];
+    let n = usize::from(locks)
+        | usize::from(bias) << 1
+        | usize::from(narrow) << 2
+        | usize::from(local) << 3;
+    BUILDS[n].get_or_init(|| options_key(build(), locks, bias, narrow, local))
+}
+
+/// [`options_build`]'s key over the build `build`. A setting that is off
+/// adds nothing, so the entries made without it stay the ones read.
+fn options_key(build: &[u8; 32], locks: bool, bias: bool, narrow: bool, local: bool) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(build);
+    if locks {
+        h.update(b"atomic locks");
+    }
+    if bias {
+        h.update(b"bias as gradients");
+    }
+    if narrow {
+        h.update(b"narrow waves");
+    }
+    if local {
+        h.update(b"halves local");
+    }
+    *h.finalize().as_bytes()
 }
 
 pub(crate) fn runtime_options() -> victory_shader::emit::Options {
@@ -177,6 +212,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bias_as_gradients: bias_as_gradients(),
         host_wave32: host_wave32(),
         narrow_waves: narrow_waves(),
+        halves_local: halves_local(),
     }
 }
 
@@ -186,11 +222,16 @@ pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
     let options = runtime_options();
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
-    let build = if options.atomic_locks || options.bias_as_gradients || options.narrow_waves {
+    let build = if options.atomic_locks
+        || options.bias_as_gradients
+        || options.narrow_waves
+        || options.halves_local
+    {
         options_build(
             options.atomic_locks,
             options.bias_as_gradients,
             options.narrow_waves,
+            options.halves_local,
         )
     } else {
         build()
@@ -603,6 +644,23 @@ mod tests {
                 victory_shader::emit::loop_limit(),
                 host_wave32()
             )
+        );
+        // Half-local reads (`VICTORY_HALVES_LOCAL=1`) are entries of their
+        // own in every combination; off, the key is what it was without
+        // the setting.
+        for n in 0..8u8 {
+            let (l, b, w) = (n & 1 != 0, n & 2 != 0, n & 4 != 0);
+            assert_ne!(
+                options_key(&k, l, b, w, true),
+                options_key(&k, l, b, w, false)
+            );
+        }
+        let mut narrow = blake3::Hasher::new();
+        narrow.update(&k);
+        narrow.update(b"narrow waves");
+        assert_eq!(
+            options_key(&k, false, false, true, false),
+            *narrow.finalize().as_bytes()
         );
         // The encoding part is this file as built.
         assert!(

@@ -32,6 +32,21 @@
 //! lowering retries with that value missing), so a program is refused only
 //! when it really reads across halves.
 //!
+//! Half-local reads ([`Local::reads`], `emit::Options::halves_local`, off
+//! unless asked for): instead of those refusals each half answers from its
+//! own 32 lanes, as if it were the whole wave. A mask read as data holds
+//! the half's lanes at their console bits and none of the other half's
+//! ([`Lower::half_ballot`]); a lane read names that lane of the reader's
+//! half ([`Lower::own_half_lane`]); a reduction, prefix or first-lane read
+//! covers the half. Exact where a wave's halves never needed each other
+//! (a lane's own bit, counts and prefixes below a lane within the half, a
+//! read of a lane the reader's half holds), an approximation elsewhere: a
+//! count over the wave is the half's, a wave's one result becomes two. The
+//! idea is upstream PR #2711's (moe-miau), written there on #2176's halves,
+//! whose lanes are numbered 0 to 31 in both halves. Here the upper half's
+//! lanes stay console lanes 32 to 63, so its ballot goes into the mask's
+//! high dword instead of leaving that dword 0.
+//!
 //! LDS: the console compiler leaves out barriers between the lanes of one
 //! wave, and so between all of a group's threads only when the group is one
 //! wave. A group of 33 to 64 threads with LDS (two host waves sharing what
@@ -52,6 +67,17 @@ use super::*;
 
 /// Console lanes per host wave in halves.
 const HALF: u32 = 32;
+
+/// What a program in halves does where the console's one wave reached
+/// across its two halves, in place of a refusal. All off (the default):
+/// every such program is refused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Local {
+    /// Reads across the halves are answered from the reader's own half
+    /// (`emit::Options::halves_local`; the module notes, "Half-local
+    /// reads").
+    pub reads: bool,
+}
 
 impl Lower<'_> {
     /// Whether a wave64 program whose lanes follow the console's runs in
@@ -123,10 +149,61 @@ impl Lower<'_> {
             .is_some_and(|t| t.iter().product::<u32>() <= HALF)
     }
 
-    /// Refuses a read into the other half of the console wave in halves.
+    /// Refuses a read into the other half of the console wave in halves,
+    /// unless such reads are answered from the reader's own half
+    /// ([`Local::reads`]).
     pub(super) fn same_half(&self, what: Why) -> Result<(), Why> {
-        if self.halves { Err(what) } else { Ok(()) }
+        if self.halves && !self.x.halves_local.reads {
+            Err(what)
+        } else {
+            Ok(())
+        }
     }
+
+    /// A host wave's ballot (its dwords `lo`, `hi`, taken in block `at`) as
+    /// the console wave's mask. In halves the host wave is one half and its
+    /// 32 bits are in `lo`: the lower half's are the mask's low dword, the
+    /// upper half's (console lanes 32 to 63, [`Lower::console_lane`]) its
+    /// high dword, and the other half's lanes are missing. Reached in
+    /// halves only with half-local reads ([`Lower::same_half`]).
+    pub(super) fn half_ballot(&mut self, at: usize, (lo, hi): (V, V)) -> (V, V) {
+        if !self.halves {
+            return (lo, hi);
+        }
+        let lane = self.console_lane();
+        let (half, zero) = (self.s.m.i32(HALF), self.s.m.i32(0));
+        let upper = self.s.m.cmp(at, pred::IUGE, lane, half);
+        (
+            self.s.m.select(at, upper, zero, lo),
+            self.s.m.select(at, upper, lo, zero),
+        )
+    }
+
+    /// The host lane a read of console lane `lane` reads. In halves (with
+    /// half-local reads, [`Lower::same_half`]) that lane of the reader's own
+    /// half: the lane itself where the reader's half holds it.
+    pub(super) fn own_half_lane(&mut self, lane: V) -> V {
+        if !self.halves {
+            return lane;
+        }
+        let m = self.s.m.i32(HALF - 1);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
+    /// The word and bit of console lane `lane` in a host wave's ballot, and
+    /// the host lane to read it at ([`Lower::own_half_lane`] for a lane
+    /// known here).
+    pub(super) fn ballot_bit(&self, lane: u32) -> (u32, u32, u32) {
+        ballot_bit(lane, self.halves)
+    }
+}
+
+/// [`Lower::ballot_bit`]: in halves the host wave's own lane `lane & 31`,
+/// whose bit is in the ballot's first word (a host wave of 32 lanes has no
+/// second).
+fn ballot_bit(lane: u32, halves: bool) -> (u32, u32, u32) {
+    let at = if halves { lane & (HALF - 1) } else { lane };
+    (at / 32, at % 32, at)
 }
 
 /// Why a first-lane read stops in halves: the console's first lane may be
@@ -430,5 +507,24 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
             return same;
         }
         same.extend(next);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ballot_bit;
+
+    /// Whole, console lane 33 is bit 1 of the ballot's second word and is
+    /// read at lane 33. In halves the host wave has 32 lanes and one ballot
+    /// word: the lane asked about and the lane read are the same lane of
+    /// the host wave's own half (after upstream PR #2711's
+    /// `a_half_scans_ballot_bit_is_the_lane_it_reads`).
+    #[test]
+    fn a_ballot_is_asked_about_the_lane_that_is_read() {
+        assert_eq!(ballot_bit(33, false), (1, 1, 33));
+        assert_eq!(ballot_bit(31, false), (0, 31, 31));
+        assert_eq!(ballot_bit(33, true), (0, 1, 1));
+        assert_eq!(ballot_bit(1, true), (0, 1, 1));
+        assert_eq!(ballot_bit(63, true), (0, 31, 31));
     }
 }

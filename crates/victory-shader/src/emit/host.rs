@@ -942,6 +942,7 @@ fn fmad_probe() -> Result<HostShader, crate::ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })?;
     Ok(HostShader {

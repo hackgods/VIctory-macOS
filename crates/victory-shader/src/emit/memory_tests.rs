@@ -136,6 +136,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         host_wave32: false,
         view_marks: true,
     })?;
@@ -301,6 +302,7 @@ fn program() -> HostShader {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
     .expect("lower");
@@ -534,6 +536,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
     .expect("lower");
@@ -680,6 +683,7 @@ fn writes_through_views_mark_their_pages() {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: true,
     })
     .expect("lower");
@@ -904,6 +908,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
             atomic_locks: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            halves_local: Default::default(),
         })
         .expect("lower")
     };
@@ -1030,6 +1035,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         host_wave32: false,
         view_marks: false,
     })

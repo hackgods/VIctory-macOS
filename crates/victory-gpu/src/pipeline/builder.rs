@@ -111,7 +111,8 @@ pub(crate) fn runs() -> bool {
             .map(|p| make::state(&p))
             .collect()
     };
-    let open = all_made(&states);
+    let halves = crate::shader_cache::halves_local_here();
+    let open = opens(&states, halves);
     if open != decided.1 || !SAID.swap(true, Ordering::Relaxed) {
         let (made, refused) = (
             states.iter().filter(|s| **s == Some(true)).count(),
@@ -125,6 +126,8 @@ pub(crate) fn runs() -> bool {
             "BVH builder {}",
             if open {
                 "runs"
+            } else if halves {
+                "held back: its 64-lane programs would run as 32-lane halves on their own (VICTORY_HALVES_LOCAL=1)"
             } else {
                 "held back: not all its pipelines are made"
             }
@@ -138,6 +141,16 @@ pub(crate) fn runs() -> bool {
 /// `Some(false)`, those still being made `None`.
 fn all_made(states: &[Option<bool>]) -> bool {
     states.iter().all(|s| *s == Some(true))
+}
+
+/// Whether the builder runs: every pipeline made, and its 64-lane programs
+/// not run as two 32-lane halves that each act as a wave (`halves`:
+/// `VICTORY_HALVES_LOCAL=1` on a host of 32-lane waves). The builder's
+/// programs exchange across the halves; run that way they hung the GPU
+/// within two minutes on an RTX 4070 SUPER (upstream PR #2711, from which
+/// this rule is taken, keyed there on the host's wave size alone).
+fn opens(states: &[Option<bool>], halves: bool) -> bool {
+    !halves && all_made(states)
 }
 
 /// Tests that set the builder's image, one at a time; each starts with
@@ -162,6 +175,10 @@ mod tests {
         assert!(all_made(&[Some(true), Some(true)]));
         assert!(!all_made(&[Some(true), Some(false)]), "one refused");
         assert!(!all_made(&[Some(true), None]), "one still being made");
+        assert!(opens(&[Some(true)], false));
+        assert!(!opens(&[Some(true), Some(false)], false));
+        assert!(!opens(&[Some(true)], true), "64-lane programs run as halves");
+        assert!(!opens(&[], true));
     }
 
     /// Pipelines are the builder's by their bytecode in its image, or by

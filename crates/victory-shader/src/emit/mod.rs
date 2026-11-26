@@ -221,6 +221,8 @@ mod crosslane_tests;
 mod diff_tests;
 #[cfg(all(test, windows))]
 mod flow_tests;
+#[cfg(test)]
+mod halves_local_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -415,6 +417,13 @@ pub struct Options {
     /// than 32 lanes gets group barriers where its lanes read LDS other
     /// lanes may have written, which the console's lockstep made safe.
     pub narrow_waves: bool,
+    /// With [`Options::host_wave32`]: a program that reads across the two
+    /// 32-lane halves is translated with each half answering from its own
+    /// lanes, as if it were the whole wave, instead of being refused
+    /// (`lower::halves`, "Half-local reads"; after upstream PR #2711).
+    /// Approximate where the console's wave exchanged across its halves.
+    /// The translation differs, so the shader cache keys on it.
+    pub halves_local: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -793,6 +802,9 @@ fn emit_pruned(
         bias_as_gradients: options.bias_as_gradients,
         host_wave32: options.host_wave32,
         narrow_waves: options.narrow_waves,
+        halves_local: lower::HalvesLocal {
+            reads: options.halves_local,
+        },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {
         // Discarded lanes kept on as helpers can read what no surviving

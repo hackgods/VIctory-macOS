@@ -154,6 +154,7 @@ fn lowered_with(
         atomic_locks: false,
         bias_as_gradients: false,
         narrow_waves,
+        halves_local: Default::default(),
         host_wave32,
     })
 }

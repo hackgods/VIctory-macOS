@@ -24,6 +24,7 @@ mod bvh;
 mod halves;
 mod mesh;
 pub(crate) use mesh::KeptOutputs;
+pub(crate) use halves::Local as HalvesLocal;
 use mesh::prune_signature;
 
 type Why = &'static str;
@@ -118,6 +119,9 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// What a program in halves does across them in place of a refusal
+    /// ([`Options::halves_local`](super::Options)).
+    pub halves_local: HalvesLocal,
 }
 
 enum Stop {
@@ -1300,7 +1304,7 @@ impl<'a> Lower<'a> {
             Shape::Prefix(op, src, mask, ident, inclusive) => {
                 (op, src, mask, ident, Some(inclusive))
             }
-            Shape::Half(..) if self.halves => return Err(ACROSS),
+            Shape::Half(..) if self.same_half(ACROSS).is_err() => return Err(ACROSS),
             Shape::Half(_, src, mask, ident, hi) => {
                 // The high half is a console lane's: compute only.
                 if self.mask_data != MaskData::Console {
@@ -1339,14 +1343,17 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
                 let r = self.s.m.bin(c, Bin::And, r, low);
                 // Lane `hi` runs the section on the console even where it is
-                // elsewhere on the host; there it holds the identity.
+                // elsewhere on the host; there it holds the identity. In
+                // halves (half-local reads) that lane of the host wave's own
+                // half, in the ballot and in the read alike.
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let b = self
                     .s
                     .op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[on]);
-                let word = self.s.m.extract(c, b, hi / 32);
-                let (sh, one, z) = (self.s.m.i32(hi % 32), self.s.m.i32(1), self.s.m.i32(0));
+                let (word, shift, hi) = self.ballot_bit(hi);
+                let word = self.s.m.extract(c, b, word);
+                let (sh, one, z) = (self.s.m.i32(shift), self.s.m.i32(1), self.s.m.i32(0));
                 let bit = self.s.m.bin(c, Bin::LShr, word, sh);
                 let bit = self.s.m.bin(c, Bin::And, bit, one);
                 let there = self.s.m.cmp(c, pred::NE, bit, z);
@@ -2065,6 +2072,7 @@ impl<'a> Lower<'a> {
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
                 let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let xy = self.half_ballot(at, xy);
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -7068,6 +7076,7 @@ impl<'a> Lower<'a> {
                         "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)",
                     )?;
                 }
+                let lane = self.own_half_lane(lane);
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -7137,13 +7146,14 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 // In halves the host wave's first lane is the console's only
                 // for a value the same in both halves, or where the group is
-                // one host wave.
+                // one host wave; else refused, or with half-local reads the
+                // half's own first lane.
                 if self.halves
                     && !self.one_host_wave()
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
-                    return Err(halves::FIRST_ACROSS);
+                    self.same_half(halves::FIRST_ACROSS)?;
                 }
                 let a = s(self, 0)?;
                 // shortcut: without console lanes, the first lane of the host

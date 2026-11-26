@@ -154,6 +154,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })?;
 
@@ -1743,6 +1744,7 @@ fn lower_cs32_with(
         bias_as_gradients: super::host::under_wine(),
         host_wave32: false,
         narrow_waves: false,
+        halves_local: Default::default(),
         view_marks: false,
     })
     .expect("lower");

@@ -23,8 +23,8 @@
 
 #[cfg(windows)]
 mod crash;
-pub mod mapdata_pace;
 pub mod masked;
+pub mod pool_watch;
 pub mod probe_guard;
 pub mod prepare;
 pub(crate) mod publish;

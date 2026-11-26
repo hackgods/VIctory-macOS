@@ -289,13 +289,15 @@ fn link_mesh_outputs() -> bool {
 pub(crate) fn merge_mesh_rows() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| {
-        // On under D3DMetal, whose limit this is for, at level 6: the
-        // measured smallest order, exact, and free. `=7` also clips a pair
-        // still over the limit in its pixel shader (not exact; it draws the
-        // last two no-op pairs, at about 200 ms of GPU time a frame in the
-        // prison yard, runs 26 November 15:14 and 15:28). `=3` is the
-        // reorder before the measured rule, `=0` off.
-        let default = if crate::shader_cache::under_wine() { 6 } else { 0 };
+        // On under D3DMetal, whose limit this is for, at level 8: the
+        // measured smallest order, and clip distances a mesh program writes
+        // as a constant that clips nothing left out of the pair. Exact; all
+        // four pairs that were no-ops draw, with the early depth test kept
+        // (run 26 November 17:47: no size error, 270 to 350 ms of GPU time
+        // in the prison yard, as at level 6). `=7` adds a pixel-shader clip
+        // for a pair still over the limit (none now), `=6` is the order
+        // alone, `=3` the reorder before the measured rule, `=0` off.
+        let default = if crate::shader_cache::under_wine() { 8 } else { 0 };
         std::env::var("VICTORY_MERGE_MESH_ROWS").ok().and_then(|v| v.parse().ok()).filter(|m| *m <= 8).unwrap_or(default)
     })
 }

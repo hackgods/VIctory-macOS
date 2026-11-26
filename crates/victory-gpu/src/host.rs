@@ -1628,6 +1628,16 @@ impl Host {
     /// submission lock.
     fn lost(&self, submitted: &mut u64, mark: &Mark) {
         let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        // A lane that held a lock of an emulated 64-bit atomic when the GPU
+        // ended its shader never frees it (`victory_shader::emit`, "Atomic
+        // locks"): free them all before anything else runs.
+        let freed = crate::shadow::free_atomic_locks();
+        if freed > 0 {
+            tracing::warn!(
+                freed,
+                "atomic locks left taken by the ended submission freed"
+            );
+        }
         if self.runs(submitted, mark) {
             if lost.is_power_of_two() {
                 tracing::warn!(

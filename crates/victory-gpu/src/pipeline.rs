@@ -789,6 +789,9 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod screen;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
 

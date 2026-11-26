@@ -880,8 +880,20 @@ impl HostHeap {
         if !candidates.is_empty() {
             let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
             let mut current = Vec::with_capacity(records.len());
+            #[cfg(feature = "diagnostics")]
+            let asking =
+                crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncViewsNs);
             views_current_into(&records, &mut current);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
+            #[cfg(feature = "diagnostics")]
+            let waited = crate::watch::TimedNs(
+                std::time::Instant::now(),
+                crate::copystat::C::SyncSlotLockNs,
+            );
             let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             for (&(i, [_, view, generation]), is_current) in candidates.iter().zip(current) {
                 let changed = match made.get(i as usize) {
                     Some(&m) if is_current => m != (u64::from(generation) << 32 | u64::from(view)),
@@ -1094,6 +1106,9 @@ impl HostHeap {
     /// wrote again meanwhile is left to `mirror`; views are unpinned after
     /// the lock, whose holders their release may need.
     fn mirror_synced(&self, slots: &[u32], at: impl Fn(u32) -> u64) {
+        #[cfg(feature = "diagnostics")]
+        let preparing =
+            crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncPrepareNs);
         let entries: Vec<(u32, [u32; 3], Option<ViewPin>)> = slots
             .iter()
             .filter(|&&index| index < self.count)
@@ -1110,13 +1125,32 @@ impl HostHeap {
                 (index, record, view)
             })
             .collect();
+        #[cfg(feature = "diagnostics")]
+        drop(preparing);
+        // Nothing to make (a page of empty or verified slots): neither the
+        // slot lock nor `VIEWS`, which title threads writing views wait on.
+        if entries.is_empty() {
+            return;
+        }
         let mut again = Vec::new();
         {
+            #[cfg(feature = "diagnostics")]
+            let waited = crate::watch::TimedNs(
+                std::time::Instant::now(),
+                crate::copystat::C::SyncSlotLockNs,
+            );
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
             // Whether each view is still current, as `mirror` asks under the lock.
             let records: Vec<[u32; 3]> = entries.iter().map(|&(_, record, _)| record).collect();
             let mut current = Vec::with_capacity(records.len());
+            #[cfg(feature = "diagnostics")]
+            let asking =
+                crate::watch::TimedNs(std::time::Instant::now(), crate::copystat::C::SyncViewsNs);
             views_current_into(&records, &mut current);
+            #[cfg(feature = "diagnostics")]
+            drop(asking);
             for ((index, record, view), current) in entries.iter().zip(current) {
                 let index = *index;
                 // SAFETY: as above.
@@ -1125,7 +1159,11 @@ impl HostHeap {
                     continue;
                 }
                 match view.as_deref().filter(|_| current) {
-                    None => self.unmake_locked(&mut made, index),
+                    None => {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::SyncUnmade, 1);
+                        self.unmake_locked(&mut made, index);
+                    }
                     Some(view) => {
                         let [_, i, generation] = *record;
                         let key = u64::from(generation) << 32 | u64::from(i);
@@ -1656,21 +1694,37 @@ fn buffer_srv(
         desc.Format = widened_format(desc.Format.0).expect("a three-channel format");
         buffer.FirstElement = 0;
         buffer.NumElements = count;
-        // SAFETY: a live widened buffer and a slot of our heap.
-        unsafe {
-            host.device
-                .CreateShaderResourceView(&widened.buffer, Some(&desc), at)
-        };
+        made_view(
+            &host.device,
+            &widened.buffer,
+            (SRV, srv_key(&desc, None)),
+            at,
+            |at| {
+                // SAFETY: a live widened buffer and a slot of a heap of ours.
+                unsafe {
+                    host.device
+                        .CreateShaderResourceView(&widened.buffer, Some(&desc), at)
+                }
+            },
+        );
         return Some(Some((
             widened.buffer.clone(),
             Some(HeldSource::Widened(widened, shadow.clone())),
         )));
     }
-    // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device
-            .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
+    made_view(
+        &host.device,
+        &shadow.buffer,
+        (SRV, srv_key(&desc, None)),
+        at,
+        |at| {
+            // SAFETY: a live buffer and a slot of a heap of ours.
+            unsafe {
+                host.device
+                    .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
+            }
+        },
+    );
     Some(Some((
         shadow.buffer.clone(),
         own.then(|| HeldSource::Shadow(shadow)),
@@ -1745,15 +1799,32 @@ fn buffer_uav(
             return None;
         }
     }
-    // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
-        host.device.CreateUnorderedAccessView(
-            &shadow.buffer,
-            None::<&ID3D12Resource>,
-            Some(&desc),
-            at,
-        )
-    };
+    // SAFETY: the buffer views' union member, set in full by `uav_desc`.
+    let b = unsafe { desc.Anonymous.Buffer };
+    let (first, counter) = (b.FirstElement, b.CounterOffsetInBytes);
+    let key = [
+        desc.Format.0 as u32,
+        desc.ViewDimension.0 as u32,
+        first as u32,
+        (first >> 32) as u32,
+        b.NumElements,
+        b.StructureByteStride,
+        counter as u32,
+        (counter >> 32) as u32,
+        b.Flags.0 as u32,
+        0,
+    ];
+    made_view(&host.device, &shadow.buffer, (UAV, key), at, |at| {
+        // SAFETY: a live buffer and a slot of a heap of ours.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &shadow.buffer,
+                None::<&ID3D12Resource>,
+                Some(&desc),
+                at,
+            )
+        }
+    });
     // CreateUnorderedAccessView is void and cannot report failure directly.
     // If it removed the native device, do not keep its descriptor or mark.
     // SAFETY: a plain device query.
@@ -1904,6 +1975,167 @@ fn typed_store(format: u32) -> bool {
     ok
 }
 
+/// Whether views of resources made once a frame are copied where they are
+/// made again ([`made_view`]): on unless `VICTORY_VIEW_COPIES=0`.
+fn view_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_VIEW_COPIES").as_deref() != Some(std::ffi::OsStr::new("0"))
+    })
+}
+
+/// What a view of a host resource is made from: the resource, the kind of
+/// view ([`SRV`], [`UAV`]) and its description's words (in the host's
+/// layout; all 0 and kind | [`DEFAULT`] for the resource's own).
+type ViewKey = (usize, u8, [u32; 10]);
+const SRV: u8 = 0;
+const UAV: u8 = 1;
+const DEFAULT: u8 = 2;
+
+/// Views of host resources made this frame, in a heap of the CPU's, by what
+/// they are made from ([`ViewKey`]).
+struct MadeViews {
+    /// Held: the views are in it.
+    #[allow(dead_code)]
+    heap: ID3D12DescriptorHeap,
+    start: usize,
+    step: usize,
+    at: HashMap<ViewKey, u32>,
+    /// The resource each view views, in order: held, so that no other one is
+    /// made at its address while its views are copied.
+    held: Vec<ID3D12Resource>,
+}
+
+/// Views [`MadeViews`] holds at most; past them it starts again.
+const MADE_VIEWS: u32 = 1 << 14;
+
+static MADE_VIEWS_NOW: Mutex<Option<MadeViews>> = Mutex::new(None);
+
+/// Makes at `at` the view `create` makes of `resource` from `key`, or copies
+/// the one made from the same this frame. D3DMetal takes ~0.4 µs to make a
+/// shader view of a resource and ~13 ns to copy one (M5 Pro, under Wine),
+/// and heap syncs make the same views again thousands of times a frame: in
+/// the world the title copies some 40,000 slots of ~1,700 distinct views
+/// into its heap a frame. A descriptor is what it is made from, so the copy
+/// is the view.
+fn made_view(
+    device: &ID3D12Device,
+    resource: &ID3D12Resource,
+    key: (u8, [u32; 10]),
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    create: impl FnOnce(D3D12_CPU_DESCRIPTOR_HANDLE),
+) {
+    const VIEWS: D3D12_DESCRIPTOR_HEAP_TYPE = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    if !view_copies() {
+        return create(at);
+    }
+    let mut now = MADE_VIEWS_NOW.lock().unwrap_or_else(|e| e.into_inner());
+    if now.is_none() {
+        // SAFETY: plain heap creation and a query of the new heap.
+        *now = unsafe {
+            device
+                .CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: VIEWS,
+                    NumDescriptors: MADE_VIEWS,
+                    ..Default::default()
+                })
+                .ok()
+                .map(|heap| MadeViews {
+                    start: heap.GetCPUDescriptorHandleForHeapStart().ptr,
+                    step: device.GetDescriptorHandleIncrementSize(VIEWS) as usize,
+                    heap,
+                    at: HashMap::new(),
+                    held: Vec::new(),
+                })
+        };
+    }
+    let Some(views) = now.as_mut() else {
+        drop(now);
+        return create(at);
+    };
+    let key = (
+        windows::core::Interface::as_raw(resource) as usize,
+        key.0,
+        key.1,
+    );
+    let made = match views.at.get(&key) {
+        Some(&i) => {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ViewsCopied, 1);
+            i
+        }
+        None => {
+            if views.held.len() as u32 == MADE_VIEWS {
+                views.at.clear();
+                std::mem::take(&mut views.held)
+                    .into_iter()
+                    .for_each(crate::host::retire);
+            }
+            let i = views.held.len() as u32;
+            create(D3D12_CPU_DESCRIPTOR_HANDLE {
+                ptr: views.start + i as usize * views.step,
+            });
+            views.at.insert(key, i);
+            views.held.push(resource.clone());
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::ViewsMadeOnce, 1);
+            i
+        }
+    };
+    let from = D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: views.start + made as usize * views.step,
+    };
+    // SAFETY: a view of the CPU's heap, copied into a slot of the caller's.
+    unsafe { device.CopyDescriptorsSimple(1, at, from, VIEWS) };
+}
+
+/// A frame was shown: the views made in it are made again when next needed,
+/// and the resources they held go once the GPU work running now has run.
+pub(crate) fn forget_made_views() {
+    let held = {
+        let mut now = MADE_VIEWS_NOW.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(views) = now.as_mut() else { return };
+        views.at.clear();
+        std::mem::take(&mut views.held)
+    };
+    held.into_iter().for_each(crate::host::retire);
+}
+
+/// A shader view's description as [`ViewKey`] words: those of a buffer
+/// view (from `buffer_srv`), or `words` with the format the view is made in.
+fn srv_key(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC, words: Option<&[u32; 10]>) -> [u32; 10] {
+    let head = [
+        desc.Format.0 as u32,
+        desc.ViewDimension.0 as u32,
+        desc.Shader4ComponentMapping,
+    ];
+    match words {
+        Some(words) => {
+            let mut key = *words;
+            key[0] = head[0];
+            key
+        }
+        None => {
+            // SAFETY: buffer views' union member, which every buffer view's
+            // description sets in full.
+            let b = unsafe { desc.Anonymous.Buffer };
+            let first = b.FirstElement;
+            [
+                head[0],
+                head[1],
+                head[2],
+                0,
+                first as u32,
+                (first >> 32) as u32,
+                b.NumElements,
+                b.StructureByteStride,
+                b.Flags.0 as u32,
+                0,
+            ]
+        }
+    }
+}
+
 /// Makes the host descriptor for `view` at `at` (in any host view heap):
 /// the host resource it views, if it can.
 pub(crate) fn make_view(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -1943,7 +2175,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             if let Some(copy) = crate::resource::host_copy(resource) {
                 copy.viewed.store(true, std::sync::atomic::Ordering::Relaxed);
                 let texture = &copy.texture;
-                let mut desc = desc.as_ref().map(srv_desc);
+                let view_words = desc.as_ref();
+                let mut desc = view_words.map(srv_desc);
                 if desc.is_none() && !default_view(resource) {
                     return None;
                 }
@@ -1956,14 +2189,20 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, &copy.castable, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
-                // SAFETY: a live texture and a slot of our heap.
-                unsafe {
-                    device.CreateShaderResourceView(
-                        texture,
-                        desc.as_ref().map(std::ptr::from_ref),
-                        at,
-                    )
+                let key = match (&desc, view_words) {
+                    (Some(d), Some(words)) => (SRV, srv_key(d, Some(words))),
+                    _ => (SRV | DEFAULT, [0; 10]),
                 };
+                made_view(device, texture, key, at, |at| {
+                    // SAFETY: a live texture and a slot of a heap of ours.
+                    unsafe {
+                        device.CreateShaderResourceView(
+                            texture,
+                            desc.as_ref().map(std::ptr::from_ref),
+                            at,
+                        )
+                    }
+                });
                 Some(Some((texture.clone(), None)))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -2284,6 +2523,9 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 }
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2525,14 +2767,37 @@ mod tests {
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    std::thread_local! {
+        /// Work to run while this thread prepares a view's texture, once
+        /// (tests). Each thread's own: tests run at once, and a hook of the
+        /// whole process was taken or replaced by another test's prepare.
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> =
+            const { std::cell::RefCell::new(None) };
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let work = WHILE_PREPARING.with_borrow_mut(Option::take);
         if let Some(work) = work {
             work();
         }
+    }
+
+    /// A test's prepare hook is its own thread's: a view prepared on another
+    /// thread meanwhile (another test's) neither runs it nor takes it.
+    #[test]
+    fn a_view_prepared_on_another_thread_leaves_the_prepare_hook() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let set = ran.clone();
+        WHILE_PREPARING.set(Some(Box::new(move || set.store(true, Ordering::SeqCst))));
+        std::thread::spawn(|| prepare(&View::Sampler([0; 13])))
+            .join()
+            .unwrap();
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "another thread's prepare ran it"
+        );
+        prepare(&View::Sampler([0; 13]));
+        assert!(ran.load(Ordering::SeqCst), "this thread's prepare runs it");
     }
 
     /// A resource's final release during preparation returns at once, and the
@@ -2561,7 +2826,7 @@ mod tests {
             resource,
             0x10,
         );
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             // The title's last reference goes while the view is being made.
             // The call must not wait for the make: this very thread is the
             // one making the view, so a wait would never end.
@@ -2575,10 +2840,13 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(released.join().unwrap(), 1, "the pin still holds it");
-        }));
+        })));
 
         let view = heap.mirror(0, at, false).expect("the current view");
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(
+            WHILE_PREPARING.with_borrow(Option::is_none),
+            "the prepare ran"
+        );
         assert!(heap.made(0), "the view was made from the live resource");
         assert!(
             crate::descriptor::view(at).is_some(),
@@ -2617,14 +2885,14 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
                 done.send(()).unwrap();
             });
             assert!(waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the write waits");
-        }));
+        })));
         // A draw reads the slot: its first record is prepared.
         assert!(host.mirror(s, at, true).is_some());
         let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
@@ -2660,7 +2928,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -2670,9 +2938,12 @@ mod tests {
                 waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
                 "a view bound while another slot's texture is made waits"
             );
-        }));
+        })));
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(
+            WHILE_PREPARING.with_borrow(Option::is_none),
+            "the prepare ran"
+        );
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
@@ -2783,12 +3054,15 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
         // While the sync prepares slot 1's view, the title clears slot 1.
         let slot1 = start + 32;
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        WHILE_PREPARING.set(Some(Box::new(move || {
             // SAFETY: slot 1 of the heap's memory.
             unsafe { std::ptr::write_bytes(slot1 as *mut u8, 0, 32) };
-        }));
+        })));
         host.sync_slots(0, 4, start, 32);
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(
+            WHILE_PREPARING.with_borrow(Option::is_none),
+            "the prepare ran"
+        );
         assert!(host.made(0), "slot 0 stays made");
         assert!(
             !host.made(1),
@@ -2799,6 +3073,97 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(start as *const u8, (start + 32) as *mut u8, 32) };
         host.sync_slots(0, 4, start, 32);
         assert!(host.made(1), "made from the record copied again");
+    }
+
+    /// A view made again from what it was made from this frame is copied,
+    /// not made; one made from anything else, or in a later frame, is made.
+    #[test]
+    fn a_view_made_again_this_frame_is_copied() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        if !view_copies() {
+            return; // VICTORY_VIEW_COPIES=0
+        }
+        let heap = HostHeap::new(false, 4).expect("a host heap");
+        let (buffer, _) = host.shared_buffer(256).expect("a buffer");
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 64,
+                    ..Default::default()
+                },
+            },
+        };
+        let made = std::cell::Cell::new(0);
+        let make_at = |slot: u32, desc: &D3D12_SHADER_RESOURCE_VIEW_DESC| {
+            made_view(
+                &host.device,
+                &buffer,
+                (SRV, srv_key(desc, None)),
+                heap.cpu(slot),
+                |at| {
+                    made.set(made.get() + 1);
+                    // SAFETY: a live buffer and a slot of a heap of ours.
+                    unsafe {
+                        host.device
+                            .CreateShaderResourceView(&buffer, Some(desc), at)
+                    }
+                },
+            );
+        };
+        make_at(0, &desc);
+        make_at(1, &desc);
+        assert_eq!(made.get(), 1, "made once, copied into the second slot");
+        let mut other = desc;
+        other.Anonymous.Buffer.NumElements = 32;
+        make_at(2, &other);
+        assert_eq!(made.get(), 2, "another description is made");
+        forget_made_views();
+        make_at(3, &desc);
+        assert_eq!(made.get(), 3, "made again in the next frame");
+    }
+
+    /// A heap sync of slots holding nothing made takes no lock: it does not
+    /// wait for a title thread holding the slot lock (writing a view).
+    #[test]
+    fn a_heap_sync_of_empty_slots_does_not_wait_for_the_slot_lock() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let start = title_heap.start;
+        let host = title_heap.host().expect("a host view heap");
+        let held = host.made.lock().unwrap();
+        let heap = heap as usize;
+        let (done, synced) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let h = crate::descriptor::heap(heap as crate::object::This);
+            // No record was ever written: every slot is empty.
+            h.host().unwrap().sync_slots(0, 4, start, 32);
+            let _ = done.send(());
+        });
+        let waited = synced
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_err();
+        drop(held);
+        assert!(!waited, "the sync of empty slots waited for the slot lock");
     }
 
     /// The world's 16-byte view of 0 elements removed the device.

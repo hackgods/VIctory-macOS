@@ -158,8 +158,21 @@ pub(crate) enum C {
     SyncCheckNs,
     SyncMakeNs,
     ViewsForgot,
+    /// Of the slots a heap sync made again, those left without a view (their
+    /// record holds none); the time it spent pinning and preparing the views
+    /// to make (before the slot lock), waiting for heaps' slot locks (in
+    /// checking and in making), and asking `VIEWS` whether records are
+    /// current (waiting for its lock included).
+    SyncUnmade,
+    SyncPrepareNs,
+    SyncSlotLockNs,
+    SyncViewsNs,
+    /// Views of host resources made, and copied from one made from the same
+    /// this frame (`crate::descriptor::host::made_view`).
+    ViewsMadeOnce,
+    ViewsCopied,
 }
-const COUNTERS: usize = C::ViewsForgot as usize + 1;
+const COUNTERS: usize = C::ViewsCopied as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -472,7 +485,9 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  heap sync per frame: {:.0} pages, {:.0} slots: {:.0} made from their record already, {:.0} no view, \
          {:.0} checked ({:.0} in blocks not verified) in {:.1} ms, {:.0} made again in {:.1} ms; pages read in \
-         {:.1} ms, {:.1} ms waiting for the heaps' lock; {:.1} releases forgot views",
+         {:.1} ms, {:.1} ms waiting for the heaps' lock; {:.1} releases forgot views; of those made again {:.0} left \
+         without a view; {:.1} ms preparing views, {:.1} ms waiting for slot locks, {:.1} ms asking VIEWS; views of \
+         resources {:.0} made, {:.0} copied",
         c[C::SyncPages as usize],
         c[C::SyncSlots as usize],
         c[C::SyncFast as usize],
@@ -485,6 +500,12 @@ pub(crate) fn log(frames: f64) {
         c[C::SyncReadNs as usize] / 1e6,
         c[C::SyncLockNs as usize] / 1e6,
         c[C::ViewsForgot as usize],
+        c[C::SyncUnmade as usize],
+        c[C::SyncPrepareNs as usize] / 1e6,
+        c[C::SyncSlotLockNs as usize] / 1e6,
+        c[C::SyncViewsNs as usize] / 1e6,
+        c[C::ViewsMadeOnce as usize],
+        c[C::ViewsCopied as usize],
     );
     let mut snapshots: Vec<((u64, u64), u64)> =
         SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();

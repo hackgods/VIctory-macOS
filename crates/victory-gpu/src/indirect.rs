@@ -447,6 +447,9 @@ fn bound_with(
     if count.is_some() {
         RECORDS[1].fetch_add(u64::from(records), Ordering::Relaxed);
     }
+    if kind == DISPATCH {
+        FOR_DISPATCHES[0].fetch_add(1, Ordering::Relaxed);
+    }
     let out = list.arguments(u64::from(stride) * u64::from(records.max(1)))?;
     let l = &list.list;
     // SAFETY: an open list; our buffers, and title buffers' copies the
@@ -710,6 +713,17 @@ pub(crate) fn take_dispatches() -> u64 {
     DISPATCHES.swap(0, Ordering::Relaxed)
 }
 static DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// The kind of an indirect dispatch's records (PC numbering).
+const DISPATCH: u32 = 2;
+
+/// Clamps of indirect dispatches since the last call (the frame line), of
+/// all the clamps: recorded, in the list before their dispatch's, in
+/// batches.
+pub(crate) fn take_for_dispatches() -> [u64; 3] {
+    FOR_DISPATCHES.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static FOR_DISPATCHES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Records the clamps were asked to walk (the maximum of each execution)
 /// since the last call, and the part of them under a count buffer, where

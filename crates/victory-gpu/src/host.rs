@@ -4923,6 +4923,7 @@ impl Meter {
             let hoists = crate::list::take_hoists() as f64 / report_frames;
             let (batched, batches) = crate::indirect::take_batched();
             let (batched, batches) = (batched as f64 / report_frames, batches as f64 / report_frames);
+            let [for_dispatches, ..] = crate::indirect::take_for_dispatches().map(|n| n as f64 / report_frames);
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -4931,7 +4932,8 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count), {clamps:.0} clamp \
                  dispatches/frame ({hoisted:.0} clamps in the list before their draw's, \
-                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches)",
+                 {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
+                 {for_dispatches:.0} clamps of indirect dispatches)",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

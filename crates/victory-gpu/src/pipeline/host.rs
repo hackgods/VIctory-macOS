@@ -689,6 +689,29 @@ impl HostPipeline {
                 &state,
             );
             let ms = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, code(0));
+            // Diagnostics (VICTORY_MESH_SIZE_LOG=1): one mesh pipeline at a
+            // time, its outputs logged before it is made, so a D3DMetal
+            // "Total mesh size" line can be matched to its mesh shader.
+            static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let _serial = crate::switch::on("VICTORY_MESH_SIZE_LOG").then(|| {
+                let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+                let elements = (|| {
+                    // Register and column mask of each vertex output element.
+                    let bytes = code_bytes(&code(0));
+                    let c = victory_shader::Container::parse(&bytes).ok()?;
+                    let d = c.part(victory_shader::FourCC::OSG1)?.data;
+                    let word = |at: usize| Some(u32::from_le_bytes(d.get(at..at + 4)?.try_into().ok()?));
+                    let (count, base) = (word(0)?, word(4)?);
+                    (0..count as usize)
+                        .map(|i| {
+                            let at = base as usize + 32 * i;
+                            Some((word(at + 20)?, *d.get(at + 24)?))
+                        })
+                        .collect::<Option<Vec<(u32, u8)>>>()
+                })();
+                tracing::info!(?shaders, ?elements, "making host mesh pipeline");
+                guard
+            });
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
                     &host.device, &root, ms, code(1), g,

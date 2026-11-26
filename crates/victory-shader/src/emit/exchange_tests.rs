@@ -1,7 +1,7 @@
 //! Reads across the two 32-lane halves handed over through group-shared
 //! memory (`lower::exchange`, `Options::halves_exchange`;
-//! `notes/ray-tracing-plan.md`): lane reads, lane masks read as data and
-//! integer reductions. The translation tests and the model of the hand-over
+//! `notes/ray-tracing-plan.md`): lane reads, first-lane reads, lane masks
+//! read as data and integer reductions. The translation tests and the model of the hand-over
 //! run on any host. The GPU test (Windows) runs the programs in halves with
 //! the setting on every hardware adapter and compares with the console's
 //! values.
@@ -338,12 +338,57 @@ fn the_setting_acts_only_in_halves_and_within_shared_memory() {
     assert!(full.contains(REFUSAL), "{full}");
 }
 
+/// A first-lane read under a narrowed EXEC: the lanes above 29 are left
+/// (no branch), and the first of them is read (lane 30 on the console).
+fn first_lane_of_some() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        V16_IS_32_TIMES_V0,
+        0xD765_0001,
+        0x0001_00C1,         // v_mbcnt_lo_u32_b32 v1, -1, 0
+        sop1(2, 0x04, EXEC), // s_mov_b64 s[2:3], exec
+        0x7DA2_009D,         // v_cmpx_lt_u32 exec, 29, v0
+        0x7E18_0500,         // v_readfirstlane_b32 s12, v0
+        sop1(EXEC, 0x04, 2), // s_mov_b64 exec, s[2:3]
+        v_mov_s(2, 12),
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// A lane mask read as data, a wave sum and a wave prefix sum, each where
 /// every lane runs, translate with the setting, each with one hand-over of
 /// a dword per half: the same translation with half-local reads or
-/// without. A first-lane read is not handed over and stays refused.
+/// without. So does a first-lane read where EXEC is every lane (lane 0's
+/// value, a hand-over per lane); under a narrowed EXEC it stays refused.
 #[test]
 fn ballots_and_integer_reductions_are_handed_over_per_half() {
+    let narrowed = first_lane_of_some();
+    let code: Vec<u8> = narrowed.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    assert!(
+        text.contains(&"v_cmpx_lt_u32 exec, 29, v0".to_owned()),
+        "{text:?}"
+    );
+    assert!(
+        text.contains(&"v_readfirstlane_b32 s12, v0".to_owned()),
+        "{text:?}"
+    );
+    for mac in [Mac::default(), exchange()] {
+        let why = halves(&narrowed, false, mac)
+            .err()
+            .expect("refused")
+            .to_string();
+        assert!(
+            why.contains("a first-lane read of a value that may differ"),
+            "{why}"
+        );
+    }
     for (what, words, refusal) in across() {
         let off = halves(&words, false, Mac::default())
             .err()
@@ -351,11 +396,6 @@ fn ballots_and_integer_reductions_are_handed_over_per_half() {
             .to_string();
         assert!(off.contains(refusal), "{what}: {off}");
         let on = halves(&words, false, exchange());
-        if what == "a first-lane read" {
-            let why = on.err().expect("refused").to_string();
-            assert!(why.contains(refusal), "{what}: {why}");
-            continue;
-        }
         let on = on.unwrap_or_else(|e| panic!("{what}: {e}"));
         assert_eq!((on.wave_size, on.exchanges), (Some(32), 1), "{what}");
         let with_local = halves(&words, true, exchange()).expect("handed over");
@@ -680,8 +720,12 @@ mod gpu {
     #[test]
     fn both_halves_get_the_consoles_mask_and_reductions_on_every_gpu() {
         let lanes = |n: u32, f: &dyn Fn(u32) -> Vec<u32>| (0..n).flat_map(f).collect::<Vec<u32>>();
-        let [mask, _, _, sum, prefix] = across().map(|p| p.1);
+        let [mask, _, first, sum, prefix] = across().map(|p| p.1);
         let mut failed = Vec::new();
+        // The first lane is lane 0 of the console wave in both halves.
+        failed.extend(differences("first lane", &first, 64, 1, &[0; 64]));
+        let want = lanes(128, &|l| vec![l & !63]);
+        failed.extend(differences("first lane, two waves", &first, 128, 1, &want));
         let want = lanes(64, &|_| vec![0xC000_0000, u32::MAX]);
         failed.extend(differences("mask", &mask, 64, 2, &want));
         failed.extend(differences("sum", &sum, 64, 1, &[2016; 64]));

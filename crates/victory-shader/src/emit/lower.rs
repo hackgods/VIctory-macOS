@@ -7275,6 +7275,13 @@ impl<'a> Lower<'a> {
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if !inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)))
                 {
+                    // Mac (`exchange`): lane 0's value handed over.
+                    if self.exchange_first_at(inst) {
+                        let (a, zero) = (s(self, 0)?, self.s.m.i32(0));
+                        if let Some(r) = self.exchanged_lane(a, zero) {
+                            return int(self, r);
+                        }
+                    }
                     self.same_half(halves::FIRST_ACROSS)?;
                 }
                 let a = s(self, 0)?;

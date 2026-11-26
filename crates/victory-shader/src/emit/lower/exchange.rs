@@ -33,6 +33,12 @@
 //!   the console compiler ends a prefix sum over the wave's 64 lanes (the
 //!   lower half's total, lane 31, added in the upper half): the form of
 //!   five programs of the title's ray-tracing structure builder;
+//! * lane 0's value, for `v_readfirstlane_b32` where EXEC is every lane
+//!   ([`Lower::exchange_first_at`]): the first lane with its EXEC bit set
+//!   is then lane 0. (The title's tiled shadow programs let lane 0 load a
+//!   tile's header and then read it in every lane this way.) Under a
+//!   narrowed EXEC the first lane is not known here and the read is left
+//!   as it was;
 //! * a half's answer, one dword per host wave
 //!   ([`Lower::exchanged_halves`]): its 32 ballot bits, for a lane mask read
 //!   as data (the two halves' dwords are the console's mask), and its part
@@ -217,6 +223,19 @@ impl Lower<'_> {
         let from = self.s.m.bin(c, Bin::Add, from, k);
         let at = self.s.m.element(c, slots, from);
         Some(self.s.m.load(c, at))
+    }
+
+    /// Whether the first-lane read `inst` (of the block being lowered) reads
+    /// lane 0 where the exchange applies: a block every lane runs once, and
+    /// EXEC every lane there (no guard), so that the first lane with its
+    /// EXEC bit set is lane 0, which every console wave of a group has.
+    pub(super) fn exchange_first_at(&mut self, inst: &Inst) -> bool {
+        let b = self.cur_ir;
+        let i = self.x.p.blocks[b]
+            .insts
+            .iter()
+            .position(|x| std::ptr::eq(x, inst));
+        self.exchange_in(b) && i.is_some_and(|i| self.x.st.guards[b][i].is_none())
     }
 
     /// Whether a half's answer made in IR block `b` can be handed over

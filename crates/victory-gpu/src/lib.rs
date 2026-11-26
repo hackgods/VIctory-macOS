@@ -18,6 +18,11 @@
 
 #[cfg(windows)]
 mod ambient;
+#[cfg(windows)]
+mod ambient_estimate;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod ambient_estimate_set;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod ambient_set;

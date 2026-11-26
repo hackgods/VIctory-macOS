@@ -1,0 +1,1009 @@
+//! What the estimated stand-in for ray-traced indirect light
+//! (`crate::ambient_estimate`, `VICTORY_AMBIENT=estimate`) is told by its
+//! switches, which of the title's programs it follows, its passes' shader
+//! and constants, and the same arithmetic on the CPU to test against.
+//! Plain std, so its tests run everywhere.
+
+// Used by `crate::ambient_estimate`, which is only built for Windows.
+#![cfg_attr(not(windows), allow(dead_code))]
+
+/// The share of the estimate `VICTORY_AMBIENT`'s value asks for, if it
+/// asks for the estimate: `estimate` (all of it) or `estimate:<share>`. A
+/// share that is not a number above 0 counts as 1. Any other value is the
+/// constant stand-in's (`crate::ambient_set::is_on`), which this leaves as
+/// it is.
+pub(crate) fn share(value: Option<&str>) -> Option<f32> {
+    let value = value?.trim().to_ascii_lowercase();
+    let rest = value.strip_prefix("estimate")?;
+    if rest.is_empty() {
+        return Some(1.0);
+    }
+    let share = rest.strip_prefix(':')?.trim().parse().ok();
+    Some(share.filter(|s: &f32| s.is_finite() && *s > 0.0).unwrap_or(1.0))
+}
+
+/// `VICTORY_AMBIENT_LEFT=<multiple>`: how much of what the title's resolve
+/// left in the light image counts, as a multiple of the estimate's
+/// luminance there; the written light is the larger of the two. 0 (the
+/// default here): nothing of it, the estimate replaces the image, as the
+/// constant stand-in does.
+///
+/// The fork has 4, fixed: there the resolve leaves the sky's light
+/// outdoors. On this line it leaves next to nothing where the sun does not
+/// reach (the cell without a stand-in is dark, `notes/PLAN.md`, 26 November
+/// 17:25) and bright specks on foliage (the boat dump's frame 1766).
+pub(crate) fn left(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|m: &f32| m.is_finite() && *m >= 0.0)
+        .unwrap_or(0.0)
+}
+
+/// The program that keeps the light visible surfaces send out, for the
+/// title's own screen traces, by the start of its name, and where it writes
+/// it (R11G11B10_FLOAT, half the picture's size): root parameter and place
+/// in its table, in dwords. One program of that name in the title's shader
+/// database (`e6d8226a6870f577`), with that place.
+pub(crate) const RADIANCE_PROGRAM: &[u8] = b"CS_CacheScreenSpaceRadiance";
+pub(crate) const RADIANCE: (u8, u32) = (1, 16);
+
+/// What a program is to the estimate, beside `crate::ambient_set`'s bits
+/// (`RESOLVES` and its siblings).
+pub(crate) const KEEPS: u8 = 8;
+
+/// What the program of shader container `container` is to the estimate
+/// alone (the resolve is `crate::ambient_set`'s).
+pub(crate) fn role_of(container: &[u8]) -> u8 {
+    let has = |name: &[u8]| container.windows(name.len()).any(|w| w == name);
+    let mut role = 0;
+    if has(RADIANCE_PROGRAM) {
+        role |= KEEPS;
+    }
+    role
+}
+
+/// What the estimate calls a role in the log.
+pub(crate) fn role_name(role: u8) -> &'static str {
+    match role {
+        KEEPS => "keeps the light visible surfaces send out",
+        _ => "several",
+    }
+}
+
+/// Cells the picture's light is averaged in, and points the light around is
+/// worked out at.
+pub(crate) const CX: u32 = 64;
+pub(crate) const CY: u32 = 36;
+pub(crate) const CELLS: u32 = CX * CY;
+pub(crate) const PX: u32 = 160;
+pub(crate) const PY: u32 = 90;
+
+/// Bytes of the cells' buffer (their light, the slow mean, their places)
+/// and of the points' (three `float4` a point).
+pub(crate) const CELL_BYTES: u64 = (2 * CELLS as u64 + 1) * 16;
+pub(crate) const POINT_BYTES: u64 = PX as u64 * PY as u64 * 48;
+
+/// The share of the way the slow mean goes at every keeping.
+pub(crate) const FOLLOW: f32 = 0.04;
+
+/// The passes. From the fork's shader (`victory-gpu/src/ambient.rs` at
+/// avatarmanz 9576c45f), with what Wine's HLSL compiler (vkd3d-shader 1.18
+/// in CrossOver 26.3; `docs/macos.md`) and D3DMetal need changed:
+/// - no `[RootSignature]`: Wine ignores it, so `crate::ambient_estimate`
+///   builds it in code (`crate::compute::pipeline`): the constants in `b0`,
+///   a table of `u0` and `t0`, then the two buffers as root views `u1` to
+///   `u4`;
+/// - one entry point, `main`, chosen by a `#define` put before the source
+///   ([`part`]): `crate::compute::pipeline` compiles `main`;
+/// - no stores through `RWStructuredBuffer` (not implemented in Wine's
+///   compiler): each buffer is read through a structured view and written
+///   through a raw one, as `crate::twin`'s shader does;
+/// - no `GetDimensions` (Wine has no such method on unordered views): the
+///   sizes are constants;
+/// - the light visible surfaces send out is read through a shader resource
+///   view, not through an unordered one: an R11G11B10_FLOAT image is not
+///   one Metal reads and writes in one view;
+/// - no `isnan`, `isinf`: comparisons, false for a NaN;
+/// - conversions are written as casts, `near` (a keyword to some compilers)
+///   is `near_z`, the constant buffer is all scalars, and what a
+///   conditional expression would evaluate on both sides is behind an `if`
+///   (as in `crate::ambient_set::SOURCE`);
+/// - the light probe's sums (`InterlockedAdd` on a raw buffer) are left
+///   out: `crate::ambient_estimate::log` reads the buffers instead.
+pub(crate) const SOURCE: &str = r#"
+#define CX 64
+#define CY 36
+#define CELLS 2304
+#define PX 160
+#define PY 90
+cbuffer Set : register(b0) {
+    float level; float strength; float radius; float near_z;
+    float tan_y; float follow; float most; uint width;
+    uint height; uint flat;
+};
+// Cells: the light they send out (then, at CELLS, the slow mean), from
+// CELLS + 1 on where they are. Read through the structured view, written
+// through the raw one (the same buffer).
+RWStructuredBuffer<float4> cells : register(u1);
+RWByteAddressBuffer cells_out : register(u2);
+// Three a point: red, green and blue, each a direction and a mean.
+RWStructuredBuffer<float4> points : register(u3);
+RWByteAddressBuffer points_out : register(u4);
+float luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
+
+#ifdef SEES
+Texture2D<float> depth : register(t0);
+// The point seen at a texel, in metres from the eye (x right, y up, z away).
+float3 seen(int2 p, float2 size) {
+    float d = depth.Load(int3(clamp(p, int2(0, 0), (int2)size - 1), 0));
+    float z = min(near_z / max(d, 1e-7), 1000.0);
+    float2 ndc = ((float2)p + 0.5) / size * 2.0 - 1.0;
+    return float3(ndc.x * tan_y * size.x / size.y * z, -ndc.y * tan_y * z, z);
+}
+#endif
+
+#ifdef PACKS
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2((float)(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp((int)floor(log2(max(top, 1e-9))) + 16, 0, 31);
+    float scale = exp2((float)(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2((float)(24 - e)); }
+    uint3 m = min((uint3)(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | ((uint)e << 27);
+}
+#endif
+
+#ifdef KEEP
+Texture2D<float4> radiance : register(t0);
+[numthreads(8, 4, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    float3 sum = 0.0;
+    for (uint y = 0; y < 5; y++)
+        for (uint x = 0; x < 5; x++) {
+            uint2 p = (uint2)(((float2)at.xy + (float2(x, y) + 0.5) / 5.0) * float2(width, height) / float2(CX, CY));
+            float3 c = radiance.Load(int3(p, 0)).rgb;
+            // Neither negative, infinite nor a NaN (a comparison with one
+            // is false).
+            bool sane = c.r >= 0.0 && c.g >= 0.0 && c.b >= 0.0 && c.r < 65100.0 && c.g < 65100.0 && c.b < 65100.0;
+            if (!sane) c = float3(0.0, 0.0, 0.0);
+            // Lamps and glints count, but not for everything.
+            sum += c / max(1.0, luma(c) / 20.0);
+        }
+    cells_out.Store4((at.y * CX + at.x) * 16, asuint(float4(sum / 25.0, 1.0)));
+}
+#endif
+
+#ifdef MEAN
+[numthreads(1, 1, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    float3 sum = 0.0;
+    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    float4 was = cells[CELLS];
+    float3 mean = sum / CELLS;
+    // Its fourth part: above 0 once something is kept.
+    if (was.a > 0.0) mean = lerp(was.rgb, mean, follow);
+    cells_out.Store4(CELLS * 16, asuint(float4(mean, 1.0)));
+}
+#endif
+
+#ifdef PLACE
+[numthreads(8, 4, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen((int2)(((float2)at.xy + 0.5) * size / float2(CX, CY)), size);
+    cells_out.Store4((CELLS + 1 + at.y * CX + at.x) * 16, asuint(float4(p, p.z * p.z)));
+}
+#endif
+
+#ifdef GATHER
+[numthreads(8, 2, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    float2 size = float2(width, height);
+    float3 p = seen((int2)(((float2)at.xy + 0.5) * size / float2(PX, PY)), size);
+    float r2 = 0.25 + 0.0025 * p.z * p.z;
+    float whole = 0.0;
+    float3 toward = 0.0, light = 0.0, red = 0.0, green = 0.0, blue = 0.0;
+    for (uint i = 0; i < CELLS; i++) {
+        float4 c = cells[CELLS + 1 + i];
+        float3 L = cells[i].rgb;
+        float3 d = c.xyz - p;
+        float dd = dot(d, d);
+        float w = c.w / (dd + r2);
+        float3 dir = d / sqrt(dd + 0.25 * r2);
+        whole += w;
+        toward += w * dir;
+        light += w * L;
+        red += w * L.r * dir;
+        green += w * L.g * dir;
+        blue += w * L.b * dir;
+    }
+    whole = max(whole, 1e-6);
+    light /= whole;
+    toward /= whole;
+    uint at0 = (at.y * PX + at.x) * 48;
+    points_out.Store4(at0, asuint(float4(red / whole - light.r * toward, light.r)));
+    points_out.Store4(at0 + 16, asuint(float4(green / whole - light.g * toward, light.g)));
+    points_out.Store4(at0 + 32, asuint(float4(blue / whole - light.b * toward, light.b)));
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
+[numthreads(8, 8, 1)]
+void main(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float2 size = float2(width, height);
+    int2 p = (int2)at.xy;
+    float4 around = cells[CELLS];
+    // Without the scene's depth: the slow mean alone.
+    float3 found = around.rgb * level;
+    if (flat == 0) {
+        float3 c = seen(p, size);
+        float3 l = seen(p + int2(-1, 0), size), r = seen(p + int2(1, 0), size);
+        float3 u = seen(p + int2(0, -1), size), d = seen(p + int2(0, 1), size);
+        float3 dx = abs(l.z - c.z) < abs(r.z - c.z) ? c - l : r - c;
+        float3 dy = abs(u.z - c.z) < abs(d.z - c.z) ? c - u : d - c;
+        float3 n = normalize(cross(dy, dx) + float3(0.0, 0.0, -1e-9));
+        if (dot(n, c) > 0.0) n = -n;
+        // How open it is (as in beloooo's cd9f78ce).
+        float open = 1.0;
+        float px = min(radius * size.y / (2.0 * tan_y * c.z), 128.0);
+        float noise = frac(52.9829189 * frac(dot((float2)p, float2(0.06711056, 0.00583715))));
+        if (strength > 0.0 && px >= 1.5 && c.z < 400.0) {
+            float shut = 0.0;
+            const int N = 12;
+            for (int i = 0; i < N; i++) {
+                float a = i * 2.399963 + noise * 6.2831853;
+                float2 o = float2(cos(a), sin(a)) * (sqrt((i + 0.5) / N) * px);
+                float3 v = seen(p + (int2)round(o), size) - c;
+                float vv = dot(v, v);
+                float over = dot(v, n) - 0.004 * c.z - 0.005;
+                shut += max(over, 0.0) / sqrt(vv + 1e-6) * saturate(1.0 - vv / (radius * radius));
+            }
+            open = saturate(1.0 - strength * 2.0 * shut / N);
+        }
+        // Between the four points around, those at its own depth first;
+        // which four is dithered a little.
+        float2 g = ((float2)p + 0.5) / size * float2(PX, PY) - 0.5 + (noise - 0.5) * 0.5;
+        int2 g0 = (int2)floor(g);
+        float2 f = g - (float2)g0;
+        float4 sr = 0.0, sg = 0.0, sb = 0.0;
+        float sum = 0.0;
+        for (int k = 0; k < 4; k++) {
+            int2 q = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX - 1, PY - 1));
+            float z = seen((int2)(((float2)q + 0.5) * size / float2(PX, PY)), size).z;
+            float bx = (k & 1) != 0 ? f.x : 1.0 - f.x;
+            float by = (k >> 1) != 0 ? f.y : 1.0 - f.y;
+            float w = (bx * by + 1e-3) / (0.02 + abs(z - c.z) / c.z);
+            uint at0 = (uint)(q.y * PX + q.x) * 3;
+            sr += w * points[at0];
+            sg += w * points[at0 + 1];
+            sb += w * points[at0 + 2];
+            sum += w;
+        }
+        float3 all = float3(sr.w, sg.w, sb.w) / sum;
+        float3 lit = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
+        lit = clamp(lit, 0.2 * all, 2.5 * all);
+        found = lerp(lit, around.rgb, 0.2) * level * open;
+    }
+    // What the program left counts as far as it can be true (`most` times
+    // the estimate; 0: not at all): the sky's light outdoors, not the
+    // blocks of other memory.
+    float3 written = found;
+    if (most > 0.0) {
+        float3 was = unpack(light[at.xy]);
+        float top = max(luma(found) * most, 1e-6);
+        was *= min(1.0, top / max(luma(was), 1e-6));
+        written = max(was, found);
+    }
+    light[at.xy] = pack(written);
+}
+#endif
+"#;
+
+/// The passes of [`SOURCE`], by the `#define` that chooses each.
+pub(crate) const KEEP: &str = "KEEP";
+pub(crate) const MEAN: &str = "MEAN";
+pub(crate) const PLACE: &str = "PLACE";
+pub(crate) const GATHER: &str = "GATHER";
+pub(crate) const RAISE: &str = "RAISE";
+
+/// The source of pass `pass`: [`SOURCE`] after the `#define`s that choose
+/// its `main` and the helpers it uses.
+pub(crate) fn part(pass: &str) -> String {
+    let helpers = match pass {
+        PLACE | GATHER => "#define SEES\n",
+        RAISE => "#define SEES\n#define PACKS\n",
+        _ => "",
+    };
+    format!("#define {pass}\n{helpers}{SOURCE}")
+}
+
+/// What one pass is given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Pass {
+    /// The share of the estimate.
+    pub(crate) level: f32,
+    /// Strength, radius, near plane, tangent of half the vertical field of
+    /// view (`crate::ambient_set::shade`).
+    pub(crate) shade: [f32; 4],
+    /// The share of the way the slow mean goes at this keeping.
+    pub(crate) follow: f32,
+    /// [`left`].
+    pub(crate) most: f32,
+    /// The size of the image the pass reads or writes.
+    pub(crate) size: [u32; 2],
+    /// No depth image: the slow mean alone is written.
+    pub(crate) flat: bool,
+}
+
+/// Dwords of the passes' constant buffer.
+pub(crate) const CONSTANTS: usize = 10;
+
+/// A pass's root constants, in the order the constant buffer declares them
+/// (all scalars, so four to a row whatever the compiler's packing).
+pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
+    let [strength, radius, near, tan_y] = p.shade;
+    let floats = [p.level, strength, radius, near, tan_y, p.follow, p.most];
+    let mut out = [0; CONSTANTS];
+    for (to, f) in out.iter_mut().zip(floats) {
+        *to = f.to_bits();
+    }
+    out[7..].copy_from_slice(&[p.size[0], p.size[1], u32::from(p.flat)]);
+    out
+}
+
+/// The line logged once at start when the estimate is on.
+pub(crate) fn start_line(share: f32, shade: [f32; 4], most: f32) -> String {
+    let shaded = if shade[0] > 0.0 { "shaded from depth" } else { "not shaded" };
+    let left = if most > 0.0 {
+        format!("what the title's resolve left counts up to {most} times it")
+    } else {
+        "what the title's resolve left is replaced".to_owned()
+    };
+    format!(
+        "VICTORY_AMBIENT=estimate: the screen probes' indirect diffuse light is replaced by an \
+         estimate from the light visible surfaces send out ({share} of it; {CX}x{CY} cells, \
+         {PX}x{PY} points), {shaded}; {left}"
+    )
+}
+
+fn luminance(c: [f32; 3]) -> f32 {
+    c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722
+}
+
+/// The mean, the least and the most luminance of the points' light (each
+/// point's red, green and blue means), leaving out what is not a number.
+pub(crate) fn over_the_picture(points: impl Iterator<Item = [f32; 3]>) -> [f32; 3] {
+    let (mut sum, mut least, mut most, mut n) = (0.0f64, f32::INFINITY, 0.0f32, 0u32);
+    for l in points.map(luminance).filter(|l| l.is_finite()) {
+        sum += f64::from(l);
+        least = least.min(l);
+        most = most.max(l);
+        n += 1;
+    }
+    if n == 0 { [0.0; 3] } else { [(sum / f64::from(n)) as f32, least, most] }
+}
+
+/// The line logged with the frame line: the slow mean of the light around
+/// and the points' luminance (`seen`; `None`: nothing kept yet), and the
+/// keepings and raisings recorded a frame.
+pub(crate) fn frame_line(share: f32, seen: Option<([f32; 3], [f32; 3])>, per_frame: [f64; 2]) -> String {
+    let [keeps, raises] = per_frame;
+    let what = match seen {
+        Some(([r, g, b], [mean, least, most])) => format!(
+            "the light around (slow mean) is {r:.4} {g:.4} {b:.4}, luminance {:.4}; the picture's \
+             {PX}x{PY} points hold a luminance of {mean:.4} on average (least {least:.4}, most \
+             {most:.4}); texels are written about {:.4}, the share {share} of it (the constant \
+             stand-in writes its level)",
+            luminance([r, g, b]),
+            mean * share,
+        ),
+        None => format!(
+            "nothing kept yet: no dispatch of {} seen, the title's own light stays",
+            String::from_utf8_lossy(RADIANCE_PROGRAM)
+        ),
+    };
+    format!(
+        "ambient estimate (VICTORY_AMBIENT=estimate): {what}; {keeps:.1} keepings and {raises:.1} \
+         raisings/frame"
+    )
+}
+
+/// The passes' arithmetic on the CPU, as [`SOURCE`] has it: what the tests
+/// here and the GPU tests of `crate::ambient_estimate` compare with.
+#[cfg(test)]
+pub(crate) mod reference {
+    use super::{CELLS, CX, CY, PX, PY};
+
+    pub(crate) type V3 = [f32; 3];
+    pub(crate) type V4 = [f32; 4];
+
+    pub(crate) fn luma(c: V3) -> f32 {
+        c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722
+    }
+
+    fn sub(a: V3, b: V3) -> V3 {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn dot(a: V3, b: V3) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn cross(a: V3, b: V3) -> V3 {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    }
+
+    /// A picture's depth (reversed: `near / distance`), its size, the near
+    /// plane and the tangent of half the vertical field of view.
+    pub(crate) struct Scene<'a> {
+        pub(crate) depth: &'a dyn Fn(u32, u32) -> f32,
+        pub(crate) size: [u32; 2],
+        pub(crate) near: f32,
+        pub(crate) tan_y: f32,
+    }
+
+    impl Scene<'_> {
+        /// `seen` of the shader: the point at a texel (clamped to the
+        /// picture), in metres from the eye.
+        pub(crate) fn seen(&self, p: [i32; 2]) -> V3 {
+            let [w, h] = self.size;
+            let at = [p[0].clamp(0, w as i32 - 1), p[1].clamp(0, h as i32 - 1)];
+            let d = (self.depth)(at[0] as u32, at[1] as u32);
+            let z = (self.near / d.max(1e-7)).min(1000.0);
+            let (w, h) = (w as f32, h as f32);
+            let ndc = [(p[0] as f32 + 0.5) / w * 2.0 - 1.0, (p[1] as f32 + 0.5) / h * 2.0 - 1.0];
+            [ndc[0] * self.tan_y * w / h * z, -ndc[1] * self.tan_y * z, z]
+        }
+
+        /// The texel at the middle of place (`x`, `y`) of a grid of `nx` x
+        /// `ny` over the picture.
+        fn middle(&self, x: u32, y: u32, nx: u32, ny: u32) -> [i32; 2] {
+            let at = |i: u32, n: u32, size: u32| ((i as f32 + 0.5) * size as f32 / n as f32) as i32;
+            [at(x, nx, self.size[0]), at(y, ny, self.size[1])]
+        }
+
+        /// The `PLACE` pass: where each cell is, and its weight.
+        pub(crate) fn place(&self) -> Vec<V4> {
+            (0..CELLS)
+                .map(|i| {
+                    let p = self.seen(self.middle(i % CX, i / CX, CX, CY));
+                    [p[0], p[1], p[2], p[2] * p[2]]
+                })
+                .collect()
+        }
+
+        /// The `GATHER` pass: at each point, per colour a direction and a
+        /// mean of the cells' `light`, weighted by the share of the point's
+        /// surroundings each cell covers.
+        pub(crate) fn gather(&self, light: &[V3], places: &[V4]) -> Vec<[V4; 3]> {
+            (0..PX * PY)
+                .map(|i| {
+                    let p = self.seen(self.middle(i % PX, i / PX, PX, PY));
+                    let r2 = 0.25 + 0.0025 * p[2] * p[2];
+                    let mut whole = 0.0f32;
+                    let (mut toward, mut all) = ([0.0f32; 3], [0.0f32; 3]);
+                    let mut by = [[0.0f32; 3]; 3];
+                    for (l, c) in light.iter().zip(places) {
+                        let d = sub([c[0], c[1], c[2]], p);
+                        let dd = dot(d, d);
+                        let w = c[3] / (dd + r2);
+                        let dir = d.map(|v| v / (dd + 0.25 * r2).sqrt());
+                        whole += w;
+                        for k in 0..3 {
+                            toward[k] += w * dir[k];
+                            all[k] += w * l[k];
+                            for (colour, sum) in by.iter_mut().enumerate() {
+                                sum[k] += w * l[colour] * dir[k];
+                            }
+                        }
+                    }
+                    let whole = whole.max(1e-6);
+                    let all = all.map(|v| v / whole);
+                    let toward = toward.map(|v| v / whole);
+                    let one = |colour: usize| {
+                        let d: Vec<f32> =
+                            (0..3).map(|k| by[colour][k] / whole - all[colour] * toward[k]).collect();
+                        [d[0], d[1], d[2], all[colour]]
+                    };
+                    [one(0), one(1), one(2)]
+                })
+                .collect()
+        }
+
+        /// The normal at texel `p`, toward the eye, from the depth alone,
+        /// and how open the texel is to the light around (1 in the open).
+        pub(crate) fn surface(&self, p: [i32; 2], strength: f32, radius: f32) -> (V3, f32) {
+            let c = self.seen(p);
+            let at = |dx: i32, dy: i32| self.seen([p[0] + dx, p[1] + dy]);
+            let (l, r, u, d) = (at(-1, 0), at(1, 0), at(0, -1), at(0, 1));
+            let dx = if (l[2] - c[2]).abs() < (r[2] - c[2]).abs() { sub(c, l) } else { sub(r, c) };
+            let dy = if (u[2] - c[2]).abs() < (d[2] - c[2]).abs() { sub(c, u) } else { sub(d, c) };
+            let mut n = cross(dy, dx);
+            n[2] -= 1e-9;
+            let len = dot(n, n).sqrt();
+            let mut n = n.map(|v| v / len);
+            if dot(n, c) > 0.0 {
+                n = n.map(|v| -v);
+            }
+            let px = (radius * self.size[1] as f32 / (2.0 * self.tan_y * c[2])).min(128.0);
+            let mut open = 1.0;
+            if strength > 0.0 && px >= 1.5 && c[2] < 400.0 {
+                const N: usize = 12;
+                let noise = noise(p);
+                let mut shut = 0.0;
+                for i in 0..N {
+                    let a = i as f32 * 2.399963 + noise * 6.2831853;
+                    let far = ((i as f32 + 0.5) / N as f32).sqrt() * px;
+                    // (`round` of the shader rounds halves to even.)
+                    let o = [(a.cos() * far).round_ties_even() as i32, (a.sin() * far).round_ties_even() as i32];
+                    let v = sub(self.seen([p[0] + o[0], p[1] + o[1]]), c);
+                    let vv = dot(v, v);
+                    let over = dot(v, n) - 0.004 * c[2] - 0.005;
+                    shut += over.max(0.0) / (vv + 1e-6).sqrt() * (1.0 - vv / (radius * radius)).clamp(0.0, 1.0);
+                }
+                open = (1.0 - strength * 2.0 * shut / N as f32).clamp(0.0, 1.0);
+            }
+            (n, open)
+        }
+
+        /// The `RAISE` pass at texel `p`: the light written there, before
+        /// it is packed. `was` is what the title's resolve left.
+        pub(crate) fn raise(&self, p: [i32; 2], points: &[[V4; 3]], around: V3, set: &super::Pass, was: V3) -> V3 {
+            let mut found = around.map(|v| v * set.level);
+            if !set.flat {
+                let c = self.seen(p);
+                let (n, open) = self.surface(p, set.shade[0], set.shade[1]);
+                let noise = noise(p);
+                let g = [0, 1].map(|k| {
+                    (p[k] as f32 + 0.5) / self.size[k] as f32 * [PX, PY][k] as f32 - 0.5 + (noise - 0.5) * 0.5
+                });
+                let g0 = g.map(f32::floor);
+                let f = [g[0] - g0[0], g[1] - g0[1]];
+                let mut sums = [[0.0f32; 4]; 3];
+                let mut sum = 0.0;
+                for k in 0..4 {
+                    let q = [
+                        (g0[0] as i32 + (k & 1)).clamp(0, PX as i32 - 1) as u32,
+                        (g0[1] as i32 + (k >> 1)).clamp(0, PY as i32 - 1) as u32,
+                    ];
+                    let z = self.seen(self.middle(q[0], q[1], PX, PY))[2];
+                    let bx = if k & 1 != 0 { f[0] } else { 1.0 - f[0] };
+                    let by = if k >> 1 != 0 { f[1] } else { 1.0 - f[1] };
+                    let w = (bx * by + 1e-3) / (0.02 + (z - c[2]).abs() / c[2]);
+                    let point = &points[(q[1] * PX + q[0]) as usize];
+                    for (to, from) in sums.iter_mut().zip(point) {
+                        for (to, from) in to.iter_mut().zip(from) {
+                            *to += w * from;
+                        }
+                    }
+                    sum += w;
+                }
+                for (k, found) in found.iter_mut().enumerate() {
+                    let s = sums[k];
+                    let all = s[3] / sum;
+                    let lit = all + 1.2 * dot([s[0], s[1], s[2]], n) / sum;
+                    let lit = lit.max(0.2 * all).min(2.5 * all);
+                    *found = (lit + (around[k] - lit) * 0.2) * set.level * open;
+                }
+            }
+            if set.most <= 0.0 {
+                return found;
+            }
+            let top = (luma(found) * set.most).max(1e-6);
+            let scale = (top / luma(was).max(1e-6)).min(1.0);
+            [0, 1, 2].map(|k| (was[k] * scale).max(found[k]))
+        }
+    }
+
+    /// The shader's noise at a texel, in [0, 1).
+    pub(crate) fn noise(p: [i32; 2]) -> f32 {
+        let inner = p[0] as f32 * 0.06711056 + p[1] as f32 * 0.00583715;
+        (52.9829189 * inner.fract()).fract()
+    }
+
+    /// The `KEEP` pass: the light of each cell, the mean of 25 texels of
+    /// `radiance` (`size` texels), bright ones held down.
+    pub(crate) fn keep(radiance: &dyn Fn(u32, u32) -> V3, size: [u32; 2]) -> Vec<V3> {
+        (0..CELLS)
+            .map(|i| {
+                let mut sum = [0.0f32; 3];
+                for s in 0..25u32 {
+                    let at = |cell: u32, sample: u32, size: u32, cells: u32| {
+                        ((cell as f32 + (sample as f32 + 0.5) / 5.0) * size as f32 / cells as f32) as u32
+                    };
+                    let mut c = radiance(at(i % CX, s % 5, size[0], CX), at(i / CX, s / 5, size[1], CY));
+                    if !c.iter().all(|&v| (0.0..65100.0).contains(&v)) {
+                        c = [0.0; 3];
+                    }
+                    let held = (luma(c) / 20.0).max(1.0);
+                    for k in 0..3 {
+                        sum[k] += c[k] / held;
+                    }
+                }
+                sum.map(|v| v / 25.0)
+            })
+            .collect()
+    }
+
+    /// The `MEAN` pass: the slow mean after a keeping of `cells`, from the
+    /// one before (`was`; its fourth part 0: none).
+    pub(crate) fn mean(cells: &[V3], was: V4, follow: f32) -> V4 {
+        let mut now = [0.0f32; 3];
+        for c in cells {
+            for k in 0..3 {
+                now[k] += c[k];
+            }
+        }
+        let now = now.map(|v| v / cells.len() as f32);
+        if was[3] > 0.0 {
+            let m = [0, 1, 2].map(|k| was[k] + (now[k] - was[k]) * follow);
+            [m[0], m[1], m[2], 1.0]
+        } else {
+            [now[0], now[1], now[2], 1.0]
+        }
+    }
+
+    /// R9G9B9E5 as the shader packs it.
+    pub(crate) fn pack(c: V3) -> u32 {
+        let c = c.map(|v| v.clamp(0.0, 65408.0));
+        let top = c[0].max(c[1]).max(c[2]);
+        let mut e = (top.max(1e-9).log2().floor() as i32 + 16).clamp(0, 31);
+        let mut scale = 2f32.powi(24 - e);
+        if top * scale >= 511.5 {
+            e = (e + 1).min(31);
+            scale = 2f32.powi(24 - e);
+        }
+        let m = c.map(|v| ((v * scale + 0.5) as u32).min(511));
+        m[0] | m[1] << 9 | m[2] << 18 | (e as u32) << 27
+    }
+
+    pub(crate) fn unpack(v: u32) -> V3 {
+        let scale = 2f32.powi((v >> 27) as i32 - 24);
+        [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|m| m as f32 * scale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reference::{Scene, V3, keep, luma, mean, pack, unpack};
+    use super::*;
+
+    /// `estimate` and `estimate:<share>` ask for the estimate; everything
+    /// else is left to the constant stand-in.
+    #[test]
+    fn the_estimate_is_asked_for_by_name() {
+        for other in [None, Some(""), Some("0"), Some("off"), Some("1"), Some("0.6"), Some("on"), Some("constant:0.3")] {
+            assert_eq!(share(other), None, "{other:?}");
+        }
+        assert_eq!(share(Some("estimate")), Some(1.0));
+        assert_eq!(share(Some(" Estimate ")), Some(1.0));
+        assert_eq!(share(Some("estimate:0.8")), Some(0.8));
+        assert_eq!(share(Some("estimate: 2")), Some(2.0));
+        // A share that is no number above 0 counts as 1.
+        for odd in ["estimate:", "estimate:x", "estimate:0", "estimate:-1", "estimate:nan", "estimate:inf"] {
+            assert_eq!(share(Some(odd)), Some(1.0), "{odd}");
+        }
+        // Not the estimate: another word that starts the same.
+        assert_eq!(share(Some("estimated")), None);
+        // Every value that asks for the estimate also turns the stand-in on
+        // for `crate::ambient`, whose hooks the estimate runs from.
+        for on in ["estimate", "estimate:0.8", "estimate:0", "Estimate"] {
+            assert!(crate::ambient_set::is_on(Some(on)), "{on}");
+        }
+    }
+
+    #[test]
+    fn what_the_resolve_left_is_replaced_by_default() {
+        assert_eq!(left(None), 0.0);
+        assert_eq!(left(Some("x")), 0.0);
+        assert_eq!(left(Some("-1")), 0.0);
+        assert_eq!(left(Some(" 4 ")), 4.0);
+    }
+
+    /// The programs are known by the start of their names, and none of the
+    /// constant stand-in's programs is taken for one of them.
+    #[test]
+    fn programs_are_known_by_name() {
+        assert_eq!(role_of(b"..tiled_lighting:CS_CacheScreenSpaceRadiance_eed2fc35_Wrapped.."), KEEPS);
+        assert_eq!(role_of(b"CS_CacheScreenSpaceRadianc"), 0);
+        assert_eq!(role_of(b"CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped"), 0);
+        assert_eq!(role_of(b""), 0);
+        use crate::ambient_set as constant;
+        assert_eq!(constant::role_of(RADIANCE_PROGRAM), 0);
+        assert_eq!(KEEPS & (constant::RESOLVES | constant::ENDS_REFLECTIONS | constant::DRAWS_SKY), 0);
+        assert_eq!(role_of(constant::PROGRAM) | role_of(constant::REFLECTED) | role_of(constant::SKY), 0);
+    }
+
+    /// The names a shader source's constant buffer declares, in order.
+    fn declared(source: &str) -> Vec<String> {
+        let buffer = source.split_once("cbuffer").map_or("", |(_, rest)| rest);
+        let body = buffer.split_once('{').and_then(|(_, rest)| rest.split_once('}'));
+        body.map_or("", |(body, _)| body)
+            .split(';')
+            .filter_map(|decl| decl.split_whitespace().nth(1).map(str::to_owned))
+            .collect()
+    }
+
+    /// The constants go out in the order the shader declares them.
+    #[test]
+    fn constants_follow_the_shader() {
+        let p = Pass {
+            level: 0.8,
+            shade: [1.0, 0.6, 0.1, 0.45],
+            follow: 0.04,
+            most: 4.0,
+            size: [2560, 1440],
+            flat: true,
+        };
+        let c = constants(&p);
+        let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
+        assert_eq!(floats, [0.8, 1.0, 0.6, 0.1, 0.45, 0.04, 4.0]);
+        assert_eq!(c[7..], [2560, 1440, 1]);
+        let declared = declared(SOURCE);
+        assert_eq!(
+            declared,
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat"]
+        );
+        assert_eq!(declared.len(), CONSTANTS);
+    }
+
+    /// What Wine's HLSL compiler (vkd3d-shader) does not take is not in the
+    /// source, and every pass has its `main`.
+    #[test]
+    fn the_source_keeps_to_what_wine_compiles() {
+        for refused in [
+            "RootSignature",
+            "GetDimensions",
+            "NonUniformResourceIndex",
+            "[]",
+            "Interlocked",
+            "isnan",
+            "isinf",
+            ".Load4",
+            ".Load(uint",
+        ] {
+            assert!(!SOURCE.contains(refused), "{refused}");
+        }
+        // No store through a structured view: `cells[..] =`, `points[..] =`.
+        for line in SOURCE.lines() {
+            let line = line.trim_start();
+            for buffer in ["cells[", "points["] {
+                if let Some(rest) = line.strip_prefix(buffer) {
+                    let after = rest.split_once(']').map_or("", |(_, after)| after).trim_start();
+                    assert!(!after.starts_with('=') || after.starts_with("=="), "{line}");
+                }
+            }
+        }
+        assert!(SOURCE.is_ascii());
+        assert_eq!(SOURCE.matches("void main(").count(), 5);
+        for pass in [KEEP, MEAN, PLACE, GATHER, RAISE] {
+            let source = part(pass);
+            assert!(source.starts_with(&format!("#define {pass}\n")), "{pass}");
+            assert!(SOURCE.contains(&format!("#ifdef {pass}\n")), "{pass}");
+            // The helpers a pass calls are defined for it.
+            let body = SOURCE.split_once(&format!("#ifdef {pass}\n")).unwrap().1.split_once("#endif").unwrap().0;
+            assert_eq!(body.contains("seen("), source.contains("#define SEES\n"), "{pass}");
+            assert_eq!(body.contains("pack("), source.contains("#define PACKS\n"), "{pass}");
+        }
+        assert_eq!((CELLS, CELL_BYTES, POINT_BYTES), (2304, 73_744, 691_200));
+        assert!(SOURCE.contains("#define CELLS 2304\n") && SOURCE.contains("#define PX 160\n"));
+    }
+
+    #[test]
+    fn the_start_line_says_what_is_on() {
+        let line = start_line(1.0, [1.0, 0.6, 0.1, 0.45], 0.0);
+        assert!(line.starts_with("VICTORY_AMBIENT=estimate: "), "{line}");
+        assert!(line.contains("(1 of it; 64x36 cells, 160x90 points), shaded from depth"), "{line}");
+        assert!(line.ends_with("what the title's resolve left is replaced"), "{line}");
+        let line = start_line(0.5, [0.0, 0.6, 0.1, 0.45], 4.0);
+        assert!(line.contains("(0.5 of it;") && line.contains("not shaded"), "{line}");
+        assert!(line.ends_with("counts up to 4 times it"), "{line}");
+    }
+
+    #[test]
+    fn the_frame_line_says_what_the_estimate_is() {
+        let line = frame_line(0.5, Some(([0.2, 0.1, 0.05], [0.3, 0.01, 2.0])), [1.0, 2.0]);
+        assert!(line.starts_with("ambient estimate (VICTORY_AMBIENT=estimate): the light around (slow mean) is 0.2000 0.1000 0.0500, luminance 0.1177;"), "{line}");
+        assert!(line.contains("160x90 points hold a luminance of 0.3000 on average (least 0.0100, most 2.0000)"), "{line}");
+        assert!(line.contains("texels are written about 0.1500, the share 0.5 of it"), "{line}");
+        assert!(line.ends_with("; 1.0 keepings and 2.0 raisings/frame"), "{line}");
+        let line = frame_line(1.0, None, [0.0, 0.0]);
+        assert!(line.contains("nothing kept yet: no dispatch of CS_CacheScreenSpaceRadiance seen"), "{line}");
+        // The points' luminance: mean, least and most, without what is no number.
+        let points = [[1.0f32; 3], [3.0; 3], [f32::NAN, 0.0, 0.0], [2.0; 3]];
+        let [mean, least, most] = over_the_picture(points.into_iter());
+        assert!(near(mean, 2.0, 1e-5) && near(least, 1.0, 1e-5) && near(most, 3.0, 1e-5));
+        assert_eq!(over_the_picture(std::iter::empty()), [0.0; 3]);
+    }
+
+    fn near(a: f32, b: f32, part: f32) -> bool {
+        (a - b).abs() <= part * a.abs().max(b.abs()).max(1e-6)
+    }
+
+    /// A cell's light is the mean of its texels; a very bright texel counts
+    /// for no more than about 20, and a NaN, an infinity or a negative one
+    /// for nothing.
+    #[test]
+    fn cells_hold_the_mean_of_their_texels() {
+        let size = [1280, 720];
+        let grey = keep(&|_, _| [0.5, 0.25, 0.125], size);
+        assert_eq!(grey.len(), CELLS as usize);
+        assert!(grey.iter().all(|c| near(c[0], 0.5, 1e-5) && near(c[1], 0.25, 1e-5) && near(c[2], 0.125, 1e-5)));
+        // The left half lit: cells keep to their own texels.
+        let halves = keep(&|x, _| if x < 640 { [1.0; 3] } else { [0.0; 3] }, size);
+        assert!(near(halves[0][0], 1.0, 1e-5) && halves[(CX - 1) as usize][0] == 0.0);
+        assert!(near(halves[(CX / 2 - 1) as usize][0], 1.0, 1e-5) && halves[(CX / 2) as usize][0] == 0.0);
+        // The sun's disc in one texel of a cell's 25.
+        let glint = keep(&|x, y| if (x, y) == (2, 2) { [60_000.0; 3] } else { [0.0; 3] }, size);
+        assert!(near(glint[0][0], 20.0 / 25.0, 1e-3), "{}", glint[0][0]);
+        for bad in [f32::NAN, f32::INFINITY, -1.0] {
+            let cells = keep(&|_, _| [bad, 1.0, 1.0], size);
+            assert!(cells.iter().all(|c| *c == [0.0; 3]), "{bad}");
+        }
+        // Every texel sampled is inside the image, whatever its size.
+        for size in [[1280, 720], [64, 36], [1, 1], [1921, 1081]] {
+            keep(&|x, y| { assert!(x < size[0] && y < size[1], "{x} {y}"); [0.0; 3] }, size);
+        }
+    }
+
+    /// The slow mean starts at the first keeping's mean and then goes a
+    /// share of the way at each.
+    #[test]
+    fn the_slow_mean_follows_by_a_share() {
+        let dark = vec![[0.0f32; 3]; CELLS as usize];
+        let lit = vec![[2.0f32, 1.0, 0.5]; CELLS as usize];
+        let first = mean(&lit, [0.0; 4], FOLLOW);
+        assert!(near(first[0], 2.0, 1e-5) && near(first[2], 0.5, 1e-5) && first[3] > 0.0);
+        let next = mean(&dark, first, FOLLOW);
+        assert!(near(next[0], 2.0 * 0.96, 1e-5), "{next:?}");
+        // 25 keepings: to 1/e of the way, about.
+        let mut m = first;
+        for _ in 0..25 {
+            m = mean(&dark, m, FOLLOW);
+        }
+        assert!(near(m[0], 2.0 * 0.96f32.powi(25), 1e-4) && m[0] < 2.0 * 0.37);
+    }
+
+    /// A wall straight ahead at `metres`.
+    fn wall(metres: f32) -> impl Fn(u32, u32) -> f32 {
+        move |_, _| 0.1 / metres
+    }
+
+    const SET: Pass = Pass { level: 1.0, shade: [1.0, 0.6, 0.1, 0.45], follow: FOLLOW, most: 0.0, size: [640, 360], flat: false };
+
+    /// Texels are placed by their depth: the picture's middle straight
+    /// ahead, its edges where the field of view puts them.
+    #[test]
+    fn texels_are_placed_by_depth() {
+        let depth = wall(4.0);
+        let scene = Scene { depth: &depth, size: [640, 360], near: 0.1, tan_y: 0.45 };
+        let top_left = scene.seen([0, 0]);
+        assert!(near(top_left[2], 4.0, 1e-5));
+        assert!(near(top_left[0], -(1.0 - 1.0 / 640.0) * 0.45 * 640.0 / 360.0 * 4.0, 1e-4), "{top_left:?}");
+        assert!(near(top_left[1], (1.0 - 1.0 / 360.0) * 0.45 * 4.0, 1e-4), "{top_left:?}");
+        // Outside the picture: the depth of the nearest texel.
+        assert!(near(scene.seen([-5, 400])[2], 4.0, 1e-5));
+        // The sky (depth 0) is far, not infinitely.
+        let sky = |_: u32, _: u32| 0.0;
+        assert_eq!(Scene { depth: &sky, size: [640, 360], near: 0.1, tan_y: 0.45 }.seen([320, 180])[2], 1000.0);
+        let places = scene.place();
+        assert_eq!(places.len(), CELLS as usize);
+        assert!(places.iter().all(|c| near(c[2], 4.0, 1e-5) && near(c[3], 16.0, 1e-5)));
+        assert!(places[0][0] < 0.0 && places[0][1] > 0.0 && places[(CELLS - 1) as usize][0] > 0.0);
+    }
+
+    /// Where every cell sends out the same light, every point is given that
+    /// light from no direction, and every texel is written it (the wall is
+    /// open, so nothing is shaded).
+    #[test]
+    fn even_light_stays_even() {
+        let depth = wall(4.0);
+        let scene = Scene { depth: &depth, size: [640, 360], near: 0.1, tan_y: 0.45 };
+        let light = vec![[0.5f32, 0.25, 0.125]; CELLS as usize];
+        let points = scene.gather(&light, &scene.place());
+        assert_eq!(points.len(), (PX * PY) as usize);
+        for p in &points {
+            for (colour, want) in [0.5, 0.25, 0.125].into_iter().enumerate() {
+                assert!(near(p[colour][3], want, 1e-4), "{p:?}");
+                assert!(p[colour][..3].iter().all(|d| d.abs() < 1e-4 * want.max(1.0)), "{p:?}");
+            }
+        }
+        for p in [[0, 0], [320, 180], [639, 359], [17, 301]] {
+            let (n, open) = scene.surface(p, 1.0, 0.6);
+            assert!(n[2] < -0.999 && open == 1.0, "{n:?} {open}");
+            let written = scene.raise(p, &points, [0.5, 0.25, 0.125], &SET, [0.0; 3]);
+            assert!(near(written[0], 0.5, 1e-3) && near(written[2], 0.125, 1e-3), "{written:?}");
+            // A share of it.
+            let half = scene.raise(p, &points, [0.5, 0.25, 0.125], &Pass { level: 0.5, ..SET }, [0.0; 3]);
+            assert!(near(half[0], 0.25, 1e-3), "{half:?}");
+        }
+    }
+
+    /// A lit half of the wall lights its own side more than the other, and
+    /// each point knows which way the light comes from.
+    #[test]
+    fn light_comes_from_where_it_is() {
+        let depth = wall(4.0);
+        let scene = Scene { depth: &depth, size: [640, 360], near: 0.1, tan_y: 0.45 };
+        let light: Vec<V3> = (0..CELLS).map(|i| if i % CX < CX / 2 { [1.0, 0.0, 0.0] } else { [0.0; 3] }).collect();
+        let points = scene.gather(&light, &scene.place());
+        let at = |x: u32, y: u32| points[(y * PX + x) as usize];
+        let (left, right) = (at(10, 45), at(150, 45));
+        assert!(left[0][3] > 0.85 && right[0][3] < 0.15, "{} {}", left[0][3], right[0][3]);
+        // Between them: half, and from the left (x right, so less than 0).
+        let middle = at(80, 45);
+        assert!(middle[0][3] > 0.3 && middle[0][3] < 0.7 && middle[0][0] < -0.01, "{middle:?}");
+        // No green or blue anywhere.
+        assert!(points.iter().all(|p| p[1] == [0.0; 4] && p[2] == [0.0; 4]));
+        // Texels in between are given what lies between their points, and
+        // never less than a fifth nor more than 2.5 times the mean there.
+        let around = [0.5, 0.0, 0.0];
+        let dark = scene.raise([600, 180], &points, around, &SET, [0.0; 3])[0];
+        let lit = scene.raise([40, 180], &points, around, &SET, [0.0; 3])[0];
+        assert!(lit > 0.75 && lit < 1.0 && dark >= 0.1 - 1e-4 && dark < 0.25, "{lit} {dark}");
+        // Without a depth image: the slow mean alone.
+        let flat = scene.raise([40, 180], &points, around, &Pass { flat: true, ..SET }, [0.0; 3]);
+        assert_eq!(flat, around);
+    }
+
+    /// The crease between a floor and a wall is darker than the open floor.
+    #[test]
+    fn creases_are_shaded() {
+        // A floor 0.6 m under the eye up to a wall 3 m ahead.
+        let size = [640u32, 360];
+        let depth = move |_: u32, y: u32| {
+            let down = ((y as f32 + 0.5) / size[1] as f32 * 2.0 - 1.0) * 0.45;
+            let z = if down > 0.0 { (0.6 / down).min(3.0) } else { 3.0 };
+            0.1 / z
+        };
+        let scene = Scene { depth: &depth, size, near: 0.1, tan_y: 0.45 };
+        // The row where the floor meets the wall: down * 3 = 0.6.
+        let crease = ((0.2 / 0.45 + 1.0) / 2.0 * 360.0) as i32;
+        let (_, at_crease) = scene.surface([320, crease + 3], 1.0, 0.6);
+        let (_, in_the_open) = scene.surface([320, 350], 1.0, 0.6);
+        assert!(at_crease < 0.9 && in_the_open > 0.99, "{at_crease} {in_the_open}");
+        // No strength, no shade.
+        assert_eq!(scene.surface([320, crease + 3], 0.0, 0.6).1, 1.0);
+    }
+
+    /// With a multiple set, what the resolve left counts up to that many
+    /// times the estimate's luminance, and never lowers the estimate.
+    #[test]
+    fn what_the_resolve_left_counts_up_to_a_multiple() {
+        let depth = wall(4.0);
+        let scene = Scene { depth: &depth, size: [640, 360], near: 0.1, tan_y: 0.45 };
+        let light = vec![[0.5f32; 3]; CELLS as usize];
+        let points = scene.gather(&light, &scene.place());
+        let set = Pass { most: 4.0, ..SET };
+        let raise = |was: V3| scene.raise([320, 180], &points, [0.5; 3], &set, was);
+        assert!(near(raise([0.0; 3])[0], 0.5, 1e-3));
+        assert!(near(raise([1.0; 3])[0], 1.0, 1e-3));
+        assert!(near(raise([100.0; 3])[0], 2.0, 1e-3));
+        // A coloured leftover keeps its colour, at four times the luminance.
+        let magenta = raise([50.0, 0.0, 50.0]);
+        assert!(near(luma(magenta), luma([0.5; 3]) * 4.0, 0.3) && magenta[1] >= 0.5 - 1e-3, "{magenta:?}");
+        // Replaced when the multiple is 0.
+        assert!(near(scene.raise([320, 180], &points, [0.5; 3], &SET, [100.0; 3])[0], 0.5, 1e-3));
+    }
+
+    /// The light is packed as R9G9B9E5 and comes back within a 512th of its
+    /// brightest part.
+    #[test]
+    fn the_light_is_packed_as_r9g9b9e5() {
+        for c in [[0.0f32; 3], [1.0, 0.5, 0.25], [0.01, 0.02, 0.03], [300.0, 2.0, 0.1], [65408.0, 1.0, 0.0], [1e-5, 0.0, 0.0]] {
+            let back = unpack(pack(c));
+            let top = c[0].max(c[1]).max(c[2]);
+            for k in 0..3 {
+                assert!((back[k] - c[k]).abs() <= top / 256.0 + 2e-5, "{c:?} {back:?}");
+            }
+        }
+        assert_eq!(pack([0.0; 3]) & 0x07ff_ffff, 0);
+        assert_eq!(unpack(pack([1.0; 3])), [1.0; 3]);
+    }
+}

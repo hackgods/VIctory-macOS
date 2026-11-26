@@ -59,7 +59,10 @@ fn var(name: &str) -> Option<String> {
 
 /// Says what is on, once, when the host device is ready.
 pub(crate) fn announce() {
-    if on() {
+    // The estimate in its place (`VICTORY_AMBIENT=estimate`).
+    if crate::ambient_estimate::on() {
+        crate::ambient_estimate::announce();
+    } else if on() {
         tracing::info!("{}", set::start_line(level(), shade(), keep(), follow()));
     }
 }
@@ -76,9 +79,12 @@ pub(crate) fn note_program(hash: &str, container: &[u8]) {
         return;
     }
     let role = set::role_of(container);
-    if role != 0 {
-        tracing::info!(hash, "a program the ambient light follows: it {}", set::role_name(role));
-        FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).push((hash.to_owned(), role));
+    // The estimate's own programs (none while it is off).
+    let more = crate::ambient_estimate::role_of(container);
+    if role | more != 0 {
+        let name = if more != 0 { crate::ambient_estimate::role_name(more) } else { set::role_name(role) };
+        tracing::info!(hash, "a program the ambient light follows: it {name}");
+        FOLLOWED.lock().unwrap_or_else(|e| e.into_inner()).push((hash.to_owned(), role | more));
     }
 }
 

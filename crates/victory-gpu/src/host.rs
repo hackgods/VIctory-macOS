@@ -4010,6 +4010,7 @@ impl Meter {
             crate::descriptor::slots::log(report_frames);
             crate::descriptor::pool::log(report_frames);
             crate::descriptor::reports::log(report_frames);
+            crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

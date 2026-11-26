@@ -1243,7 +1243,8 @@ impl State {
             return;
         }
         let role = crate::pipeline::ambient_role(self.pipeline as This);
-        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS) == 0 {
+        let estimate = crate::ambient_estimate::roles();
+        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS | estimate) == 0 {
             return;
         }
         let Some(stage) =
@@ -1274,7 +1275,32 @@ impl State {
             };
             (texture != 0).then_some((pin, texture as This))
         };
-        let recorded = if role & crate::ambient::RESOLVES != 0 {
+        let recorded = if crate::ambient_estimate::on() {
+            // The estimate in the constant's place (`VICTORY_AMBIENT=estimate`,
+            // from avatarmanz 82ca1347).
+            use crate::ambient_estimate as estimate;
+            if role & estimate::KEEPS != 0 {
+                match &image(ResourceType::Uav, estimate::RADIANCE) {
+                    Some((_, radiance)) => estimate::keep(list, *radiance),
+                    None => {
+                        once!("no ambient estimate: the light visible surfaces send out is not at its place in the table");
+                        false
+                    }
+                }
+            } else if role & crate::ambient::RESOLVES != 0 {
+                let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+                let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+                match &light {
+                    Some((_, light)) => estimate::raise(list, *light, depth.as_ref().map(|d| d.1)),
+                    None => {
+                        once!("no ambient estimate: the resolve's light image is not at its place in the table");
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else if role & crate::ambient::RESOLVES != 0 {
             let light = image(ResourceType::Uav, crate::ambient::LIGHT);
             let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
             match &light {

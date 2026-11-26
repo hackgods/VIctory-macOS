@@ -55,7 +55,19 @@ pub fn run(
     if execute {
         // Before the host's own memory (the image read below, the GPU
         // device, the caches) takes the space the title's 32-bit memory needs.
-        victory_hle::modules::xmem::low_guards::install();
+        // macOS port: off under Rosetta unless VICTORY_LOW_GUARDS=1. With the guards in
+        // place, a later address-limited allocation has made Wine search for free space
+        // for minutes while it held its virtual-memory lock (three stalled runs on
+        // 26 November, watchdog at +0x23cf683); the start-up failure the guards fix on
+        // Windows has not been seen here.
+        let low_guards = match std::env::var("VICTORY_LOW_GUARDS").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => !victory_gpu::rosetta(),
+        };
+        if low_guards {
+            victory_hle::modules::xmem::low_guards::install();
+        }
     }
     let cfg = victory_core::Config::load()?;
     // Before the import registry is first used: it holds the module only

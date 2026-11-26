@@ -411,6 +411,14 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // macOS port: a sampling profile of the process's threads
+    // (victory_gpu::profile); off unless VICTORY_PROFILE names a file.
+    let titled = std::iter::once((exe_name.as_ref(), image.base(), image.info().size_of_image as usize)).chain(
+        dlls.iter().map(|(name, dll)| (name.as_str(), dll.base(), dll.info().size_of_image as usize)),
+    );
+    if let Some(line) = victory_gpu::profile::start(titled) {
+        println!("profile        {line}");
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

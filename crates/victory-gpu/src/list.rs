@@ -1540,7 +1540,10 @@ pub(crate) static UPLOADS: [std::sync::atomic::AtomicU64; 2] =
 
 /// Draw state the host has no use for (root signatures: ours come with
 /// the pipeline; depth bounds, depth order and shading rate hints): any
-/// arguments, nothing returned.
+/// arguments, nothing returned. Never inlined: an optimized build would
+/// otherwise give each code unit its own copy, so the tables and the test
+/// that checks them would hold different addresses for it.
+#[inline(never)]
 extern "system" fn ignored_state(_: This) {}
 
 extern "system" fn depth_bounds(this: This, min: f32, max: f32) {

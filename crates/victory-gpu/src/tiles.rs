@@ -707,10 +707,13 @@ mod tests {
             [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
                 b.Store(dst + id.x * 4, 7);\n\
             }\n";
+        // Reads through a view of its own (a root SRV of the same reserved
+        // buffer), as the title's programs mostly read.
         const READ: &str = "cbuffer c : register(b0) { uint dst; uint src; };\n\
             RWByteAddressBuffer b : register(u0);\n\
+            ByteAddressBuffer r : register(t0);\n\
             [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
-                b.Store(dst + id.x * 4, b.Load(src + id.x * 4) + 1);\n\
+                b.Store(dst + id.x * 4, r.Load(src + id.x * 4) + 1);\n\
             }\n";
         let params = [
             Param::Constants {
@@ -718,6 +721,10 @@ mod tests {
                 count: 2,
             },
             Param::Uav { register: 0 },
+            Param::Srv {
+                register: 0,
+                space: 0,
+            },
         ];
         let (root, write) = pipeline(WRITE, windows::core::s!("alias write"), 0, &params)
             .unwrap_or_else(|e| panic!("the probe's write pipeline: {e}"));
@@ -742,6 +749,7 @@ mod tests {
         rig.record(|l| unsafe {
             l.SetComputeRootSignature(&root);
             l.SetComputeRootUnorderedAccessView(1, reserved.GetGPUVirtualAddress());
+            l.SetComputeRootShaderResourceView(2, reserved.GetGPUVirtualAddress());
             // 7s into the first half of the page, through tile 0.
             l.SetPipelineState(&write);
             l.SetComputeRoot32BitConstants(0, 2, [0u32, 0].as_ptr().cast(), 0);

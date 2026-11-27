@@ -5,6 +5,14 @@
 //! once the title presents its first frame with at least `WORLD_DRAW_THRESHOLD`
 //! draws so input replay (`victory_hle`) and benchmark capture share one
 //! loading-screen-immune timeline.
+//!
+//! `VICTORY_BENCH_WARMUP` (default 30) is counted in world-scale presents only:
+//! presents with at least `WORLD_DRAW_THRESHOLD` draws. Presents with fewer
+//! draws that arrive while warming up (a second loading phase after a brief
+//! world frame) are discarded, and a run of `WARMUP_RESTART_LOW_RUN` such
+//! presents in a row restarts the warmup count. Measurement therefore starts
+//! only after the last loading phase; once it has started, every present is
+//! measured, including zero-draw ones (`zero_draw_world_frames`).
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +22,8 @@ use std::time::Instant;
 /// Minimum draws in a single presented frame to latch into the 3D world.
 pub const WORLD_DRAW_THRESHOLD: u64 = 500;
 const DEFAULT_WARMUP_FRAMES: u64 = 30;
+/// Consecutive presents below `WORLD_DRAW_THRESHOLD` that restart the warmup.
+const WARMUP_RESTART_LOW_RUN: u64 = 30;
 const ROOT_MARKER: &str = ".victory-root";
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -358,6 +368,7 @@ struct BenchRecorder {
     world_frame: u64,
     prev_drawn: u64,
     warmup_frames: u64,
+    low_run: u64,
     frame_ms: Vec<f64>,
     draws: Vec<u64>,
     zero_draw_world_frames: u64,
@@ -376,6 +387,7 @@ impl BenchRecorder {
             world_frame: 0,
             prev_drawn: 0,
             warmup_frames: 0,
+            low_run: 0,
             frame_ms: Vec::new(),
             draws: Vec::new(),
             zero_draw_world_frames: 0,
@@ -392,7 +404,9 @@ impl BenchRecorder {
     /// post-warmup metrics. `frame_ms` is `None` on the first ever present
     /// (where no prior present timestamp exists) so a bogus `0.0 ms` sample is
     /// never recorded when `VICTORY_BENCH_WARMUP=0`. Returns
-    /// `(world_frame, measured_count)`.
+    /// `(world_frame, measured_count)`. Only presents with at least
+    /// `WORLD_DRAW_THRESHOLD` draws count toward warmup; a run of
+    /// `WARMUP_RESTART_LOW_RUN` lower presents restarts it.
     fn observe(
         &mut self,
         drawn: u64,
@@ -414,8 +428,17 @@ impl BenchRecorder {
             self.world_frame += 1;
         }
 
-        if self.world_frame <= self.warmup_target {
-            self.warmup_frames += 1;
+        if self.warmup_frames < self.warmup_target {
+            if frame_draws >= WORLD_DRAW_THRESHOLD {
+                self.warmup_frames += 1;
+                self.low_run = 0;
+            } else {
+                self.low_run += 1;
+                if self.low_run >= WARMUP_RESTART_LOW_RUN {
+                    self.warmup_frames = 0;
+                    self.low_run = 0;
+                }
+            }
             return (self.world_frame, self.draws.len() as u64);
         }
 
@@ -440,6 +463,11 @@ impl BenchRecorder {
             .max(mem.ram_working_set_bytes);
 
         (self.world_frame, self.draws.len() as u64)
+    }
+
+    /// True once the warmup is complete, so the next present is measured.
+    fn warmed_up(&self) -> bool {
+        self.warmup_frames >= self.warmup_target
     }
 
     fn report(&self, input_script_sha256: Option<String>) -> BenchReport {
@@ -597,12 +625,13 @@ pub(crate) fn on_present(drawn: u64, black_frame: bool) {
         // Keep `recorder.world_frame` synchronized with the atomic `WORLD_FRAME`.
         state.recorder.prev_drawn = prev;
         state.recorder.world_frame = next_wf - 1;
-        let mem = if next_wf > cfg.warmup_frames {
+        let measuring = state.recorder.warmed_up();
+        let mem = if measuring {
             sample_host_memory()
         } else {
             MemorySample::default()
         };
-        let removed = if next_wf > cfg.warmup_frames {
+        let removed = if measuring {
             is_device_removed()
         } else {
             false
@@ -654,12 +683,12 @@ mod tests {
 
         // First frame with >= 500 draws latches to world_frame == 1 (warmup 1/3).
         assert_eq!(rec.observe(1100, Some(50.0), false, mem, false), (1, 0));
-        assert_eq!(rec.observe(1500, Some(40.0), false, mem, false), (2, 0));
-        assert_eq!(rec.observe(1800, Some(30.0), false, mem, false), (3, 0));
+        assert_eq!(rec.observe(1600, Some(40.0), false, mem, false), (2, 0));
+        assert_eq!(rec.observe(2200, Some(30.0), false, mem, false), (3, 0));
 
         // Post-warmup world frames are measured even if draws drop on a subsequent frame.
-        assert_eq!(rec.observe(2800, Some(10.0), false, mem, false), (4, 1));
-        assert_eq!(rec.observe(2800, Some(20.0), true, mem, false), (5, 2));
+        assert_eq!(rec.observe(3200, Some(10.0), false, mem, false), (4, 1));
+        assert_eq!(rec.observe(3200, Some(20.0), true, mem, false), (5, 2));
 
         let rep = rec.report(None);
         assert_eq!(rep.warmup_frames, 3);
@@ -683,6 +712,81 @@ mod tests {
         assert_eq!(rep0.world_frames, 2);
         assert!((rep0.frame_ms.avg - 12.0).abs() < 1e-6);
         assert!((rep0.frame_ms.median - 12.0).abs() < 1e-6);
+    }
+
+    /// Feeds per-present draw counts; returns the recorder.
+    fn feed(rec: &mut BenchRecorder, drawn: &mut u64, per_present: &[u64]) {
+        for &d in per_present {
+            *drawn += d;
+            rec.observe(*drawn, Some(30.0), false, MemorySample::default(), false);
+        }
+    }
+
+    /// Per-5-s draws/frame sequence seen in the title, expanded to presents.
+    fn observed_sequence() -> Vec<u64> {
+        // (draws per present, presents in the 5 s sample)
+        let samples: [(u64, usize); 19] = [
+            (4, 120),
+            (6, 120),
+            (6, 120),
+            (6, 120),
+            (10, 120),
+            (11, 120),
+            (11, 120),
+            (11, 120),
+            (10, 120),
+            (12, 120),
+            (76, 40),
+            (2016, 1),
+            (1021, 1),
+            (2, 125),
+            (2, 125),
+            (2, 125),
+            (162, 15),
+            (4911, 15),
+            (4864, 15),
+        ];
+        samples
+            .iter()
+            .flat_map(|&(d, n)| std::iter::repeat_n(d, n))
+            .collect()
+    }
+
+    #[test]
+    fn warmup_waits_out_second_loading_phase() {
+        let seq = observed_sequence();
+        let steady_start = seq.iter().rposition(|&d| d == 162).unwrap() + 1;
+        let mut rec = BenchRecorder::new(10);
+        let mut drawn = 0;
+        feed(&mut rec, &mut drawn, &seq[..steady_start]);
+        // Brief world frames and loading presents are not measurement.
+        assert!(rec.draws.is_empty());
+        assert!(!rec.warmed_up());
+        feed(&mut rec, &mut drawn, &seq[steady_start..]);
+        // 30 steady presents: 10 warm, 20 measured, all in the steady phase.
+        assert_eq!(rec.warmup_frames, 10);
+        assert_eq!(rec.draws.len(), 20);
+        assert!(rec.draws.iter().all(|&d| d >= 4800));
+        assert_eq!(rec.zero_draw_world_frames, 0);
+    }
+
+    #[test]
+    fn warmup_without_second_loading_phase_is_unchanged() {
+        let mut rec = BenchRecorder::new(3);
+        let mut drawn = 0;
+        feed(&mut rec, &mut drawn, &[4; 50]);
+        feed(&mut rec, &mut drawn, &[900, 900, 900, 900, 900]);
+        assert_eq!(rec.warmup_frames, 3);
+        assert_eq!(rec.draws, vec![900, 900]);
+    }
+
+    #[test]
+    fn short_low_draw_gap_does_not_restart_warmup() {
+        let mut rec = BenchRecorder::new(3);
+        let mut drawn = 0;
+        feed(&mut rec, &mut drawn, &[900, 2, 2, 900, 900, 900]);
+        assert_eq!(rec.warmup_frames, 3);
+        assert_eq!(rec.draws, vec![900]);
     }
 
     #[test]

@@ -4316,3 +4316,606 @@ fn a_store_in_a_while_loop_is_made_by_the_lanes_still_in_it_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// [`native`] for a group of two dimensions: thread ids x and y in `v0` and
+/// `v1`, the group's x in `s1` (after the one user-data SGPR).
+fn native_2d(words: &[u32], threads: [u32; 2]) -> NativeProgram {
+    let mut n = native(words, true, threads[0] * threads[1], 0);
+    n.io = StageIo::Cs(ComputeIo {
+        // One user-data SGPR, the group's x (bit 7), thread ids x and y
+        // (bits 11-12: 1).
+        rsrc2: 1 << 1 | 1 << 7 | 1 << 11,
+        threads: [threads[0], threads[1], 1],
+    });
+    n
+}
+
+/// [`while_loop_with_a_store`] in a group `width` threads wide (8 or 16), of
+/// several rows, in a dispatch of several groups: the thread's flat id
+/// `width y + x` is in `v0`, and a lane stays while
+/// `v1 < ((flat + group) & 7)`, so the lanes leave at passes that differ
+/// from group to group. Each lane has 16 dwords at
+/// `(256 group + flat) * 64`: the accumulator of first lanes, its passes
+/// at dwords 1 to 7, `flat + 1` added (atomically, so a thread id two
+/// host lanes hold shows) at dword 8, and its count of passes at dword 9. `forever`: no lane ever leaves (the
+/// loop then runs to the translation's limit of passes), and no pass stores.
+fn while_loop_in_rows(forever: bool, width: u32) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3406_0280 | width.trailing_zeros(), // v_lshlrev_b32 v3, 3 or 4, v1
+        0x4A00_0700,                          // v_add_nc_u32 v0, v0, v3
+        0x3420_0086,                          // v_lshlrev_b32 v16, 6, v0
+        0x7E08_0201,                          // v_mov_b32 v4, s1
+        0x3408_088E,                          // v_lshlrev_b32 v4, 14, v4
+        0x4A20_0910,                          // v_add_nc_u32 v16, v16, v4
+        0x4A0C_0001,                          // v_add_nc_u32 v6, s1, v0
+        0x7E02_0280,                          // v_mov_b32 v1, 0
+        0x7E04_0280,                          // v_mov_b32 v2, 0
+        if forever {
+            0x7E0A_02C1 // v_mov_b32 v5, -1
+        } else {
+            0x360A_0C87 // v_and_b32 v5, 7, v6
+        },
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+    ]);
+    if forever {
+        w.extend([
+            0xBF82_0003, // s_branch (the test)
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFA, // s_cbranch_execnz (the body)
+        ]);
+    } else {
+        w.extend([
+            0xBF82_0007, // s_branch (the test)
+            0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+            0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+            0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+            0x3422_0282, // v_lshlrev_b32 v17, 2, v1
+            0x4A22_2310, // v_add_nc_u32 v17, v16, v17
+            0xE070_1000,
+            0x800A_0111, // buffer_store_dword v1, v17, s[40:43], 0 offen
+            0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFF6, // s_cbranch_execnz (the body)
+        ]);
+    }
+    w.extend([
+        0xBEFE_0424, // s_mov_b64 exec, s[36:37]
+        0x4A0E_0081, // v_add_nc_u32 v7, 1, v0
+        0xE0C8_1020,
+        0x800A_0710, // buffer_atomic_add v7, v16, s[40:43], 0 offen offset:32
+    ]);
+    w.extend(store(1, 36));
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_while_loop_in_rows_is_what_its_comments_say() {
+    for (forever, width) in [(false, 8), (true, 8), (false, 16)] {
+        let words = while_loop_in_rows(forever, width);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let text: Vec<String> = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect();
+        let bound = if forever {
+            "v_mov_b32 v5, -1"
+        } else {
+            "v_and_b32 v5, 7, v6"
+        };
+        let rows = if width == 8 {
+            "v_lshlrev_b32 v3, 3, v1"
+        } else {
+            "v_lshlrev_b32 v3, 4, v1"
+        };
+        let mut want = vec![
+            rows,
+            "v_add_nc_u32 v0, v0, v3",
+            "v_lshlrev_b32 v16, 6, v0",
+            "v_mov_b32 v4, s1",
+            "v_lshlrev_b32 v4, 14, v4",
+            "v_add_nc_u32 v16, v16, v4",
+            "v_add_nc_u32 v6, s1, v0",
+            "v_mov_b32 v1, 0",
+            "v_mov_b32 v2, 0",
+            bound,
+            "s_mov_b64 s[36:37], exec",
+            "s_branch",
+            "v_readfirstlane_b32 s6, v0",
+            "v_add_nc_u32 v2, s6, v2",
+            "v_add_nc_u32 v1, 1, v1",
+        ];
+        if !forever {
+            want.extend([
+                "v_lshlrev_b32 v17, 2, v1",
+                "v_add_nc_u32 v17, v16, v17",
+                "buffer_store_dword v1, v17, s[40:43], 0 offen",
+            ]);
+        }
+        want.extend([
+            "v_cmp_lt_u32 vcc, v1, v5",
+            "s_and_b64 exec, exec, vcc",
+            "s_cbranch_execnz",
+            "s_mov_b64 exec, s[36:37]",
+            "v_add_nc_u32 v7, 1, v0",
+            "buffer_atomic_add v7, v16, s[40:43], 0 offen offset:32",
+            "buffer_store_dword v1, v16, s[40:43], 0 offen offset:36",
+        ]);
+        // The prologue's five words are four instructions.
+        for (n, want) in want.iter().enumerate() {
+            let got = &text[PROLOGUE.len() - 1 + n];
+            assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+        }
+    }
+}
+
+/// What the console stores for [`while_loop_in_rows`]'s lanes of group
+/// `group`, `lanes` threads in console waves of 64: 16 dwords each.
+#[cfg(windows)]
+fn console_while_loop_in_rows(lanes: u32, group: u32) -> Vec<[u32; 16]> {
+    let stays = |t: u32| (t + group) & 7;
+    (0..lanes)
+        .map(|t| {
+            let mut lane = [0; 16];
+            let wave = (t & !63)..lanes.min((t & !63) + 64);
+            for pass in 0..stays(t) {
+                // The first lane of its wave still in the loop in this pass.
+                lane[0] += wave.clone().find(|&f| stays(f) > pass).expect("this one");
+                lane[pass as usize + 1] = pass + 1;
+            }
+            lane[8] = t + 1;
+            lane[9] = stays(t);
+            lane
+        })
+        .collect()
+}
+
+/// A `while` loop in lockstep translates in halves in groups of rows.
+#[test]
+fn a_while_loop_in_rows_translates_in_halves() {
+    for threads in [[8, 8], [8, 6], [16, 16]] {
+        for forever in [false, true] {
+            let n = native_2d(&while_loop_in_rows(forever, threads[0]), threads);
+            let l =
+                lowered(&n, true).unwrap_or_else(|e| panic!("{threads:?} forever={forever}: {e}"));
+            assert_eq!(l.wave_size, Some(32));
+            assert!(l.barriers > 0, "the halves meet in the loop");
+        }
+    }
+}
+
+/// A `while` loop in lockstep in groups of rows (8x8: two full host waves;
+/// 8x6: 48 threads, the console wave's upper half 16 lanes; 16x16: four
+/// console waves, as GTA VI's programs with such a loop have), several groups
+/// to a dispatch, lanes leaving at different passes: every lane stores what
+/// the console's does, its count of passes too, and each thread id is held
+/// by one host lane. Left by no lane, the loop ends at the translation's
+/// limit of passes in every lane of every group.
+///
+/// A group that stayed in the loop after its last lane left would store
+/// nothing more, so that shows only in time. Time does not tell here: on an
+/// M5 Pro 2,048 groups of 8x8 took 22 to 25 ms, and 56 to 62 ms with every
+/// group at the limit (16,383 passes, two exchanges each), so the times are
+/// printed, not checked.
+#[cfg(windows)]
+#[test]
+fn a_while_loop_in_rows_matches_the_console_and_leaves_on_every_gpu() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return;
+    }
+    let mut failed = Vec::new();
+    for (adapter, host) in &hosts {
+        for threads in [[8u32, 8], [8, 6], [16, 16]] {
+            let lanes = threads[0] * threads[1];
+            for narrow_waves in [false, true] {
+                let label = format!("{adapter} {threads:?} narrow_waves={narrow_waves}");
+                let make = |forever: bool| {
+                    let n = native_2d(&while_loop_in_rows(forever, threads[0]), threads);
+                    let s = shader(lower_halves(&n, true, narrow_waves, false).expect("halves"));
+                    if let Ok(mut v) =
+                        validator::Validator::load(validator::Validator::default_path().as_deref())
+                    {
+                        v.validate(&mut s.dxil.clone())
+                            .expect("DXIL validation failed");
+                    }
+                    let Ok((root, pso)) = host.compute_pipeline(&s) else {
+                        panic!("{label}: no pipeline");
+                    };
+                    (s, root, pso)
+                };
+                let leaves = make(false);
+                let stays = make(true);
+                let run = |forever: bool, groups: u32| {
+                    let (s, root, pso) = if forever { &stays } else { &leaves };
+                    let ud = vec![0u32; s.user_data_dwords().max(1) as usize];
+                    let views = [
+                        View::Texture(1, 1, &[[0.0; 4]]),
+                        View::Buffer {
+                            data: &[0; 4],
+                            stride: Stride::Structured(16),
+                        },
+                        View::RawUav(groups * 256 * 16),
+                    ];
+                    let start = std::time::Instant::now();
+                    let out = host
+                        .dispatch(
+                            root,
+                            pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(ud))],
+                                views: &views,
+                                samplers: &[],
+                                groups: [groups, 1, 1],
+                            },
+                        )
+                        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                    (out, start.elapsed())
+                };
+                for groups in [1u32, 5, 37] {
+                    let (out, _) = run(false, groups);
+                    let mut wrong = 0;
+                    for g in 0..groups {
+                        let want = console_while_loop_in_rows(lanes, g);
+                        for (t, want) in want.iter().enumerate() {
+                            let at = (g as usize * 256 + t) * 16;
+                            let got = &out[0][at..at + 16];
+                            if got != want {
+                                wrong += 1;
+                                failed.push(format!(
+                                    "{label}: {groups} groups: group {g} lane {t}: {got:?}, the console {want:?}"
+                                ));
+                            }
+                        }
+                        // Nothing stored where the group has no thread.
+                        let past = (g as usize * 256 + lanes as usize) * 16;
+                        let end = (g as usize + 1) * 256 * 16;
+                        if out[0][past..end].iter().any(|&d| d != 0) {
+                            wrong += 1;
+                            failed.push(format!(
+                                "{label}: {groups} groups: group {g}: stores past its {lanes} threads"
+                            ));
+                        }
+                    }
+                    eprintln!("{label}: {groups} groups: {wrong} lanes differ from the console");
+                }
+                // Many groups, the best of three, and the loop no lane leaves
+                // (every group at the limit of passes).
+                let groups = 512;
+                let best = (0..3).map(|_| run(false, groups).1).min().expect("three");
+                let (out, limit) = run(true, groups);
+                // Every lane of every group ran to the limit of passes.
+                let passes: std::collections::BTreeSet<u32> = (0..groups as usize * 256)
+                    .filter(|t| t % 256 < lanes as usize)
+                    .map(|t| out[0][t * 16 + 9])
+                    .collect();
+                eprintln!("{label}: passes at the limit: {passes:?}");
+                if passes != [super::DEFAULT_LOOP_LIMIT - 1].into() {
+                    failed.push(format!("{label}: passes at the limit: {passes:?}"));
+                }
+                eprintln!(
+                    "{label}: {groups} groups: {best:?}; with every group at the limit of passes {limit:?}"
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A sum over the group's earlier console waves, in a `while` loop whose
+/// exit test is in its header and whose latch reads the first lane (the
+/// shape of the loops in GTA VI's acceleration-structure builder): every
+/// lane writes its wave's number plus 5 to the wave's LDS dword; after a
+/// barrier, the lanes of wave `w > 0` add dwords 0 to `w - 1` up, carrying
+/// the sum from pass to pass through the first lane (`s17`), and leave when
+/// the pass count `s18` is their wave. Each lane stores its sum.
+fn sum_of_earlier_waves() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0
+        0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
+        0x4A12_0E85, // v_add_nc_u32 v9, 5, v7
+        0xD834_0000,
+        0x0000_0908, // ds_write_b32 v8, v9
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x7E10_0280, // v_mov_b32 v8, 0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DAA_0E80, // v_cmpx_ne_u32 exec, 0, v7
+        0xBF88_0012, // s_cbranch_execz (the end)
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE86_047E, // s_mov_b64 s[6:7], exec
+        0xBE92_0380, // s_mov_b32 s18, 0
+        0xBE91_0380, // s_mov_b32 s17, 0
+        0xBF82_0002, // s_branch (the header)
+        0x87FE_0610, // s_and_b64 exec, s[16:17], s[6:7]
+        0x7E22_0508, // v_readfirstlane_b32 s17, v8
+        0x8F10_8212, // s_lshl_b32 s16, s18, 2
+        0x8112_8112, // s_add_i32 s18, s18, 1
+        0x7E10_0210, // v_mov_b32 v8, s16
+        0xD8D8_0000,
+        0x0800_0008, // ds_read_b32 v8, v8
+        S_WAITCNT_LGKM,
+        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7DA4_0E12, // v_cmpx_eq_u32 exec, s18, v7
+        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
+        0xBF85_FFF3, // s_cbranch_scc1 (the latch)
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]);
+    w.extend(store(8, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_sum_of_earlier_waves_is_what_its_comments_say() {
+    let words = sum_of_earlier_waves();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_lshrrev_b32 v7, 6, v0",
+        "v_lshlrev_b32 v8, 2, v7",
+        "v_add_nc_u32 v9, 5, v7",
+        "ds_write_b32 v8, v9",
+        "s_waitcnt lgkmcnt(0)",
+        "s_barrier",
+        "v_mov_b32 v8, 0",
+        "s_mov_b64 s[0:1], exec",
+        "v_cmpx_ne_u32 exec, 0, v7",
+        "s_cbranch_execz",
+        "s_mov_b64 s[2:3], exec",
+        "s_mov_b64 s[6:7], exec",
+        "s_mov_b32 s18, 0",
+        "s_mov_b32 s17, 0",
+        "s_branch",
+        "s_and_b64 exec, s[16:17], s[6:7]",
+        "v_readfirstlane_b32 s17, v8",
+        "s_lshl_b32 s16, s18, 2",
+        "s_add_i32 s18, s18, 1",
+        "v_mov_b32 v8, s16",
+        "ds_read_b32 v8, v8",
+        "s_waitcnt lgkmcnt(0)",
+        "v_add_nc_u32 v8, s17, v8",
+        "s_mov_b64 s[16:17], exec",
+        "v_cmpx_eq_u32 exec, s18, v7",
+        "s_andn2_b64 s[6:7], s[6:7], exec",
+        "s_cbranch_scc1",
+        "s_mov_b64 exec, s[0:1]",
+    ];
+    // The prologue's five words are four instructions.
+    for (n, want) in want.iter().enumerate() {
+        let got = &text[PROLOGUE.len() - 1 + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+    // The three branches go to the end, the header and the latch.
+    let at = |name: &str| {
+        let i = gfx10::decode(&code).expect("decodes");
+        i.iter()
+            .find(|i| i.text(true).starts_with(name))
+            .map(|i| i.text(true))
+            .expect("there")
+    };
+    let offset = |n: usize| {
+        let i = gfx10::decode(&code).expect("decodes");
+        i[PROLOGUE.len() - 1 + n].offset
+    };
+    assert!(
+        at("s_cbranch_execz").contains(&format!("{:04X}", offset(28))),
+        "{}",
+        at("s_cbranch_execz")
+    );
+    assert!(
+        at("s_branch").contains(&format!("{:04X}", offset(18))),
+        "{}",
+        at("s_branch")
+    );
+    assert!(
+        at("s_cbranch_scc1").contains(&format!("{:04X}", offset(16))),
+        "{}",
+        at("s_cbranch_scc1")
+    );
+}
+
+/// The sum translates in halves, its loop in lockstep.
+#[test]
+fn a_sum_of_earlier_waves_translates_in_halves() {
+    for threads in [128, 256, 512] {
+        for narrow_waves in [false, true] {
+            let n = native(&sum_of_earlier_waves(), true, threads, 512);
+            let l = lowered_with(&n, true, narrow_waves)
+                .unwrap_or_else(|e| panic!("{threads} threads narrow_waves={narrow_waves}: {e}"));
+            assert_eq!(l.wave_size, Some(32));
+        }
+    }
+}
+
+/// Each lane of wave `w` stores `5 + 6 + ... + (w + 4)`, as on the console.
+#[cfg(windows)]
+#[test]
+fn a_sum_of_earlier_waves_matches_the_console_on_every_gpu() {
+    let words = sum_of_earlier_waves();
+    let mut failed = Vec::new();
+    for threads in [128u32, 256, 512] {
+        let want: Vec<u32> = (0..threads)
+            .map(|t| (0..t >> 6).map(|k| k + 5).sum())
+            .collect();
+        for narrow_waves in [false, true] {
+            failed.extend(
+                differences_with(&words, threads, 1, &want, 512, narrow_waves)
+                    .into_iter()
+                    .map(|m| format!("{threads} threads narrow_waves={narrow_waves}: {m}")),
+            );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// LDS written in a `while` loop of a group of one console wave (64
+/// threads), the shape of the loops in the builder's `28918b7150a7aad5` and
+/// `caa78b8ca62bc3d6`: each lane clears its eight LDS dwords; the lanes whose
+/// count `tid & 7` is not 0 then loop, writing the pass number `s28` at
+/// dword `s28 - 1` of theirs in each pass, and leave when `s28` is their
+/// count (the latch restores EXEC from the mask of lanes left, `s[16:17]`).
+/// After the loop each lane reads the eight dwords of lane `tid ^ 63`, in
+/// the wave's other half, and stores them.
+fn lds_written_in_a_while_loop() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3614_0087, // v_and_b32 v10, 7, v0
+        0x3418_0085, // v_lshlrev_b32 v12, 5, v0
+        0x7E16_0280, // v_mov_b32 v11, 0
+    ]);
+    for k in 0..8 {
+        w.extend([0xD834_0000 | (4 * k), 0x0000_0B0C]); // ds_write_b32 v12, v11 offset:4k
+    }
+    w.extend([
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0x7DAA_1480, // v_cmpx_ne_u32 exec, 0, v10
+        0xBF88_000F, // s_cbranch_execz (the end)
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0xBE9C_0380, // s_mov_b32 s28, 0
+        0xBF82_0001, // s_branch (the header)
+        0x87FE_1012, // s_and_b64 exec, s[18:19], s[16:17]
+        0x8F12_821C, // s_lshl_b32 s18, s28, 2
+        0x811C_811C, // s_add_i32 s28, s28, 1
+        0x4A1A_1812, // v_add_nc_u32 v13, s18, v12
+        0x7E1E_021C, // v_mov_b32 v15, s28
+        0xBE92_047E, // s_mov_b64 s[18:19], exec
+        0xD834_0000,
+        0x0000_0F0D, // ds_write_b32 v13, v15
+        0x7DA4_141C, // v_cmpx_eq_u32 exec, s28, v10
+        0x8A90_7E10, // s_andn2_b64 s[16:17], s[16:17], exec
+        0xBF85_FFF5, // s_cbranch_scc1 (the latch)
+        0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+        0x3A1C_00BF, // v_xor_b32 v14, 63, v0
+        0x341C_1C85, // v_lshlrev_b32 v14, 5, v14
+    ]);
+    for k in 0..8 {
+        w.extend([0xD8D8_0000 | (4 * k), 0x0000_000E | (20 + k) << 24]); // ds_read_b32 v(20+k), v14 offset:4k
+    }
+    w.push(S_WAITCNT_LGKM);
+    for k in 0..8 {
+        w.extend(store(20 + k as u8, 4 * k));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_lds_while_loop_is_what_its_comments_say() {
+    let words = lds_written_in_a_while_loop();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let list = gfx10::decode(&code).expect("decodes");
+    let text: Vec<String> = list.iter().map(|i| i.text(true)).collect();
+    let all = text.join("\n");
+    for want in [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_and_b32 v10, 7, v0",
+        "v_lshlrev_b32 v12, 5, v0",
+        "v_mov_b32 v11, 0",
+        "ds_write_b32 v12, v11\n",
+        "ds_write_b32 v12, v11 offset:28",
+        "s_mov_b64 s[12:13], exec",
+        "v_cmpx_ne_u32 exec, 0, v10",
+        "s_mov_b64 s[14:15], exec",
+        "s_mov_b64 s[16:17], exec",
+        "s_mov_b32 s28, 0",
+        "s_and_b64 exec, s[18:19], s[16:17]",
+        "s_lshl_b32 s18, s28, 2",
+        "s_add_i32 s28, s28, 1",
+        "v_add_nc_u32 v13, s18, v12",
+        "v_mov_b32 v15, s28",
+        "s_mov_b64 s[18:19], exec",
+        "ds_write_b32 v13, v15",
+        "v_cmpx_eq_u32 exec, s28, v10",
+        "s_andn2_b64 s[16:17], s[16:17], exec",
+        "s_mov_b64 exec, s[12:13]",
+        "v_xor_b32 v14, 63, v0",
+        "v_lshlrev_b32 v14, 5, v14",
+        "ds_read_b32 v20, v14\n",
+        "ds_read_b32 v27, v14 offset:28",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    // The branches: to the end, the header and the latch.
+    let at = |name: &str| {
+        list.iter()
+            .position(|i| i.text(true).starts_with(name))
+            .expect("there")
+    };
+    let target = |n: usize| format!("{:04X}", list[n].offset);
+    let (end, header, latch) = (
+        at("s_mov_b64 exec, s[12:13]"),
+        at("s_lshl_b32 s18"),
+        at("s_and_b64 exec, s[18:19]"),
+    );
+    assert!(
+        text[at("s_cbranch_execz")].contains(&target(end)),
+        "{}",
+        text[at("s_cbranch_execz")]
+    );
+    assert!(
+        text[at("s_branch")].contains(&target(header)),
+        "{}",
+        text[at("s_branch")]
+    );
+    assert!(
+        text[at("s_cbranch_scc1")].contains(&target(latch)),
+        "{}",
+        text[at("s_cbranch_scc1")]
+    );
+}
+
+/// Each lane stores the dwords of lane `tid ^ 63`: 1 to that lane's count,
+/// then zeros, as on the console.
+#[cfg(windows)]
+#[test]
+fn lds_written_in_a_while_loop_matches_the_console_on_every_gpu() {
+    let words = lds_written_in_a_while_loop();
+    let want: Vec<u32> = (0..64u32)
+        .flat_map(|t| {
+            let n = (t ^ 63) & 7;
+            (1..=8).map(move |p| if p <= n { p } else { 0 })
+        })
+        .collect();
+    let mut failed = Vec::new();
+    for narrow_waves in [true, false] {
+        let n = native(&words, true, 64, 2048);
+        match lowered_with(&n, true, narrow_waves) {
+            Ok(l) => eprintln!(
+                "narrow_waves={narrow_waves}: translates, {} barriers",
+                l.barriers
+            ),
+            Err(e) => {
+                eprintln!("narrow_waves={narrow_waves}: refused: {e}");
+                continue;
+            }
+        }
+        failed.extend(
+            differences_with(&words, 64, 8, &want, 2048, narrow_waves)
+                .into_iter()
+                .map(|m| format!("narrow_waves={narrow_waves}: {m}")),
+        );
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

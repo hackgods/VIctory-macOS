@@ -2191,6 +2191,22 @@ impl Host {
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
+                // Mac: which programs the ended submission ran (the first
+                // twenty such submissions), so that a page fault or a lock-up
+                // names its suspects.
+                static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if NAMED.fetch_add(1, Ordering::Relaxed) < 20 {
+                    let pipelines: std::collections::BTreeSet<String> = runs
+                        .iter()
+                        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .collect();
+                    tracing::warn!(
+                        lists = runs.len(),
+                        frame = crate::frame::current(),
+                        ?pipelines,
+                        "the host GPU ended this submission: its programs"
+                    );
+                }
                 self.lost(&mut submitted, mark);
             }
             #[cfg(feature = "diagnostics")]

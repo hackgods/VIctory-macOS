@@ -604,6 +604,103 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::object::release_ref(dst);
     }
 
+    /// With the cache of made views (`VICTORY_VIEW_TEMPLATES`), the views the
+    /// quick sync copies are the ones it makes: a shader reads the same
+    /// through them, in a first sync (views made into the cache) and in a
+    /// second one over another heap (views copied from it). Dropping the
+    /// buffers' copies lets the cache give their views up.
+    #[test]
+    fn quick_sync_views_copied_from_the_cache_read_as_made_ones() {
+        const SHADER: &str = r#"
+ByteAddressBuffer cbv_raw : register(t0);
+Buffer<uint> typed_u32 : register(t1);
+Buffer<uint> dup_typed : register(t2);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(0, cbv_raw.Load(8));
+    dst.Store(4, typed_u32[3]);
+    dst.Store(8, dup_typed[3]);
+}
+"#;
+        let Some(host) = host() else {
+            return;
+        };
+        let src = crate::resource::test_buffer(4096);
+        let dst = crate::resource::test_buffer(256);
+        let (src_ptr, src_len) = crate::resource::buffer_bytes(src).expect("src bytes");
+        let (dst_ptr, dst_len) = crate::resource::buffer_bytes(dst).expect("dst bytes");
+        // SAFETY: 4096 bytes of test buffer memory.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_ptr.cast::<u32>(), 1024);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0xB000_0000 + i as u32;
+            }
+        }
+        crate::shadow::register(src as usize, src_ptr as u64, src_len);
+        crate::shadow::register(dst as usize, dst_ptr as u64, dst_len);
+        let src_shadow = crate::shadow::find(src_ptr as u64, src_len).expect("src shadow");
+        src_shadow.update(src_ptr as usize, src_len as usize);
+        let dst_shadow = crate::shadow::find(dst_ptr as u64, dst_len).expect("dst shadow");
+
+        const SLOTS: u32 = 4;
+        let mut title_heap = vec![0u8; SLOTS as usize * 32];
+        let start = title_heap.as_mut_ptr() as u64;
+        let at = |i: u32| start + u64::from(i) * 32;
+        let null = std::ptr::null();
+        let mem = src_ptr as u64;
+        crate::descriptor::create_cbv(
+            null,
+            &[(mem + 16) as u32, ((mem + 16) >> 32) as u32, 64, 0],
+            at(0),
+        );
+        let typed_desc = [42u32, 1, 0x1688, 0, 2, 0, 16, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &typed_desc, at(1));
+        crate::descriptor::create_srv(null, src, &typed_desc, at(2));
+        crate::descriptor::create_uav(null, dst, null, &[39, 1, 0, 0, 16, 0, 0, 0, 1, 0], at(3));
+
+        use crate::compute::{Param, srv, uav};
+        let params = &[Param::Table(&[srv(0, 3), uav(0, 1)])];
+        let (root, pso) =
+            crate::compute::pipeline(SHADER, windows::core::s!("view_templates_eq"), 0, params)
+                .expect("compute pipeline");
+        let run = |quick: bool, cached: bool| -> [u32; 3] {
+            crate::descriptor::host::templates::tests::ON.with(|on| on.set(Some(cached)));
+            let mut heap = HostHeap::new(false, SLOTS).expect("host heap");
+            heap.viewed = Arc::new(Viewed::with_options(quick, quick));
+            heap.sync_slots_bytes_mode(0..SLOTS, start, 32, (start, &title_heap), true, quick);
+            crate::descriptor::host::templates::tests::ON.with(|on| on.set(None));
+            let list = host.new_list().expect("list");
+            // SAFETY: open list, live heap/root/pso.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.defer_heap(&heap.viewed);
+            list.close();
+            host.execute(&[&list]);
+            let words = dst_shadow.read_host(dst_ptr as u64, 3);
+            words.try_into().expect("3 dwords")
+        };
+        let want = [0xB000_0006, 0xB000_0005, 0xB000_0005];
+        assert_eq!(run(false, false), want, "standard");
+        assert_eq!(run(true, true), want, "views made into the cache");
+        let buffer = windows::core::Interface::as_raw(&src_shadow.buffer) as usize;
+        assert!(
+            crate::descriptor::host::templates::tests::entries_of(buffer) > 0,
+            "the cache holds them"
+        );
+        assert_eq!(run(true, true), want, "views copied from the cache");
+        // SAFETY: plain device health check.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop((src_shadow, dst_shadow));
+        crate::object::release_ref(src);
+        crate::object::release_ref(dst);
+    }
+
     /// Concurrent title rewrite occurring while `quick::resolve` runs outside
     /// `HostHeap::made` must be detected on the live re-read and land the
     /// newer view cleanly.

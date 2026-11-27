@@ -13,6 +13,13 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 mod quick;
+mod templates;
+
+/// The host buffer `buffer` goes with its copy: the heap syncs' cache of
+/// made buffer views gives up its views of it (`templates`).
+pub(crate) fn forget_views_of(buffer: &ID3D12Resource) {
+    templates::forget(windows::core::Interface::as_raw(buffer) as usize);
+}
 
 use super::paged::Paged;
 use super::{
@@ -1805,6 +1812,11 @@ impl HostHeap {
         let host = host();
         #[cfg(feature = "diagnostics")]
         drop(preparing);
+        // Buffer views earlier syncs made, copied instead of made again
+        // (`VICTORY_VIEW_TEMPLATES`): held until the copies below are made.
+        let mut cached = host
+            .filter(|_| use_quick && staging.is_some() && templates::on())
+            .and_then(|h| templates::batch(&h.device));
 
         let mut again: Vec<u32> = Vec::new();
         let mut retired: Vec<ID3D12Resource> = Vec::new();
@@ -1917,6 +1929,17 @@ impl HostHeap {
                         }
                     }
                     (None, None)
+                } else if let Some(resolved_buf) = resolved_buf
+                    && let Some((cache, h)) = cached.as_mut().zip(host)
+                    && let Some(src) =
+                        cache.view(&h.device, &resolved_buf.buffer, &resolved_buf.desc)
+                {
+                    copy_dsts.push(self.cpu(index));
+                    copy_srcs.push(src);
+                    (
+                        Some(Some((resolved_buf.buffer.clone(), resolved_buf.held()))),
+                        None,
+                    )
                 } else if let Some(resolved_buf) = resolved_buf {
                     if key_counts[kidx] >= 2
                         && let (Some(h), Some(st)) = (host, staging)
@@ -2094,6 +2117,8 @@ impl HostHeap {
 
             #[cfg(feature = "diagnostics")]
             drop(copying);
+            // The cache's entries copied from: given up again from here on.
+            drop(cached);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncMade, finalize.len() as u64);
             #[cfg(feature = "diagnostics")]

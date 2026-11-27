@@ -159,8 +159,12 @@ pub(crate) enum C {
     SyncCopyUs,
     SyncKeepUs,
     SyncAgain,
+    /// Buffer views a heap sync copied from the cache of made ones
+    /// (`VICTORY_VIEW_TEMPLATES`), and entries it gave up for room.
+    TemplateHits,
+    TemplatesGivenUp,
 }
-const COUNTERS: usize = C::SyncAgain as usize + 1;
+const COUNTERS: usize = C::TemplatesGivenUp as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -465,7 +469,8 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  heap sync per frame: {:.0} slots looked at, {:.0} stale, {:.0} made again in {:.1} ms with {:.0} \
          re-reads: preparing views {:.1} ms, {:.0} views made in {:.1} ms ({:.0} of a key made before), \
-         descriptor copies {:.1} ms, keeping {:.1} ms; {:.0} rewritten meanwhile",
+         descriptor copies {:.1} ms, keeping {:.1} ms; {:.0} rewritten meanwhile; {:.0} views copied \
+         from the cache of made ones, {:.0} of its entries given up",
         c[C::SyncSlots as usize],
         c[C::SyncStale as usize],
         c[C::SyncMade as usize],
@@ -478,6 +483,8 @@ pub(crate) fn log(frames: f64) {
         ms(c[C::SyncCopyUs as usize]),
         ms(c[C::SyncKeepUs as usize]),
         c[C::SyncAgain as usize],
+        c[C::TemplateHits as usize],
+        c[C::TemplatesGivenUp as usize],
     );
     tracing::info!(
         "  depth twin copies per frame: {:.1} into depth ({:.2} MB), {:.1} into twin ({:.2} MB)",

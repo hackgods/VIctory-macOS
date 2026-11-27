@@ -232,6 +232,13 @@ pub(crate) struct Widened {
 // SAFETY: the resource is free-threaded; `data` is a persistent mapping
 // written only by the submitting thread.
 unsafe impl Send for Widened {}
+
+impl Drop for Widened {
+    /// Views made of the buffer, kept for heap syncs, go with it.
+    fn drop(&mut self) {
+        crate::descriptor::host::forget_views_of(&self.buffer);
+    }
+}
 // SAFETY: as above.
 unsafe impl Sync for Widened {}
 
@@ -1403,6 +1410,8 @@ impl Drop for Shadow {
         if let Some(slice) = self.slice {
             arena().give_back(slice);
         } else {
+            // Views made of the buffer, kept for heap syncs, go with it.
+            crate::descriptor::host::forget_views_of(&self.buffer);
             crate::host::retire(self.buffer.clone());
         }
         if let Some(base) = self.marks {

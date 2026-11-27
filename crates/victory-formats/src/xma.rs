@@ -1272,7 +1272,8 @@ mod tests {
                     let mut data: Vec<u8> =
                         (0..4 * PACKET_BYTES).map(|i| (i * 37 + 11) as u8).collect();
                     for packet in 0..4 {
-                        put_bits(&mut data, packet * PACKET_BITS, 32, (1 << 26) | skip);
+                        let at = packet * PACKET_BYTES;
+                        data[at..at + 4].copy_from_slice(&((1u32 << 26) | skip).to_be_bytes());
                     }
                     // Write the length using the same packet navigation as the reader.
                     let mut cursor = Cursor {

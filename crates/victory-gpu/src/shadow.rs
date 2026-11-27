@@ -399,7 +399,11 @@ impl Shadow {
             ranges.retain(|(_, _, view)| view.strong_count() > 0);
         }
         ranges.push((address, len, Arc::downgrade(&widened)));
-        WIDENED_ANY.store(true, Ordering::Release);
+        // mac: one line when the run's first widened view is made (do
+        // world runs have any: `VICTORY_WIDENED_IN_PLACE` saves only then).
+        if !WIDENED_ANY.swap(true, Ordering::AcqRel) {
+            tracing::info!(address = format_args!("{address:#x}"), len, "the first widened RGB32 view is made");
+        }
         self.has_widened.store(true, Ordering::Release);
         Some(widened)
     }
@@ -2494,6 +2498,8 @@ pub(crate) fn near(va: u64) -> String {
 
 #[cfg(test)]
 mod parallel_copy_tests;
+#[cfg(test)]
+mod widened_bench;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -3026,13 +3032,7 @@ pub(crate) mod tests {
             (writer, start as usize + 9, 15),
             (overlap, start as usize + 10, 10),
         ];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some());
         list.close();
         host.execute(&[&list]);
         assert_eq!(
@@ -3070,13 +3070,7 @@ pub(crate) mod tests {
         unsafe { std::ptr::copy_nonoverlapping(first_bytes.as_ptr(), first_data, 4) };
         let list = host.new_list().unwrap();
         let writes = [(first.clone(), start as usize + 2, 4)];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some());
         list.close();
         host.execute(&[&list]);
         assert_eq!(widened.read_host(4), [0x0201_0000, 0x0000_0403, 0, 1]);
@@ -3094,10 +3088,108 @@ pub(crate) mod tests {
             (second, start as usize + 6, 4),
         ];
         let ready = std::collections::HashSet::from([widened.buffer.as_raw() as usize]);
-        assert!(crate::widened::sync(&list, &writes, 1, &ready).is_some());
+        assert!(crate::widened::sync(&list, &writes[..1], &writes[1..], &ready).is_some());
         list.close();
         host.execute(&[&list]);
         assert_eq!(widened.read_host(4), [0x0201_0000, 0x0605_0403, 0x0000_0807, 1]);
+    }
+
+    /// A shadow of `len` bytes at title address `start`, on a buffer of its
+    /// own (no title memory behind it).
+    fn loose_shadow(start: u64, len: u64) -> Arc<Shadow> {
+        let (buffer, data) = host().unwrap().shared_buffer(len).unwrap();
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        Shadow::new(buffer, data, gpu, start, len)
+    }
+
+    /// mac (`VICTORY_WIDENED_IN_PLACE=1`, from VIctory-macOS #520): the
+    /// world's lists keep tens of thousands of widened writes and meet
+    /// hundreds of barriers a frame. In place, each barrier takes the writes
+    /// since the last one into the list's history without copying it, and
+    /// the buffers stay with the list from barrier to barrier and from one
+    /// use to the next, so a list used again the same way grows none of them.
+    #[test]
+    fn widened_writes_in_place_keep_their_buffers_across_barriers_and_uses() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        // A widened view (so barriers widen), and a copy UAVs write that it
+        // does not overlap (no widening work, only the bookkeeping).
+        let parent = loose_shadow(0x1000, 48);
+        let _widened = parent.widened(0x1000, 48, 1).expect("a widened view");
+        let written = loose_shadow(0x10_0000, 0x1000);
+        let list = host.new_list().unwrap();
+        const WRITES: usize = 20_000;
+        let mut kept = None;
+        for round in 0..2 {
+            let mut pointers = Vec::new();
+            for barrier in 1..=3 {
+                for i in 0..WRITES {
+                    list.mark_widened_write(&written, 0x10_0000 + (i * 8) % 0x1000, 8);
+                }
+                list.sync_widened_in_place();
+                let (history, at, writes, waiting) = list.widened_state();
+                if history.is_empty() {
+                    return; // not under Wine, or the widening pass cannot run here
+                }
+                assert_eq!(history.len(), barrier * WRITES, "every write in the history");
+                assert!(!waiting, "nothing left for the next barrier");
+                pointers.push((at, writes));
+            }
+            // The new writes' buffer serves every barrier.
+            assert!(pointers.iter().all(|p| p.1 == pointers[0].1), "round {round}");
+            if let Some(kept) = kept {
+                assert!(pointers.iter().all(|&p| p == kept), "the second use grows nothing");
+            }
+            kept = Some(pointers[2]);
+            list.close();
+            list.reset();
+        }
+    }
+
+    /// mac: in place and copied, a barrier after heap-writing draws and a
+    /// write leaves the same history, in the same order (a heap's ranges
+    /// where its draws stood, as `VICTORY_CENSUS_FAST` says), and the in-place
+    /// one leaves nothing for the next barrier.
+    #[test]
+    fn widened_histories_are_the_same_in_place_and_copied() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let host = host().unwrap();
+        let parent = loose_shadow(0x3000, 48);
+        let _widened = parent.widened(0x3000, 48, 1).expect("a widened view");
+        let written = loose_shadow(0x20_0000, 0x1000);
+        let viewed = Arc::new(crate::bindless::Viewed::new(false));
+        viewed.set_seen(0, Some(crate::bindless::Seen::Buffer(written.clone(), 0x20_0000, 0x100, true)));
+        viewed.set_seen(1, Some(crate::bindless::Seen::Buffer(written.clone(), 0x20_0800, 0x100, true)));
+        let histories: Vec<_> = [false, true]
+            .into_iter()
+            .map(|in_place| {
+                let list = host.new_list().unwrap();
+                for _ in 0..2 {
+                    list.mark_widened_heap(&viewed);
+                    list.mark_widened_write(&written, 0x20_0400, 16);
+                    list.mark_widened_heap(&viewed);
+                    if in_place {
+                        list.sync_widened_in_place();
+                    } else {
+                        list.sync_widened();
+                    }
+                }
+                let (history, _, _, waiting) = list.widened_state();
+                assert!(!in_place || !waiting, "nothing left for the next barrier");
+                list.close();
+                history
+            })
+            .collect();
+        if histories[0].is_empty() {
+            return; // not under Wine
+        }
+        assert_eq!(histories[0], histories[1]);
+        assert!(histories[0].contains(&(0x20_0400, 16)) && histories[0].contains(&(0x20_0800, 0x100)));
     }
 
     /// An element-aligned shadow that starts after the widened view cannot
@@ -3126,13 +3218,7 @@ pub(crate) mod tests {
         unsafe { std::ptr::copy_nonoverlapping(changed.as_ptr(), later_data, 12) };
         let list = host.new_list().unwrap();
         let writes = [(later, start as usize + 12, 12)];
-        assert!(crate::widened::sync(
-            &list,
-            &writes,
-            0,
-            &std::collections::HashSet::new(),
-        )
-        .is_some());
+        assert!(crate::widened::sync(&list, &[], &writes, &std::collections::HashSet::new()).is_some());
         list.close();
         host.execute(&[&list]);
         assert_eq!(

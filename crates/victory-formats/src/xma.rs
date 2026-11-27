@@ -1212,47 +1212,6 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "benchmark"]
-    fn perf_overlap() {
-        use std::{hint::black_box, time::Instant};
-        for n in [128, 512] {
-            let window = sine_window(n);
-            let mut samples = Vec::new();
-            let mut block: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
-            for round in 0..35 {
-                let start = Instant::now();
-                for _ in 0..8192 {
-                    window_overlap(black_box(&mut block), black_box(&window));
-                }
-                if round >= 4 {
-                    samples.push(start.elapsed().as_nanos());
-                }
-            }
-            println!("overlap_{n}_8192_ns {samples:?}");
-        }
-    }
-
-    #[test]
-    fn overlap_matches_scalar_operations_bit_for_bit() {
-        for n in [0, 128, 256, 512] {
-            let window = sine_window(n);
-            let original: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
-            let mut actual = original.clone();
-            let mut expected = original.clone();
-            for k in 0..n / 2 {
-                let j = n - 1 - k;
-                expected[k] = original[k] * window[j] - original[j] * window[k];
-                expected[j] = original[k] * window[k] + original[j] * window[j];
-            }
-            window_overlap(&mut actual, &window);
-            assert_eq!(
-                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
-            );
-        }
-    }
-
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
         for i in 0..n as usize {
@@ -1474,6 +1433,47 @@ mod tests {
             println!(
                 "n {n}: untabled {before:.0} ns, tabled {after:.0} ns, {:.1}x",
                 before / after
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_overlap() {
+        use std::{hint::black_box, time::Instant};
+        for n in [128, 512] {
+            let window = sine_window(n);
+            let mut samples = Vec::new();
+            let mut block: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            for round in 0..35 {
+                let start = Instant::now();
+                for _ in 0..8192 {
+                    window_overlap(black_box(&mut block), black_box(&window));
+                }
+                if round >= 4 {
+                    samples.push(start.elapsed().as_nanos());
+                }
+            }
+            println!("overlap_{n}_8192_ns {samples:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_matches_scalar_operations_bit_for_bit() {
+        for n in [0, 128, 256, 512] {
+            let window = sine_window(n);
+            let original: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            let mut actual = original.clone();
+            let mut expected = original.clone();
+            for k in 0..n / 2 {
+                let j = n - 1 - k;
+                expected[k] = original[k] * window[j] - original[j] * window[k];
+                expected[j] = original[k] * window[k] + original[j] * window[j];
+            }
+            window_overlap(&mut actual, &window);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
             );
         }
     }

@@ -211,6 +211,8 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: Map<V, (V, V)>,
+    /// Calls [`Module::drop_call`] took out: not written.
+    dropped: std::collections::HashSet<u32>,
 }
 
 impl Module {
@@ -493,6 +495,78 @@ impl Module {
         self.blocks[block].term = Some(t);
     }
 
+    /// Takes the void call `call` out of the module: it is not written.
+    pub fn drop_call(&mut self, call: V) {
+        if let V::Inst(i) = call
+            && matches!(self.insts[i as usize].op, Op::Call(..))
+            && self.is_void(self.insts[i as usize].ty)
+        {
+            self.dropped.insert(i);
+        }
+    }
+
+    /// Per block, whether a path of the written control flow (branches on
+    /// constants taking their one edge) leads from it back to it: a block
+    /// on no cycle runs at most once. Strongly connected components,
+    /// without recursion (Tarjan).
+    pub fn blocks_on_cycles(&self) -> Vec<bool> {
+        let n = self.blocks.len();
+        let succs = |b: usize| successors(self.term(b));
+        let (mut index, mut low) = (vec![usize::MAX; n], vec![0usize; n]);
+        let (mut on_stack, mut stack) = (vec![false; n], Vec::new());
+        let mut cyclic = vec![false; n];
+        let mut next = 0;
+        for root in 0..n {
+            if index[root] != usize::MAX {
+                continue;
+            }
+            let mut calls = vec![(root, 0usize)];
+            index[root] = next;
+            low[root] = next;
+            next += 1;
+            stack.push(root);
+            on_stack[root] = true;
+            while let Some(top) = calls.last_mut() {
+                let (b, k) = *top;
+                if let Some(&t) = succs(b).get(k) {
+                    top.1 += 1;
+                    if t == b {
+                        cyclic[b] = true;
+                    }
+                    if index[t] == usize::MAX {
+                        index[t] = next;
+                        low[t] = next;
+                        next += 1;
+                        stack.push(t);
+                        on_stack[t] = true;
+                        calls.push((t, 0));
+                    } else if on_stack[t] {
+                        low[b] = low[b].min(index[t]);
+                    }
+                    continue;
+                }
+                calls.pop();
+                if let Some(&(parent, _)) = calls.last() {
+                    low[parent] = low[parent].min(low[b]);
+                }
+                if low[b] == index[b] {
+                    let mut members = Vec::new();
+                    while let Some(m) = stack.pop() {
+                        on_stack[m] = false;
+                        members.push(m);
+                        if m == b {
+                            break;
+                        }
+                    }
+                    if members.len() > 1 {
+                        members.into_iter().for_each(|m| cyclic[m] = true);
+                    }
+                }
+            }
+        }
+        cyclic
+    }
+
     pub fn md_str(&mut self, s: &str) -> Md {
         self.mds.push(MdDef::Str(s.into()));
         Md(self.mds.len() as u32 - 1)
@@ -514,6 +588,9 @@ impl Module {
     /// has effects (stores, atomics, calls of operations that are neither
     /// read-none nor read-only).
     fn rooted(&self, i: u32) -> bool {
+        if self.dropped.contains(&i) {
+            return false;
+        }
         match &self.insts[i as usize].op {
             Op::Call(f, _) => !matches!(self.funcs[*f as usize].attr, Some(Attr::ReadNone | Attr::ReadOnly)),
             Op::Store(..) | Op::AtomicRmw(..) | Op::CmpXchg(..) => true,
@@ -1346,6 +1423,41 @@ impl Writer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Blocks on a cycle: a loop of two, a block branching to itself, and
+    /// not the blocks before, after or beside them.
+    #[test]
+    fn blocks_on_cycles_are_the_loops_members() {
+        let mut m = Module::default();
+        let b: Vec<usize> = (0..6).map(|_| m.new_block()).collect();
+        m.terminate(b[0], Term::Br(b[1]));
+        m.terminate(b[1], Term::Br(b[2]));
+        m.terminate(b[2], Term::Br(b[1]));
+        m.terminate(b[3], Term::Br(b[3]));
+        m.terminate(b[4], Term::Br(b[5]));
+        m.terminate(b[5], Term::Ret);
+        assert_eq!(
+            m.blocks_on_cycles(),
+            [false, true, true, true, false, false]
+        );
+    }
+
+    /// A dropped barrier is not written; the rest of its block is.
+    #[test]
+    fn a_dropped_call_is_not_written() {
+        let mut m = Module::default();
+        let (void, i32t) = (m.void(), m.int(32));
+        let ty = m.func_ty(void, vec![i32t]);
+        let f = m.function("dx.op.barrier", ty, Some(Attr::NoDuplicate), false);
+        let b = m.new_block();
+        let mode = m.i32(9);
+        let first = m.call(b, f, vec![mode]);
+        m.call(b, f, vec![mode]);
+        m.terminate(b, Term::Ret);
+        assert_eq!(m.written_calls("dx.op.barrier"), 2);
+        m.drop_call(first);
+        assert_eq!(m.written_calls("dx.op.barrier"), 1);
+    }
 
     #[test]
     fn vbr_and_blocks() {

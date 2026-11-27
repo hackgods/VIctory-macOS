@@ -424,6 +424,35 @@ fn reread_by_slot() -> bool {
     })
 }
 
+/// [`make_marked`] for a heap sync's slot of view `key`. Diagnostics builds
+/// count the views made and their time, and those made for a key some sync
+/// made a view of already (in the last 2^20 keys made): how many a
+/// cache of made views could have copied instead.
+fn sync_make(
+    view: &View,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    key: u64,
+) -> (Option<Kept>, Option<(u32, u32)>) {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = key;
+    #[cfg(feature = "diagnostics")]
+    let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncCreateUs);
+    #[cfg(feature = "diagnostics")]
+    {
+        static MADE: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+        let made = made.get_or_insert_with(Default::default);
+        if made.len() >= 1 << 20 {
+            made.clear();
+        }
+        crate::copystat::add(crate::copystat::C::SyncCreates, 1);
+        if !made.insert(key) {
+            crate::copystat::add(crate::copystat::C::SyncCreatesAgain, 1);
+        }
+    }
+    make_marked(view, at)
+}
+
 /// Most bytes [`live_records`] reads in one kernel call: a page.
 const REREAD_SPAN: u64 = 64 << 10;
 
@@ -1729,6 +1758,9 @@ impl HostHeap {
             }
         }
 
+        #[cfg(feature = "diagnostics")]
+        let preparing =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPrepareUs);
         let pins = views_at_batch(&unique_keys);
         let mut resolved_bufs: Vec<Option<quick::ResolvedBuffer>> =
             Vec::with_capacity(if use_quick { unique_keys.len() } else { 0 });
@@ -1767,6 +1799,8 @@ impl HostHeap {
         // Initialize the staging heap before acquiring `self.made`.
         let staging = self.staging();
         let host = host();
+        #[cfg(feature = "diagnostics")]
+        drop(preparing);
 
         let mut again: Vec<u32> = Vec::new();
         let mut retired: Vec<ID3D12Resource> = Vec::new();
@@ -1948,7 +1982,7 @@ impl HostHeap {
                     } else if next_template < st.count {
                         let t = next_template;
                         next_template += 1;
-                        let (k, m) = make_marked(view, st.cpu(t));
+                        let (k, m) = sync_make(view, st.cpu(t), key);
                         let src = if k.is_none() && !self.sampler {
                             st.cpu(null_slot_index(false, Some(view)))
                         } else {
@@ -1963,7 +1997,7 @@ impl HostHeap {
                         });
                         (k, m)
                     } else {
-                        let (k, m) = make_marked(view, self.cpu(index));
+                        let (k, m) = sync_make(view, self.cpu(index), key);
                         if k.is_none() && !self.sampler {
                             let null_slot = null_slot_index(false, Some(view));
                             copy_dsts.push(self.cpu(index));
@@ -1972,7 +2006,7 @@ impl HostHeap {
                         (k, m)
                     }
                 } else {
-                    let (k, m) = make_marked(view, self.cpu(index));
+                    let (k, m) = sync_make(view, self.cpu(index), key);
                     if k.is_none() && !self.sampler {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
@@ -2009,6 +2043,9 @@ impl HostHeap {
                 finalize.push((index, key, ready));
             }
 
+            #[cfg(feature = "diagnostics")]
+            let copying =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncCopyUs);
             if !copy_dsts.is_empty()
                 && let (Some(h), Some(st)) = (host, staging)
             {
@@ -2031,7 +2068,12 @@ impl HostHeap {
             }
 
             #[cfg(feature = "diagnostics")]
+            drop(copying);
+            #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SyncMade, finalize.len() as u64);
+            #[cfg(feature = "diagnostics")]
+            let _keeping =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncKeepUs);
             self.keep_batch(kept_updates, &mut retired);
             if !self.sampler {
                 self.viewed.set_batch_resolved(&viewed_updates);
@@ -2086,6 +2128,8 @@ impl HostHeap {
 
         crate::host::retire_all(retired);
         drop(pins);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncAgain, again.len() as u64);
         for index in again {
             self.mirror(index, at(index), false);
         }

@@ -2148,6 +2148,7 @@ mod tests {
 
         drop((copied, again, shadow));
         crate::watch::title_memory_remapped(view as usize, TEST_SECTION);
+        crate::shadow::forget_loose_windows(view as u64, (view as usize + TEST_SECTION) as u64);
         TEST_IN_PLACE.with(|c| c.set(None));
         TEST_IN_PLACE_LOOSE.with(|c| c.set(None));
         *LOOSE_HEAP.lock().unwrap() = None;

@@ -267,6 +267,8 @@ mod flow_tests;
 mod f64_tests;
 #[cfg(test)]
 mod halves_local_tests;
+#[cfg(test)]
+mod thread_counts_tests;
 #[cfg(all(test, windows))]
 mod halves_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
@@ -446,6 +448,15 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 /// address's byte offset in the view [`ROOT_SRV_VIEW`] or [`ROOT_UAV_VIEW`]
 /// names.
 pub const ROOT_VIEW_OFFSET: u32 = 4;
+/// `RootType::Other` code of a user-data dword the host fills at a dispatch
+/// whose counts are threads, not groups (the console's `DispatchX` with its
+/// thread-dimensions flag, 0x20): the dispatch's thread count in dimension
+/// [`UserData::dword`] (0 to 2). Read only by translations made with
+/// [`Options::thread_counts`]; there a lane is on at entry when its thread
+/// lies below the count in each dimension wider than one thread, and a
+/// count of 0 puts every lane on. The code is the one fxceless/victory-fork
+/// and VIctory-macOS #527 use.
+pub const USER_DISPATCH_THREADS: u32 = 0x106;
 
 /// One dword of user data and the root parameter that fills it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +601,17 @@ pub struct Options {
     /// (measured on D3DMetal). Exact for the LDS, or the program stays as
     /// it was. The shader cache keys on it.
     pub lds_rounds: bool,
+    /// A compute program for dispatches whose counts are threads, not groups
+    /// (the console's `DispatchX` with its thread-dimensions flag): the last
+    /// group in a dimension is partial. The host runs whole groups, rounded
+    /// up, and passes the counts ([`USER_DISPATCH_THREADS`]). Every host
+    /// thread still runs, as the console's lanes exist, but a thread past a
+    /// count starts with EXEC off: it stores nothing, is no bit of a ballot
+    /// or a count of EXEC, and still meets the group's barriers and the
+    /// halves' hand-overs. Other stages ignore it. After
+    /// LakshanSivakumar/Native-Victory-macOS 0ae6cfcd. Mac; the shader cache
+    /// keys on it.
+    pub thread_counts: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -697,6 +719,13 @@ struct Prepared<'a> {
 }
 
 fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
+    prepare_for(container, false)
+}
+
+/// [`prepare`]; `thread_counts`: a compute program is structured with EXEC
+/// on entry the lanes a dispatch counted in threads launches
+/// ([`Options::thread_counts`]).
+fn prepare_for(container: &[u8], thread_counts: bool) -> Result<Prepared<'_>, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -716,7 +745,11 @@ fn prepare(container: &[u8]) -> Result<Prepared<'_>, ShaderError> {
         })?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
-    let (p, st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let (mut p, mut st) = crate::range::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    if thread_counts && native.stage == HwStage::Cs {
+        p.thread_counts = true;
+        st = structure::structure(&p);
+    }
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
@@ -773,7 +806,7 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 
 /// [`translate`] made as `options` say.
 pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
-    let prep = prepare(container)?;
+    let prep = prepare_for(container, options.thread_counts)?;
     emit_pruned(
         &EmitInput {
             c: &prep.c,

@@ -413,6 +413,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And the form for dispatches counted in threads (the BVH builder's,
+    // `VICTORY_BVH_BUILDER=1`); off, it adds nothing.
+    let key = if options.thread_counts {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"thread counts");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -462,6 +472,9 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         bvh_miss: crate::mac_switches::bvh_miss(),
         lds_rounds: crate::mac_switches::lds_rounds(),
         descriptor_as_data: descriptor_as_data(),
+        // Only for the BVH builder's pipelines, which ask for it
+        // (`crate::pipeline::builder`).
+        thread_counts: false,
     }
 }
 
@@ -801,6 +814,16 @@ mod tests {
         let bvh = victory_shader::emit::Options { bvh_miss: true, ..off };
         assert_ne!(translation_build(bvh), translation_build(victory_shader::emit::Options { descriptor_as_data: true, ..bvh }));
         assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { descriptor_as_data: false, ..off }));
+    }
+
+    /// The form for dispatches counted in threads (`Options::thread_counts`)
+    /// is another translation, so the cache keys on it; off, nothing changes.
+    #[test]
+    fn the_cache_keys_on_thread_counts() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { thread_counts: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { thread_counts: false, ..off }));
     }
 
     fn shader() -> HostShader {

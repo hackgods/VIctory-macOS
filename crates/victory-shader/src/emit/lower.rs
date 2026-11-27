@@ -31,6 +31,7 @@ pub(crate) mod lds_order;
 pub(crate) mod lds_rounds;
 mod mac;
 mod mesh;
+mod thread_counts;
 mod together;
 mod wide;
 pub(crate) use mesh::{KeptOutputs, idle_clip, plan_merge};
@@ -1651,6 +1652,11 @@ impl<'a> Lower<'a> {
         }
         self.find_sections();
         self.inputs()?;
+        // Mac (`Options::thread_counts`): EXEC on entry is the lanes a
+        // dispatch counted in threads launches.
+        if p.thread_counts {
+            self.launched();
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);

@@ -192,6 +192,8 @@ pub(crate) fn walked(p: &Program, wanted: &[bool]) -> Option<(Program, Vec<Skip>
         return None;
     }
     let mut q = rename(blocks, p.wave64);
+    // The lanes a dispatch counted in threads launches stay what they were.
+    q.thread_counts = p.thread_counts;
     let mut tested = Vec::new();
     for &(b, ..) in &left {
         tested.push(q.blocks[b].insts.pop()?.read(Reg::S(EXEC))?);
@@ -306,6 +308,7 @@ fn rename(mut blocks: Vec<Block>, wave64: bool) -> Program {
         wave64,
         blocks,
         inputs,
+        thread_counts: false,
     }
 }
 

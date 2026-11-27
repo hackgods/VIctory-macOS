@@ -140,12 +140,46 @@ pub(crate) enum C {
     TwinToDepthBytes,
     TwinToTwin,
     TwinToTwinBytes,
+    /// Preparing submissions, all of it (as the frame line's "preparing"),
+    /// and its parts no other counter times: giving up unused textures and
+    /// copies once a frame, collecting the lists' texture steps and trimming
+    /// idle lists, the loop over the lists (steps and preludes with it), the
+    /// last refresh batch, the diagnostics line of the submission's
+    /// refreshes; and, after it (the frame line counts it as GPU time),
+    /// naming what a hang would wait on.
+    PrepUs,
+    EvictUs,
+    CollectUs,
+    ListsUs,
+    LastFlushUs,
+    RefreshLogUs,
+    WaitingOnUs,
+    /// Steps run at submission, by kind (refreshes are `Refreshes`).
+    SlotSteps,
+    HeapSteps,
+    MemorySteps,
+    HostSteps,
 }
-const COUNTERS: usize = C::TwinToTwinBytes as usize + 1;
+const COUNTERS: usize = C::HostSteps as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+/// Nanoseconds of [`add_ns`], kept apart and added to the microseconds at
+/// each line: timing calls of a microsecond or less in whole microseconds
+/// dropped about half of each (the world's ~25,000 steps a frame).
+static NS: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// Adds `ns` nanoseconds to a counter of microseconds.
+pub(crate) fn add_ns(c: C, ns: u64) {
+    NS[c as usize].fetch_add(ns, Relaxed);
+}
+
+/// Counter `i` since the last line, its nanoseconds as microseconds added
+/// in, both taken.
+fn take(i: usize) -> f64 {
+    COUNT[i].swap(0, Relaxed) as f64 + NS[i].swap(0, Relaxed) as f64 / 1e3
 }
 
 /// A counter's count so far, for the tests.
@@ -315,10 +349,7 @@ pub(crate) fn log(frames: f64) {
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
-    let c: Vec<f64> = COUNT
-        .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
-        .collect();
+    let c: Vec<f64> = (0..COUNTERS).map(|i| take(i) / frames).collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
     tracing::info!(
@@ -443,6 +474,54 @@ pub(crate) fn log(frames: f64) {
         c[C::GroupBarriers as usize],
         c[C::GroupCalls as usize],
     );
+    let prep = c[C::PrepUs as usize];
+    let parts = [
+        C::EvictUs,
+        C::SyncHeapsUs,
+        C::CollectUs,
+        C::UploadsUs,
+        C::ListsUs,
+        C::LastFlushUs,
+        C::RefreshLogUs,
+    ]
+    .map(|p| c[p as usize]);
+    let steps: f64 = [
+        C::StepRefreshUs,
+        C::StepCopyUs,
+        C::StepWorkUs,
+        C::StepGpuWriteUs,
+        C::StepTextureUs,
+        C::StepHeapUs,
+        C::StepMemoryUs,
+    ]
+    .map(|p| c[p as usize])
+    .iter()
+    .sum();
+    tracing::info!(
+        "  preparing per frame: {:.1} ms: giving up unused {:.1}, heap slots {:.1}, collecting {:.1}, heap \
+         texture uploads {:.1}, lists {:.1} (steps {:.1}, preludes {:.1}, the rest {:.1}), last refresh batch \
+         {:.1}, refresh log {:.1}, untimed {:.1}; then naming the wait {:.1} ms; steps: {:.0} refresh, {:.0} slot, \
+         {:.0} heap, {:.0} memory, {:.0} host work, {:.0} copies",
+        ms(prep),
+        ms(parts[0]),
+        ms(parts[1]),
+        ms(parts[2]),
+        ms(parts[3]),
+        ms(parts[4]),
+        ms(steps),
+        ms(c[C::PreludeUs as usize]),
+        ms(parts[4] - steps - c[C::PreludeUs as usize]),
+        ms(parts[5]),
+        ms(parts[6]),
+        ms(prep - parts.iter().sum::<f64>()),
+        ms(c[C::WaitingOnUs as usize]),
+        c[C::Refreshes as usize],
+        c[C::SlotSteps as usize],
+        c[C::HeapSteps as usize],
+        c[C::MemorySteps as usize],
+        c[C::HostSteps as usize],
+        c[C::Copies as usize],
+    );
     tracing::info!(
         "  depth twin copies per frame: {:.1} into depth ({:.2} MB), {:.1} into twin ({:.2} MB)",
         c[C::TwinToDepth as usize],
@@ -554,6 +633,27 @@ mod tests {
         assert_eq!(all.remove(&(0x5100_0000_0000, 0x100)), Some((2, 0x200, 7, 0)));
         assert_eq!(all.remove(&(0x5100_0000_1000, 0x40)), Some((2, 0x80, 11, 7)));
         assert!(!merged().contains_key(&(0x5100_0000_0000, 0x100)), "the dump took the lists");
+    }
+
+    /// Timings in nanoseconds add up past their whole microseconds: two of
+    /// 2.5 us are 5 us, not 4.
+    #[test]
+    fn nanoseconds_add_up_to_microseconds() {
+        let at = C::WaitingOnUs as usize;
+        take(at);
+        add_ns(C::WaitingOnUs, 2_500);
+        add_ns(C::WaitingOnUs, 2_500);
+        // Other tests' submissions may add to it meanwhile, never take it.
+        assert!(take(at) >= 5.0);
+        let now = std::time::Instant::now();
+        let before = now
+            .checked_sub(std::time::Duration::from_nanos(300))
+            .unwrap_or(now);
+        drop(crate::watch::Timed(before, C::WaitingOnUs));
+        assert!(
+            NS[at].load(Relaxed) >= 300,
+            "a timing under a microsecond counts"
+        );
     }
 
     /// Threads count into their own lists, and the dump sums them.

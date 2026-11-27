@@ -1504,7 +1504,7 @@ pub(crate) struct Timed(pub(crate) std::time::Instant, pub(crate) crate::copysta
 impl Drop for Timed {
     fn drop(&mut self) {
         let c = std::mem::replace(&mut self.1, crate::copystat::C::Submissions);
-        crate::copystat::add(c, self.0.elapsed().as_micros() as u64);
+        crate::copystat::add_ns(c, self.0.elapsed().as_nanos() as u64);
     }
 }
 

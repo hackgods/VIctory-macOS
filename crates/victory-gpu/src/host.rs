@@ -2315,12 +2315,16 @@ impl Host {
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
+        #[cfg(feature = "diagnostics")]
+        let evicting = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::EvictUs);
         crate::resource::evict_unused();
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
         }
+        #[cfg(feature = "diagnostics")]
+        drop(evicting);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -2330,6 +2334,9 @@ impl Host {
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
+        #[cfg(feature = "diagnostics")]
+        let collecting =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::CollectUs);
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
             .iter()
             .flat_map(|l| {
@@ -2362,6 +2369,8 @@ impl Host {
         // submission staged) age on each one (`uploads`), and so do the
         // idle spare lists. The last submission has run.
         crate::list::trim_idle();
+        #[cfg(feature = "diagnostics")]
+        drop(collecting);
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
         let uploads = crate::bindless::uploads(&heaps, &textures);
@@ -2422,6 +2431,8 @@ impl Host {
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::take();
+        #[cfg(feature = "diagnostics")]
+        let listing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::ListsUs);
         for (idx, list) in runs.iter().enumerate() {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -2447,12 +2458,28 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         drop(barrier_pool);
+        #[cfg(feature = "diagnostics")]
+        drop(listing);
+        #[cfg(feature = "diagnostics")]
+        let flushing =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::LastFlushUs);
         batch.flush();
         #[cfg(feature = "diagnostics")]
-        batch.log_refreshes(*submitted + 1, runs.len());
+        drop(flushing);
+        #[cfg(feature = "diagnostics")]
+        {
+            let _logging =
+                crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::RefreshLogUs);
+            batch.log_refreshes(*submitted + 1, runs.len());
+        }
         #[cfg(not(feature = "diagnostics"))]
         let _ = submitted;
         let prepared = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add_ns(
+            crate::copystat::C::PrepUs,
+            (prepared - started).as_nanos() as u64,
+        );
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::FaultsPrep,
@@ -2468,6 +2495,9 @@ impl Host {
             });
         }
         // What a hang would be waiting on (`Host::wait_for` names it after 8 s).
+        #[cfg(feature = "diagnostics")]
+        let naming =
+            crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::WaitingOnUs);
         *WAITING_ON.lock().unwrap_or_else(|e| e.into_inner()) = {
             let pipelines: std::collections::BTreeSet<String> = runs
                 .iter()
@@ -2481,6 +2511,8 @@ impl Host {
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
         drop(run_refs);
+        #[cfg(feature = "diagnostics")]
+        drop(naming);
         #[cfg(not(feature = "diagnostics"))]
         let _ = firsts;
         PreparedSubmission {
@@ -4447,10 +4479,14 @@ impl HostList {
                     continue;
                 }
                 Step::Slot(viewed, index) => {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::SlotSteps, 1);
                     crate::bindless::refresh_slot(viewed, *index, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
                 Step::Host(work) => {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::HostSteps, 1);
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4471,10 +4507,14 @@ impl HostList {
                 // Brought up to date before the submission's lists were made.
                 Step::Texture(..) => continue,
                 Step::Heap(viewed) => {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::HeapSteps, 1);
                     crate::bindless::refresh(viewed, |s, a, l| batch.add(s, a, l));
                     continue;
                 }
                 &Step::Memory(heap) => {
+                    #[cfg(feature = "diagnostics")]
+                    add(C::MemorySteps, 1);
                     crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
                     continue;
                 }

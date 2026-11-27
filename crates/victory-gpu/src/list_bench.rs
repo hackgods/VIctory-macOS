@@ -323,9 +323,10 @@ enum M {
     Barrier,
     CreateCbv,
     CopyDescriptors,
+    CopyRecord,
 }
 
-const METHODS: [&str; 19] = [
+const METHODS: [&str; 20] = [
     "Reset",
     "Close",
     "SetDescriptorHeaps",
@@ -345,7 +346,12 @@ const METHODS: [&str; 19] = [
     "ResourceBarrier",
     "(device) CreateCBV",
     "(device) CopyDescriptorsSimple",
+    "(memory) record copied",
 ];
+
+/// Constant views made once for [`LIST_BENCH_COPIED`](Shared::copied):
+/// the records a draw copies into its ring slot.
+const COPIED_VIEWS: u32 = 1024;
 
 /// Time and calls per method, on one thread.
 #[derive(Clone, Default)]
@@ -385,6 +391,13 @@ struct Shared {
     vertices: BufferView,
     indices: BufferView,
     constants: u64,
+    /// `LIST_BENCH_COPIED=1`: the draws' constant views are records copied
+    /// as bytes from views made once (at this CPU address, [`COPIED_VIEWS`]
+    /// of them), as Grand Theft Auto VI copies its views into per-draw
+    /// tables: a slot holds another record each frame, so its host view is
+    /// made again when a draw reads it. Otherwise each draw's view is
+    /// written with `CreateConstantBufferView`.
+    copied: Option<u64>,
 }
 
 /// One title thread's list and resources.
@@ -501,15 +514,29 @@ impl Thread {
             // a table.
             let desc = [constants + u64::from(k) * CONSTANTS, CONSTANTS];
             let slot = base + 16 + k;
-            t.time(M::CreateCbv, || {
-                call!(
-                    device,
-                    0x88,
-                    fn(*const [u64; 2], u64),
-                    &desc,
-                    view_cpu(slot)
-                )
-            });
+            if let Some(records) = s.copied {
+                let from = records + u64::from((self.n * draws + d) % COPIED_VIEWS) * VIEW;
+                t.time(M::CopyRecord, || {
+                    // SAFETY: two descriptor slots of our heaps, a record each.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            from as *const u8,
+                            view_cpu(slot) as *mut u8,
+                            VIEW as usize,
+                        )
+                    }
+                });
+            } else {
+                t.time(M::CreateCbv, || {
+                    call!(
+                        device,
+                        0x88,
+                        fn(*const [u64; 2], u64),
+                        &desc,
+                        view_cpu(slot)
+                    )
+                });
+            }
             t.time(M::Table, || {
                 call!(list, 0x120, fn(u32, u64), 1, view_gpu(slot))
             });
@@ -857,6 +884,20 @@ fn list_calls() {
             stride_or_format: R16U,
         },
         constants: address(constants),
+        copied: (env("LIST_BENCH_COPIED", 0) != 0).then(|| {
+            let (_records, cpu, _) = heap(0, COPIED_VIEWS, false);
+            for i in 0..COPIED_VIEWS {
+                let desc = [address(constants) + u64::from(i) * CONSTANTS, CONSTANTS];
+                call!(
+                    device,
+                    0x88,
+                    fn(*const [u64; 2], u64),
+                    &desc,
+                    cpu + u64::from(i) * VIEW
+                );
+            }
+            cpu
+        }),
     };
 
     let mut queue = std::ptr::null();

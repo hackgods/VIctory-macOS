@@ -127,13 +127,23 @@ fn current_cpu() -> u32 {
 }
 
 /// The calling thread's CPU time in nanoseconds (`thread_selfusage`, BSD
-/// syscall 482), under Rosetta only.
+/// syscall 482, which counts in ticks of the timebase, `hw.tbfrequency`:
+/// 24 MHz on Apple silicon), under Rosetta only.
 #[cfg(target_arch = "x86_64")]
 fn thread_used_ns() -> Option<u64> {
-    static UNDER_ROSETTA: OnceLock<bool> = OnceLock::new();
-    if !*UNDER_ROSETTA.get_or_init(crate::watch::rosetta) {
-        return None;
-    }
+    static TICK_HZ: OnceLock<Option<u64>> = OnceLock::new();
+    let hz = (*TICK_HZ.get_or_init(|| {
+        if !crate::watch::rosetta() {
+            return None;
+        }
+        let mut value = [0u8; 8];
+        match crate::mac_pressure::sysctl_by_name(b"hw.tbfrequency", &mut value)? {
+            4 => Some(u64::from(u32::from_le_bytes(value[..4].try_into().ok()?))),
+            8 => Some(u64::from_le_bytes(value)),
+            _ => None,
+        }
+        .filter(|&hz| hz > 0)
+    }))?;
     let ret: u64;
     let failed: u8;
     // SAFETY: XNU's x86-64 BSD syscall ABI under Rosetta 2:
@@ -150,7 +160,7 @@ fn thread_used_ns() -> Option<u64> {
             lateout("r11") _,
         );
     }
-    (failed == 0).then_some(ret)
+    (failed == 0).then(|| (u128::from(ret) * 1_000_000_000 / u128::from(hz)) as u64)
 }
 
 #[cfg(not(target_arch = "x86_64"))]

@@ -126,6 +126,11 @@ struct List {
     segment: std::sync::atomic::AtomicUsize,
     #[cfg(windows)]
     state: std::sync::Mutex<crate::draw::State>,
+    /// mac: the `VICTORY_AB` side (`crate::ab`) taken at creation and at
+    /// each reset, which every host list it records into takes
+    /// (`crate::host::HostList::ab`): a list is recorded on one side.
+    #[cfg(windows)]
+    ab: std::sync::atomic::AtomicBool,
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
@@ -211,7 +216,7 @@ pub(crate) fn take_dispatch_hoists() -> u64 {
 }
 static DISPATCH_HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Before an indirect draw (`crate::indirect::hoisting`): unless the clamps
+/// Before an indirect draw (`crate::indirect::hoisting_at`): unless the clamps
 /// of the list's draws already go to the host list before it and nothing
 /// since may have written arguments, the title list goes on in a new host
 /// list here, as at a wait. The one it leaves stays open for the clamps of
@@ -219,20 +224,22 @@ static DISPATCH_HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// it ends where the run does ([`end_hoist`]).
 ///
 /// mac: the same before an indirect dispatch with
-/// `crate::indirect::hoisting_dispatches`, unless the clamps already go to
+/// `crate::indirect::hoisting_dispatches_at`, unless the clamps already go to
 /// the host list before and no barrier, sync, copy, clear or immediate
 /// write was recorded since (`State::hoists_dispatches_into`).
 #[cfg(windows)]
 fn hoist(this: This, kind: u32) {
-    if !crate::indirect::hoisting() {
-        return;
-    }
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
+    // mac: the list's `VICTORY_AB` side (`crate::ab`), from its reset.
+    let b = list.ab.load(std::sync::atomic::Ordering::Relaxed);
+    if !crate::indirect::hoisting_at(b) {
+        return;
+    }
     let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
     let dispatch = kind == crate::draw::INDIRECT_DISPATCH;
     let hoistable = if dispatch {
-        crate::indirect::hoisting_dispatches() && state.dispatch_hoistable()
+        crate::indirect::hoisting_dispatches_at(b) && state.dispatch_hoistable(b)
     } else {
         state.hoistable(kind)
     };
@@ -368,10 +375,23 @@ fn next_segment<'a>(this: This) -> Option<&'a crate::host::HostList> {
         hosts.push(std::sync::Arc::new(made));
     }
     list.segment.store(k, std::sync::atomic::Ordering::Relaxed);
+    hosts[k].set_ab(list.ab.load(std::sync::atomic::Ordering::Relaxed));
     let next: *const crate::host::HostList = std::sync::Arc::as_ptr(&hosts[k]);
     drop(hosts);
     // SAFETY: as in `host_list`.
     Some(unsafe { &*next })
+}
+
+/// mac: at a list's creation or reset, the `VICTORY_AB` side now
+/// (`crate::ab`): the list records on it until its next reset, and so does
+/// the host list it starts in (the later ones take it in [`next_segment`]).
+#[cfg(windows)]
+fn take_side(list: &List) {
+    let b = crate::ab::side();
+    list.ab.store(b, std::sync::atomic::Ordering::Relaxed);
+    if let Some(first) = list.hosts.lock().unwrap_or_else(|e| e.into_inner()).first() {
+        first.set_ab(b);
+    }
 }
 
 /// After the title list's last submission: its host lists start again,
@@ -537,7 +557,11 @@ fn new_list(
             state.set_pipeline(pipeline);
             std::sync::Mutex::new(state)
         },
+        #[cfg(windows)]
+        ab: false.into(),
     });
+    #[cfg(windows)]
+    take_side(&list);
     let hr = object::hand_out(LIST, list, iid, &LIST_IIDS, out);
     if hr == S_OK {
         crate::pipeline::bound(pipeline);
@@ -603,6 +627,8 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
     {
         end_hoist(this);
         let held = restart(this);
+        // SAFETY: the title passes one of our lists.
+        take_side(unsafe { &*this.cast::<List>() });
         // SAFETY: the title passes one of our lists.
         let mut state = unsafe { &(*this.cast::<List>()).state }.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::mem::take(&mut *state);
@@ -2355,7 +2381,7 @@ mod tests {
         assert_eq!(release(allocator), 0);
     }
 
-    /// Hoisted clamps (`crate::indirect::hoisting`): the first indirect
+    /// Hoisted clamps (`crate::indirect::hoisting_at`): the first indirect
     /// draw of a run cuts the title list, the host list before staying open
     /// for the run's clamps; draws of the same run add no cut until
     /// something may have written arguments, and a wait ends the run. The

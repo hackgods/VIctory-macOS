@@ -100,7 +100,7 @@ fn parts(value: Option<&str>) -> (u8, bool) {
     (parts, true)
 }
 
-/// The parts that are on, read once.
+/// The parts that are on, read once (side A of `VICTORY_AB`, `crate::ab`).
 pub(crate) fn on() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -114,6 +114,25 @@ pub(crate) fn on() -> u8 {
         }
         on
     })
+}
+
+/// mac: the parts left out on `VICTORY_AB` side `b` (`crate::ab`), the
+/// recording list's: side B leaves nothing out where A leaves something,
+/// else both, or `=<value>` by the rule.
+pub(crate) fn parts_at(b: bool) -> u8 {
+    crate::ab::value_at(
+        "VICTORY_RAY_SKIP",
+        b,
+        on(),
+        |&a| if a != 0 { 0 } else { RESOLVE | ACTIVATE },
+        |v| parts(Some(v)).0,
+    )
+}
+
+/// The parts either side leaves out: the programs and pipelines of those
+/// are known (as [`on`] alone without a toggle of this switch).
+fn learnt() -> u8 {
+    on() | if crate::ab::names("VICTORY_RAY_SKIP") { parts_at(true) } else { 0 }
 }
 
 /// The line said at start when something is left out.
@@ -162,7 +181,7 @@ static KNOWN: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// first time, `hash` as logged: remembered if a part that is on leaves
 /// its program out. Nothing while the switch is off.
 pub(crate) fn note_program(stage: &str, hash: &str, container: &[u8]) {
-    let on = on();
+    let on = learnt();
     if on == 0 || stage != "compute" {
         return;
     }
@@ -197,7 +216,7 @@ fn name(part: u8) -> &'static str {
 /// What a title pipeline of the shaders with these hashes is to this
 /// module (0: nothing, and always while the switch is off).
 pub(crate) fn kind<'a>(hashes: impl Iterator<Item = &'a str>) -> u8 {
-    if on() == 0 {
+    if learnt() == 0 {
         return 0;
     }
     let programs = PROGRAMS.lock().unwrap_or_else(|e| e.into_inner());
@@ -233,7 +252,7 @@ fn frame_line(left: [u64; 2], frames: f64, known: [u64; 2]) -> String {
 /// With the frame line, over `frames` frames: the dispatches left out.
 /// Nothing while the switch is off.
 pub(crate) fn log(frames: f64) {
-    if on() == 0 {
+    if learnt() == 0 {
         return;
     }
     let left = LEFT_OUT.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
@@ -244,6 +263,28 @@ pub(crate) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mac: `VICTORY_AB` (`crate::ab`): side B leaves out both parts where
+    /// side A leaves out none, or the parts given, and the programs of what
+    /// either side leaves out are learnt.
+    #[test]
+    fn side_b_leaves_out_the_other_parts_and_both_sides_are_learnt() {
+        if std::env::var_os("VICTORY_RAY_SKIP").is_some() {
+            return;
+        }
+        assert_eq!((parts_at(false), parts_at(true), learnt()), (0, 0, 0), "no toggle: nothing, as before");
+        let with = |toggle: &str, f: &dyn Fn()| {
+            crate::ab::force(Some(crate::ab::parse(toggle).unwrap()), false);
+            f();
+            crate::ab::force(None, false);
+        };
+        with("VICTORY_RAY_SKIP:10", &|| {
+            assert_eq!((parts_at(false), parts_at(true)), (0, RESOLVE | ACTIVATE));
+            assert_eq!(learnt(), RESOLVE | ACTIVATE);
+        });
+        with("VICTORY_RAY_SKIP=activate:10", &|| assert_eq!((parts_at(true), learnt()), (ACTIVATE, ACTIVATE)));
+        with("VICTORY_DIRTY_ROWS:10", &|| assert_eq!((parts_at(true), learnt()), (0, 0), "another switch"));
+    }
 
     #[test]
     fn the_switch_names_its_parts() {

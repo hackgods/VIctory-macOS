@@ -54,9 +54,12 @@ pub(crate) fn lock_writers(wine: bool) -> [bool; 2] {
 /// says whether; asked once), where a frame's CPU part is the cost.
 /// `VICTORY_QUICK_SYNC=0`: neither, as before; `maps` or `views`: that part
 /// alone; `1`: both, anywhere. Neither changes what a slot shows.
-pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
+///
+/// mac: `VICTORY_AB=VICTORY_QUICK_SYNC` (`crate::ab`) flips the views part
+/// only (read once a heap sync pass); the maps are how a census is made.
+pub(crate) fn quick_sync(wine: impl Fn() -> bool) -> [bool; 2] {
     static ON: OnceLock<[bool; 2]> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let [maps, views] = *ON.get_or_init(|| {
         let value = std::env::var("VICTORY_QUICK_SYNC").ok();
         let [maps, views] = quick(value.as_deref(), wine());
         tracing::info!(
@@ -65,7 +68,8 @@ pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
             "VICTORY_QUICK_SYNC: the heap census in hash maps, buffer shader views of a heap sync made from one lookup"
         );
         [maps, views]
-    })
+    });
+    [maps, crate::ab::flag("VICTORY_QUICK_SYNC", views, |v| quick(Some(v), wine())[1])]
 }
 
 /// [`quick_sync`]'s rule: census maps, views.
@@ -256,6 +260,9 @@ pub(crate) fn walk() -> bool {
 /// first has run on the GPU before the copy is made. `0`, `keep` and
 /// anything else leave it off (the diagnostics of `crate::host` read the
 /// same variable).
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); what a list records reads
+/// its title list's side ([`copy_order_split_at`]).
 pub(crate) fn copy_order_split() -> Option<usize> {
     #[cfg(test)]
     if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -278,6 +285,19 @@ pub(crate) fn copy_order_split() -> Option<usize> {
     })
 }
 
+/// mac: [`copy_order_split`] on `VICTORY_AB` side `b` (`crate::ab`): side
+/// B is off where A splits, else every range, or `=<value>` by the rule.
+pub(crate) fn copy_order_split_at(b: bool) -> Option<usize> {
+    let a = copy_order_split();
+    crate::ab::value_at(
+        "VICTORY_COPY_ORDER",
+        b,
+        a,
+        |a| if a.is_some() { None } else { Some(usize::MAX) },
+        |v| copy_order(Some(v)),
+    )
+}
+
 /// `VICTORY_COPY_ORDER`'s rule for the split: `split` is every read range,
 /// `split:<bytes>` those of at most `bytes` (1 or more); anything else is
 /// off.
@@ -295,6 +315,9 @@ fn copy_order(value: Option<&str>) -> Option<usize> {
 /// leaves each a dispatch of its own (to tell the two steps apart in a
 /// run). Off by default: each clamp is a dispatch of ours just before its
 /// draw, about 4,200 a world frame, each between two draws.
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); lists read their title
+/// list's side ([`batch_clamps_at`]).
 pub(crate) fn batch_clamps() -> [bool; 2] {
     static ON: OnceLock<[bool; 2]> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -307,6 +330,19 @@ pub(crate) fn batch_clamps() -> [bool; 2] {
         }
         [hoist, batch]
     })
+}
+
+/// mac: [`batch_clamps`] on `VICTORY_AB` side `b` (`crate::ab`), a title
+/// list's from its reset: side B is off where A hoists, else both, or
+/// `=<value>` by the rule.
+pub(crate) fn batch_clamps_at(b: bool) -> [bool; 2] {
+    crate::ab::value_at(
+        "VICTORY_BATCH_CLAMPS",
+        b,
+        batch_clamps(),
+        |a| if a[0] { [false, false] } else { [true, true] },
+        |v| clamps(Some(v)),
+    )
 }
 
 /// `VICTORY_BATCH_CLAMPS`'s rule: hoisted, batched. `1` is both, `hoist`
@@ -327,12 +363,16 @@ fn clamps(value: Option<&str>) -> [bool; 2] {
 /// pipeline sync, copy, clear or immediate write, not at its dispatches.
 /// Off by default: each indirect dispatch has a clamp of ours just before
 /// it, about 960 a frame at the prison.
-pub(crate) fn dispatch_clamps() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+///
+/// mac: on `VICTORY_AB` side `b` (`crate::ab`; false is the switch as set),
+/// a title list's from its reset: asked for on that side (the opposite of
+/// side A's asking, or `=<value>`), and only where that side hoists
+/// ([`batch_clamps_at`]: a toggle of the draws' clamps takes these along).
+pub(crate) fn dispatch_clamps_at(b: bool) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         let asked = dispatch_rule(std::env::var("VICTORY_DISPATCH_CLAMPS").ok().as_deref());
-        let on = asked && batch_clamps()[0];
-        if on {
+        if asked && batch_clamps()[0] {
             tracing::info!(
                 batch = batch_clamps()[1],
                 "VICTORY_DISPATCH_CLAMPS: the clamps of a run of indirect dispatches go to the host list before it too (a run ends at the title's next barrier)"
@@ -340,8 +380,9 @@ pub(crate) fn dispatch_clamps() -> bool {
         } else if asked {
             tracing::warn!("VICTORY_DISPATCH_CLAMPS=1 does nothing without VICTORY_BATCH_CLAMPS=1 or hoist");
         }
-        on
-    })
+        asked
+    });
+    crate::ab::flag_at("VICTORY_DISPATCH_CLAMPS", b, asked, |v| dispatch_rule(Some(v))) && batch_clamps_at(b)[0]
 }
 
 /// Whether every BVH node test misses without reading the node
@@ -444,9 +485,12 @@ fn census_rule(value: Option<&str>) -> bool {
 /// anything else): every request is refreshed, as before. Nothing with
 /// `VICTORY_FLIGHTS=1`, where refreshes are asked for while the submission
 /// before still runs and its copy-back can still change title memory.
+///
+/// mac: `VICTORY_AB=VICTORY_SYNC_EPOCH` (`crate::ab`) flips it per range
+/// asked; refused with `VICTORY_FLIGHTS=1` ([`ab_blocked`]).
 pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let asked = epoch(std::env::var("VICTORY_SYNC_EPOCH").ok().as_deref());
         let on = asked && !flights();
         if on {
@@ -457,7 +501,8 @@ pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
             tracing::warn!("VICTORY_SYNC_EPOCH=1 does nothing with VICTORY_FLIGHTS=1");
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_SYNC_EPOCH", a, |v| epoch(Some(v)))
 }
 
 /// [`sync_epoch`]'s rule: `1` turns it on; every other value leaves it off.
@@ -538,6 +583,9 @@ pub(crate) fn metal_bc_casts(wine: impl FnOnce() -> bool) -> bool {
 /// time. In place, the buffers stay with the list, and keep their room from
 /// one use to the next. The same writes reach `sync` in the same order.
 /// Only with `VICTORY_WIDENED_IN_PLACE=1`, read once (at the first barrier).
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); a host list reads its
+/// title list's side from its reset to its close ([`widened_in_place_at`]).
 pub(crate) fn widened_in_place() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -551,19 +599,28 @@ pub(crate) fn widened_in_place() -> bool {
     })
 }
 
+/// mac: [`widened_in_place`] on `VICTORY_AB` side `b` (`crate::ab`).
+pub(crate) fn widened_in_place_at(b: bool) -> bool {
+    crate::ab::flag_at("VICTORY_WIDENED_IN_PLACE", b, widened_in_place(), |v| in_place_rule(Some(v)))
+}
+
 /// From VIctory-macOS #436 (82587a26): whether a write snapshot keeps only
 /// the bytes each declared GPU write newly covers
 /// (`crate::snapshot_spans::Spans`), instead of merging overlapping
 /// declarations into one segment copied again whenever it grows. Only for
 /// unmarked writes (marked ones keep no snapshot). Only with
 /// `VICTORY_SNAPSHOT_SPANS=1`, read once.
+///
+/// mac: `VICTORY_AB=VICTORY_SNAPSHOT_SPANS` (`crate::ab`): a snapshot keeps
+/// the form its first capture took until copy-back empties it
+/// (`crate::shadow::Shadow::writing`), so a flip changes the next ones.
 pub(crate) fn snapshot_spans() -> bool {
     #[cfg(test)]
     if tests::SPANS_HERE.with(std::cell::Cell::get) {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = spans_rule(std::env::var("VICTORY_SNAPSHOT_SPANS").ok().as_deref());
         if on {
             tracing::info!(
@@ -571,7 +628,8 @@ pub(crate) fn snapshot_spans() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_SNAPSHOT_SPANS", a, |v| spans_rule(Some(v)))
 }
 
 /// `VICTORY_SNAPSHOT_SPANS`'s rule: on only for `1`.
@@ -586,9 +644,12 @@ fn spans_rule(value: Option<&str>) -> bool {
 /// `Batch::title_copied`). Off: every title copy makes all pending
 /// refreshes first, as before. Only with `VICTORY_FLUSH_OVERLAPPING=1`, read
 /// once.
+///
+/// mac: `VICTORY_AB=VICTORY_FLUSH_OVERLAPPING` (`crate::ab`): a submission's
+/// batch takes the side once, when it is made.
 pub(crate) fn flush_overlapping() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = overlapping_rule(std::env::var("VICTORY_FLUSH_OVERLAPPING").ok().as_deref());
         if on {
             tracing::info!(
@@ -596,7 +657,8 @@ pub(crate) fn flush_overlapping() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_FLUSH_OVERLAPPING", a, |v| overlapping_rule(Some(v)))
 }
 
 /// `VICTORY_FLUSH_OVERLAPPING`'s rule: on only for `1`.
@@ -652,9 +714,15 @@ fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
 }
 
 /// `VICTORY_PLACED_AT_ONCE`, read once ([`PlacedAtOnce`]).
+///
+/// mac: `VICTORY_AB=VICTORY_PLACED_AT_ONCE` (`crate::ab`): side B is off
+/// where A is on, else `all`, or `=<value>`; read once a slot a heap sync
+/// makes. A slot made either way stays valid the other way: a view made at
+/// once stays until the slot is rewritten, a slot left null is made when a
+/// shader reads it.
 pub(crate) fn placed_at_once() -> PlacedAtOnce {
     static ON: OnceLock<PlacedAtOnce> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let mode = placed_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
         match mode {
             PlacedAtOnce::Off => {}
@@ -669,7 +737,13 @@ pub(crate) fn placed_at_once() -> PlacedAtOnce {
             ),
         }
         mode
-    })
+    });
+    crate::ab::value(
+        "VICTORY_PLACED_AT_ONCE",
+        a,
+        |a| if a.made() { PlacedAtOnce::Off } else { PlacedAtOnce::All },
+        |v| placed_rule(Some(v)),
+    )
 }
 
 /// Which views a record names whole instead of through the view table
@@ -803,6 +877,103 @@ mod clamp_tests {
     }
 }
 
+/// mac: `VICTORY_AB` (`crate::ab`): side B of each switch read here. The
+/// tests set none of these switches, so side A is each one's default.
+#[cfg(test)]
+mod ab_tests {
+    use super::*;
+
+    /// Runs `f` with `VICTORY_AB=<toggle>` on side `b` on this thread.
+    fn with(toggle: &str, b: bool, f: impl FnOnce()) {
+        crate::ab::force(Some(crate::ab::parse(toggle).unwrap()), b);
+        f();
+        crate::ab::force(None, false);
+    }
+
+    fn unset(names: &[&str]) -> bool {
+        names.iter().all(|n| std::env::var_os(n).is_none())
+    }
+
+    #[test]
+    fn on_off_switches_read_the_opposite_or_the_value_on_side_b() {
+        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
+            return;
+        }
+        assert!(!flush_overlapping() && !snapshot_spans() && !sync_epoch(|| false) && !widened_in_place());
+        with("VICTORY_FLUSH_OVERLAPPING:10", true, || assert!(flush_overlapping()));
+        with("VICTORY_FLUSH_OVERLAPPING:10", false, || assert!(!flush_overlapping(), "side A: as set"));
+        with("VICTORY_FLUSH_OVERLAPPING=0:10", true, || assert!(!flush_overlapping(), "=0 on side B: off (A/A)"));
+        with("VICTORY_SNAPSHOT_SPANS:10", true, || {
+            assert!(snapshot_spans());
+            assert!(!flush_overlapping(), "another switch keeps side A");
+        });
+        with("VICTORY_SYNC_EPOCH:10", true, || assert!(sync_epoch(|| false)));
+        // A list's side, not the side now.
+        with("VICTORY_WIDENED_IN_PLACE:10", false, || {
+            assert!(widened_in_place_at(true) && !widened_in_place_at(false));
+        });
+    }
+
+    #[test]
+    fn quick_sync_flips_only_its_views() {
+        if !unset(&["VICTORY_QUICK_SYNC"]) {
+            return;
+        }
+        let a = quick_sync(|| true);
+        with("VICTORY_QUICK_SYNC:10", true, || assert_eq!(quick_sync(|| true), [a[0], !a[1]]));
+        with("VICTORY_QUICK_SYNC=views:10", true, || assert_eq!(quick_sync(|| true), [a[0], true]));
+        with("VICTORY_QUICK_SYNC=0:10", true, || assert_eq!(quick_sync(|| true), [a[0], false]));
+    }
+
+    #[test]
+    fn placed_views_are_made_at_once_on_side_b_where_side_a_leaves_them() {
+        if !unset(&["VICTORY_PLACED_AT_ONCE"]) {
+            return;
+        }
+        assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+        with("VICTORY_PLACED_AT_ONCE:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::All));
+        with("VICTORY_PLACED_AT_ONCE=keep:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Keep));
+    }
+
+    #[test]
+    fn clamps_flip_per_list_and_take_the_dispatch_clamps_along() {
+        if !unset(&["VICTORY_BATCH_CLAMPS", "VICTORY_DISPATCH_CLAMPS"]) {
+            return;
+        }
+        assert_eq!(batch_clamps_at(false), [false, false]);
+        with("VICTORY_BATCH_CLAMPS:10", false, || {
+            assert_eq!(batch_clamps_at(true), [true, true], "a list on side B");
+            assert_eq!(batch_clamps_at(false), [false, false], "a list on side A");
+            assert!(!dispatch_clamps_at(true), "dispatch clamps not asked for: off on both sides");
+        });
+        with("VICTORY_BATCH_CLAMPS=hoist:10", false, || assert_eq!(batch_clamps_at(true), [true, false]));
+        // Dispatch clamps asked for on side B only hoist where side B hoists.
+        with("VICTORY_DISPATCH_CLAMPS:10", false, || {
+            assert!(!dispatch_clamps_at(true), "side A does not hoist the draws' clamps");
+        });
+    }
+
+    #[test]
+    fn the_copy_order_split_flips_per_list() {
+        if !unset(&["VICTORY_COPY_ORDER"]) || tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return;
+        }
+        assert_eq!(copy_order_split_at(false), None);
+        with("VICTORY_COPY_ORDER:10", false, || {
+            // (Another test may force the split on meanwhile: then both are.)
+            if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                assert_eq!(copy_order_split_at(true), Some(usize::MAX));
+                assert_eq!(copy_order_split_at(false), None);
+            }
+        });
+        with("VICTORY_COPY_ORDER=split:4096:10", false, || {
+            if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                assert_eq!(copy_order_split_at(true), Some(4096));
+            }
+        });
+    }
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -850,6 +1021,32 @@ fn setting(value: Option<&str>, default: bool) -> bool {
         Some("0") => false,
         Some("1") => true,
         _ => default,
+    }
+}
+
+/// mac: why `VICTORY_AB` (`crate::ab`) cannot flip switch `name` in this
+/// run (side B's `value`, if given), asked at the first present: a side
+/// the switch's own rules refuse would measure nothing, or a picture the
+/// line never runs with.
+#[cfg(windows)]
+pub(crate) fn ab_blocked(name: &str, value: Option<&str>) -> Option<String> {
+    let _ = value;
+    match name {
+        "VICTORY_SYNC_EPOCH" if crate::host::unwaited::flights::on() => {
+            Some("VICTORY_SYNC_EPOCH does nothing with VICTORY_FLIGHTS=1".to_owned())
+        }
+        "VICTORY_DISPATCH_CLAMPS" if !batch_clamps()[0] => {
+            Some("VICTORY_DISPATCH_CLAMPS does nothing without VICTORY_BATCH_CLAMPS=1 or hoist".to_owned())
+        }
+        // `crate::alias` turns the aliasing on only with the split: off on
+        // side B, commands before a title copy into aliased memory would
+        // read its new bytes.
+        "VICTORY_COPY_ORDER" if crate::alias::enabled() && copy_order_split_at(true).is_none() => Some(
+            "VICTORY_ALIAS_BUFFERS is on, which needs VICTORY_COPY_ORDER=split on both sides \
+             (side B may be =split:<bytes>)"
+                .to_owned(),
+        ),
+        _ => None,
     }
 }
 

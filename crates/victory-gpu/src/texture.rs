@@ -1680,13 +1680,17 @@ thread_local! {
 /// zeros with no kernel copy tried, a subresource left all zeros over them
 /// is not read, hashed or detiled again, and an all-zero one is not hashed.
 /// `VICTORY_UNMAPPED_SPLIT=1`; off by default.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh. The pages known to
+/// be unmapped stay known on both sides and leave the set as on side on,
+/// when a take reports them written.
 fn split_unmapped() -> bool {
     #[cfg(test)]
     if SPLIT_IN_TEST.get() {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = crate::switch::on("VICTORY_UNMAPPED_SPLIT");
         if on {
             tracing::info!(
@@ -1694,7 +1698,8 @@ fn split_unmapped() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_UNMAPPED_SPLIT", a, |v| crate::switch::value_is_on(Some(std::ffi::OsStr::new(v))))
 }
 
 #[cfg(test)]
@@ -1708,13 +1713,16 @@ thread_local! {
 /// detile and upload only the touched rows, with the other #416 parts
 /// (VIctory-macOS #416, bfe988b4; on by default there, `VICTORY_DIRTY_ROWS=0`
 /// off): `VICTORY_DIRTY_ROWS=1`, off by default.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh: either way the
+/// host texture ends whole.
 fn dirty_rows_enabled() -> bool {
     #[cfg(test)]
     if ROWS_IN_TEST.get() {
         return true;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = dirty_rows_from_env(std::env::var_os("VICTORY_DIRTY_ROWS").as_deref());
         if on {
             tracing::info!(
@@ -1722,7 +1730,8 @@ fn dirty_rows_enabled() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_DIRTY_ROWS", a, |v| dirty_rows_from_env(Some(std::ffi::OsStr::new(v))))
 }
 
 fn dirty_rows_from_env(value: Option<&std::ffi::OsStr>) -> bool {
@@ -1734,9 +1743,15 @@ fn dirty_rows_from_env(value: Option<&std::ffi::OsStr>) -> bool {
 /// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
 /// watch tracking is off). Newly created or not-yet-readable textures are
 /// still checked on every submission until their first real upload lands.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh: a frame stamp left
+/// from side on is of an earlier frame, so the first check of a frame runs.
 fn once_per_frame() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"))
+    let a = *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"));
+    crate::ab::flag("VICTORY_TEXTURE_ONCE_PER_FRAME", a, |v| {
+        crate::switch::value_is_on(Some(std::ffi::OsStr::new(v)))
+    })
 }
 
 fn skip_same_frame(

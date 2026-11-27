@@ -517,17 +517,18 @@ unsafe fn run(
 /// Whether the clamps of a run of indirect draws go to the host list
 /// before the one that draws (`VICTORY_BATCH_CLAMPS=1` or `hoist`,
 /// `crate::mac_switches::batch_clamps`); else each is recorded before its
-/// draw.
-pub(crate) fn hoisting() -> bool {
-    crate::mac_switches::batch_clamps()[0]
+/// draw. mac: on `VICTORY_AB` side `b` (`crate::ab`), the title list's
+/// from its reset.
+pub(crate) fn hoisting_at(b: bool) -> bool {
+    crate::mac_switches::batch_clamps_at(b)[0]
 }
 
 /// Whether the clamps of runs of indirect dispatches go to the host list
-/// before too (`VICTORY_DISPATCH_CLAMPS=1` with [`hoisting`],
-/// `crate::mac_switches::dispatch_clamps`); else each is recorded before
-/// its dispatch.
-pub(crate) fn hoisting_dispatches() -> bool {
-    crate::mac_switches::dispatch_clamps()
+/// before too (`VICTORY_DISPATCH_CLAMPS=1` with [`hoisting_at`],
+/// `crate::mac_switches::dispatch_clamps_at`); else each is recorded before
+/// its dispatch. mac: on `VICTORY_AB` side `b`, as [`hoisting_at`].
+pub(crate) fn hoisting_dispatches_at(b: bool) -> bool {
+    crate::mac_switches::dispatch_clamps_at(b)
 }
 
 /// As [`bound`], recorded in `clamps`, the host list that runs before
@@ -552,7 +553,8 @@ pub(crate) fn bound_before(
     spec: (u32, u32, u32),
     count: Option<(u64, u64)>,
 ) -> Option<(ID3D12Resource, u64)> {
-    bound_before_as(clamps, into, gpu, spec, count, crate::mac_switches::batch_clamps()[1])
+    // mac: batched on the `VICTORY_AB` side of the list that draws.
+    bound_before_as(clamps, into, gpu, spec, count, crate::mac_switches::batch_clamps_at(into.ab())[1])
 }
 
 /// [`bound_before`], the clamp `batched` or recorded at once.

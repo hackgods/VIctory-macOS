@@ -352,6 +352,8 @@ fn account_frame(frame: u64) {
     }
     tracing::info!(
         frame,
+        // mac: with `VICTORY_AB` only (`crate::ab`): the frame's side.
+        ab = crate::ab::label(),
         submissions = a.submissions,
         pieces = a.pieces,
         segments = a.segments,
@@ -680,6 +682,10 @@ extern "system" fn present(
     #[cfg(windows)]
     unwaited::settle(unwaited::By::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // mac: `VICTORY_AB` (`crate::ab`): the frame's lines name the side its
+    // work ran on, and the side may flip here for the frames after.
+    #[cfg(windows)]
+    crate::ab::present(frame, crate::draw::drawn, crate::mac_switches::ab_blocked);
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(windows)]

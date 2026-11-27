@@ -192,7 +192,7 @@ pub(crate) fn count_history(in_place: bool, writes: usize) {
 /// and the list histories copied for [`sync`], or taken without a copy.
 pub(crate) fn log(frames: f64) {
     use std::sync::atomic::Ordering::Relaxed;
-    let in_place = crate::mac_switches::widened_in_place();
+    let in_place = crate::mac_switches::widened_in_place_at(crate::ab::side());
     if !in_place && !crate::shadow::WIDENED_ANY.load(Relaxed) {
         return;
     }

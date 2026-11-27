@@ -4221,3 +4221,98 @@ fn a_first_lane_read_in_a_while_loop_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// [`while_loop_first_lane`] (the form lanes leave one by one: a lane stays
+/// while `v1 < (tid & 7)`) with a store in its body: each pass a lane makes
+/// stores its count of passes `v1` at dword `v1` of its own eight. A lane
+/// that has left the loop stores no more.
+fn while_loop_with_a_store() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x360A_0087, // v_and_b32 v5, 7, v0
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+        0xBF82_0007, // s_branch (the test)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x3422_0282, // v_lshlrev_b32 v17, 2, v1
+        0x4A22_2310, // v_add_nc_u32 v17, v16, v17
+        0xE070_1000,
+        0x800A_0111, // buffer_store_dword v1, v17, s[40:43], 0 offen
+        0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF89_FFF6, // s_cbranch_execnz (the body)
+        0xBEFE_0424, // s_mov_b64 exec, s[36:37]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_while_loop_with_a_store_is_what_its_comments_say() {
+    let words = while_loop_with_a_store();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_and_b32 v5, 7, v0",
+        "s_mov_b64 s[36:37], exec",
+        "s_branch",
+        "v_readfirstlane_b32 s6, v0",
+        "v_add_nc_u32 v2, s6, v2",
+        "v_add_nc_u32 v1, 1, v1",
+        "v_lshlrev_b32 v17, 2, v1",
+        "v_add_nc_u32 v17, v16, v17",
+        "buffer_store_dword v1, v17, s[40:43], 0 offen",
+        "v_cmp_lt_u32 vcc, v1, v5",
+        "s_and_b64 exec, exec, vcc",
+        "s_cbranch_execnz",
+        "s_mov_b64 exec, s[36:37]",
+    ];
+    // The prologue's five words are four instructions.
+    for (n, want) in want.iter().enumerate() {
+        let got = &text[PROLOGUE.len() - 1 + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+}
+
+/// A store in a `while` loop run in lockstep is made by the lanes still in
+/// the loop only: a lane that left keeps running the body with the group,
+/// inactive, and stores nothing. Each lane's dwords 1 to `tid & 7` hold
+/// their own index, the rest stay 0; dword 0 is the accumulator of
+/// [`console_while_loop_first_lane`].
+#[cfg(windows)]
+#[test]
+fn a_store_in_a_while_loop_is_made_by_the_lanes_still_in_it_on_every_gpu() {
+    let words = while_loop_with_a_store();
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads)
+            .flat_map(|t| {
+                let n = t & 7;
+                let mut lane = [0; 8];
+                lane[0] = console_while_loop_first_lane(true, t);
+                for p in 1..=n {
+                    lane[p as usize] = p;
+                }
+                lane
+            })
+            .collect();
+        failed.extend(
+            differences(&words, threads, 8, &want)
+                .into_iter()
+                .map(|m| format!("{threads} threads: {m}")),
+        );
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

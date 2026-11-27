@@ -77,6 +77,8 @@
 //! - Reflections are held to a part of the light around, as the constant
 //!   stand-in holds them to a part of its level ([`hold`],
 //!   `VICTORY_AMBIENT_REFLECT`); the fork leaves them alone (`0` here).
+//!   `VICTORY_AMBIENT_REFLECT_FLOOR` (off unless set) also holds them to
+//!   no less than a part of it, for metal, whose light comes all from them.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -169,6 +171,14 @@ fn reflect_part() -> f32 {
     *SET.get_or_init(|| crate::ambient_set::keep(var("VICTORY_AMBIENT_REFLECT").as_deref()))
 }
 
+/// The least a reflection holds, as a part of the light around
+/// (`VICTORY_AMBIENT_REFLECT_FLOOR`, `set::reflect_floor`; 0, the default:
+/// none). Read once.
+fn reflect_floor() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| set::reflect_floor(var("VICTORY_AMBIENT_REFLECT_FLOOR").as_deref()))
+}
+
 /// How a texel's light is put together (`VICTORY_AMBIENT_MIX`, `set::mix`;
 /// the fork's fixed numbers unless set).
 fn mix() -> [f32; 4] {
@@ -216,6 +226,15 @@ pub(crate) fn announce() {
             "{}",
             set::start_line(share, shade(), left(), air_bound(), settle(), reflect_part(), mix(), floor_share())
         );
+        if reflect_floor() > 0.0 {
+            tracing::info!(
+                least = reflect_floor(),
+                held = reflect_part(),
+                "VICTORY_AMBIENT_REFLECT_FLOOR: no reflection holds less than this part of the light around \
+                 the point seen there (the light the hold's cap is a part of); a darker one is replaced by it \
+                 (nothing while the hold is off, VICTORY_AMBIENT_REFLECT=0)"
+            );
+        }
     }
 }
 
@@ -628,6 +647,7 @@ fn settings(share: f32) -> set::Pass {
         sky: [0.0, 0.0, 1.0],
         floor: [0.0; 3],
         sky_size: [0, 0],
+        reflect_least: reflect_floor(),
     }
 }
 
@@ -891,6 +911,7 @@ pub(crate) fn hold(list: &HostList, image: This) -> bool {
     FIRST.call_once(|| {
         tracing::info!(
             held = reflect_part(),
+            least = reflect_floor(),
             width = d.Width,
             height = d.Height,
             "ambient estimate: reflections held to the light around"
@@ -1114,6 +1135,7 @@ mod tests {
         sky: [0.0, 0.0, 1.0],
         floor: [0.0; 3],
         sky_size: [0, 0],
+        reflect_least: 0.0,
     };
 
     /// The sky dome of the GPU tests: 16x8, a bright blue half (with texels
@@ -1358,7 +1380,8 @@ mod tests {
     }
 
     /// The hold's pass keeps every reflection to a part of the light around
-    /// the point seen there, as the arithmetic on the CPU does.
+    /// the point seen there, as the arithmetic on the CPU does; with the
+    /// reflection floor also no darker than another part of it.
     #[test]
     fn reflections_are_held_on_the_gpu() {
         let Some(host) = host() else {
@@ -1369,44 +1392,54 @@ mod tests {
         // A reflection image of another size than the light's.
         let size = [96u32, 54];
         let there_at = |x: u32, y: u32| -> V3 {
-            match (x + 2 * y) % 3 {
+            match (x + 2 * y) % 4 {
                 0 => [40.0, 30.0, 20.0],
                 1 => [0.75, 0.5, 0.25],
-                _ => [0.0078125, 0.015625, 0.0078125],
+                2 => [0.0078125, 0.015625, 0.0078125],
+                _ => [0.0; 3],
             }
         };
-        let list = host.new_list().unwrap();
-        let l = &list.list;
-        let mut keep = Vec::new();
-        let words: Vec<u32> = (0..size[0] * size[1]).map(|i| reference::pack(there_at(i % size[0], i / size[0]))).collect();
-        let image = texture(host, l, DXGI_FORMAT_R32_UINT, size, &words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mut keep);
-        pass.hold(host, &list, Image { image: &image, format: DXGI_FORMAT_R32_UINT, slices: 0 }, size, &BASE);
-        let pitch = (size[0] * 4).next_multiple_of(256);
-        let (back, data) = host.readback_buffer(u64::from(pitch) * u64::from(size[1])).unwrap();
-        // SAFETY: an open list and live resources.
-        unsafe {
-            l.ResourceBarrier(&[transition(&image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
-            l.CopyTextureRegion(&rows(&back, DXGI_FORMAT_R32_UINT, size, pitch), 0, 0, 0, &whole(&image), None);
-        }
-        list.close();
-        host.execute(&[&list]);
-        let (mut held, mut kept) = (0, 0);
-        for y in 0..size[1] {
-            for x in 0..size[0] {
-                // SAFETY: the copy has run; inside the mapped buffer.
-                let got = reference::unpack(unsafe { data.add((y * pitch + x * 4) as usize).cast::<u32>().read_volatile() });
-                let q = [0, 1].map(|k| {
-                    (((([x, y][k] as f32 + 0.5) / size[k] as f32) * [set::PX, set::PY][k] as f32) as u32).min([set::PX, set::PY][k] - 1)
-                });
-                let point = ((q[1] * set::PX + q[0]) * 3) as usize;
-                let seen_there = [points[point][3], points[point + 1][3], points[point + 2][3]];
-                let was = reference::unpack(reference::pack(there_at(x, y)));
-                let want = reference::hold(was, &BASE, [mean[0], mean[1], mean[2]], seen_there);
-                assert!(close(got, reference::unpack(reference::pack(want))), "reflection at {x},{y}: {got:?} {want:?} (was {was:?})");
-                if want == was { kept += 1 } else { held += 1 }
+        for given in [BASE, set::Pass { reflect_least: 0.15, ..BASE }] {
+            let list = host.new_list().unwrap();
+            let l = &list.list;
+            let mut keep = Vec::new();
+            let words: Vec<u32> = (0..size[0] * size[1]).map(|i| reference::pack(there_at(i % size[0], i / size[0]))).collect();
+            let image = texture(host, l, DXGI_FORMAT_R32_UINT, size, &words, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &mut keep);
+            pass.hold(host, &list, Image { image: &image, format: DXGI_FORMAT_R32_UINT, slices: 0 }, size, &given);
+            let pitch = (size[0] * 4).next_multiple_of(256);
+            let (back, data) = host.readback_buffer(u64::from(pitch) * u64::from(size[1])).unwrap();
+            // SAFETY: an open list and live resources.
+            unsafe {
+                l.ResourceBarrier(&[transition(&image, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                l.CopyTextureRegion(&rows(&back, DXGI_FORMAT_R32_UINT, size, pitch), 0, 0, 0, &whole(&image), None);
             }
+            list.close();
+            host.execute(&[&list]);
+            let (mut held, mut kept, mut raised) = (0, 0, 0);
+            for y in 0..size[1] {
+                for x in 0..size[0] {
+                    // SAFETY: the copy has run; inside the mapped buffer.
+                    let got = reference::unpack(unsafe { data.add((y * pitch + x * 4) as usize).cast::<u32>().read_volatile() });
+                    let q = [0, 1].map(|k| {
+                        (((([x, y][k] as f32 + 0.5) / size[k] as f32) * [set::PX, set::PY][k] as f32) as u32).min([set::PX, set::PY][k] - 1)
+                    });
+                    let point = ((q[1] * set::PX + q[0]) * 3) as usize;
+                    let seen_there = [points[point][3], points[point + 1][3], points[point + 2][3]];
+                    let was = reference::unpack(reference::pack(there_at(x, y)));
+                    let want = reference::hold(was, &given, [mean[0], mean[1], mean[2]], seen_there);
+                    assert!(
+                        close(got, reference::unpack(reference::pack(want))),
+                        "reflection at {x},{y} (floor {}): {got:?} {want:?} (was {was:?})",
+                        given.reflect_least
+                    );
+                    let more = (0..3).all(|k| want[k] >= was[k]);
+                    if want == was { kept += 1 } else if more { raised += 1 } else { held += 1 }
+                }
+            }
+            assert!(held > 0 && kept > 0, "{held} held, {kept} kept");
+            // Unset nothing is raised; set, the black ones are.
+            assert_eq!(raised > 0, given.reflect_least > 0.0, "{raised} raised");
         }
-        assert!(held > 0 && kept > 0, "{held} held, {kept} kept");
     }
 
     /// What each pass costs on this GPU at the title's sizes (the light

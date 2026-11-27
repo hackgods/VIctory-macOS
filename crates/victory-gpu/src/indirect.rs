@@ -120,11 +120,9 @@ pub(crate) fn with_clamp_groups<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
 /// it runs: such an execution is clamped inline, right before it runs, not
 /// hoisted into the prelude nor grouped (avatarmanz 631400f: hoisted, trees
 /// flickered). The hook for in-place section views
-/// (`VICTORY_INPLACE_SECTIONS`, `crate::alias::clamp_in_place_inline`);
-/// none are read in place yet.
+/// (`VICTORY_INPLACE_SECTIONS`, `crate::alias::clamp_in_place_inline`).
 pub(crate) fn clamped_in_place(arguments: u64, len: u64, count: Option<u64>) -> bool {
-    let _ = (arguments, len, count);
-    false
+    crate::alias::clamp_in_place_inline(arguments, len, count)
 }
 
 /// What keeps an indirect execution's clamp out of its list's prelude:

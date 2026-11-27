@@ -39,7 +39,7 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = matches!(level(), 1 | 2);
+        let on = matches!(level(), 1..=3);
         if on {
             tracing::info!(
                 "VICTORY_POINTER_PAGES=1: title memory shaders reach by address with no copy gets one from the next submission on"
@@ -55,6 +55,7 @@ fn level() -> u8 {
     *LEVEL.get_or_init(|| match std::env::var("VICTORY_POINTER_PAGES").as_deref().map(str::trim) {
         Ok("1") => 1,
         Ok("2") => 2,
+        Ok("3") => 3,
         _ => 0,
     })
 }
@@ -79,12 +80,106 @@ pub(crate) fn null_page_free() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = level() == 2;
+        let on = level() >= 2;
         if on {
             tracing::info!("VICTORY_POINTER_PAGES=2: reads of the null page are no miss (the list's writes are not withheld for them)");
         }
         on
     })
+}
+
+/// `VICTORY_POINTER_PAGES=3` (includes 2): also, a read of memory no one
+/// allocated (`MEM_FREE` in the host's memory map: a page, or a whole
+/// 256 MiB region with no block) is no miss.
+///
+/// Run rtk (27 November 19:44:24) read `0x7150000000`, `0x7160000000`
+/// (whole regions) and `0x70df200000` every frame, all free: addresses the
+/// title never allocated (stray pointers, or ones derived from data the
+/// host does not have). Each such read made every frame withhold what
+/// shaders wrote (112 MB a frame), so the BVH builder's structures still
+/// never outlasted their submission or frame. Such memory has nothing to
+/// copy, and the console would read nothing there either (guess). Its
+/// writes are still dropped.
+pub(crate) fn unallocated_free() -> bool {
+    #[cfg(test)]
+    if UNALLOCATED_FREE.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = level() == 3;
+        if on {
+            tracing::info!("VICTORY_POINTER_PAGES=3: reads of memory no one allocated are no miss (the list's writes are not withheld for them)");
+        }
+        on
+    })
+}
+
+/// Tests: [`unallocated_free`] whatever the variable says.
+#[cfg(test)]
+pub(crate) static UNALLOCATED_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Misses [`never_allocated`] let pass since the last [`take_unallocated`].
+static UNALLOCATED: AtomicU64 = AtomicU64::new(0);
+
+/// Frames a verdict of [`never_allocated`] is kept before the memory map is
+/// asked again (the title may allocate there later).
+const VERDICT_FRAMES: u64 = 60;
+
+/// Whether `missed` lies in memory no one allocated: a page whose memory
+/// map entry is free, or a region free from its start to its end. Asked of
+/// the memory map once per address every [`VERDICT_FRAMES`] frames, and
+/// counted when it is (the list's own count, after its run).
+pub(crate) fn never_allocated(missed: Missed) -> bool {
+    let free = is_never_allocated(missed);
+    if free {
+        UNALLOCATED.fetch_add(1, Ordering::Relaxed);
+    }
+    free
+}
+
+/// [`never_allocated`], not counted (whether a submission missed).
+pub(crate) fn is_never_allocated(missed: Missed) -> bool {
+    static VERDICTS: std::sync::Mutex<std::collections::BTreeMap<u64, (u64, bool)>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+    let (at, span) = match missed {
+        Missed::Page(a) => (a & !(PAGE - 1), PAGE),
+        Missed::Region(a) => (a & !(REGION - 1), REGION),
+    };
+    if at < LOWEST {
+        return false;
+    }
+    let now = crate::frame::current();
+    let free = {
+        let mut verdicts = VERDICTS.lock().unwrap_or_else(|e| e.into_inner());
+        match verdicts.get(&at) {
+            Some(&(when, free)) if now.saturating_sub(when) < VERDICT_FRAMES => free,
+            _ => {
+                let free = free_span(at, span);
+                verdicts.insert(at, (now, free));
+                free
+            }
+        }
+    };
+    free
+}
+
+/// Whether `[at, at + span)` is free memory in the host's memory map, all
+/// of it.
+fn free_span(at: u64, span: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return false;
+    }
+    info.State == MEM_FREE && info.BaseAddress as u64 + info.RegionSize as u64 >= at + span
+}
+
+/// Misses let pass as never allocated since the last call.
+pub(crate) fn take_unallocated() -> u64 {
+    UNALLOCATED.swap(0, Ordering::Relaxed)
 }
 
 /// Whether page-table entry `entry` (of `blocks`, the level-1 index of each
@@ -389,6 +484,22 @@ mod tests {
         assert!(!admit(&mut held, 0x3000_0000, 4 << 20, 10 << 20), "past the budget");
         assert_eq!(held.1, 8 << 20);
         assert!(admit(&mut held, 0x3000_0000, 2 << 20, 10 << 20), "a smaller one fits");
+    }
+
+    /// Memory no one allocated is told from memory that is: a free
+    /// region far from any allocation, against a live allocation and the
+    /// null page.
+    #[test]
+    fn memory_no_one_allocated_is_told_apart() {
+        let held = vec![1u8; 1 << 16];
+        let at = held.as_ptr() as u64;
+        assert!(!free_span(at & !(PAGE - 1), PAGE), "a live allocation");
+        assert!(!never_allocated(Missed::Page(0)), "the null page");
+        // An address just below 2^47, which nothing maps.
+        let far = (1u64 << 47) - 2 * REGION;
+        assert!(free_span(far, REGION));
+        assert!(never_allocated(Missed::Region(far)));
+        assert!(never_allocated(Missed::Page(far + 3 * PAGE)));
     }
 
     /// The host's memory map: a committed allocation is found from below

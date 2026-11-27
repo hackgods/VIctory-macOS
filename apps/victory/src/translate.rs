@@ -180,6 +180,10 @@ struct Checks {
     /// The dwords of one console load are read four a call
     /// (`VICTORY_SHADER_OPT=64`, as `run`; mac).
     wide: bool,
+    /// One-wave groups that share LDS across loop rounds get barriers where
+    /// every thread that has not ended meets (`VICTORY_HALVES_LDS_ROUNDS=1`,
+    /// as `run`).
+    lds_rounds: bool,
 }
 
 pub fn run(
@@ -244,6 +248,10 @@ pub fn run(
     if wide {
         println!("loads        the dwords of one console load four a call (VICTORY_SHADER_OPT=64)");
     }
+    let lds_rounds = victory_gpu::shader_cache::halves_lds_rounds();
+    if lds_rounds {
+        println!("LDS          of one-wave groups ordered across loop rounds where it can be (VICTORY_HALVES_LDS_ROUNDS=1)");
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -291,6 +299,7 @@ pub fn run(
                                 walk,
                                 across,
                                 wide,
+                                lds_rounds,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -659,6 +668,7 @@ fn translate(
                         halves_walk: checks.walk,
                         halves_across: checks.across,
                         wide_loads: checks.wide,
+                        lds_rounds: checks.lds_rounds,
                         ..Default::default()
                     };
                     let _ = emit::uav_size_queries();

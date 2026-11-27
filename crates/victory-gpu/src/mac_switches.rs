@@ -139,6 +139,30 @@ pub(crate) fn across() -> bool {
     })
 }
 
+/// Whether a compute group of one console wave that shares LDS across the
+/// rounds of a loop, with lanes that leave the program before it, gets
+/// group barriers where every thread that has not ended meets
+/// (`victory_shader::emit::lower::lds_rounds`,
+/// `victory_shader::emit::Options::lds_rounds`; `notes/replay-determinism.md`,
+/// "HairOnly, 27 November"): only with `VICTORY_HALVES_LDS_ROUNDS=1`. The
+/// title's hair shadow masks (`0a5ecfee6b79e13b`) then no longer race
+/// between the halves. Exact for the LDS where it applies; a program it
+/// does not order stays as it was (refused, or raced with
+/// `VICTORY_HALVES_SHARED_LDS=1`). It rests on a thread that has ended not
+/// holding up a group barrier, measured on D3DMetal.
+pub(crate) fn lds_rounds() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_LDS_ROUNDS").ok().as_deref(), false);
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_LDS_ROUNDS=1: one-wave64 groups that share LDS across loop rounds get group barriers where every thread that has not ended meets, when that orders the LDS exactly"
+            );
+        }
+        on
+    })
+}
+
 /// Whether a size query on a writable image asks for level 0 in every
 /// program (`victory_shader::emit::Options::uav_size_level0`): only with
 /// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC

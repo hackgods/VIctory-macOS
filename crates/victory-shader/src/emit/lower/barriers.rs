@@ -26,6 +26,18 @@ use super::*;
 /// since the last barrier. A write in divergent code after a read there gets
 /// no barrier, as before.
 pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(usize, usize)>> {
+    split_wave_barriers_in(p, &in_step(p, st), false)
+}
+
+/// [`split_wave_barriers`] with the blocks barriers may go in given
+/// (`step`: every thread of the group that runs on runs them as often as
+/// every other, [`super::lds_rounds`]); `strict`: also `None` where a write
+/// in divergent code may overwrite what a read there has yet to see.
+pub(crate) fn split_wave_barriers_in(
+    p: &Program,
+    step: &[bool],
+    strict: bool,
+) -> Option<Set<(usize, usize)>> {
     /// LDS accesses since the last barrier.
     #[derive(Clone, Copy, Default, PartialEq)]
     struct Since {
@@ -56,7 +68,6 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
     };
     let n = p.blocks.len();
     let succ = |b: usize| p.blocks[b].exit.successors();
-    let step = in_step(p, st);
     let divergent_writes = (0..n).any(|b| {
         !step[b]
             && p.blocks[b]
@@ -89,7 +100,7 @@ pub(crate) fn split_wave_barriers(p: &Program, st: &Structured) -> Option<Set<(u
                     if step[b] {
                         at.insert((b, i));
                         since = Since::default();
-                    } else if stale {
+                    } else if stale || strict {
                         return None;
                     }
                 }

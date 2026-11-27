@@ -105,6 +105,18 @@ const WAITS: [(&str, &[&str]); 2] = [
 /// the first profile).
 const IO: [(&str, &[&str]); 1] = [("ntdll.dll", &["NtReadFile", "NtReadFileScatter"])];
 const STUB: u64 = 0x20;
+/// mac: threads that live in one call into Wine's Unix side and wait there
+/// nearly all the time; a sample of theirs in the image their thread
+/// started in is a wait (mmdevapi's `timer_loop_func`, which calls the
+/// Unix `timer_loop` once; 5 threads and 1,950 ms a frame of "running" in
+/// the first profile).
+const UNIX_CALL_THREADS: [&str; 1] = ["audio_client_timer"];
+/// mac: looks in a row at the same address outside every PE image that make
+/// it a wait (a thread blocked in Unix code, such as D3DMetal's waiter in
+/// `__ulock_wait2`, stands still there; running code does not).
+const SAME_AFTER: u32 = 3;
+/// mac: Unix-side wait addresses learned at most.
+const LEARNED_MOST: usize = 256;
 /// By thread (its id's place): the id of the last thread there that ended
 /// the normal way, through the image's thread detach.
 static DETACHED: [std::sync::atomic::AtomicU32; PLACES] =
@@ -152,6 +164,10 @@ struct Watched {
     /// mac: its last look was left out (an exception): what it does now is
     /// not known, so a round it is not due in does not count it running.
     unseen_last: bool,
+    /// mac: its last instruction pointer, and in how many looks in a row
+    /// before this one it stood there.
+    last_rip: u64,
+    same_rip: u32,
     /// Its previous sample (microseconds since the sampler started; 0: none).
     last_us: u64,
     failures: u32,
@@ -221,6 +237,8 @@ pub(super) struct Sampler {
     waits: Vec<(u64, u64)>,
     /// mac: the file-read calls' stubs.
     io: Vec<(u64, u64)>,
+    /// mac: wait addresses learned outside every PE image (`SAME_AFTER`).
+    learned: HashSet<u64>,
     /// Function starts by instruction pointer.
     functions: HashMap<u64, u64>,
     all: Totals,
@@ -380,6 +398,7 @@ impl Sampler {
             late: 0,
             waits: stubs(&WAITS),
             io: stubs(&IO),
+            learned: HashSet::new(),
             functions: HashMap::new(),
             all: Totals::with_callers(),
             marks: VecDeque::new(),
@@ -573,9 +592,15 @@ impl Sampler {
                 )
             };
             let rip = self.frames[0];
-            let state = self.state_of(rip);
-            let is_running = state == State::Running;
             let function = self.function_of(rip);
+            let mut state = self.state_of(rip);
+            if state == State::Running && self.unix_wait(i, rip) {
+                state = State::Waiting;
+            }
+            let t = &mut self.threads[i];
+            t.same_rip = if rip == t.last_rip { t.same_rip.saturating_add(1) } else { 0 };
+            t.last_rip = rip;
+            let is_running = state == State::Running;
             let fallback = self.period_us * if waiting { idle } else { 1 };
             let exposure = self.exposure_us();
             let t = &mut self.threads[i];
@@ -689,6 +714,31 @@ impl Sampler {
 
     fn is_wait(&self, rip: u64) -> bool {
         self.waits.iter().any(|&(from, to)| rip >= from && rip < to)
+    }
+
+    /// mac: whether thread `i`, at `rip` and not in a known wait, waits in
+    /// Wine's Unix side: a thread of [`UNIX_CALL_THREADS`] in the image it
+    /// started in, or an address outside every image where a thread stood
+    /// [`SAME_AFTER`] looks in a row before (learned once for all threads).
+    fn unix_wait(&mut self, i: usize, rip: u64) -> bool {
+        if self.learned.contains(&rip) {
+            return true;
+        }
+        let t = &self.threads[i];
+        if UNIX_CALL_THREADS.contains(&t.name.as_str()) {
+            let image = |at| self.modules.find(at).map(|m| m.base);
+            if let Some(base) = image(rip)
+                && image(t.start) == Some(base)
+            {
+                return true;
+            }
+        }
+        let outside = self.modules.find(rip).is_none();
+        if stands_still(t.last_rip, t.same_rip, rip, outside) && self.learned.len() < LEARNED_MOST {
+            self.learned.insert(rip);
+            return true;
+        }
+        false
     }
 
     /// What a thread standing at `rip` is doing.
@@ -849,6 +899,8 @@ impl Sampler {
             start,
             waits_in_row: 0,
             unseen_last: false,
+            last_rip: 0,
+            same_rip: 0,
             last_us: 0,
             failures: 0,
             ended: None,
@@ -1040,6 +1092,11 @@ impl Sampler {
             frames: self.presented_then - self.presented_from,
             running_rounds: self.running_rounds.to_vec(),
             waits_known: self.waits.len(),
+            learned: {
+                let mut l: Vec<u64> = self.learned.iter().copied().collect();
+                l.sort_unstable();
+                l
+            },
             skipped: self.skipped,
             quiet_ms: self.config.quiet_ms,
             starts: self
@@ -1118,6 +1175,13 @@ fn interval_us(rate: f64, risk: f64, exposure_us: f64) -> u64 {
 }
 
 /// The address ranges of the wait functions' stubs.
+/// mac: whether a thread now at `rip`, last at `last` for `same` looks in a
+/// row before that, stands still outside every image (`outside`) long
+/// enough for `rip` to be a wait.
+fn stands_still(last: u64, same: u32, rip: u64, outside: bool) -> bool {
+    outside && rip != 0 && rip == last && same + 1 >= SAME_AFTER
+}
+
 /// The stubs of the kernel calls `calls` names, by module.
 fn stubs(calls: &[(&str, &[&str])]) -> Vec<(u64, u64)> {
     let mut list = Vec::new();
@@ -1478,6 +1542,68 @@ mod tests {
                 "thread {} read as running: {acc:?}",
                 t.id
             );
+        }
+    }
+
+    /// mac: an address outside every image is a wait once a thread stood
+    /// there in 4 looks in a row, never inside an image, never at 0.
+    #[test]
+    fn a_still_unix_address_becomes_a_wait() {
+        let at = 0x7ff8_0798_7580;
+        assert!(!stands_still(0, 0, at, true), "first look");
+        assert!(!stands_still(at, 0, at, true), "second look");
+        assert!(!stands_still(at, 1, at, true), "third look");
+        assert!(stands_still(at, 2, at, true), "fourth look");
+        assert!(!stands_still(at, 2, at, false), "inside an image");
+        assert!(!stands_still(at + 4, 2, at, true), "moved");
+        assert!(!stands_still(0, 5, 0, true), "no address");
+    }
+
+    /// mac: a thread named as one of `UNIX_CALL_THREADS` counts as waiting
+    /// in the image it started in; another thread doing the same runs.
+    #[test]
+    fn audio_timer_threads_count_as_waiting() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
+        let workers: Vec<_> = (0..2)
+            .map(|which| {
+                let (stop, tx) = (stop.clone(), tx.clone());
+                let name = if which == 0 { UNIX_CALL_THREADS[0] } else { "plain spinner" };
+                std::thread::Builder::new()
+                    .name(name.into())
+                    .spawn(move || {
+                        // SAFETY: a plain query.
+                        tx.send((which, unsafe { GetCurrentThreadId() })).unwrap();
+                        calls_spin(&stop)
+                    })
+                    .unwrap()
+            })
+            .collect();
+        let mut ids = [0u32; 2];
+        for _ in 0..2 {
+            let (which, id) = rx.recv().unwrap();
+            ids[which] = id;
+        }
+        let filter = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let mut s = Sampler::new(config(&filter, "NUL"), Vec::new()).unwrap();
+        s.list_modules();
+        run_for(&mut s, Duration::from_millis(600));
+        stop.store(true, Relaxed);
+        for w in workers {
+            w.join().unwrap();
+        }
+        eprintln!("audio timer and spinner: {}", stats(&s));
+        assert_eq!(s.threads.len(), 2);
+        for t in &s.threads {
+            let acc = t.totals.acc;
+            eprintln!("  thread {} \"{}\": {acc:?}", t.id, t.name);
+            assert!(acc.all.samples >= 50, "{acc:?}");
+            if t.id == ids[0] {
+                assert_eq!(t.name, UNIX_CALL_THREADS[0]);
+                assert!(acc.running.samples * 10 <= acc.all.samples, "the timer thread runs: {acc:?}");
+            } else {
+                assert!(acc.running.samples * 10 >= acc.all.samples * 9, "the spinner waits: {acc:?}");
+            }
         }
     }
 

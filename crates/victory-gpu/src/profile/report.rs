@@ -341,6 +341,9 @@ pub(crate) struct Header {
     pub(crate) running_rounds: Vec<u64>,
     /// Waits recognised (wait functions found in ntdll and win32u).
     pub(crate) waits_known: usize,
+    /// mac: wait addresses learned outside every image (a thread stood
+    /// still there).
+    pub(crate) learned: Vec<u64>,
     /// Looks left out, and the quiet time after an exception that does it.
     pub(crate) skipped: u64,
     pub(crate) quiet_ms: f64,
@@ -564,6 +567,18 @@ pub(crate) fn render(
         } else {
             " per second"
         }
+    );
+    if !h.learned.is_empty() {
+        let names: Vec<String> = h.learned.iter().map(|&at| name(at)).collect();
+        let _ = writeln!(
+            out,
+            "waits learned outside every image (a thread stood still there in 4 looks in a row): {}",
+            names.join(", ")
+        );
+    }
+    let _ = writeln!(
+        out,
+        "threads named audio_client_timer count as waiting in the image they started in (one Unix call for their life)"
     );
     let whole = a.running.us;
 

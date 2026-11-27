@@ -1936,6 +1936,9 @@ mod tests {
             let t = std::time::Instant::now();
             let read = gpu_read(&h.device, &heap.backing, (len - 4096) as u64, 4096);
             let copied = t.elapsed();
+            let t = std::time::Instant::now();
+            let _ = gpu_read(&h.device, &heap.backing, (len / 2) as u64, 4096);
+            let again = t.elapsed();
             gpu_write(&h.device, &heap.backing, (len - 8192) as u64, &pattern);
             // SAFETY: inside the last view.
             let seen = unsafe { std::slice::from_raw_parts(views[1].add(VIEW - 8192), 4096) };
@@ -1945,7 +1948,7 @@ mod tests {
             let alive = unsafe { h.device.GetDeviceRemovedReason() }.is_ok();
             total += len;
             println!(
-                "heap {mib} MiB (total held {} MiB): made {:.1} ms, first touch {:.1} ms ({:.2} us/16K page, zero {}), 2 views {:.2} ms ok {ok}, gpu read ok {} ({:.2} ms), gpu write seen {}, gpu va {gpu:#x}, device alive {alive}",
+                "heap {mib} MiB (total held {} MiB): made {:.1} ms, first touch {:.1} ms ({:.2} us/16K page, zero {}), 2 views {:.2} ms ok {ok}, gpu read ok {} ({:.2} ms, a second {:.2} ms), gpu write seen {}, gpu va {gpu:#x}, device alive {alive}",
                 total >> 20,
                 made.as_secs_f64() * 1e3,
                 touched.as_secs_f64() * 1e3,
@@ -1954,6 +1957,7 @@ mod tests {
                 aliased.as_secs_f64() * 1e3,
                 read == pattern,
                 copied.as_secs_f64() * 1e3,
+                again.as_secs_f64() * 1e3,
                 seen == &pattern[..],
             );
             for view in views {

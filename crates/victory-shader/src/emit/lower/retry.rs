@@ -9,14 +9,28 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     lower_pruned(parts, None, false, false)
 }
 
+#[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) fn lower_pruned(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
     literal_halves: bool,
 ) -> Result<Lowered, ShaderError> {
+    lower_limited(parts, keep, per_vertex_center, literal_halves, false)
+}
+
+/// [`lower_pruned`]; `limits`: a compute program that can leave the lanes
+/// past a dispatch's count of threads does so at once
+/// ([`Lower::leave_past_the_count`]; never in literal halves).
+pub(crate) fn lower_limited(
+    parts: &Parts,
+    keep: Option<&KeptOutputs>,
+    per_vertex_center: bool,
+    literal_halves: bool,
+    limits: bool,
+) -> Result<Lowered, ShaderError> {
     // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
+    let original = lower_with_structure(parts, keep, per_vertex_center, limits);
     if !literal_halves
         || !parts.host_wave32
         || !parts.native.wave64
@@ -72,6 +86,9 @@ pub(crate) fn lower_literal(
         },
         keep,
         per_vertex_center,
+        // A group in literal halves takes one path: its lanes never leave
+        // past a count of threads (`Lower::can_leave_past_a_count`).
+        false,
     )
 }
 
@@ -79,6 +96,7 @@ fn lower_with_structure(
     parts: &Parts,
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
+    limits: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     // Divergent sites where the halves meet (`lower::meet`): a pass that
@@ -86,7 +104,7 @@ fn lower_with_structure(
     let mut plan: Set<MeetSite> = Set::default();
     loop {
         let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run();
+        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run(limits);
         let found = found.into_inner();
         if !found.is_empty() {
             plan.extend(found);

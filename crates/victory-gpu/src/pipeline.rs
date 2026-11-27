@@ -209,6 +209,9 @@ pub(crate) struct Translated {
     /// Whether any buffer store or atomic could not be matched to a known
     /// descriptor in [`Translated::used`], so all table UAVs keep writeback.
     pub(crate) write_unknown: bool,
+    /// A compute program's threads in a group (`numthreads`), which a
+    /// dispatch counted in threads divides by (`draw::dispatch_groups`).
+    pub(crate) threads: Option<[u32; 3]>,
 }
 
 #[cfg(windows)]
@@ -240,7 +243,11 @@ impl Shader {
                             && done.0.as_ref().is_ok_and(|t| {
                                 victory_shader::emit::needs_vertex_deltas(&t.host.dxil)
                             }));
-                    if !keep {
+                    // A compute program that may leave the lanes past a
+                    // dispatch's count of threads is translated again for
+                    // that if one comes (`thread_limited`).
+                    let limits = done.0.as_ref().is_ok_and(|t| may_limit_threads(t.threads));
+                    if !keep && !limits {
                         *container = Vec::new();
                     }
                     done
@@ -332,6 +339,7 @@ fn with_resources(
     container: &[u8],
     host: victory_shader::emit::HostShader,
 ) -> Result<Translated, String> {
+    use victory_shader::native::StageIo;
     use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
@@ -343,6 +351,10 @@ fn with_resources(
             p.stage,
             HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs
         )
+    });
+    let threads = chosen.and_then(|p| match p.io {
+        StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
     });
     let used = chosen.map(|p| p.used.clone()).unwrap_or_default();
     let (used_written, mut write_unknown) = chosen
@@ -357,6 +369,7 @@ fn with_resources(
         used,
         used_written,
         write_unknown,
+        threads,
     })
 }
 
@@ -488,6 +501,86 @@ fn written_used(
     (written, unknown)
 }
 
+/// Whether a compute program of `threads` per group could leave the lanes
+/// past a dispatch's count of threads ([`thread_limited`]): one dimension,
+/// more than one thread. Its container is kept for that translation.
+#[cfg(windows)]
+fn may_limit_threads(threads: Option<[u32; 3]>) -> bool {
+    threads.is_some_and(|t| t[0] > 1 && t[1..] == [1, 1])
+}
+
+/// The host pipeline of compute pipeline `p` whose lanes past a dispatch's
+/// count of threads leave at once (`emit::Options::thread_limits`), made on
+/// the first dispatch counted in threads that ends in a part of a group
+/// (`draw::State::dispatch_x`): its shader translated again, so programs
+/// no such dispatch reaches keep their translation. None where the program
+/// cannot leave them (a group barrier, 32-lane halves passing values) or
+/// that translation or pipeline fails; asked once per shader.
+#[cfg(windows)]
+pub(crate) fn thread_limited(p: &host::HostPipeline) -> Option<&'static host::HostPipeline> {
+    type Made = HashMap<[u8; 32], Option<&'static host::HostPipeline>>;
+    static MADE: Mutex<Option<Made>> = Mutex::new(None);
+    let shader = &p.stages.first().filter(|_| p.compute)?.shader;
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&hit) = made.as_ref().and_then(|m| m.get(&shader.full_hash)) {
+        return hit;
+    }
+    let started = std::time::Instant::now();
+    let limited = make_thread_limited(shader);
+    tracing::info!(
+        hash = %shader.hash,
+        made = limited.is_some(),
+        ms = started.elapsed().as_millis() as u64,
+        "a compute pipeline whose lanes past a dispatch's count of threads leave"
+    );
+    made.get_or_insert_with(HashMap::new)
+        .insert(shader.full_hash, limited);
+    limited
+}
+
+#[cfg(windows)]
+fn make_thread_limited(shader: &Shader) -> Option<&'static host::HostPipeline> {
+    let t = shader.translated()?;
+    let mut bytes = shader
+        .container
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if bytes.is_empty()
+        && let (Some(full), Some(dir)) = (shader.spilled.get(), SPILL_DIR.get())
+    {
+        bytes = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
+    }
+    if bytes.is_empty() {
+        tracing::warn!(hash = %shader.hash, "no container left to translate with thread limits");
+        return None;
+    }
+    let options = victory_shader::emit::Options {
+        thread_limits: true,
+        ..crate::shader_cache::runtime_options()
+    };
+    let host = match crate::shader_cache::host_shader_with(&bytes, options).0 {
+        Ok(host) => host,
+        Err(e) => {
+            tracing::warn!(hash = %shader.hash, error = %e, "no translation with thread limits");
+            return None;
+        }
+    };
+    let kind = victory_shader::RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X);
+    if !host.user_data.iter().any(|u| u.root == kind) {
+        return None;
+    }
+    let limited = shader.with_translation(Translated {
+        host,
+        used: t.used.clone(),
+        used_written: t.used_written.clone(),
+        write_unknown: t.write_unknown,
+        threads: t.threads,
+    });
+    let p = host::HostPipeline::new(&[limited], None, |_, _| {})?;
+    Some(Box::leak(Box::new(p)))
+}
+
 #[cfg(windows)]
 fn link_mesh_outputs() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -609,6 +702,7 @@ pub(crate) fn translate_linked(
                 used: ms_t.used.clone(),
                 used_written: ms_t.used_written.clone(),
                 write_unknown: ms_t.write_unknown,
+                threads: None,
             });
             let pixel = match (ps, ps_host) {
                 (Some(p), Some(host)) => {
@@ -618,6 +712,7 @@ pub(crate) fn translate_linked(
                         used: p_t.used.clone(),
                         used_written: p_t.used_written.clone(),
                         write_unknown: p_t.write_unknown,
+                        threads: None,
                     }))
                 }
                 _ => None,
@@ -689,6 +784,7 @@ pub(crate) fn translate_pixel_center(ps: &Shader) -> Option<Arc<Shader>> {
                     used,
                     used_written,
                     write_unknown,
+                    threads: ps_t.threads,
                 }))
             }
             Err(e) => {
@@ -1198,6 +1294,8 @@ mod make;
 mod schedule;
 #[cfg(all(test, windows, feature = "diagnostics"))]
 mod placed_uav_tests;
+#[cfg(all(test, windows))]
+mod thread_dispatch_tests;
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

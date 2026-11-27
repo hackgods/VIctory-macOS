@@ -5469,6 +5469,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 used: native.used,
                 used_written: Vec::new(),
                 write_unknown: true,
+                threads: None,
             },
         );
         let Some(hp) = HostPipeline::new(&[shader], None, |_, _| {}) else {

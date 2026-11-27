@@ -91,6 +91,7 @@ fn store_shader() -> Arc<Shader> {
             used: native.used,
             used_written: Vec::new(),
             write_unknown: true,
+            threads: Some([1, 1, 1]),
         })),
     })
 }

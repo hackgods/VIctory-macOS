@@ -810,6 +810,9 @@ impl State {
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
+            // Every lane of every group, unless the dispatch counts threads
+            // (`dispatch_x`, which sets it after).
+            (_, RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS_X)) => 0,
             (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
                 (address >> (32 * dword)) as u32
             }
@@ -1531,6 +1534,15 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_x(list, x, y, z, 0);
+    }
+
+    /// Runs a dispatch with the console's dispatch flags (`DispatchX`), of
+    /// which the host follows [`THREAD_DIMENSIONS`]: the counts are then
+    /// threads, run as the groups that hold them. Where the last group
+    /// along x is a part of one, the pipeline's form whose lanes past the
+    /// count leave runs instead (`crate::pipeline::thread_limited`).
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1558,7 +1570,7 @@ impl State {
             });
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(mut p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1572,14 +1584,49 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let threads = [x, y, z];
+        let counted = flags & THREAD_DIMENSIONS != 0 && thread_dimensions();
+        let size = counted
+            .then(|| p.stages.first().and_then(|s| s.translated().threads))
+            .flatten();
+        if counted && size.is_none() {
+            once!(pipeline = %p.name, "a dispatch counted in threads without the program's group size: run as groups");
+        }
+        let [x, y, z] = size.map_or(threads, |size| dispatch_groups(threads, size));
+        // The word that tells such a form's lanes how many threads run.
+        let mut limit = None;
+        if let Some(size) = size {
+            let partial = (0..3).any(|i| !threads[i].is_multiple_of(size[i]));
+            let limited = (partial && size[1..] == [1, 1])
+                .then(|| crate::pipeline::thread_limited(p))
+                .flatten();
+            note_counted_in_threads(&p.name, threads, size, partial, limited.is_some());
+            if let Some(limited) = limited {
+                p = limited;
+                limit = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X);
+            }
+        }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        if let Some((param, word)) = limit {
+            // SAFETY: an open list; the root signature has the word (`bind`
+            // set it to 0, all of every group).
+            unsafe {
+                list.list
+                    .SetComputeRoot32BitConstant(param, threads[0], word)
+            };
+        }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| {
+            self.op_text(
+                format!("dispatch {x}x{y}x{z} (asked {threads:?}, flags {flags:#x})"),
+                true,
+            )
+        });
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         // SAFETY: an open list with everything set.
@@ -2987,6 +3034,78 @@ fn is_root_view_offset(u: &victory_shader::emit::UserData) -> bool {
 /// Whether a shader reads root views through views the host makes.
 fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
     t.user_data.iter().any(is_root_view)
+}
+
+/// `DispatchX`'s flag that the counts are threads, not groups (the console's
+/// dispatch initiator bit "use thread dimensions"; DexNom/VIctory bc3cd4b0).
+/// Taken for groups, a stage of the ray-tracing structure builder ran up to
+/// 64 times its threads and stored over the structures after its own.
+const THREAD_DIMENSIONS: u32 = 0x20;
+
+/// `VICTORY_THREAD_DIMENSIONS=0`: such counts are taken for groups, as before.
+fn thread_dimensions() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_THREAD_DIMENSIONS").is_none_or(|v| v != "0"))
+}
+
+/// The groups of `size` threads that hold `threads`.
+fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> [u32; 3] {
+    std::array::from_fn(|i| threads[i].div_ceil(size[i]))
+}
+
+/// Where a compute pipeline's user data has a word of `kind` the host
+/// computes (`RootType::Other`): the root parameter and its dword there.
+fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
+    let stage = p.stages.first().filter(|_| p.compute)?;
+    let (param, _) = stage.user_data?;
+    let host = &stage.translated().host;
+    let word = host
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(kind))?;
+    Some((param, word.index))
+}
+
+/// Logs each pipeline's first dispatch counted in threads: what it asked
+/// for, its group, whether the last group is a part of one (`partial`) and
+/// whether the form whose lanes past the count leave runs it (`limited`);
+/// a part of a group without it runs whole (a warning).
+fn note_counted_in_threads(
+    name: &str,
+    threads: [u32; 3],
+    size: [u32; 3],
+    partial: bool,
+    limited: bool,
+) {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    THREAD_COUNTED.fetch_add(1, Ordering::Relaxed);
+    if !SEEN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_owned())
+    {
+        return;
+    }
+    if partial && !limited {
+        tracing::warn!(
+            pipeline = name,
+            ?threads,
+            group = ?size,
+            "a dispatch counted in threads whose program cannot leave the lanes past the count: its last group runs whole"
+        );
+    } else {
+        tracing::info!(pipeline = name, ?threads, group = ?size, partial, limited, "a dispatch counted in threads");
+    }
+}
+
+/// Dispatches counted in threads (`DispatchX`) so far.
+static THREAD_COUNTED: AtomicU64 = AtomicU64::new(0);
+
+/// Dispatches counted in threads so far.
+#[cfg(test)]
+pub(crate) fn thread_counted() -> u64 {
+    THREAD_COUNTED.load(Ordering::Relaxed)
 }
 
 /// The console's own primitive topologies.
@@ -5541,6 +5660,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 used: used_entries,
                 used_written: Vec::new(),
                 write_unknown: true,
+                threads: None,
             },
         );
         let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("compute host pipeline");
@@ -6173,6 +6293,7 @@ void main() {
                 used: Vec::new(),
                 used_written: Vec::new(),
                 write_unknown: true,
+                threads: None,
             },
         );
         let hp = HostPipeline {

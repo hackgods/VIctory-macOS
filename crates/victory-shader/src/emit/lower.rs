@@ -34,6 +34,7 @@ mod round_mode;
 mod mesh;
 mod predicate;
 mod retry;
+mod thread_limits;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
@@ -45,9 +46,9 @@ use packed::packed_half;
 use round_mode::{round16, round16_after};
 #[cfg(any(test, all(windows, feature = "host")))]
 pub(crate) use retry::lower;
+pub(crate) use retry::lower_limited;
 #[cfg(all(test, windows))]
-pub(crate) use retry::lower_literal;
-pub(crate) use retry::lower_pruned;
+pub(crate) use retry::{lower_literal, lower_pruned};
 
 type Why = &'static str;
 
@@ -1524,9 +1525,12 @@ impl<'a> Lower<'a> {
         Ok(if float { self.as_int(r) } else { r })
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn run(mut self, limits: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
         self.halves_only = self.places_read_as_halves();
+        if limits && self.can_leave_past_a_count() {
+            self.leave_past_the_count();
+        }
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;

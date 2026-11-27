@@ -702,6 +702,7 @@ mod tests {
                 used: Vec::new(),
                 used_written: Vec::new(),
                 write_unknown: true,
+                threads: None,
             },
         );
 
@@ -821,6 +822,7 @@ mod tests {
                 used: ps_used,
                 used_written: Vec::new(),
                 write_unknown: true,
+                threads: None,
             },
         );
         let mut gfx = GraphicsState::default();

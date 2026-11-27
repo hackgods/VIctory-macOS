@@ -129,6 +129,30 @@ pub(crate) fn floor(value: Option<&str>) -> f32 {
         .unwrap_or(FLOOR)
 }
 
+/// `VICTORY_AMBIENT_REFLECT_FLOOR=<part>`: the least a reflection holds, as
+/// a part of the light around the point seen there: the same light the
+/// hold's cap is a part of (the `HOLD` pass of [`SOURCE`]: the points' light
+/// there with the slow mean's part, times the estimate's share, or the
+/// floor's light where that is more). Unset, 0 or unreadable: none, the
+/// hold only caps. A reflection darker than that is replaced by it, in the
+/// colour of that light, as the constant stand-in's least (`crate::ambient`,
+/// the file's tenth number) does; one brighter is left as it is. It rides
+/// on the hold: nothing with `VICTORY_AMBIENT_REFLECT=0`.
+///
+/// Without rays the title's reflection image is 0 almost everywhere indoors
+/// (the cell, capture 01:50 in `notes/black-objects.md`: 93% of the frame).
+/// Metal gets no diffuse light and all of its light through that image, so
+/// steel there is black; the lighting weighs the reflection by each
+/// surface's specular colour, so this lights steel (F0 about 0.55) about
+/// fourteen times as much as a painted wall (F0 0.04).
+/// shortcut: stands in for what the title's traced reflections would see.
+pub(crate) fn reflect_floor(value: Option<&str>) -> f32 {
+    value
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|p: &f32| p.is_finite() && *p >= 0.0)
+        .unwrap_or(0.0)
+}
+
 /// What the floor is made of, as the passes are given it
 /// ([`Pass::sky`], [`Pass::floor`]): `share` of the constant stand-in's
 /// light, which is `level` times `tint`, or with `follow` (gain, least,
@@ -318,6 +342,7 @@ cbuffer Set : register(b0) {
     float mean_part; float turn; float least_part; float most_part;
     float sky_gain; float sky_least; float sky_power; float floor_r;
     float floor_g; float floor_b; uint sky_width; uint sky_height;
+    float reflect_least;
 };
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are, and at FLOOR_AT the least light any texel
@@ -565,7 +590,8 @@ void main(uint3 at : SV_DispatchThreadID) {
 #ifdef HOLD
 RWTexture2D<uint> light : register(u0);
 // Reflections: no brighter than a part of the light around the point seen
-// there (the slow mean's part of it as for the light itself).
+// there (the slow mean's part of it as for the light itself), and, with
+// reflect_least, no darker than another part of it.
 [numthreads(8, 8, 1)]
 void main(uint3 at : SV_DispatchThreadID) {
     if (at.x >= width || at.y >= height) return;
@@ -575,7 +601,14 @@ void main(uint3 at : SV_DispatchThreadID) {
     float cap = max(luma(lerp(seen_there, cells[CELLS].rgb, mean_part)) * level, luma(cells[FLOOR_AT].rgb)) * held;
     float3 there = unpack(light[at.xy]);
     float has = luma(there);
-    if (has > cap) light[at.xy] = pack(there * (cap / has));
+    if (has > cap) {
+        light[at.xy] = pack(there * (cap / has));
+    } else if (reflect_least > 0.0) {
+        float3 around = lerp(seen_there, cells[CELLS].rgb, mean_part) * level;
+        if (luma(around) < luma(cells[FLOOR_AT].rgb)) around = cells[FLOOR_AT].rgb;
+        float3 least = around * reflect_least;
+        if (has < luma(least)) light[at.xy] = pack(least);
+    }
 }
 #endif
 "#;
@@ -636,10 +669,13 @@ pub(crate) struct Pass {
     pub(crate) sky: [f32; 3],
     pub(crate) floor: [f32; 3],
     pub(crate) sky_size: [u32; 2],
+    /// [`reflect_floor`]: the least a reflection holds, as a part of the
+    /// light around (0: none).
+    pub(crate) reflect_least: f32,
 }
 
 /// Dwords of the passes' constant buffer.
-pub(crate) const CONSTANTS: usize = 28;
+pub(crate) const CONSTANTS: usize = 29;
 
 /// A pass's root constants, in the order the constant buffer declares them
 /// (all scalars, so four to a row whatever the compiler's packing).
@@ -655,7 +691,8 @@ pub(crate) fn constants(p: &Pass) -> [u32; CONSTANTS] {
     out[16..20].copy_from_slice(&p.mix.map(f32::to_bits));
     out[20..23].copy_from_slice(&p.sky.map(f32::to_bits));
     out[23..26].copy_from_slice(&p.floor.map(f32::to_bits));
-    out[26..].copy_from_slice(&p.sky_size);
+    out[26..28].copy_from_slice(&p.sky_size);
+    out[28] = p.reflect_least.to_bits();
     out
 }
 
@@ -1083,11 +1120,24 @@ pub(crate) mod reference {
     }
 
     /// [`hold`] with the floor's light `least` counted as light around.
+    /// With [`super::Pass::reflect_least`], a reflection no brighter than
+    /// the cap and darker than that part of the light around is that part
+    /// of it, in its colour.
     pub(crate) fn hold_over(there: V3, set: &super::Pass, around: V3, seen_there: V3, least: V3) -> V3 {
-        let light = [0, 1, 2].map(|k| seen_there[k] + (around[k] - seen_there[k]) * set.mix[0]);
-        let cap = (luma(light) * set.level).max(luma(least)) * set.held;
+        let light = [0, 1, 2].map(|k| (seen_there[k] + (around[k] - seen_there[k]) * set.mix[0]) * set.level);
+        let cap = luma(light).max(luma(least)) * set.held;
         let has = luma(there);
-        if has > cap { there.map(|v| v * (cap / has)) } else { there }
+        if has > cap {
+            return there.map(|v| v * (cap / has));
+        }
+        if set.reflect_least > 0.0 {
+            let around = if luma(light) < luma(least) { least } else { light };
+            let floor = around.map(|v| v * set.reflect_least);
+            if has < luma(floor) {
+                return floor;
+            }
+        }
+        there
     }
 
     /// The light that follows the sky dome, as the `MEAN` pass (and
@@ -1198,6 +1248,41 @@ mod tests {
         assert!(near(hold([9.0; 3], &SET, [0.02; 3], [0.01; 3])[0], 0.5 * 0.012, 1e-4));
         // With all of it the slow mean.
         assert!(near(hold([9.0; 3], &Pass { mix: [1.0, 1.2, 0.2, 2.5], ..SET }, around, there)[0], 0.1, 1e-4));
+    }
+
+    /// The reflection floor: off unless set; set, a black reflection is
+    /// that part of the light around (in its colour, against the floor's
+    /// light where the room is darker), a brighter one is left alone, and
+    /// the cap still holds.
+    #[test]
+    fn the_reflection_floor_is_a_part_of_the_light_around() {
+        assert_eq!(reflect_floor(None), 0.0);
+        assert_eq!(reflect_floor(Some("x")), 0.0);
+        assert_eq!(reflect_floor(Some("-1")), 0.0);
+        assert_eq!(reflect_floor(Some(" 0.15 ")), 0.15);
+        use super::reference::{hold, hold_over};
+        let (around, seen) = ([0.2f32, 0.2, 0.4], [1.0f32, 0.5, 0.25]);
+        let least = [0.25f32, 0.25, 0.3];
+        // Unset (and 0): exactly the hold without it.
+        for there in [[0.0; 3], [0.001, 0.0, 0.0], [0.1; 3], [9.0, 4.0, 2.0]] {
+            assert_eq!(hold_over(there, &SET, around, seen, least), hold_over(there, &Pass { reflect_least: 0.0, ..SET }, around, seen, least));
+            assert_eq!(hold(there, &Pass { reflect_least: 0.0, ..SET }, around, seen), hold(there, &SET, around, seen));
+        }
+        let floored = Pass { reflect_least: 0.15, ..SET };
+        // The light around there: 0.8 of the point's, 0.2 of the slow mean.
+        let light = [0.84f32, 0.44, 0.28];
+        let got = hold([0.0; 3], &floored, around, seen);
+        assert!((0..3).all(|k| near(got[k], light[k] * 0.15, 1e-6)), "{got:?}");
+        // With the estimate's share.
+        let half = Pass { level: 0.5, ..floored };
+        let got = hold([0.0; 3], &half, around, seen);
+        assert!((0..3).all(|k| near(got[k], light[k] * 0.5 * 0.15, 1e-6)), "{got:?}");
+        // A brighter reflection is left alone; one above the cap is capped.
+        assert_eq!(hold([0.2, 0.1, 0.05], &floored, around, seen), [0.2, 0.1, 0.05]);
+        assert_eq!(hold([9.0; 3], &floored, around, seen), hold([9.0; 3], &SET, around, seen));
+        // In a room darker than the floor's light: a part of the floor's.
+        let got = hold_over([0.0; 3], &floored, [0.002; 3], [0.002; 3], least);
+        assert!((0..3).all(|k| near(got[k], least[k] * 0.15, 1e-6)), "{got:?}");
     }
 
     #[test]
@@ -1369,6 +1454,7 @@ mod tests {
             sky: [0.108, 0.05, 0.4],
             floor: [0.18, 0.17, 0.16],
             sky_size: [128, 64],
+            reflect_least: 0.15,
         };
         let c = constants(&p);
         let floats: Vec<f32> = c[..7].iter().map(|&w| f32::from_bits(w)).collect();
@@ -1382,11 +1468,12 @@ mod tests {
             c[20..26].iter().map(|&w| f32::from_bits(w)).collect::<Vec<_>>(),
             [0.108, 0.05, 0.4, 0.18, 0.17, 0.16]
         );
-        assert_eq!(c[26..], [128, 64]);
+        assert_eq!(c[26..28], [128, 64]);
+        assert_eq!(f32::from_bits(c[28]), 0.15);
         let declared = declared(SOURCE);
         assert_eq!(
             declared,
-            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held", "mean_part", "turn", "least_part", "most_part", "sky_gain", "sky_least", "sky_power", "floor_r", "floor_g", "floor_b", "sky_width", "sky_height"]
+            ["level", "strength", "radius", "near_z", "tan_y", "follow", "most", "width", "height", "flat", "air", "slices", "jump", "fresh", "dt", "held", "mean_part", "turn", "least_part", "most_part", "sky_gain", "sky_least", "sky_power", "floor_r", "floor_g", "floor_b", "sky_width", "sky_height", "reflect_least"]
         );
         assert_eq!(declared.len(), CONSTANTS);
     }
@@ -1582,6 +1669,7 @@ mod tests {
         sky: [0.0, 0.0, 1.0],
         floor: [0.0; 3],
         sky_size: [0, 0],
+        reflect_least: 0.0,
     };
 
     /// Texels are placed by their depth: the picture's middle straight

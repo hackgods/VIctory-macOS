@@ -1863,7 +1863,8 @@ const RAM_LOW: f64 = 0.10;
 const RAM_FREE: f64 = 0.15;
 
 /// The bytes [`evict_unused`] gives up for the computer's free memory
-/// ([`RAM_LOW`]): none unless the card's memory is unified.
+/// ([`RAM_LOW`]) or the macOS kernel's memory pressure
+/// ([`pressure_excess`]): none unless the card's memory is unified.
 #[cfg(windows)]
 fn ram_over() -> u64 {
     if !unified() {
@@ -1877,7 +1878,31 @@ fn ram_over() -> u64 {
     if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
         return 0;
     }
-    ram_excess(m.ullAvailPhys, m.ullTotalPhys, ram_marks())
+    let free = ram_excess(m.ullAvailPhys, m.ullTotalPhys, ram_marks());
+    free.max(pressure_excess(crate::mac_pressure::now(), m.ullTotalPhys))
+}
+
+/// The share of the computer's memory given up each presented frame while
+/// the macOS kernel warns of memory pressure, and while it is short.
+/// Wine's free memory stays far above [`RAM_LOW`] while macOS compresses
+/// and swaps (`crate::mac_pressure`), so the kernel's word is taken too. A
+/// slice a frame rather than all at once: what goes is made again from
+/// title memory when it is asked for, and a frame later the kernel says
+/// whether that was enough.
+#[cfg(windows)]
+const PRESSURE_SHARES: [f64; 2] = [0.01, 0.04];
+
+/// The bytes to give up for the macOS kernel's memory `pressure`, with
+/// `total` bytes of memory: none without pressure or a reading.
+#[cfg(windows)]
+fn pressure_excess(pressure: Option<crate::mac_pressure::Pressure>, total: u64) -> u64 {
+    use crate::mac_pressure::Pressure;
+    let share = match pressure {
+        Some(Pressure::Warn) => PRESSURE_SHARES[0],
+        Some(Pressure::Critical) => PRESSURE_SHARES[1],
+        Some(Pressure::Normal) | None => return 0,
+    };
+    (share * total as f64) as u64
 }
 
 /// With `available` of `total` bytes free: what to give up so that
@@ -3021,6 +3046,27 @@ mod tests {
             ram_excess(0, 8 * gb, marks),
             (0.15 * (8 * gb) as f64) as u64
         );
+    }
+
+    /// The macOS kernel's warning gives up a slice of the computer's memory
+    /// a frame, its shortage a larger one, and no pressure or no reading
+    /// none, whatever Wine says is free.
+    #[cfg(windows)]
+    #[test]
+    fn macos_memory_pressure_gives_up_a_slice_a_frame() {
+        use crate::mac_pressure::Pressure;
+        let total = 24u64 << 30;
+        assert_eq!(pressure_excess(None, total), 0);
+        assert_eq!(pressure_excess(Some(Pressure::Normal), total), 0);
+        let warn = pressure_excess(Some(Pressure::Warn), total);
+        let critical = pressure_excess(Some(Pressure::Critical), total);
+        assert_eq!(warn, (0.01 * total as f64) as u64);
+        assert!(critical > warn);
+        // Wine said 17 % free on 24 GB while macOS swapped: the free-memory
+        // marks give up nothing there, the kernel's warning does.
+        let wine_free = (0.17 * total as f64) as u64;
+        assert_eq!(ram_excess(wine_free, total, ram_marks_from(None, None)), 0);
+        assert!(warn > 0);
     }
 
     /// `VICTORY_RAM_LOW` and `VICTORY_RAM_FREE` move the two shares, and

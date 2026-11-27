@@ -236,6 +236,10 @@ struct Shared {
     table: ID3D12Resource,
     data: usize,
     gpu: u64,
+    /// The table of lists that only look addresses up ([`bind_table`]),
+    /// where that is another than the one shaders also write through
+    /// ([`split`]): it names every copy, whatever [`names`] says.
+    reads: bool,
     /// The pair of null views entries without a copy name.
     null: u32,
     /// Each copy's view pair (its first slot), by copy.
@@ -252,6 +256,20 @@ struct Shared {
 // SAFETY: `data` is the persistent mapping of `table`, written only under
 // the lock; D3D12 resources are free-threaded.
 unsafe impl Send for Shared {}
+
+/// Whether a page table that shaders write through names `copy`. Every
+/// copy here; where title memory is used in place, shaders must not write
+/// it, and the tables they write through leave it out.
+pub(crate) fn names(_copy: &Shadow) -> bool {
+    true
+}
+
+/// Whether [`names`] leaves copies out: lists that only look addresses up
+/// (views taken from the title's records) then get a table of their own,
+/// which names every copy and whose view pairs are only ever read through.
+pub(crate) fn split() -> bool {
+    false
+}
 
 /// Page tables by view heap (the title heap's address, or [`OURS`]).
 static SHARED: Mutex<Vec<(usize, Shared)>> = Mutex::new(Vec::new());
@@ -455,6 +473,7 @@ impl Shared {
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
             host: std::ptr::from_ref(heap) as usize,
+            reads: false,
             table,
             data: data as usize,
             gpu,
@@ -471,7 +490,11 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
-        let copies = crate::shadow::all();
+        let reads = self.reads;
+        let copies: Vec<_> = crate::shadow::all()
+            .into_iter()
+            .filter(|c| reads || names(c))
+            .collect();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|(copy, _), &mut slot| {
             let keep = live.contains(copy);
@@ -541,7 +564,7 @@ impl Shared {
 fn layout(key: usize) -> Arc<Layout> {
     shared()
         .iter()
-        .find(|(k, _)| *k == key)
+        .find(|(k, s)| *k == key && !s.reads)
         .map(|(_, s)| s.layout.clone())
         .unwrap_or_default()
 }
@@ -554,12 +577,19 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     let layout = with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
-            s.rewrite(heap, now);
+        // The heap's tables (two where they are split): each rewritten, and
+        // the copies of the one naming most brought up to date.
+        let mut most: Option<Arc<Layout>> = None;
+        for (_, s) in shared.iter_mut().filter(|(k, s)| *k == key && s.host == host) {
+            if s.generation != now {
+                s.rewrite(heap, now);
+            }
+            if most.as_ref().is_none_or(|l| l.copies.len() < s.layout.copies.len()) {
+                most = Some(s.layout.clone());
+            }
         }
-        Some(s.layout.clone())
+        most
     })
     .flatten();
     // Copies the title has not written since they took it are passed by
@@ -608,23 +638,26 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 /// and the copies it names brought up to date at each submission of the
 /// list; no bitmap, nothing checked or copied back after it.
 pub(crate) fn bind_table(list: &HostList, key: usize) -> Option<u64> {
-    let table = table_of(list, key)?;
+    let table = table_of(list, key, split())?;
     list.defer_memory(key);
     Some(table)
 }
 
 /// The page table of view heap `key`, kept by `list`: made the first time.
-fn table_of(list: &HostList, key: usize) -> Option<u64> {
+/// With `reads`, the one of lists that only look addresses up.
+fn table_of(list: &HostList, key: usize, reads: bool) -> Option<u64> {
     with_heap(key, |heap| {
         let mut shared = shared();
         let host = std::ptr::from_ref(heap) as usize;
-        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
+        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host && s.reads == reads) {
             list.keep(&s.table);
             return Some(s.gpu);
         }
-        // A released heap's table goes with it (lists that name it hold it).
-        shared.retain(|(k, _)| *k != key);
-        let s = Shared::new(heap)?;
+        // A released heap's tables go with it (lists that name them hold
+        // them); this heap's other table stays.
+        shared.retain(|(k, s)| *k != key || s.host == host);
+        let mut s = Shared::new(heap)?;
+        s.reads = reads;
         list.keep(&s.table);
         let gpu = s.gpu;
         shared.push((key, s));
@@ -634,22 +667,7 @@ fn table_of(list: &HostList, key: usize) -> Option<u64> {
 }
 
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
-    let table = with_heap(key, |heap| {
-        let mut shared = shared();
-        let host = std::ptr::from_ref(heap) as usize;
-        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
-            list.keep(&s.table);
-            return Some(s.gpu);
-        }
-        // A released heap's table goes with it (lists that name it hold it).
-        shared.retain(|(k, _)| *k != key);
-        let s = Shared::new(heap)?;
-        list.keep(&s.table);
-        let gpu = s.gpu;
-        shared.push((key, s));
-        Some(gpu)
-    })
-    .flatten()?;
+    let table = table_of(list, key, false)?;
     let pooled = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let dirty = pooled.gpu();
     list.defer_memory(key);

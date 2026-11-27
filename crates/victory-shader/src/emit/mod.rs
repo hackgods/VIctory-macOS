@@ -121,10 +121,10 @@
 //!   the heap-info table (root SRV `t`[`HEAP_RECORDS`] in
 //!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]) gives the
 //!   title address of the bound view heap's first descriptor and its
-//!   slots, and the record's three dwords are read through the title page
-//!   table ("Title memory"; `t0` of the memory space, so
-//!   [`HostShader::memory`] is set, but not
-//!   [`HostShader::memory_writes`]: nothing is marked). A record that
+//!   slots, and the record's three dwords are read through a title page
+//!   table ("Title memory"'s layout; root SRV `t`[`HEAP_PAGES`] there, a
+//!   binding of its own: its views are only read through and nothing is
+//!   marked, so [`HostShader::memory`] is not set by it). A record that
 //!   names a constant buffer view whole (its tag, then kind 1 in the top
 //!   two bits of its third dword: a 47-bit address and 15 bits of size)
 //!   is read at the memory the page table names at that address plus the
@@ -330,7 +330,7 @@ pub use shader::{
     ATOMIC_LOCK_ROUNDS, ATOMIC_LOCK_SPINS, ATOMIC_LOCK_SPINS_DRAWN, ATOMIC_LOCKS, ATOMIC_LOCKS_AT,
     ATOMIC_LOCKS_GAVE_UP_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    HEAP_RECORDS, HEAP_SHAPES, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_PAGES, HEAP_RECORDS, HEAP_SHAPES, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
     VIEW_WRITES_BYTES,
 };
 

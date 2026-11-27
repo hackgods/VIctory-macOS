@@ -1018,8 +1018,12 @@ fn a_constant_buffer_is_taken_from_the_titles_record() {
     let shader = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
     lower::GPU_RECORDS.set(0);
     assert!(shader.heap && !shader.heap_writes);
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES, super::HEAP_RECORDS], "the stride table and heap info");
-    assert!(shader.memory && !shader.memory_writes, "reads the page table, marks nothing");
+    assert_eq!(
+        shader.root_srvs,
+        [VIEW_STRIDES, super::HEAP_RECORDS, super::HEAP_PAGES],
+        "the stride table, heap info and the page table"
+    );
+    assert!(!shader.memory && !shader.memory_writes, "no title memory of its own");
     // The host's own view of slot 1, and title memory holding the heap's
     // records and other constants.
     let own: Vec<u32> = vec![7, 8, 9, 10];
@@ -1085,9 +1089,9 @@ fn a_constant_buffer_is_taken_from_the_titles_record() {
                     &Dispatch {
                         roots: vec![
                             (0, Root::Constants(user_data(&shader))),
-                            (1, Root::View { srv: true, data: info(slots) }),
-                            (2, Root::View { srv: true, data: vec![4, 4, 4, 4, 4, 4] }),
-                            (3, Root::View { srv: true, data: table.clone() }),
+                            (1, Root::View { srv: true, data: table.clone() }),
+                            (2, Root::View { srv: true, data: info(slots) }),
+                            (3, Root::View { srv: true, data: vec![4, 4, 4, 4, 4, 4] }),
                         ],
                         views: &[
                             View::RawUav(32),
@@ -1209,9 +1213,9 @@ fn a_constant_buffer_across_two_copies_is_read_from_both() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
-                        (2, Root::View { srv: true, data: vec![4; 8] }),
-                        (3, Root::View { srv: true, data: table.clone() }),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                        (2, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
+                        (3, Root::View { srv: true, data: vec![4; 8] }),
                     ],
                     views: &[
                         View::RawUav(32),
@@ -1253,7 +1257,7 @@ fn a_wave64_program_in_halves_reads_constants_from_the_titles_record() {
     lower::GPU_RECORDS.set(1);
     let shader = build_waves(HEAP_CONSTANT_WAVE32, layout, vec![entry(ResourceType::Uav, 4, 2)], 64, true);
     lower::GPU_RECORDS.set(0);
-    assert_eq!(shader.root_srvs, [VIEW_STRIDES, super::HEAP_RECORDS]);
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES, super::HEAP_RECORDS, super::HEAP_PAGES]);
     let constants = TITLE + CONSTANTS_AT as u64;
     let mut memory = vec![0u32; 0x800 / 4];
     memory[(HEAP_AT + 32) / 4..][..3].copy_from_slice(&constant_record(constants, 16));
@@ -1288,9 +1292,9 @@ fn a_wave64_program_in_halves_reads_constants_from_the_titles_record() {
                 &Dispatch {
                     roots: vec![
                         (0, Root::Constants(ud)),
-                        (1, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
-                        (2, Root::View { srv: true, data: vec![4; 6] }),
-                        (3, Root::View { srv: true, data: table.clone() }),
+                        (1, Root::View { srv: true, data: table.clone() }),
+                        (2, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
+                        (3, Root::View { srv: true, data: vec![4; 6] }),
                     ],
                     views: &[
                         View::RawUav(64),

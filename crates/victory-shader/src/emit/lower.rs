@@ -479,7 +479,7 @@ struct Lower<'a> {
     memory_null: Option<V>,
     /// The bound heap's start (low, high) and slots, from the heap-info
     /// table ([`Lower::heap_info`]).
-    heap_info: Option<(V, V, V, V)>,
+    heap_info: Option<(V, V, V, V, V)>,
     /// Records read in the entry block, in a block, and at a join
     /// ([`Lower::record_for`]), as the handles of such descriptors are kept.
     entry_records: Map<(EntryAddress, u8), RecordView>,

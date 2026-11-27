@@ -985,7 +985,7 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
-        let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory_dirty.is_some()));
+        let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1034,7 +1034,7 @@ impl State {
             };
             // Shaders using title memory mark in a bitmap of their own, held
             // back while their results are (`crate::memory::withholding`).
-            let memory = p.stages.iter().any(|s| s.memory_dirty.is_some());
+            let memory = p.stages.iter().any(|s| s.memory.is_some());
             let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes(memory)) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
@@ -1203,6 +1203,34 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
+                    if kind == 1 && slot == victory_shader::emit::HEAP_PAGES {
+                        // The page table of shaders that take views from the
+                        // title's records: looked up only, its views only
+                        // read through (`crate::memory::bind_table`).
+                        let heap = match self.heaps[0] {
+                            0 => MEMORY_HEAP,
+                            h => h,
+                        };
+                        let table = match self.records_table {
+                            Some((h, table)) if h == heap => Some(table),
+                            _ => crate::memory::bind_table(list, heap),
+                        };
+                        let Some(table) = table else {
+                            once!("a shader reading the title's records dropped: no view heap or page table");
+                            not_run("title records without a view heap or page table");
+                            return false;
+                        };
+                        self.records_table = Some((heap, table));
+                        // SAFETY: an open list; the list keeps the table.
+                        unsafe {
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, table);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, table);
+                            }
+                        }
+                        continue;
+                    }
                     if kind == 1 && slot == victory_shader::emit::HEAP_SHAPES {
                         // The shapes of placed views, for records naming one.
                         let Some(table) = crate::descriptor::host::shapes_table() else {
@@ -1330,32 +1358,7 @@ impl State {
                     }
                 }
             }
-            if let (Some(param), None) = (stage.memory, stage.memory_dirty) {
-                // Views taken from the title's records: the page table
-                // alone (every title-memory access also marks pages).
-                let heap = match self.heaps[0] {
-                    0 => MEMORY_HEAP,
-                    h => h,
-                };
-                let table = match self.records_table {
-                    Some((h, table)) if h == heap => Some(table),
-                    _ => crate::memory::bind_table(list, heap),
-                };
-                let Some(table) = table else {
-                    once!("a shader reading the title's records dropped: no view heap or page table");
-                    not_run("title records without a view heap or page table");
-                    return false;
-                };
-                self.records_table = Some((heap, table));
-                // SAFETY: an open list; the list keeps the table.
-                unsafe {
-                    if compute {
-                        l.SetComputeRootShaderResourceView(param, table);
-                    } else {
-                        l.SetGraphicsRootShaderResourceView(param, table);
-                    }
-                }
-            } else if let Some(param) = stage.memory {
+            if let Some(param) = stage.memory {
                 let Some((table, dirty)) = self.memory_map(list) else {
                     once!("a shader reading title memory dropped: no view heap or page table");
                     not_run("title memory without a view heap or page table");
@@ -6901,7 +6904,8 @@ void main() {
         let hs = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
         assert_eq!(hs.root_srvs.contains(&emit::HEAP_RECORDS), records);
         assert_eq!(hs.root_srvs.contains(&emit::HEAP_SHAPES), kinds & 2 != 0);
-        assert_eq!(hs.memory, records);
+        assert_eq!(hs.root_srvs.contains(&emit::HEAP_PAGES), records);
+        assert!(!hs.memory);
         assert!(!hs.memory_writes);
         let shader = Shader::for_test(
             "compute",

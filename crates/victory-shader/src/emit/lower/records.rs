@@ -113,7 +113,9 @@ impl Lower<'_> {
     /// SRV `t`[`HEAP_RECORDS`] in [`crate::emit::ROOT_CBV_SPACE`], read
     /// once in the entry block. Zero slots: no record is read. The fourth
     /// dword counts the shapes in the shape table.
-    fn heap_info(&mut self) -> (V, V, V, V) {
+    /// The fifth value is the null view's heap index, the page table's
+    /// first block-0 entry.
+    fn heap_info(&mut self) -> (V, V, V, V, V) {
         if let Some(info) = self.heap_info {
             return info;
         }
@@ -126,8 +128,13 @@ impl Lower<'_> {
             let x = self.s.m.extract(b, r, j);
             self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32)
         });
-        self.heap_info = Some((lo, hi, count, shapes));
-        (lo, hi, count, shapes)
+        let pages = self.s.root_srv_handle(crate::emit::HEAP_PAGES);
+        let (first, mask) = (self.s.m.i32(4096 * 4), self.s.m.i8(1));
+        let r = self.raw_buffer_load(b, &[pages, first, u, mask, al]);
+        let x = self.s.m.extract(b, r, 0);
+        let null = self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32);
+        self.heap_info = Some((lo, hi, count, shapes, null));
+        (lo, hi, count, shapes, null)
     }
 
     /// The page table's entry for title address `(hi:lo)`, without a handle
@@ -135,9 +142,25 @@ impl Lower<'_> {
     /// page (the null view's if none does) and the low dword of that
     /// memory's title address.
     fn page_view(&mut self, lo: V, hi: V) -> (V, V) {
-        let (entry, _, _) = self.memory_page(lo, hi);
         let c = self.cur;
-        let map = self.s.memory_handle();
+        let map = self.s.root_srv_handle(crate::emit::HEAP_PAGES);
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        // Level 1: (hi:lo) >> 28, 4096 entries for 40-bit addresses; then
+        // the page's entry in its block (block 0: no memory).
+        let (k4, k28, k256, zero, two) = (k(self, 4), k(self, 28), k(self, 256), k(self, 0), k(self, 2));
+        let top = self.s.m.bin(c, Bin::Shl, hi, k4);
+        let low = self.s.m.bin(c, Bin::LShr, lo, k28);
+        let l1 = self.s.m.bin(c, Bin::Or, top, low);
+        let inside = self.s.m.cmp(c, pred::IULT, hi, k256);
+        let l1 = self.s.m.select(c, inside, l1, zero);
+        let at = self.s.m.bin(c, Bin::Shl, l1, two);
+        let block = self.raw_dword(map, at);
+        let block = self.s.m.select(c, inside, block, zero);
+        let (k16, k12, mask) = (k(self, 16), k(self, 12), k(self, 0xFFF));
+        let page = self.s.m.bin(c, Bin::LShr, lo, k16);
+        let page = self.s.m.bin(c, Bin::And, page, mask);
+        let entry = self.s.m.bin(c, Bin::Shl, block, k12);
+        let entry = self.s.m.bin(c, Bin::Or, entry, page);
         let (k3, first) = (self.s.m.i32(3), self.s.m.i32(4096 * 4));
         let at = self.s.m.bin(c, Bin::Shl, entry, k3);
         let at = self.s.m.bin(c, Bin::Add, at, first);
@@ -155,7 +178,7 @@ impl Lower<'_> {
     /// three dwords through the page table at the heap's address, and what
     /// they name. `legacy` is the index of the host's own view of the slot.
     fn record_view(&mut self, index: V, legacy: V) -> RecordView {
-        let (start_lo, start_hi, count, shapes) = self.heap_info();
+        let (start_lo, start_hi, count, shapes, null) = self.heap_info();
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let inside = self.s.m.cmp(c, pred::IULT, index, count);
@@ -164,7 +187,6 @@ impl Lower<'_> {
         let (lo, hi) = self.add64(start_lo, start_hi, at, false);
         let (view, start) = self.page_view(lo, hi);
         let c = self.cur;
-        let null = self.memory_null();
         let view = self.s.m.select(c, inside, view, null);
         let h = self.s.heap_handle(c, view, false, true, (11, 0));
         self.s.view_index.remove(&h);
@@ -343,7 +365,7 @@ impl Lower<'_> {
         let (lo, hi) = self.add64(record.lo, record.hi, off, false);
         let (view, start) = self.page_view(lo, hi);
         let c = self.cur;
-        let null = self.memory_null();
+        let null = self.heap_info().4;
         let four = self.s.m.i32(4);
         let fits = self.s.m.cmp(c, pred::IUGE, record.size, four);
         let view = self.s.m.select(c, fits, view, null);

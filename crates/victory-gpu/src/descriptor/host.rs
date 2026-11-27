@@ -2271,6 +2271,57 @@ impl HostHeap {
         slots.len()
     }
 
+    /// Makes again the title slots whose view is one of `copies`, the
+    /// title's heap starting at `start` with `step` bytes a slot
+    /// ([`crate::descriptor::remake_holding`]).
+    pub(crate) fn remake_holding(
+        &self,
+        start: u64,
+        step: u64,
+        copies: &[std::sync::Arc<crate::shadow::Shadow>],
+    ) -> usize {
+        let slots: Vec<u32> = {
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            kept.iter()
+                .filter(|&(index, held)| {
+                    let shadow = match &held.1 {
+                        Some(HeldSource::Shadow(s)) | Some(HeldSource::Widened(_, s)) => s,
+                        None => return false,
+                    };
+                    (index as u32) < self.count
+                        && copies.iter().any(|c| std::sync::Arc::ptr_eq(c, shadow))
+                })
+                .map(|(index, _)| index as u32)
+                .collect()
+        };
+        for &index in &slots {
+            {
+                let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                self.ready[index as usize].store(0, Ordering::Relaxed);
+                self.synced[index as usize].store(0, Ordering::Release);
+                made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
+            }
+            self.mirror(index, start + u64::from(index) * step, true);
+        }
+        slots.len()
+    }
+
+    /// The title memory copy slot `index`'s view reads, if it has one (tests).
+    #[cfg(test)]
+    pub(crate) fn held_copy(&self, index: u32) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+        match &self
+            .kept
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)?
+            .1
+        {
+            Some(HeldSource::Shadow(s)) | Some(HeldSource::Widened(_, s)) => Some(s.clone()),
+            None => None,
+        }
+    }
+
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());

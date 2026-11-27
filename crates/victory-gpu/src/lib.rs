@@ -40,6 +40,9 @@ mod caption;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod census_fast;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod census_maps;
 #[cfg(windows)]
 mod composite;
 #[cfg(windows)]

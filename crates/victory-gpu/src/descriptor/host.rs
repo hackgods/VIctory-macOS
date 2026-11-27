@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
+mod quick;
+
 use super::paged::Paged;
 use super::{
     VIEW_TAG, View, ViewPin, view_at, view_gen_current, views_at_batch, views_current_into,
@@ -1392,6 +1394,18 @@ impl HostHeap {
         buf: &[u8],
         fast: bool,
     ) {
+        self.sync_slots_bytes_mode(slots, start, step, (buf_start, buf), fast, quick::on());
+    }
+
+    fn sync_slots_bytes_mode(
+        &self,
+        slots: std::ops::Range<u32>,
+        start: u64,
+        step: u64,
+        (buf_start, buf): (u64, &[u8]),
+        fast: bool,
+        quick_views: bool,
+    ) {
         let first = slots.start;
         let last = slots.end.min(self.count);
         if first >= last {
@@ -1509,7 +1523,7 @@ impl HostHeap {
                 }
             }
             if !stale.is_empty() {
-                self.mirror_synced_batch(&stale, at);
+                self.mirror_synced_batch(&stale, at, quick_views);
             }
         } else {
             let legacy_fast = sync_fast_enabled();
@@ -1594,16 +1608,26 @@ impl HostHeap {
     /// of `VIEWS`, `self.made`, `self.kept`, `self.viewed`, and `shadow::READS`,
     /// deduplicating `prepare` and descriptor creation via [`StagingHeap`] +
     /// `CopyDescriptorsSimple`.
-    fn mirror_synced_batch(&self, stale: &[(u32, [u32; 3])], at: impl Fn(u32) -> u64) {
+    ///
+    /// When `quick_views` is enabled on a view heap, each unique buffer-SRV or
+    /// CBV record in the page is resolved once outside `self.made` via
+    /// [`quick::resolve`], avoiding repeated shadow and bindless lookups under
+    /// `self.made`.
+    fn mirror_synced_batch(&self, stale: &[(u32, [u32; 3])], at: impl Fn(u32) -> u64, quick_views: bool) {
         struct CachedTemplate {
             src: D3D12_CPU_DESCRIPTOR_HANDLE,
             kept: Option<Kept>,
             mark: Option<(u32, u32)>,
         }
 
+        let use_quick = quick_views && !self.sampler;
         let mut unique_keys: Vec<u64> = Vec::new();
         let mut key_counts: Vec<u32> = Vec::new();
-        let mut key_to_idx: HashMap<u64, usize> = HashMap::new();
+        let mut key_to_idx: HashMap<u64, usize, crate::census_maps::Hashing> =
+            HashMap::with_capacity_and_hasher(
+                stale.len(),
+                crate::census_maps::Hashing::new(use_quick),
+            );
         let mut slot_key_idx: Vec<Option<usize>> = Vec::with_capacity(stale.len());
 
         for &(_, [tag, view, generation]) in stale {
@@ -1629,11 +1653,23 @@ impl HostHeap {
         }
 
         let pins = views_at_batch(&unique_keys);
+        let mut resolved_bufs: Vec<Option<quick::ResolvedBuffer>> =
+            Vec::with_capacity(if use_quick { unique_keys.len() } else { 0 });
         let mut is_placed: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut is_tex: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut strides: Vec<u32> = Vec::with_capacity(unique_keys.len());
         for pin in &pins {
             if let Some(view) = pin.as_deref() {
+                if use_quick && let Some(resolved_buf) = quick::resolve(view) {
+                    strides.push(resolved_buf.stride);
+                    is_placed.push(false);
+                    is_tex.push(false);
+                    resolved_bufs.push(Some(resolved_buf));
+                    continue;
+                }
+                if use_quick {
+                    resolved_bufs.push(None);
+                }
                 let placed = is_placed_texture(view);
                 if !placed {
                     prepare(view);
@@ -1642,6 +1678,9 @@ impl HostHeap {
                 is_tex.push(is_texture(view));
                 strides.push(view_stride(view) | view_kind(view));
             } else {
+                if use_quick {
+                    resolved_bufs.push(None);
+                }
                 is_placed.push(false);
                 is_tex.push(false);
                 strides.push(0);
@@ -1663,7 +1702,8 @@ impl HostHeap {
             let mut kept_updates: Vec<(u32, Kept)> = Vec::with_capacity(stale.len());
             let mut copy_dsts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::with_capacity(stale.len());
             let mut copy_srcs: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::with_capacity(stale.len());
-            let mut viewed_updates: Vec<(u32, Option<&View>, bool)> = if self.sampler {
+            let mut viewed_updates: Vec<(u32, crate::bindless::BatchUpdate<'_>)> = if self.sampler
+            {
                 Vec::new()
             } else {
                 Vec::with_capacity(stale.len())
@@ -1681,7 +1721,8 @@ impl HostHeap {
                 let addr = at(index);
                 // Re-read live title memory under `self.made`: if a title
                 // thread overwrote the slot since the page snapshot (including
-                // during `prepare`), defer to `mirror` after dropping locks.
+                // during `prepare` or `quick::resolve`), defer to `mirror`
+                // after dropping locks.
                 // SAFETY: the caller holds the heap alive until the sync completes.
                 let mut raw = [0u8; 12];
                 if !crate::host::read_into(addr as *const u8, &mut raw) {
@@ -1728,7 +1769,8 @@ impl HostHeap {
                         }
                         kept_updates.push((index, None));
                         if !self.sampler {
-                            viewed_updates.push((index, None, false));
+                            viewed_updates
+                                .push((index, crate::bindless::BatchUpdate::Resolved(None)));
                         }
                         finalize.push((index, 0, 0));
                     }
@@ -1737,13 +1779,18 @@ impl HostHeap {
                 if made[index as usize] == key {
                     continue;
                 }
+                let resolved_buf = resolved_bufs.get(kidx).and_then(Option::as_ref);
                 self.ready[index as usize].store(0, Ordering::Relaxed);
                 self.synced[index as usize].store(0, Ordering::Relaxed);
                 self.write_stride(index, strides[kidx]);
                 if let Some(data) = addr_data
                     && index < addr_slots
                 {
-                    write_address(data, index as usize, Some(view));
+                    if let Some(resolved_buf) = resolved_buf {
+                        write_buffer_address(data, index as usize, resolved_buf.address);
+                    } else {
+                        write_address(data, index as usize, Some(view));
+                    }
                 }
                 let later = is_placed[kidx];
                 if later {
@@ -1762,6 +1809,65 @@ impl HostHeap {
                         }
                     }
                     (None, None)
+                } else if let Some(resolved_buf) = resolved_buf {
+                    if key_counts[kidx] >= 2
+                        && let (Some(h), Some(st)) = (host, staging)
+                    {
+                        if let Some(tpl) = &templates[kidx] {
+                            copy_dsts.push(self.cpu(index));
+                            copy_srcs.push(tpl.src);
+                            (tpl.kept.clone(), None)
+                        } else if next_template < st.count {
+                            let t = next_template;
+                            next_template += 1;
+                            // SAFETY: live buffer held by `resolved_buf` and slot of our staging heap.
+                            unsafe {
+                                h.device.CreateShaderResourceView(
+                                    &resolved_buf.buffer,
+                                    Some(&resolved_buf.desc),
+                                    st.cpu(t),
+                                );
+                            }
+                            let k = Some(Some((resolved_buf.buffer.clone(), resolved_buf.held())));
+                            let src = st.cpu(t);
+                            copy_dsts.push(self.cpu(index));
+                            copy_srcs.push(src);
+                            templates[kidx] = Some(CachedTemplate {
+                                src,
+                                kept: k.clone(),
+                                mark: None,
+                            });
+                            (k, None)
+                        } else {
+                            // SAFETY: live buffer held by `resolved_buf` and slot of our host heap.
+                            unsafe {
+                                h.device.CreateShaderResourceView(
+                                    &resolved_buf.buffer,
+                                    Some(&resolved_buf.desc),
+                                    self.cpu(index),
+                                );
+                            }
+                            (
+                                Some(Some((resolved_buf.buffer.clone(), resolved_buf.held()))),
+                                None,
+                            )
+                        }
+                    } else if let Some(h) = host {
+                        // SAFETY: live buffer held by `resolved_buf` and slot of our host heap.
+                        unsafe {
+                            h.device.CreateShaderResourceView(
+                                &resolved_buf.buffer,
+                                Some(&resolved_buf.desc),
+                                self.cpu(index),
+                            );
+                        }
+                        (
+                            Some(Some((resolved_buf.buffer.clone(), resolved_buf.held()))),
+                            None,
+                        )
+                    } else {
+                        (None, None)
+                    }
                 } else if key_counts[kidx] >= 2
                     && let (Some(_), Some(st)) = (host, staging)
                 {
@@ -1811,7 +1917,17 @@ impl HostHeap {
 
                 self.set_mark(index, mark);
                 if !self.sampler {
-                    viewed_updates.push((index, Some(view), kept.is_some()));
+                    if let Some(resolved_buf) = resolved_buf
+                        && kept.is_some()
+                    {
+                        viewed_updates.push((
+                            index,
+                            crate::bindless::BatchUpdate::Resolved(resolved_buf.seen.clone()),
+                        ));
+                    } else {
+                        viewed_updates
+                            .push((index, crate::bindless::BatchUpdate::View(view, kept.is_some())));
+                    }
                 }
                 let kept = kept.flatten();
                 let ready = if is_tex[kidx] && kept.is_none() {
@@ -1846,7 +1962,7 @@ impl HostHeap {
 
             self.keep_batch(kept_updates, &mut retired);
             if !self.sampler {
-                self.viewed.set_batch(&viewed_updates);
+                self.viewed.set_batch_resolved(&viewed_updates);
             }
             crate::shadow::forget_reads(&forgot_reads);
             // Coalesce `made_nonzero` bit updates per 64-slot word (stale indices
@@ -2612,6 +2728,14 @@ fn write_address(data: usize, index: usize, view: Option<&View>) {
         Some(words) => words,
         None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
     };
+    // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
+    // slot (below `address_slots`).
+    unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// Fast path of [`write_address`] for pre-resolved buffer views (never a texture).
+fn write_buffer_address(data: usize, index: usize, address: u64) {
+    let words = [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0];
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
     // slot (below `address_slots`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };

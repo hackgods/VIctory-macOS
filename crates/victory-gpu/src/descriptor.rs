@@ -808,7 +808,6 @@ impl Views {
             }
         };
         let generation = self.list[i as usize].1;
-        set_view_gen(i, generation);
         self.count_address(&view);
         for r in view.resources().into_iter().filter(|&r| r != 0) {
             self.by_resource.entry(r).or_default().push(i);
@@ -852,6 +851,7 @@ fn record(handle: u64, view: View) {
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let (i, generation) = views.entry_kept(view);
+    set_view_gen(i, generation);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);

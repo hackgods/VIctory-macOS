@@ -6248,6 +6248,22 @@ fn release_later(what: Box<dyn std::any::Any + Send>) {
     let _ = release.send(what);
 }
 
+/// Waits until the release thread has dropped what was sent to it so far
+/// (tests that check what a finished submission freed: [`retire_any`]
+/// drops it there, after the submission returns).
+#[cfg(test)]
+pub(crate) fn wait_for_releases() {
+    struct Mark(std::sync::mpsc::Sender<()>);
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    release_later(Box::new(Mark(tx)));
+    let _ = rx.recv_timeout(std::time::Duration::from_secs(10));
+}
+
 /// Diagnostics: a noted command running a shader `VICTORY_TRACE_SHADERS`
 /// names (hashes, comma-separated) is logged with what it binds: all of
 /// them in listed capture frames, the first 500 elsewhere.

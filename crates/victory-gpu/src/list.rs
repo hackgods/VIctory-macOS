@@ -2444,6 +2444,9 @@ mod tests {
             assert_eq!(got1[i as usize], 0xA1B2_0000 + i, "batch 1 word {i} corrupted");
             assert_eq!(got2[i as usize], 0xC3D4_0000 + i, "batch 2 word {i} corrupted");
         }
+        // The finished batches, uploads included, are dropped on the
+        // release thread, behind what other tests retired.
+        crate::host::wait_for_releases();
         assert!(
             crate::shadow::find(p1 as u64, 256).is_none()
                 && crate::shadow::find(p2 as u64, 256).is_none(),

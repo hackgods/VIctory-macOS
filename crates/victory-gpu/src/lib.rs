@@ -18,6 +18,9 @@
 
 #[cfg(windows)]
 mod alias;
+// Title memory in place through tile mappings (stage 2 of #221).
+#[cfg(windows)]
+mod tiles;
 pub mod bench;
 #[cfg(windows)]
 mod backend;

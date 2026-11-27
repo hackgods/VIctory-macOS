@@ -90,6 +90,16 @@ extern "system" fn completed(this: This) -> u64 {
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
     crate::queue::pump_held_if_free(crate::queue::Why::Fence);
+    // Blocking (a null event): a Signal attached behind the flight on the
+    // host GPU (`crate::host::flight`) moves the fence once that flight and
+    // the work it lets run have landed, so they land first.
+    #[cfg(windows)]
+    if event.is_null()
+        && fence(this).value.load(Ordering::Acquire) < value
+        && (crate::host::flight1_enabled() || crate::host::async_submit_enabled())
+    {
+        crate::queue::drain_submit(crate::queue::Why::Fence);
+    }
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {

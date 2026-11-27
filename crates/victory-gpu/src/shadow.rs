@@ -2294,6 +2294,16 @@ pub(crate) fn forget_in_place(from: u64, to: u64) -> Vec<Arc<Shadow>> {
     gone
 }
 
+/// Drops the windows of loose memory that overlap `[from, to)`: tests whose
+/// memory is freed, for a later test given the address.
+#[cfg(test)]
+pub(crate) fn forget_loose_windows(from: u64, to: u64) {
+    let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    loose.retain(|&(start, len), _| start.saturating_add(len) <= from || start >= to);
+    drop(loose);
+    changed();
+}
+
 /// Titles also use memory outside any buffer object as GPU memory (Grand
 /// Theft Auto VI's interface vertices, from its own allocator). Such memory
 /// gets copies of the aligned windows it touches. Smaller windows retain

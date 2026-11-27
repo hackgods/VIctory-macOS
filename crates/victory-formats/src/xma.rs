@@ -133,8 +133,22 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
     }
     let mut out = Vec::with_capacity(bits.div_ceil(8));
     let mut cursor = Cursor { data, pos: start };
-    for _ in 0..bits / 8 {
-        out.push(cursor.byte()?);
+    while out.len() < bits / 8 {
+        let in_packet = cursor.pos % PACKET_BITS;
+        if in_packet != 0 && in_packet <= PACKET_BITS - 8 {
+            let count = (bits / 8 - out.len()).min((PACKET_BITS - in_packet) / 8);
+            let at = cursor.pos / 8;
+            let shift = cursor.pos % 8;
+            if shift == 0 {
+                out.extend_from_slice(cursor.data.get(at..at + count)?);
+            } else {
+                let source = cursor.data.get(at..at + count + 1)?;
+                out.extend(source.windows(2).map(|pair| (pair[0] << shift) | (pair[1] >> (8 - shift))));
+            }
+            cursor.pos += count * 8;
+        } else {
+            out.push(cursor.byte()?);
+        }
     }
     let tail = (bits % 8) as u32;
     if tail != 0 {
@@ -1224,6 +1238,89 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_gather_matches_bitwise_cursor() {
+        fn reference(data: &[u8], start: usize) -> Option<Frame> {
+            let bits = Cursor { data, pos: start }.bits(LENGTH_BITS)? as usize;
+            if bits <= LENGTH_BITS as usize || bits == 0x7fff {
+                return None;
+            }
+            let mut cursor = Cursor { data, pos: start };
+            let mut out = Vec::new();
+            for _ in 0..bits / 8 {
+                out.push(cursor.bits(8)? as u8);
+            }
+            let tail = (bits % 8) as u32;
+            if tail != 0 {
+                out.push((cursor.bits(tail)? << (8 - tail)) as u8);
+            }
+            Some(Frame {
+                data: out,
+                bits,
+                start,
+                next: next_frame(data, start, cursor.pos),
+            })
+        }
+        for skip in 0..=2 {
+            for start in [32, 33, 35, PACKET_BITS - 8, PACKET_BITS - 3] {
+                for length in [16, 17, 128, 16001, 24000, 32766] {
+                    let mut data: Vec<u8> =
+                        (0..4 * PACKET_BYTES).map(|i| (i * 37 + 11) as u8).collect();
+                    for packet in 0..4 {
+                        put_bits(&mut data, packet * PACKET_BITS, 32, (1 << 26) | skip);
+                    }
+                    // Write the length using the same packet navigation as the reader.
+                    let mut cursor = Cursor {
+                        data: &data,
+                        pos: start,
+                    };
+                    let mut positions = Vec::new();
+                    for _ in 0..15 {
+                        cursor.bit().unwrap();
+                        positions.push(cursor.pos - 1);
+                    }
+                    for (i, pos) in positions.into_iter().enumerate() {
+                        let mask = 1 << (7 - pos % 8);
+                        data[pos / 8] = (data[pos / 8] & !mask)
+                            | (((length >> (14 - i)) as u8 & 1) << (7 - pos % 8));
+                    }
+                    for end in [data.len(), data.len() - 1, PACKET_BYTES, 7] {
+                        let map = |f: Frame| (f.data, f.bits, f.start, f.next);
+                        assert_eq!(
+                            read_frame(&data[..end], start).map(map),
+                            reference(&data[..end], start).map(map),
+                            "skip={skip} start={start} length={length} end={end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_frame_gather() {
+        use std::{hint::black_box, time::Instant};
+        for shift in [0, 3] {
+            let mut data = vec![0u8; 4 * PACKET_BYTES];
+            // One frame spans a packet edge, skipping one other-stream packet.
+            put_bits(&mut data, 0, 32, (1 << 26) | 1);
+            let start = HEADER_BITS + shift;
+            put_bits(&mut data, start, 15, 24000);
+            let mut samples = Vec::new();
+            for round in 0..35 {
+                let begin = Instant::now();
+                for _ in 0..1024 {
+                    black_box(read_frame(black_box(&data), black_box(start)).unwrap());
+                }
+                if round >= 4 {
+                    samples.push(begin.elapsed().as_nanos());
+                }
+            }
+            println!("frame_shift_{shift}_1024_ns {samples:?}");
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {

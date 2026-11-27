@@ -5274,6 +5274,8 @@ impl Meter {
             let flushes = flush_line(report_frames);
             // mac: the copies' wall time against their thread time, always.
             let refresh_clock = refresh_clock_line(report_frames, copy_ms);
+            // mac: what the marked pages' copy-back compared and wrote, always.
+            let marked = crate::shadow::marked_back_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5298,7 +5300,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{refresh_clock}",
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{refresh_clock}{marked}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

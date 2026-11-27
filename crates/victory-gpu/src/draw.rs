@@ -6794,6 +6794,21 @@ void main() {
         values: [u32; 2],
         ops: &[(u32, u8, u16)],
     ) -> Option<(u32, Vec<bool>)> {
+        marked_stores(precise, keep, false, start, &[values], ops)
+    }
+
+    /// [`marked_store`] with a dispatch of the program for each of
+    /// `dispatches` (its root constants), all in one submission, and with
+    /// `wave64` as a wave64 program of 64 threads run in halves on a host
+    /// of 32-lane waves (every lane stores the same).
+    fn marked_stores(
+        precise: bool,
+        keep: bool,
+        wave64: bool,
+        start: u32,
+        dispatches: &[[u32; 2]],
+        ops: &[(u32, u8, u16)],
+    ) -> Option<(u32, Vec<bool>)> {
         use crate::pipeline::{Shader, Translated, host::HostPipeline};
         use victory_shader::native::{ComputeIo, StageIo};
         use victory_shader::{
@@ -6841,7 +6856,7 @@ void main() {
         };
         let native = NativeProgram {
             stage: HwStage::Cs,
-            wave64: false,
+            wave64,
             vgprs: 4,
             layout: vec![param(RootType::Constants, 4, 0, 0), param(RootType::Table, 1, 4, 1)],
             used: vec![UsedResource {
@@ -6856,7 +6871,7 @@ void main() {
             }],
             io: StageIo::Cs(ComputeIo {
                 rsrc2: 8 << 1,
-                threads: [1, 1, 1],
+                threads: [if wave64 { 64 } else { 1 }, 1, 1],
             }),
             code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
@@ -6872,6 +6887,7 @@ void main() {
         let options = emit::Options {
             view_marks: true,
             precise_marks: precise,
+            host_wave32: wave64,
             ..Default::default()
         };
         let hs = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
@@ -6917,25 +6933,42 @@ void main() {
             S_OK
         );
         let title_heap = crate::descriptor::heap(heap);
-        let out = buffer(256);
-        let out_bytes = crate::resource::buffer_bytes(out).unwrap().0 as u64;
-        // SAFETY: inside the title buffer.
+        // The buffer written: tracked title memory of its own (copies of
+        // tracked memory get mark bits), under a raw unordered view of
+        // placed memory.
+        let out_pool = crate::watch::tests::pool(1);
+        let out_bytes = out_pool as u64;
+        crate::shadow::register(out_pool, out_bytes, crate::watch::PAGE as u64);
+        // SAFETY: inside the pool page.
         unsafe { (out_bytes as *mut u32).write(start) };
-        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
-        crate::descriptor::create_uav(std::ptr::null(), out, std::ptr::null(), &raw, title_heap.start);
+        let mut resource = [0u32; 14];
+        (resource[0], resource[4]) = (1, crate::watch::PAGE as u32);
+        let mut raw = [0u32; 16];
+        raw[..10].copy_from_slice(&[39, 1, 0, 0, 64, 0, 0, 0, 1, 0]);
+        (raw[10], raw[11]) = (out_bytes as u32, (out_bytes >> 32) as u32);
+        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &raw, title_heap.start);
         crate::shadow::MARKED_SEEN.with(|seen| seen.borrow_mut().clear());
         let list = host.new_list().unwrap();
         let mut state = State::default();
         state.set_heaps(&[heap]);
-        state.set_constants(true, 0, &[values[0], values[1], 0, 0], 0);
         state.set_table(true, 1, title_heap.start);
-        assert!(state.bind(&list, &hp, true), "the dispatch is bound");
         let page = out_bytes as usize & !(crate::watch::PAGE - 1);
-        if keep {
-            assert!(crate::shadow::keep_page_for_test(page), "the copy's pages have marks");
+        for (n, values) in dispatches.iter().enumerate() {
+            state.set_constants(true, 0, &[values[0], values[1], 0, 0], 0);
+            assert!(state.bind(&list, &hp, true), "the dispatch is bound");
+            if keep && n == 0 {
+                assert!(crate::shadow::keep_page_for_test(page), "the copy's pages have marks");
+            }
+            // SAFETY: an open list with everything bound. A dispatch sees
+            // what the one before wrote (the host puts this barrier between
+            // a title's dispatches that write one buffer).
+            unsafe {
+                if n > 0 {
+                    list.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+                }
+                list.list.Dispatch(1, 1, 1);
+            }
         }
-        // SAFETY: an open list with everything bound.
-        unsafe { list.list.Dispatch(1, 1, 1) };
         list.close();
         host.execute(&[&list]);
         // SAFETY: inside the title buffer.
@@ -6955,6 +6988,8 @@ void main() {
             0
         );
         crate::watch::tests::free(memory);
+        crate::shadow::unregister(out_pool, out_bytes);
+        crate::watch::tests::free(out_pool);
         Some((after, seen))
     }
 
@@ -7018,5 +7053,32 @@ void main() {
             run(true, [OLD, NEW], &[(STORE, 0, 0), (STORE, 1, 0)]),
             (NEW, CHANGED.to_vec())
         );
+    }
+
+    /// Precise marks with more than one writer of a dword in a submission:
+    /// two dispatches, and the two halves of a wave64 program run on a host
+    /// of 32-lane waves. Whichever store changes the dword marks; a store
+    /// of what the dword holds by then does not, and the mark of the store
+    /// that changed it stands.
+    #[test]
+    fn precise_marks_hold_with_several_writers_of_a_dword() {
+        const STORE: u32 = 0x1C;
+        const OLD: u32 = 0x1111_2222;
+        const NEW: u32 = 0x3333_4444;
+        let run = |wave64, dispatches: &[[u32; 2]]| marked_stores(true, false, wave64, OLD, dispatches, &[(STORE, 0, 0)]);
+        // Two dispatches: neither changes it; the first does and the second
+        // stores the same again; the second does; the first does and the
+        // second puts the old value back.
+        let Some(none) = run(false, &[[OLD, 0], [OLD, 0]]) else {
+            return; // no host GPU with SM 6.6 here
+        };
+        assert_eq!(none, (OLD, vec![]));
+        assert_eq!(run(false, &[[NEW, 0], [NEW, 0]]), Some((NEW, vec![true])));
+        assert_eq!(run(false, &[[OLD, 0], [NEW, 0]]), Some((NEW, vec![true])));
+        assert_eq!(run(false, &[[NEW, 0], [OLD, 0]]), Some((OLD, vec![false])));
+        // 64 lanes in two halves, all storing the same dword.
+        assert_eq!(run(true, &[[OLD, 0]]), Some((OLD, vec![])));
+        assert_eq!(run(true, &[[NEW, 0]]), Some((NEW, vec![true])));
+        assert_eq!(run(true, &[[NEW, 0], [OLD, 0]]), Some((OLD, vec![false])));
     }
 }

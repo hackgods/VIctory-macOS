@@ -4094,6 +4094,54 @@ pub(crate) mod tests {
         );
     }
 
+    /// What precise marks rest on: a page shaders stored to without
+    /// changing a byte ends the same in title memory whether it was marked
+    /// or not, also when the title wrote it during the submission. Marked,
+    /// it is compared and nothing of the copy goes back (nothing the GPU
+    /// changed); unmarked, it is not looked at. So a store that leaves the
+    /// mark out because it stores what is there loses nothing, whatever the
+    /// title does meanwhile.
+    #[test]
+    fn an_unchanged_page_ends_the_same_marked_or_not() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let title = |at: usize| (p + at) as *mut u8;
+        // SAFETY: (title writes and reads below) bytes of our pool.
+        unsafe {
+            title(10).write_volatile(0x55);
+            title(PAGE + 10).write_volatile(0x55);
+        }
+        copy.update(p, len);
+        copy.writing(p, len, true);
+        // The shaders store what both pages hold (the copy is unchanged);
+        // the title writes both meanwhile.
+        // SAFETY: bytes of our pool.
+        unsafe {
+            title(40).write_volatile(0x11);
+            title(PAGE + 40).write_volatile(0x11);
+        }
+        // Page 0 marked (as every store marked), page 1 not (a store that
+        // marks only what it changes).
+        let quiet = host().and_then(|h| h.quiet());
+        let bits = b.data as *mut u32;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        drop(quiet);
+        // SAFETY: bytes of our pool.
+        let read = |at: usize| unsafe { title(at).read_volatile() };
+        assert_eq!((read(10), read(40)), (0x55, 0x11), "marked: the title's bytes stand");
+        assert_eq!((read(PAGE + 10), read(PAGE + 40)), (0x55, 0x11), "not marked: the same");
+        assert_eq!(copy.copy_back(p, len), 0, "nothing kept to compare");
+        unregister(p, p as u64);
+    }
+
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`
     /// "Write marks") go back by the bytes the GPU changed. The title writes
     /// a marked page after the copy took it (the guard saves its bytes from

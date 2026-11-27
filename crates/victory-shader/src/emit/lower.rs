@@ -217,6 +217,10 @@ pub(crate) fn lower_pruned(
     literal_halves: bool,
 ) -> Result<Lowered, ShaderError> {
     // Retry refusals from the legacy cross-half gates with whole-wave control flow.
+    // So too an s_barrier a lane may miss by leaving at a loop's cap: in
+    // whole-wave control flow every lane follows the console wave's blocks,
+    // goes round each loop as often as the others and leaves at a cap with
+    // them (`step_and_cap` finds no escape where every block is in step).
     let original = lower_with_structure(parts, keep, per_vertex_center);
     if !literal_halves
         || !parts.host_wave32
@@ -232,7 +236,8 @@ pub(crate) fn lower_pruned(
                     | halves::LDS_ACROSS
                     | halves::REDUCTION_ACROSS
                     | halves::FIRST_ACROSS
-                    | halves::READ_ACROSS,
+                    | halves::READ_ACROSS
+                    | CAP_BARRIER,
                 ..
             })
         )
@@ -650,6 +655,10 @@ type PendingMask = (V, usize, usize, Option<(Value, Value)>);
 const LANE_MASK: Why = "a lane mask read as data";
 const MASK_CYCLE: Why = "a lane mask whose lanes depend on its own value";
 const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
+/// An explicit `s_barrier` a lane may not reach because it left the program
+/// at a capped back edge's iteration limit ([`step_and_cap`]).
+const CAP_BARRIER: Why =
+    "an s_barrier where a lane may have left the program early at a loop's iteration limit";
 
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
@@ -4228,7 +4237,7 @@ impl<'a> Lower<'a> {
                 // edge's iteration limit before this block; a group barrier
                 // here would wait for lanes that are gone.
                 if self.cap_escaped.get(b).copied().unwrap_or(false) {
-                    Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
+                    Err(CAP_BARRIER)
                 } else {
                     self.group_barrier();
                     Ok(())

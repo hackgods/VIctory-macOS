@@ -2934,3 +2934,90 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
     let got_40 = run(lowered_40, 40);
     assert_eq!(got_40, vec![1u32; 40], "all 40 threads (32 full + 8 partial) must run once");
 }
+
+/// A per-lane loop (lane `l` goes round `l & 3` times, adding 7) whose latch
+/// is an unconditional `s_branch` back to its header, the back edge lowering
+/// caps with an early return at the loop iteration limit; then an explicit
+/// `s_barrier` orders an LDS exchange with lane `l ^ 1`.
+fn capped_loop_then_s_barrier() -> Vec<u32> {
+    literal_program(&[
+        0x3602_0083, // v_and_b32 v1, 3, v0
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x7D82_0280, // top: v_cmp_lt_u32 vcc, 0, v1
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0003, // s_cbranch_execz done
+        0x4A06_0687, // v_add_nc_u32 v3, 7, v3
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0xBF82_FFFA, // s_branch top (unconditional back edge, capped)
+        0xBEFE_0418, // done: s_mov_b64 exec, s[24:25]
+        0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+        0xD834_0000,
+        0x0000_0302, // ds_write_b32 v2, v3
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x3A08_0081, // v_xor_b32 v4, 1, v0
+        0x3408_0882, // v_lshlrev_b32 v4, 2, v4
+        0xD8D8_0000,
+        0x0300_0004, // ds_read_b32 v3, v4
+        S_WAITCNT_LGKM,
+    ])
+}
+
+/// An `s_barrier` after a per-lane loop with a capped back edge is refused
+/// in the per-lane translation (a lane may have left the program at the
+/// cap, #408). In exactly one console wave64 the whole-wave retry takes it:
+/// every lane follows the console wave's blocks there, so every lane goes
+/// round the loop the same number of times and all leave at the cap
+/// together, and the barrier stays. A group of more console waves keeps the
+/// refusal: its waves can reach the cap apart.
+#[test]
+fn literal_wave64_recovers_an_s_barrier_after_a_capped_per_lane_loop() {
+    let words = capped_loop_then_s_barrier();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_and_b32 v1, 3, v0",
+        "v_cmp_lt_u32 vcc, 0, v1",
+        "s_and_b64 exec, exec, vcc",
+        "s_cbranch_execz",
+        "v_add_nc_u32 v3, 7, v3",
+        "s_branch",
+        "s_mov_b64 exec, s[24:25]",
+        "ds_write_b32 v2, v3",
+        "s_barrier",
+        "v_xor_b32 v4, 1, v0",
+        "ds_read_b32 v3, v4",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    const CAP: &str = "an s_barrier where a lane may have left the program early";
+    let n = native(&words, true, 64, 512);
+    let why = lowered_with(&n, true, true)
+        .err()
+        .expect("per-lane refusal");
+    assert!(why.to_string().contains(CAP), "{why}");
+    let l = lower_halves(&n, true, true, true).expect("whole-wave retry");
+    assert_eq!(l.wave_size, Some(32));
+    assert!(l.barriers > 0, "no dx.op.barrier written");
+    for threads in [128, 256] {
+        let n = native(&words, true, threads, 512);
+        let why = lower_halves(&n, true, true, true)
+            .err()
+            .expect("several console waves keep the refusal");
+        assert!(why.to_string().contains(CAP), "{threads}: {why}");
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn an_s_barrier_after_a_capped_loop_in_literal_halves_matches_the_console_on_every_gpu() {
+    let want: Vec<u32> = (0..64).map(|l| 7 * ((l ^ 1) & 3)).collect();
+    let words = capped_loop_then_s_barrier();
+    let failed = differences_in(true, &words, 64, 1, &want, 512, true, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

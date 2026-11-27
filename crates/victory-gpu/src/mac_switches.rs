@@ -351,6 +351,30 @@ fn census_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// Whether a heap sync pass also holds the census updates of the slots
+/// `HostHeap::mirror` and `HostHeap::make_null` make in it, and enters them
+/// a batch at a time (`crate::bindless::Pass`, `crate::census_fast::Hold`)
+/// instead of one census lock a slot. Only with `VICTORY_CENSUS_BATCH=1`
+/// and `VICTORY_CENSUS_FAST=1` (whose tickets keep a slot's last making),
+/// read once (at the first view heap). Every held update is entered before
+/// the pass returns.
+pub(crate) fn census_batch() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = census_rule(std::env::var("VICTORY_CENSUS_BATCH").ok().as_deref());
+        let on = asked && census_fast();
+        if on {
+            tracing::info!(
+                "VICTORY_CENSUS_BATCH=1: heap sync passes hold the census updates of mirror and make_null too, \
+                 entered 256 at a time and before the pass returns"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_CENSUS_BATCH=1 does nothing without VICTORY_CENSUS_FAST=1");
+        }
+        on
+    })
+}
+
 #[cfg(test)]
 mod census_tests {
     use super::census_rule;
@@ -362,6 +386,14 @@ mod census_tests {
         }
         assert!(census_rule(Some("1")));
         assert!(census_rule(Some(" 1 ")));
+    }
+
+    #[test]
+    fn the_census_batch_is_off_by_default() {
+        // Read once; the tests never set it.
+        if std::env::var_os("VICTORY_CENSUS_BATCH").is_none() {
+            assert!(!super::census_batch());
+        }
     }
 }
 

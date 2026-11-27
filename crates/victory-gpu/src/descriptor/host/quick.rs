@@ -206,6 +206,9 @@ impl HostHeap {
         // mac: the census updates of the slots made here, entered a batch
         // at a time with `VICTORY_CENSUS_FAST=1` (at once without it).
         let mut census = self.viewed.batch();
+        // mac: and those of the slots `mirror` makes here
+        // (`VICTORY_CENSUS_BATCH=1`; inside `make_stale`'s pass, its).
+        let pass = self.viewed.pass();
         for &index in stale {
             let handle = at(index);
             // SAFETY: a record in title heap memory the caller found mapped.
@@ -230,9 +233,11 @@ impl HostHeap {
                 self.mirror(index, handle, false);
             }
             census.enter_if_full();
+            pass.enter_if_full();
         }
         // Before the pass returns (its thread reads the census next).
         drop(census);
+        drop(pass);
         // The pins go here, with no lock of the heap held.
     }
 
@@ -406,6 +411,76 @@ mod tests {
         assert!(!shown(&quick, 1).0, "a cleared record leaves its slot");
         assert_eq!(shown(&quick, 2), whole, "the replaced slot shows the whole view");
         drop((slow, quick));
+        release(resource);
+    }
+
+    /// mac (`VICTORY_CENSUS_BATCH=1`): the census updates a heap sync makes
+    /// through `mirror` (unordered views, a view the host refuses, views of
+    /// other kinds) and `make_null` (cleared records) are held by its pass,
+    /// and when `make_stale` returns every slot it made is in the census as
+    /// a sync without holding leaves it; the same for records rewritten and
+    /// cleared at the next sync. The held counts show lock takes saved.
+    #[test]
+    fn a_syncs_held_census_updates_are_in_when_it_returns() {
+        if host().is_none() {
+            return; // no host GPU here
+        }
+        let resource = crate::resource::test_buffer(4096);
+        let release = crate::object::slot::<extern "system" fn(crate::object::This) -> u32>(resource, 0x10);
+        let memory = crate::resource::buffer_bytes(resource).expect("a buffer").0 as u64;
+        const SLOTS: u32 = 64;
+        let mut records = [0u32; 8 * SLOTS as usize];
+        let start = records.as_mut_ptr() as u64;
+        let at = |i: u32| start + 32 * u64::from(i);
+        let null = std::ptr::null();
+        let write = |round: u32| {
+            for i in 0..SLOTS {
+                let first = u32::from(round == 1) * 8 + i % 16;
+                match i % 4 {
+                    // Shader views (the quick way).
+                    0 => crate::descriptor::create_srv(null, resource, &[62, 1, 0x1688, 0, first, 0, 32, 0, 0, 0], at(i)),
+                    // Raw unordered views (`mirror`).
+                    1 => crate::descriptor::create_uav(null, resource, null, &[39, 1, 0, 0, first, 0, 16, 0, 1, 0], at(i)),
+                    // A view the host refuses (`mirror`).
+                    2 => crate::descriptor::create_srv(null, resource, &[62, 1, 0x1688, 0, 0, 0, 0, 0, 0, 0], at(i)),
+                    // A constant buffer (the quick way).
+                    _ => crate::descriptor::create_cbv(null, &[(memory + 256 * u64::from(first)) as u32, ((memory + 256 * u64::from(first)) >> 32) as u32, 64, 0], at(i)),
+                }
+            }
+        };
+        let (Some(slow), Some(mut held)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS)) else {
+            release(resource);
+            return;
+        };
+        held.viewed = Arc::new(crate::bindless::Viewed::with_batch(true, true));
+        let all: Vec<u32> = (0..SLOTS).collect();
+        let census = |heap: &HostHeap| all.iter().map(|&i| heap.viewed.range_at(i)).collect::<Vec<_>>();
+        let _ = crate::census_fast::take_held(1.0);
+        for round in 0..3 {
+            match round {
+                // Cleared records: `mirror` makes the slots null (`make_null`).
+                2 => {
+                    // SAFETY: the test's own records.
+                    unsafe { std::ptr::write_bytes(records.as_mut_ptr(), 0, records.len()) }
+                }
+                _ => write(round),
+            }
+            for &i in &all {
+                slow.mirror(i, at(i), false);
+            }
+            held.make_stale(all.clone(), start, 32);
+            for &i in &all {
+                assert_eq!(shown(&held, i), shown(&slow, i), "round {round}, slot {i}");
+            }
+            assert_eq!(census(&held), census(&slow), "round {round}");
+        }
+        assert!(census(&held).iter().all(Option::is_none), "the cleared slots left the census");
+        let [updates, takes, saved, _] = crate::census_fast::take_held(1.0);
+        // Round 0: the unordered and refused views (32); round 1: the
+        // unordered ones (the refused records are as they were); round 2:
+        // the 64 cleared slots. One lock take a round.
+        assert!(updates >= 112.0 && takes >= 3.0 && saved >= 109.0, "{updates} {takes} {saved}");
+        drop((slow, held));
         release(resource);
     }
 }

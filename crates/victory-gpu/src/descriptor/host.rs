@@ -981,6 +981,10 @@ impl HostHeap {
     /// slot of `stale`, in order.
     pub(crate) fn make_stale(&self, stale: Vec<u32>, start: u64, step: u64) {
         let at = |i: u32| start + u64::from(i) * step;
+        // mac: the census updates of the slots made here held and entered a
+        // batch at a time, all of them before this returns
+        // (`VICTORY_CENSUS_BATCH=1`, `crate::bindless::Pass`).
+        let pass = self.viewed.pass();
         if super::ahead::on() {
             super::ahead::changed(stale.len());
         }
@@ -1001,6 +1005,7 @@ impl HostHeap {
         }
         for i in stale {
             self.mirror(i, at(i), false);
+            pass.enter_if_full();
         }
     }
 
@@ -1056,6 +1061,9 @@ impl HostHeap {
         let quick = !self.sampler && quick::on();
         pool.run(parts.len(), &|k| {
             let _syncing = super::slots::Syncing::enter();
+            // mac: each thread's part holds its census updates, entered
+            // before the part ends (`VICTORY_CENSUS_BATCH=1`).
+            let pass = self.viewed.pass();
             super::ahead::as_round(round, || {
                 crate::host::as_holder(holds, || {
                     if quick {
@@ -1063,6 +1071,7 @@ impl HostHeap {
                     } else {
                         for &i in parts[k] {
                             self.mirror(i, at(i), false);
+                            pass.enter_if_full();
                         }
                     }
                 })
@@ -1097,10 +1106,13 @@ impl HostHeap {
         left.sort_unstable();
         left.dedup();
         super::ahead::changed(left.len());
+        // mac: as a sync pass's (`VICTORY_CENSUS_BATCH=1`).
+        let pass = self.viewed.pass();
         for i in left {
             let at = start + u64::from(i) * step;
             if crate::host::read_into(at as *const u8, &mut [0u8; 4]) {
                 self.mirror(i, at, false);
+                pass.enter_if_full();
             }
         }
     }

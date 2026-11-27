@@ -1230,10 +1230,12 @@ mod tests {
     /// `notes/overlap-stages-design.md`): the next submission's texture
     /// upload from memory the one left writes (here on the GPU, through an
     /// aliased buffer, a range it declared) finishes that one first and
-    /// uploads what it wrote; a texture elsewhere is uploaded beside it.
-    /// Needs Rosetta (the aliasing) and the heap sync ahead
-    /// (`VICTORY_ASYNC_HEAP_SYNC=1`, as the launcher sets it): without it
-    /// every flight is finished at the heap sync, before the uploads.
+    /// uploads what it wrote; a texture elsewhere is uploaded beside it,
+    /// also while the one left has an upload list of its own (the other
+    /// list and staging are taken). Needs Rosetta (the aliasing) and the
+    /// heap sync ahead (`VICTORY_ASYNC_HEAP_SYNC=1`, as the launcher sets
+    /// it): without it every flight is finished at the heap sync, before
+    /// the uploads.
     #[test]
     fn with_flights_an_upload_from_memory_the_one_left_writes_waits() {
         let Some(host) = host() else {
@@ -1308,6 +1310,35 @@ mod tests {
             drop(back);
             drop(take_done());
         }
+        // The one left has an upload list of its own (its texture changed):
+        // the next one's uploads take the other list and staging, and do
+        // not finish it for that.
+        let memory = [0, 1].map(|_| crate::watch::tests::pool(1));
+        let (first, firsts) = texture(memory[0]);
+        let (second, seconds) = texture(memory[1]);
+        let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+        crate::texture::upload(&lists[0], first, &firsts.texture);
+        crate::texture::upload(&lists[1], second, &seconds.texture);
+        lists.iter().for_each(|l| l.close());
+        for at in memory {
+            // SAFETY: a texture's own page.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0x44, page) };
+        }
+        let finishes = flights::finished_for(flights::Why::Uploads);
+        let slot = crate::texture::upload_slot();
+        let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        let left = VALUE.load(Acquire) != 0;
+        assert_eq!(crate::texture::upload_slot(), slot ^ 1, "the first's uploads took a slot");
+        back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        assert_eq!(crate::texture::upload_slot(), slot, "the second's took the other");
+        settle(By::Signal);
+        assert_eq!(crate::texture::uploads(first), 2);
+        assert_eq!(crate::texture::uploads(second), 2);
+        if left {
+            assert_eq!(flights::finished_for(flights::Why::Uploads), finishes, "not finished for its upload list");
+        }
+        drop(back);
+        drop(take_done());
         flights::FORCED_ALIAS.store(false, Relaxed);
         drop(flights);
     }

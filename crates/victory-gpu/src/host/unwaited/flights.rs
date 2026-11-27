@@ -44,7 +44,8 @@
 //! `VICTORY_FLIGHTS_WITH=alias` (E2 of `notes/overlap-stages-design.md`)
 //! keeps title buffers zero-copy (`crate::alias`), where the shaders of the
 //! submission left write title memory itself while the next is prepared.
-//! The next one's texture uploads then finish it first when a texture's
+//! The next one's texture uploads then use the upload list and staging the
+//! one left does not (two, in turn), and finish it first when a texture's
 //! memory could meet what it writes or lands ([`Host::beside_texture_reads`]);
 //! a fill and a step of ours that read title memory follow the same rule.
 
@@ -113,9 +114,10 @@ fn with() -> u32 {
         if taken & 1 != 0 {
             tracing::info!(
                 "VICTORY_FLIGHTS_WITH=alias: title buffers stay aliased with flights (VICTORY_ALIAS_BUFFERS); the \
-                 texture uploads of a submission prepared while the one before runs finish that one first where a \
-                 texture's memory, or the memory a fill or a step of ours reads, is in what it may write or (if it \
-                 writes anything) is shown at another address too"
+                 texture uploads of a submission prepared while the one before runs take an upload list and staging \
+                 of their own (two, in turn), and finish that one first where a texture's memory, or the memory a \
+                 fill or a step of ours reads, is in what it may write or (if it writes anything) is shown at \
+                 another address too"
             );
         }
         taken
@@ -458,9 +460,13 @@ impl Host {
 
     /// Whether the texture uploads would reset what the submission left
     /// runs: its upload list, and the staging pool its uploads read from
-    /// (`crate::bindless::uploads_after`, `crate::texture::recycle`).
+    /// (`crate::bindless::uploads_after`, `crate::texture::recycle_in`).
+    /// mac: never with `VICTORY_FLIGHTS_WITH=alias`, where the next
+    /// submission's uploads take the other list and staging
+    /// (`crate::texture::upload_slot`).
     pub(in crate::host) fn beside_uploads(&self, beside: &Option<Beside>) -> bool {
         beside.as_ref().is_some_and(Beside::running)
+            && !with_alias()
             && LEFT
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

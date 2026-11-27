@@ -507,11 +507,15 @@ pub(crate) fn uploads_after(
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
     before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]),
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
+    // mac: two, used in turn with flights' `alias`, else the first only: a
+    // submission prepared while the one before still runs takes the list
+    // and staging that one is not using (`crate::texture::upload_slot`).
+    static LISTS: [Mutex<Holder>; 2] = [const { Mutex::new(Holder(None)) }; 2];
+    let slot = crate::texture::upload_slot();
+    let mut guard = LISTS[slot].lock().unwrap_or_else(|e| e.into_inner());
+    crate::texture::recycle_in(slot);
     match &guard.0 {
-        // Closed by the last submission, which has run.
+        // Closed by the last submission of the slot, which has run.
         Some(list) => list.reset(),
         // Made open.
         None => {
@@ -647,9 +651,12 @@ pub(crate) fn uploads_after(
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads {
-        list: guard,
-        worker: Mutex::new(ready),
+    recorded.then(|| {
+        crate::texture::slot_given(slot);
+        Uploads {
+            list: guard,
+            worker: Mutex::new(ready),
+        }
     })
 }
 

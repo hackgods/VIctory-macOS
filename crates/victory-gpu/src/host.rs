@@ -3910,10 +3910,16 @@ impl HostList {
             if let Some(gate) = gate.as_mut() {
                 gate(step);
             }
-            let started = std::time::Instant::now();
+            // mac: the clock only where its reading is used: under Wine each
+            // reading is a call into the kernel, and most steps (refreshes,
+            // slots, heaps) only queue work and continue (profile of
+            // 27 November: ~13 ms a frame of clock readings).
+            let started = (cfg!(feature = "diagnostics")
+                || matches!(step, Step::Copy(..) | Step::Move(..) | Step::Fill(..)))
+            .then(std::time::Instant::now);
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(
-                started,
+                started.unwrap_or_else(std::time::Instant::now),
                 match step {
                     Step::Refresh(..) | Step::Slot(..) => C::StepRefreshUs,
                     Step::Copy(..) | Step::Move(..) | Step::Fill(..) => C::StepCopyUs,
@@ -3978,7 +3984,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.map_or(0, |s| s.elapsed().as_micros() as u64));
                     }
                     continue;
                 }
@@ -4002,7 +4008,9 @@ impl HostList {
                     continue;
                 }
             };
-            PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            if let Some(started) = started {
+                PREPARING[0].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+            }
             PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
     }
@@ -4275,26 +4283,33 @@ impl Batch {
             && work.len() >= 2
             && total_requested >= crate::shadow::PARALLEL_REFRESH_MIN_BYTES
         {
-            type RefreshOut = Vec<(usize, usize, usize, u64)>;
+            // (ranges, the copy's whole time outside diagnostics: see below)
+            type RefreshOut = (Vec<(usize, usize, usize, u64)>, u64);
             let results: Vec<Mutex<RefreshOut>> =
                 (0..work.len()).map(|_| Mutex::default()).collect();
             let early = self.early;
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
                 let mut out = Vec::new();
+                // mac: per copy, not per range, outside diagnostics (as in
+                // the serial loop below).
+                let copy_started = (!cfg!(feature = "diagnostics")).then(std::time::Instant::now);
                 for (from, to) in ranges.iter() {
-                    let started = std::time::Instant::now();
+                    let started = cfg!(feature = "diagnostics").then(std::time::Instant::now);
                     let copied = refresh(shadow, from, to - from, early);
-                    let us = started.elapsed().as_micros() as u64;
+                    let us = started.map_or(0, |s| s.elapsed().as_micros() as u64);
                     out.push((from, to, copied, us));
                 }
-                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
+                let whole = copy_started.map_or(0, |s| s.elapsed().as_micros() as u64);
+                *results[i].lock().unwrap_or_else(|e| e.into_inner()) = (out, whole);
             });
             for ((shadow, _), done) in work.into_iter().zip(results) {
                 let key = std::sync::Arc::as_ptr(&shadow) as usize;
                 let (start, len) = shadow.range();
-                let (before, mut spent) = (total, 0);
-                for (from, to, copied, us) in done.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                let (done, whole) = done.into_inner().unwrap_or_else(|e| e.into_inner());
+                let (before, mut spent) = (total, whole);
+                PREPARING[0].fetch_add(whole, Ordering::Relaxed);
+                for (from, to, copied, us) in done {
                     spent += us;
                     #[cfg(feature = "diagnostics")]
                     {
@@ -4330,10 +4345,14 @@ impl Batch {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
             let (before, mut spent) = (total, 0);
+            // mac: timed per copy, not per range, outside diagnostics: two
+            // clock readings for each of ~23,000 ranges a frame cost more
+            // than many of the refreshes they timed under Wine.
+            let copy_started = (!cfg!(feature = "diagnostics")).then(std::time::Instant::now);
             for (from, to) in ranges.iter() {
-                let started = std::time::Instant::now();
+                let started = cfg!(feature = "diagnostics").then(std::time::Instant::now);
                 let copied = refresh(&shadow, from, to - from, self.early);
-                let us = started.elapsed().as_micros() as u64;
+                let us = started.map_or(0, |s| s.elapsed().as_micros() as u64);
                 spent += us;
                 #[cfg(feature = "diagnostics")]
                 {
@@ -4357,6 +4376,11 @@ impl Batch {
                     std::collections::hash_map::Entry::Occupied(occupied) => occupied.into_mut(),
                 };
                 have.insert(from, to, 0);
+            }
+            if let Some(started) = copy_started {
+                let us = started.elapsed().as_micros() as u64;
+                spent += us;
+                PREPARING[0].fetch_add(us, Ordering::Relaxed);
             }
             if total > before {
                 self.copied.0 += 1;

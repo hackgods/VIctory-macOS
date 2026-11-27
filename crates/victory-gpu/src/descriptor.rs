@@ -1954,6 +1954,119 @@ pub(crate) mod tests {
         }
     }
 
+    /// The section view [`unordered_resolve`] answers for, and its heap.
+    #[cfg(windows)]
+    static UNORDERED_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(windows)]
+    static UNORDERED_HEAP: std::sync::Mutex<Option<std::sync::Arc<crate::alias::PhysicalHeap>>> =
+        std::sync::Mutex::new(None);
+
+    /// As [`in_place_resolve`], for [`UNORDERED_VIEW`].
+    #[cfg(windows)]
+    fn unordered_resolve(
+        start: u64,
+        len: u64,
+    ) -> Option<(std::sync::Arc<crate::alias::PhysicalHeap>, usize)> {
+        let base = UNORDERED_VIEW.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let heap = UNORDERED_HEAP.lock().unwrap().clone()?;
+        (start >= base && start + len <= base + (4 << 16)).then(|| (heap, (start - base) as usize))
+    }
+
+    /// Shaders never write title memory in place (#554): an unordered view
+    /// of memory in place is made from a copy of it, which lets the memory
+    /// in place there go (its changed bytes alone go back to title memory).
+    #[cfg(windows)]
+    #[test]
+    fn unordered_views_of_memory_in_place_are_made_from_copies() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        const PAGE: usize = 64 << 10;
+        const SECTION: usize = 4 * PAGE;
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        if !crate::alias::in_place_sections() {
+            crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+            return; // not Rosetta with D3DMetal
+        }
+        let heap_of_section = crate::alias::in_place_heap(SECTION).expect("a heap for the section");
+        // SAFETY: a fresh pagefile section.
+        let section = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                SECTION as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!section.is_null());
+        // SAFETY: a view of our section, shown on the heap's pages.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, SECTION) }
+            .Value
+            .cast::<u8>();
+        assert!(!view.is_null());
+        // SAFETY: as victory-hle shows every view of a section on a heap.
+        assert!(unsafe { heap_of_section.alias_view(view as usize, 0, SECTION) });
+        let base = view as u64;
+        crate::alias::clear_remapped(base, base + SECTION as u64);
+        crate::alias::clear_written(base, base + SECTION as u64);
+        UNORDERED_VIEW.store(view as usize, std::sync::atomic::Ordering::Relaxed);
+        *UNORDERED_HEAP.lock().unwrap() = Some(heap_of_section);
+        crate::alias::TEST_RESOLVER.with(|c| c.set(Some(unordered_resolve)));
+        let start = base + PAGE as u64;
+        let resource = 0x7e57_8000usize;
+        crate::shadow::register(resource, start, 2 * PAGE as u64);
+        let at = start + 256;
+
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 16,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 16 * 32,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if heap(h).host().is_some() {
+            // Read through a view first: in place.
+            let read = crate::shadow::find(at, 256).expect("memory in place");
+            assert!(read.is_aliased());
+            // A structured view of 64 words there, for unordered access.
+            let buffer = [1, 0, 0, 0, 256, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+            let mut words = [0u32; 16];
+            words[..10].copy_from_slice(&[0, 1, 0, 0, 64, 4, 0, 0, 0, 0]);
+            words[10] = at as u32;
+            words[11] = (at >> 32) as u32;
+            create_placed_uav(std::ptr::null(), &buffer, &words, memory as u64 + 4 * 32);
+            assert!(
+                !crate::alias::is_in_place(at, 256),
+                "an unordered view lets memory in place go"
+            );
+            let copy = crate::shadow::find(at, 256).expect("a copy");
+            assert!(!copy.is_aliased(), "the view's memory is a copy");
+            drop((read, copy));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+        crate::shadow::unregister(resource, start);
+        crate::alias::clear_written(base, base + SECTION as u64);
+        crate::alias::TEST_RESOLVER.with(|c| c.set(None));
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+        *UNORDERED_HEAP.lock().unwrap() = None;
+        // SAFETY: our view and section, no longer used.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+            CloseHandle(section);
+        }
+    }
+
     /// A record the title copies into its shader-visible heap as bytes (no
     /// call) is made on the host at the next sync, and only then.
     #[cfg(windows)]

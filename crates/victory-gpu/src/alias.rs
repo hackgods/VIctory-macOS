@@ -655,7 +655,7 @@ pub(crate) fn in_place_shadow(
     start: u64,
     len: u64,
 ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-    if len == 0 || !in_place_sections() {
+    if len == 0 || !in_place_sections() || written_before(start, len) {
         return None;
     }
     // Through its reservation's tiles where it can (`crate::tiles`): the
@@ -752,8 +752,32 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
     // queue: buffers through them stay in place unless a page of theirs is
     // now no heap's (`crate::tiles::remapped`).
     let lost = crate::tiles::remapped(at, len);
+    let which = if lost {
+        crate::shadow::InPlace::All
+    } else {
+        crate::shadow::InPlace::Direct
+    };
+    let_go(at, len, which, LetGo::Remapped);
+}
+
+/// Why title memory in place is let go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LetGo {
+    /// The title mapped other pages there.
+    Remapped,
+    /// GPU work is bound to write it ([`written`]).
+    Written,
+    /// A title-memory program reached it ([`reached`]).
+    Reached,
+}
+
+/// Lets title memory in place over `[at, at + len)` go (`which` of it):
+/// buffers found there are looked up again, slots made from them are made
+/// again before the next submission, and lists recorded with them and
+/// submitted after are counted ([`stale_list`]). Whether any was there.
+fn let_go(at: u64, len: u64, which: crate::shadow::InPlace, why: LetGo) -> bool {
     if len == 0 || IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
-        return;
+        return false;
     }
     let end = at.saturating_add(len);
     let (from, to) = {
@@ -767,17 +791,13 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             .map_or((0, 0), |(f, t)| (f.min(at), t.max(end)))
     };
     if from == to {
-        return;
+        return false;
     }
-    let which = if lost {
-        crate::shadow::InPlace::All
-    } else {
-        crate::shadow::InPlace::Direct
-    };
     let gone = crate::shadow::forget_in_place(from, to, which);
     if gone.is_empty() {
-        return;
+        return false;
     }
+    let bytes: u64 = gone.iter().map(|s| s.range().1).sum();
     {
         let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
         let mut remapped = REMAPPED.write().unwrap_or_else(|e| e.into_inner());
@@ -786,12 +806,19 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             if map.remove(&start).is_some() {
                 IN_PLACE_COUNT.fetch_sub(1, Ordering::Release);
             }
-            // Never in place there again but through tiles: a list recorded
-            // before the title mapped other pages there and submitted
-            // after it read the old pages through the addresses it was
-            // recorded with (slots are made again, below; a list's own
-            // views cannot be). So that can happen once a range at most,
-            // and [`stale_list`] counts it.
+            // Through tiles a list recorded before reads the new pages (or
+            // none, where they are no heap's): found again through tiles
+            // once the pages are a heap's, never refused. Written memory is
+            // refused by [`WRITTEN`], which holds it already.
+            if why != LetGo::Remapped || crate::tiles::is_region_buffer(&shadow.buffer) {
+                continue;
+            }
+            // Never in place there again on a heap's own buffer: a list
+            // recorded before the title mapped other pages there and
+            // submitted after it read the old pages through the addresses
+            // it was recorded with (slots are made again, below; a list's
+            // own views cannot be). So that can happen once a range at
+            // most, and [`stale_list`] counts it.
             remapped
                 .entry(start)
                 .and_modify(|end| *end = (*end).max(start + bytes))
@@ -814,16 +841,121 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             .extend(gone);
         LET_GO_PENDING.store(true, Ordering::Release);
     }
-    static EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // Per reason: events, and bytes let go.
+    static EVENTS: [[std::sync::atomic::AtomicU64; 2]; 3] =
+        [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 3];
+    let [events, total] = &EVENTS[why as usize];
+    let n = events.fetch_add(1, Ordering::Relaxed) + 1;
+    let mb = (total.fetch_add(bytes, Ordering::Relaxed) + bytes) >> 20;
     if n <= 16 || n.is_power_of_two() {
-        tracing::info!(
-            from = format_args!("{from:#x}"),
-            to = format_args!("{to:#x}"),
-            n,
-            "title memory in place let go: the title mapped other pages there"
-        );
+        let from = format_args!("{from:#x}");
+        let to = format_args!("{to:#x}");
+        match why {
+            LetGo::Remapped => {
+                tracing::info!(%from, %to, n, mb, "title memory in place let go: the title mapped other pages there")
+            }
+            LetGo::Written => {
+                tracing::info!(%from, %to, n, mb, "title memory in place let go: GPU work writes it")
+            }
+            LetGo::Reached => {
+                tracing::info!(%from, %to, n, mb, "title memory in place let go: a title-memory program reached it")
+            }
+        }
     }
+    true
+}
+
+/// Title memory GPU work writes or title-memory programs reach, by start:
+/// its end. Never in place ([`in_place_shadow`]): memory in place is the
+/// title's own, and shaders never write title memory in place (#554). The
+/// title keeps CPU objects in its physical pages; written memory has a
+/// copy, whose changed bytes alone go back (`Shadow::gpu_writes`).
+static WRITTEN: std::sync::RwLock<std::collections::BTreeMap<u64, u64>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+static WRITTEN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The longest range in [`WRITTEN`].
+static WRITTEN_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// GPU work is about to be bound to write `[address, address + len)`
+/// (an unordered view, a root UAV, a title-memory program's root): title
+/// memory in place there is let go for good first, so the write goes to a
+/// host copy. Whether any was let go: a lookup made before then found it,
+/// and has to be made again.
+pub(crate) fn written(address: u64, len: u64) -> bool {
+    refuse(address, len, LetGo::Written)
+}
+
+/// A title-memory program reached `[address, address + len)` with no copy
+/// there in the page table, which names no memory in place (programs
+/// write through it): title memory in place there is let go for good, so
+/// that the next table names a copy of it.
+pub(crate) fn reached(address: u64, len: u64) {
+    refuse(address, len, LetGo::Reached);
+}
+
+fn refuse(address: u64, len: u64, why: LetGo) -> bool {
+    if len == 0 || !in_place_sections() {
+        return false;
+    }
+    let end = address.saturating_add(len);
+    let known = WRITTEN_COUNT.load(Ordering::Acquire) != 0 && {
+        let map = WRITTEN.read().unwrap_or_else(|e| e.into_inner());
+        let lowest = address.saturating_sub(WRITTEN_SPAN.load(Ordering::Relaxed));
+        map.range(lowest..=address).any(|(_, &stop)| stop >= end)
+    };
+    if !known {
+        let mut map = WRITTEN.write().unwrap_or_else(|e| e.into_inner());
+        match map.entry(address) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(end);
+                WRITTEN_COUNT.fetch_add(1, Ordering::Release);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let stop = entry.get_mut();
+                *stop = (*stop).max(end);
+            }
+        }
+        WRITTEN_SPAN.fetch_max(len, Ordering::Relaxed);
+    }
+    is_in_place(address, len) && let_go(address, len, crate::shadow::InPlace::All, why)
+}
+
+/// Whether any of `[start, start + len)` is memory GPU work writes.
+fn written_before(start: u64, len: u64) -> bool {
+    if WRITTEN_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let lowest = start.saturating_sub(WRITTEN_SPAN.load(Ordering::Relaxed));
+    WRITTEN
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(lowest..end)
+        .any(|(_, &stop)| stop > start)
+}
+
+/// Forgets that `[start, end)` was written: tests whose memory may lie
+/// where another test's was.
+#[cfg(test)]
+pub(crate) fn clear_written(start: u64, end: u64) {
+    WRITTEN
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&from, &mut to| to <= start || from >= end);
+}
+
+/// Whether `shadow` is title memory in place (which the title page table
+/// does not name: [`reached`]).
+pub(crate) fn holds_in_place(shadow: &crate::shadow::Shadow) -> bool {
+    if !shadow.is_aliased() || IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let (start, len) = shadow.range();
+    IN_PLACE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&start)
+        .is_some_and(|&end| end >= start + len)
 }
 
 /// The title now shows the page at `at` at another address too: title
@@ -1498,6 +1630,95 @@ mod tests {
         let heap = TEST_HEAP.lock().unwrap().clone()?;
         (start >= base && start + len <= base + TEST_SECTION as u64)
             .then(|| (heap, (start - base) as usize))
+    }
+
+    /// The view and heap [`written_resolve`] answers for.
+    static WRITTEN_VIEW: AtomicUsize = AtomicUsize::new(0);
+    static WRITTEN_HEAP: Mutex<Option<std::sync::Arc<PhysicalHeap>>> = Mutex::new(None);
+
+    fn written_resolve(start: u64, len: u64) -> Option<(std::sync::Arc<PhysicalHeap>, usize)> {
+        let base = WRITTEN_VIEW.load(Ordering::Relaxed) as u64;
+        let heap = WRITTEN_HEAP.lock().unwrap().clone()?;
+        (start >= base && start + len <= base + TEST_SECTION as u64)
+            .then(|| (heap, (start - base) as usize))
+    }
+
+    /// Shaders never write title memory in place (#554): memory GPU work is
+    /// bound to write, or a title-memory program reaches, is let go for good
+    /// and copied from then on (its changed bytes alone go back); the page
+    /// table names no memory in place; memory elsewhere in the section stays
+    /// in place.
+    #[test]
+    fn memory_gpu_work_writes_is_never_in_place() {
+        if !crate::watch::rosetta() || supported().is_none() || host().is_none() {
+            return;
+        }
+        TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        let heap = in_place_heap(TEST_SECTION).expect("a heap for the section");
+        // SAFETY: a fresh allocation of ours, pointed at the heap's pages.
+        let view = unsafe {
+            let view = VirtualAlloc(
+                std::ptr::null(),
+                TEST_SECTION,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!view.is_null());
+            assert!(heap.alias_view(view as usize, 0, TEST_SECTION));
+            view
+        };
+        let base = view as u64;
+        let section = base + TEST_SECTION as u64;
+        clear_remapped(base, section);
+        clear_written(base, section);
+        WRITTEN_VIEW.store(view as usize, Ordering::Relaxed);
+        *WRITTEN_HEAP.lock().unwrap() = Some(heap.clone());
+        TEST_RESOLVER.with(|c| c.set(Some(written_resolve)));
+        // Two title buffers in the section, ours.
+        let (first, second) = (0x7e57_6000usize, 0x7e57_7000usize);
+        let other = base + 2 * PAGE as u64;
+        crate::shadow::register(first, base, PAGE as u64);
+        crate::shadow::register(second, other, PAGE as u64);
+
+        let read = crate::shadow::find(base + 16, 64).expect("memory in place");
+        assert!(read.is_aliased() && holds_in_place(&read));
+        assert!(
+            !crate::memory::names(&read),
+            "the page table names no memory in place"
+        );
+        // GPU work bound to write a word of it: let go, a copy now.
+        assert!(written(base + 100, 8), "in place there: let go");
+        assert!(!is_in_place(base + 16, 64));
+        let copy = crate::shadow::find(base + 16, 64).expect("a copy");
+        assert!(!copy.is_aliased() && crate::memory::names(&copy));
+        assert!(!written(base + 100, 8), "nothing in place there now");
+        // Found again after its copy went: still not in place.
+        drop(copy);
+        crate::shadow::unregister(first, base);
+        crate::shadow::register(first, base, PAGE as u64);
+        let again = crate::shadow::find(base + 16, 64).expect("a copy");
+        assert!(!again.is_aliased(), "never in place again");
+        assert!(in_place_shadow(base + 64, 64).is_none());
+
+        // The other buffer stays in place, until a title-memory program
+        // reaches it.
+        let elsewhere = crate::shadow::find(other + 8, 8).expect("memory in place");
+        assert!(elsewhere.is_aliased(), "the rest of the section in place");
+        reached(other, PAGE as u64);
+        assert!(!is_in_place(other + 8, 8));
+        let copied = crate::shadow::find(other + 8, 8).expect("a copy");
+        assert!(!copied.is_aliased());
+
+        drop((read, again, elsewhere, copied));
+        crate::shadow::unregister(first, base);
+        crate::shadow::unregister(second, other);
+        clear_written(base, section);
+        TEST_RESOLVER.with(|c| c.set(None));
+        TEST_IN_PLACE.with(|c| c.set(None));
+        *WRITTEN_HEAP.lock().unwrap() = None;
+        // SAFETY: our allocation, no longer used.
+        unsafe { VirtualFree(view.cast(), 0, MEM_RELEASE) };
     }
 
     /// A title buffer on XMem physical pages whose section is on a heap is

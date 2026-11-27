@@ -2012,7 +2012,7 @@ impl Host {
         let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
+        let mut batch = Batch { overlap_only: crate::mac_switches::flush_overlapping(), ..Batch::default() };
         for list in runs {
             // Its first title copy opens a list the copy-order split cut.
             batch.cut = list.after_copy();
@@ -4174,6 +4174,34 @@ struct Batch {
     /// The list being prepared starts after a copy-order cut and has not
     /// made a title copy yet (`crate::alias::title_copy`).
     cut: bool,
+    /// mac: from VIctory-macOS #452 (`VICTORY_FLUSH_OVERLAPPING=1`): a title
+    /// copy not into memory shown twice flushes only the pending refreshes
+    /// its window can change ([`Batch::title_copied`]).
+    overlap_only: bool,
+}
+
+/// For the frame line, since the last one: title copies (not into memory
+/// shown twice), those into memory shown twice; refreshes of copies made
+/// before title copies (copies, ranges, bytes, µs); copies' refreshes a
+/// title copy left queued (`VICTORY_FLUSH_OVERLAPPING`); refreshes made by
+/// every other flush (copies, ranges, bytes, µs).
+static FLUSHES: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// The frame line's part for the refresh flushes (`frames` since the last
+/// one): where the submission's refreshes were made, always.
+fn flush_line(frames: f64) -> String {
+    let [copies, twice, at, at_ranges, at_bytes, at_us, kept, other, other_ranges, other_bytes, other_us] =
+        FLUSHES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!(
+        "; refresh flushes: {copies:.0} title copies ({twice:.0} into memory shown twice) flushed {at:.0} copies' \
+         refreshes ({at_ranges:.0} ranges, {:.1} MB, {:.1} ms) and left {kept:.0} queued; other flushes {other:.0} \
+         copies' refreshes ({other_ranges:.0} ranges, {:.1} MB, {:.1} ms){}",
+        at_bytes / 1e6,
+        at_us / 1e3,
+        other_bytes / 1e6,
+        other_us / 1e3,
+        if crate::mac_switches::flush_overlapping() { " (VICTORY_FLUSH_OVERLAPPING)" } else { "" }
+    )
 }
 
 /// `VICTORY_SYNC_EPOCH` since the last frame line: ranges of copies with
@@ -4243,7 +4271,9 @@ impl Batch {
         // decided here, where `clean` above decides for the whole copy.
         // The refresh it would get at the next flush copies the same
         // nothing: every step of the submission that writes title memory
-        // flushes first (`title_copied`, `title_written`), the submission
+        // flushes first (`title_copied`, `title_written`; with
+        // `VICTORY_FLUSH_OVERLAPPING` a title copy only what it can change,
+        // and the rest reads the same bytes later), the submission
         // before has been finished and copied back (no flights), and its
         // pages stay in the changed set until a take, so what the title's
         // threads write meanwhile is for the next submission either way.
@@ -4284,10 +4314,18 @@ impl Batch {
         if crate::watch::aliased(at, len) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
+            FLUSHES[1].fetch_add(1, Ordering::Relaxed);
             return self.title_written();
         }
-        self.flush();
+        FLUSHES[0].fetch_add(1, Ordering::Relaxed);
         let (from, to) = touched(at, at.saturating_add(len));
+        if self.overlap_only {
+            self.flush_overlapping(from, to);
+        } else {
+            self.pending.clear();
+            let work = std::mem::take(&mut self.refreshes);
+            self.flush_work(work, true);
+        }
         // Only the copies whose memory the bytes can be in: the rest
         // hold nothing of the window, and what a no-op remove would
         // leave whole it leaves whole.
@@ -4298,12 +4336,71 @@ impl Batch {
         }
     }
 
+    /// From VIctory-macOS #452 (18f33b86, `VICTORY_FLUSH_OVERLAPPING`): before
+    /// a title copy whose window (`touched`) is `[from, to)`, only the
+    /// pending refreshes of copies whose queued ranges reach into it are
+    /// made. The others read bytes the title copy does not change (memory
+    /// shown at two addresses never comes here), so they read the same
+    /// bytes later: they stay queued and join what later lists ask of the
+    /// same copies, made together at the submission's flush (fewer, longer
+    /// ranges, one take each, in parallel there). What the title's threads
+    /// write meanwhile is for later submissions either way.
+    fn flush_overlapping(&mut self, from: usize, to: usize) {
+        let mut overlapping = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (shadow, ranges) = &self.refreshes[i];
+            let (start, len) = shadow.range();
+            let (start, end) = (start as usize, start.saturating_add(len) as usize);
+            let reaches = start < to && end > from && ranges.iter().any(|(a, b)| a < to && b > from);
+            if !reaches {
+                i += 1;
+                continue;
+            }
+            let (shadow, ranges) = self.refreshes.swap_remove(i);
+            self.pending.remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+            // The last entry moved into `i`: its index changes.
+            if let Some((moved, _)) = self.refreshes.get(i) {
+                self.pending.insert(std::sync::Arc::as_ptr(moved) as usize, i);
+            }
+            overlapping.push((shadow, ranges));
+        }
+        FLUSHES[6].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+        self.flush_work(overlapping, true);
+    }
+
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
-        #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
         self.pending.clear();
         let work = std::mem::take(&mut self.refreshes);
+        self.flush_work(work, false)
+    }
+
+    /// Does the refreshes `work` (taken out of `refreshes`, with `pending`
+    /// told); `at_copy`: before a title copy (the frame line's count).
+    /// Returns the bytes copied.
+    fn flush_work(
+        &mut self,
+        work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+        at_copy: bool,
+    ) -> usize {
+        if work.is_empty() {
+            return 0;
+        }
+        let started = std::time::Instant::now();
+        #[cfg(feature = "diagnostics")]
+        let _timed = crate::watch::Timed(started, crate::copystat::C::FlushUs);
+        let counted_at = if at_copy { 2 } else { 7 };
+        FLUSHES[counted_at].fetch_add(work.len() as u64, Ordering::Relaxed);
+        FLUSHES[counted_at + 1].fetch_add(work.iter().map(|(_, r)| r.iter().count() as u64).sum(), Ordering::Relaxed);
+        let total = self.flush_made(work);
+        FLUSHES[counted_at + 2].fetch_add(total as u64, Ordering::Relaxed);
+        FLUSHES[counted_at + 3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        total
+    }
+
+    /// [`Batch::flush_work`]'s refreshes.
+    fn flush_made(&mut self, work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>) -> usize {
         let total_requested: usize = work
             .iter()
             .flat_map(|(_, ranges)| ranges.iter())
@@ -5136,6 +5233,12 @@ impl Meter {
             let guards = crate::watch::frame_line(report_frames);
             // From ScarlettMac 4921b7e6: with `VICTORY_SYNC_EPOCH=1` only.
             let epoch = epoch_line(report_frames);
+            // mac: write snapshots and their copy-back compares, always
+            // (`VICTORY_SNAPSHOT_SPANS`, from VIctory-macOS #436).
+            let snapshots = crate::shadow::snapshot_line(report_frames);
+            // mac: where the refreshes were made (`VICTORY_FLUSH_OVERLAPPING`,
+            // from VIctory-macOS #452), always.
+            let flushes = flush_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5160,7 +5263,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}{epoch}",
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);
@@ -6142,6 +6245,110 @@ mod batch {
         assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
         done(pa, Some(a));
         done(pb, Some(b));
+    }
+
+    /// From VIctory-macOS #452 (`VICTORY_FLUSH_OVERLAPPING`): the same, with
+    /// only overlapping refreshes made before a title copy: the disjoint
+    /// copy's refresh waits for the submission's flush, once.
+    #[test]
+    fn overlapping_title_copy_refreshes_its_destination_and_defers_the_rest() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        fill(pa, PAGE, 0x12);
+        fill(pa + PAGE, PAGE, 0x34);
+        fill(pb, 4 * PAGE, 0x56);
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        let list = super::host().unwrap().new_list().unwrap();
+        list.defer_move((pa + PAGE) as *mut u8, pa as *const u8, 2 * PAGE);
+        list.run_deferred(&mut batch, None);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(
+            batch.flush(),
+            2 * PAGE + 4 * PAGE,
+            "the overlapping copy's destination and the disjoint copy, deferred"
+        );
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
+        assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(batch.flush(), 0, "both copies are now current");
+        done(pa, Some(a));
+        done(pb, Some(b));
+    }
+
+    /// From VIctory-macOS #452: a title copy flushes only the pending
+    /// refreshes that reach its window, the overlapping copy holds the
+    /// bytes from before it, the others stay queued (their places in
+    /// `pending` kept right) and take later asks of the same copies.
+    #[test]
+    fn a_title_copy_flushes_only_overlapping_pending_refreshes() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        let (pc, c) = plain(2).expect("third host buffer");
+        fill(pa, 4 * PAGE, 0x11);
+        fill(pb, 4 * PAGE, 0x22);
+        fill(pc, 2 * PAGE, 0x33);
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (3, 3));
+        let src = [0xaau8; 64];
+        title_copy(&mut batch, pa + PAGE, src.as_ptr() as usize, src.len());
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (2, 2), "the disjoint ones stay queued");
+        for (i, (copy, _)) in batch.refreshes.iter().enumerate() {
+            assert_eq!(batch.pending[&(Arc::as_ptr(copy) as usize)], i, "their places");
+        }
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1111_1111, "made before the copy");
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0, "not made yet");
+        assert_eq!(c.read_host(pc as u64, 1)[0], 0, "not made yet");
+        // Later lists ask again: `b` and `c` join their queued refreshes,
+        // `a` asks for the window the copy wrote.
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (3, 3));
+        let window = if crate::watch::fault_tracking() { PAGE } else { src.len() };
+        assert_eq!(batch.flush(), window + 4 * PAGE + 2 * PAGE, "each once");
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0xaaaa_aaaa);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x2222_2222);
+        assert_eq!(c.read_host(pc as u64, 1)[0], 0x3333_3333);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        batch.add(&c, pc, 2 * PAGE);
+        assert_eq!(batch.flush(), 0, "all three current");
+        done(pa, Some(a));
+        done(pb, Some(b));
+        done(pc, Some(c));
+    }
+
+    /// From VIctory-macOS #452: a title copy into memory shown at two
+    /// addresses still makes every pending refresh first, disjoint or not.
+    #[test]
+    fn a_title_copy_into_memory_shown_twice_still_flushes_everything() {
+        let (a, _b) = crate::watch::tests::twin_views(2);
+        let Some((pd, d)) = plain(2) else {
+            return; // no host GPU here
+        };
+        fill(pd, 2 * PAGE, 0x44);
+        let src = crate::watch::tests::pool(1);
+        fill(src, PAGE, 0x55);
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
+        batch.add(&d, pd, 2 * PAGE);
+        assert_eq!(batch.refreshes.len(), 1);
+        title_copy(&mut batch, a, src, PAGE);
+        assert_eq!(batch.refreshes.len(), 0, "made before the copy");
+        assert_eq!(d.read_host(pd as u64, 1)[0], 0x4444_4444);
+        done(pd, Some(d));
+        done(src, None);
     }
 
     /// Two copies of title memory, every list of a submission asking for

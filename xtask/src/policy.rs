@@ -153,7 +153,13 @@ pub fn check(path: &str, content: &[u8]) -> Vec<String> {
     // port, never game content), and only in docs/images.
     let readme_art = path.starts_with("docs/images/")
         && matches!(ext.as_deref(), Some("svg" | "png" | "jpg" | "jpeg" | "gif"));
+    // The Objective-C source and C header of the Metal bridge's unixlib
+    // (#221), and only there: the macOS half of a Wine unixlib is native
+    // code that calls Metal.
+    let unixlib_source =
+        path.starts_with("crates/victory-metal/unix/") && matches!(ext.as_deref(), Some("m" | "h"));
     let allowed = readme_art
+        || unixlib_source
         || ALLOWED_NAMES.contains(&name)
         || ext
             .as_deref()
@@ -299,6 +305,33 @@ mod tests {
         );
         // Other extensions are unchanged.
         assert!(check("notes.md", b"GIT binary patch is a phrase\n").is_empty());
+    }
+
+    /// Objective-C and C headers pass only as the Metal bridge's unixlib
+    /// source, with the same content checks as any other file.
+    #[test]
+    fn accepts_the_unixlib_source_only_in_its_folder() {
+        let source = b"#import <Metal/Metal.h>\n";
+        assert!(check("crates/victory-metal/unix/victory_metal.m", source).is_empty());
+        assert!(check("crates/victory-metal/unix/abi.h", b"#include <stdint.h>\n").is_empty());
+        assert!(
+            !check("crates/victory-gpu/src/x.m", source).is_empty(),
+            "elsewhere"
+        );
+        assert!(!check("tools/macos/x.h", source).is_empty(), "elsewhere");
+        let hex: String = synthetic(600).map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !check(
+                "crates/victory-metal/unix/blob.h",
+                format!("\"{hex}\"").as_bytes()
+            )
+            .is_empty(),
+            "hex run"
+        );
+        assert!(
+            !check("crates/victory-metal/unix/x.m", b"MZ\x90\0").is_empty(),
+            "magic"
+        );
     }
 
     #[test]

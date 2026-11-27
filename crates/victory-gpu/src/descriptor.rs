@@ -808,7 +808,6 @@ impl Views {
             }
         };
         let generation = self.list[i as usize].1;
-        set_view_gen(i, generation);
         self.count_address(&view);
         for r in view.resources().into_iter().filter(|&r| r != 0) {
             self.by_resource.entry(r).or_default().push(i);
@@ -852,6 +851,9 @@ fn record(handle: u64, view: View) {
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let (i, generation) = views.entry_kept(view);
+    // The lock-free mirror of the shared table's generations, under its
+    // lock: `entry_kept` on a table of a test's own must not write it.
+    set_view_gen(i, generation);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -2153,6 +2155,36 @@ pub(crate) mod tests {
         assert_eq!(views.address_entries, [5000, 5000]);
         assert_eq!(views.address_entries, live_counts(&views));
         let _ = views_kept();
+    }
+
+    /// Entries of a table other than the shared one leave the shared
+    /// table's lock-free generations alone. They wrote generation 1 over
+    /// the first 10,000 indices, so heap syncs running beside a test like
+    /// the one above took live views there (reused, at generation 2 or
+    /// more) for gone and made their slots null
+    /// (`bench_sync_slots_1_5m_fast_vs_legacy`: "made mismatch").
+    #[test]
+    fn a_table_of_its_own_leaves_the_shared_generations_alone() {
+        const SEEN: u32 = 0x5eed;
+        let shared = |i: usize| {
+            VIEW_GENS[0]
+                .get()
+                .map(|t| t[i].load(std::sync::atomic::Ordering::Acquire))
+        };
+        // An entry of a table of its own at index 3, made again from its
+        // free list at a generation no shared view of the tests reaches.
+        let mut views = Views::default();
+        for n in 0..4u64 {
+            views.entry_kept(View::Constant(0x7_0000 + 256 * n, 256));
+        }
+        views.list[3].1 = SEEN;
+        views.free.push(3);
+        assert_eq!(views.entry_kept(View::Constant(0x9_0000, 256)), (3, SEEN));
+        assert_ne!(
+            shared(3),
+            Some(SEEN),
+            "the shared generation was not written"
+        );
     }
 
     #[test]

@@ -175,6 +175,9 @@ pub(crate) struct Parts<'a> {
     pub host_wave32: bool,
     /// See [`Options::narrow_waves`](super::Options).
     pub narrow_waves: bool,
+    /// A size query on a writable image asks for level 0, not an undefined
+    /// level ([`Options::uav_size_level0`](super::Options)).
+    pub uav_size_level0: bool,
 }
 
 enum Stop {
@@ -824,6 +827,9 @@ impl<'a> Lower<'a> {
             if declared.bytes() > super::METAL_MESH_OUTPUT_BYTES {
                 max_vertices = max_vertices.min(ms.threads);
                 max_primitives = max_primitives.min(ms.threads);
+            }
+            if max_vertices == 0 {
+                max_primitives = 0;
             }
             s.mesh = Some(super::shader::Mesh {
                 max_vertices,
@@ -4863,7 +4869,7 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
+        let mip = if image.is_some() && (!uav || self.x.uav_size_level0) {
             self.s.m.i32(0)
         } else {
             self.s.m.undef(i32t)
@@ -9575,7 +9581,9 @@ impl<'a> Lower<'a> {
             // in the first address: DXIL's dimensions; a channel DXIL leaves
             // out reads 1 (UAVs: one level).
             let h = self.handle(site, src, false, props)?;
-            let mip = if uav {
+            let mip = if uav && self.x.uav_size_level0 {
+                self.s.m.i32(0)
+            } else if uav {
                 self.s.m.undef(self.s.t.i32)
             } else {
                 addr_val(self, 0)?
@@ -10981,32 +10989,6 @@ impl<'a> Lower<'a> {
                 &args,
             );
         }
-        self.end_guarded(at, &[]);
-        Ok(())
-    }
-
-    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
-    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
-    /// and 29), which only the console's edge-flag rasterisation reads and
-    /// which is no part of the index. Bit 31 culls it (all indices 0: no
-    /// area).
-    fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
-        let v = e.values[0].ok_or("a primitive export without its indices")?;
-        let x = self.i32_of(v)?;
-        let at = self.begin_guarded(guard);
-        let c = self.cur;
-        let z = self.s.m.i32(0);
-        let culled = self.s.m.cmp(c, pred::SLT, x, z);
-        let mut args = vec![self.mesh_thread()];
-        for k in 0..3 {
-            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
-            let i = self.s.m.bin(c, Bin::LShr, x, shift);
-            let i = self.s.m.bin(c, Bin::And, i, mask);
-            args.push(self.s.m.select(c, culled, z, i));
-        }
-        let void = self.s.t.void;
-        self.s
-            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }

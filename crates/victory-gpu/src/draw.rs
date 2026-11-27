@@ -750,6 +750,9 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
+            if writes {
+                list.note_unknown_gpu_write();
+            }
             if let Some(host) = (self.heaps[0] != 0)
                 .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
                 .flatten()
@@ -961,6 +964,7 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        list.note_unknown_gpu_write();
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);
                         } else {
@@ -1198,6 +1202,18 @@ impl State {
             dropped(list, self.pipeline, "dispatch");
             return;
         }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out, and counted there, not as dropped.
+        if crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT dispatch {x}x{y}x{z} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(self.pipeline as This)
+                )
+            });
+            return;
+        }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -1241,7 +1257,8 @@ impl State {
             return;
         }
         let role = crate::pipeline::ambient_role(self.pipeline as This);
-        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS) == 0 {
+        let estimate = crate::ambient_estimate::roles();
+        if role & (crate::ambient::RESOLVES | crate::ambient::ENDS_REFLECTIONS | estimate) == 0 {
             return;
         }
         let Some(stage) =
@@ -1272,7 +1289,42 @@ impl State {
             };
             (texture != 0).then_some((pin, texture as This))
         };
-        let recorded = if role & crate::ambient::RESOLVES != 0 {
+        let recorded = if crate::ambient_estimate::on() {
+            // The estimate in the constant's place (`VICTORY_AMBIENT=estimate`,
+            // from avatarmanz 82ca1347).
+            use crate::ambient_estimate as estimate;
+            if role & estimate::KEEPS != 0 {
+                match &image(ResourceType::Uav, estimate::RADIANCE) {
+                    Some((_, radiance)) => estimate::keep(list, *radiance),
+                    None => {
+                        once!("no ambient estimate: the light visible surfaces send out is not at its place in the table");
+                        false
+                    }
+                }
+            } else if role & estimate::LIGHTS_AIR != 0 {
+                // (Nothing unless `VICTORY_AMBIENT_AIR` is set.)
+                match &image(ResourceType::Uav, estimate::AIR) {
+                    Some((_, scattered)) => estimate::air(list, *scattered),
+                    None => false,
+                }
+            } else if role & crate::ambient::RESOLVES != 0 {
+                let light = image(ResourceType::Uav, crate::ambient::LIGHT);
+                let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
+                match &light {
+                    Some((_, light)) => estimate::raise(list, *light, depth.as_ref().map(|d| d.1)),
+                    None => {
+                        once!("no ambient estimate: the resolve's light image is not at its place in the table");
+                        false
+                    }
+                }
+            } else {
+                // The reflections, held to the light around.
+                match &image(ResourceType::Uav, crate::ambient::REFLECTIONS) {
+                    Some((_, reflections)) => estimate::hold(list, *reflections),
+                    None => false,
+                }
+            }
+        } else if role & crate::ambient::RESOLVES != 0 {
             let light = image(ResourceType::Uav, crate::ambient::LIGHT);
             let depth = image(ResourceType::Srv, crate::ambient::DEPTH);
             match &light {
@@ -2028,6 +2080,19 @@ impl State {
             why("the BVH builder held back");
             return false;
         }
+        // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
+        // `crate::ray_skip`): left out before its arguments are refreshed
+        // and clamped, and counted there, not as a dropped execution.
+        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| {
+                format!(
+                    "LEFT OUT indirect kind {kind} max {max} (VICTORY_RAY_SKIP) {}",
+                    crate::pipeline::shaders_of(pipeline)
+                )
+            });
+            return true;
+        }
         if crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
@@ -2056,19 +2121,37 @@ impl State {
             why("no host signature");
             return false;
         };
+        let args_gpu = args.gpu(arguments);
+        if !crate::indirect::available() || !args_gpu.is_multiple_of(4) || !stride.is_multiple_of(4)
+        {
+            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+            return false;
+        }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
-        // Bounded first: the clamp binds a compute pipeline of its own. It
-        // reads the count, so that it stops where the execution does.
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let Some(clamped) = crate::indirect::bound(list, args.gpu(arguments), (kind, stride, max), counted) else {
-            why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+        // Decide hoisting before `prepare`/`bind`, which record *this* call's
+        // own GPU writes (those only constrain subsequent indirect calls).
+        let hoist = crate::indirect::batch_clamps_enabled()
+            && list.can_hoist_clamp(arguments, len, count);
+        let inline_clamped = if hoist {
+            None
+        } else {
+            // Bounded first: the inline clamp binds a compute pipeline of its
+            // own. It reads the count, so that it stops where execution does.
+            let Some(clamped) =
+                crate::indirect::bound(list, args_gpu, (kind, stride, max), counted)
+            else {
+                why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                return false;
+            };
+            list.note_inline_clamp();
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+            Some(clamped)
         };
-        self.host_pipeline = 0;
-        self.host_roots[1] = 0;
         let ran = match kind {
             DRAW | INDEXED => {
                 (self.topology != RECTANGLES || self.completes_rectangles() || {
@@ -2084,7 +2167,9 @@ impl State {
             _ => unreachable!("the signature check above admits only these kinds"),
         };
         if !ran {
-            crate::indirect::done(list, &clamped);
+            if let Some(clamped) = &inline_clamped {
+                crate::indirect::done(list, clamped);
+            }
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => {
@@ -2100,6 +2185,18 @@ impl State {
             }
             return false;
         }
+        let (clamped, dst_offset, needs_done) = match inline_clamped {
+            Some(clamped) => (clamped, 0, true),
+            None => {
+                let Some((clamped, dst_offset)) =
+                    crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
+                else {
+                    why("not bounded (no hoisted argument buffer)");
+                    return false;
+                };
+                (clamped, dst_offset, false)
+            }
+        };
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(
@@ -2114,7 +2211,7 @@ impl State {
                 &signature,
                 max,
                 &clamped,
-                0,
+                dst_offset,
                 counter.as_ref().map(|(s, _)| &s.buffer),
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
@@ -2128,10 +2225,19 @@ impl State {
             if always || crate::capture::dump_on() {
                 let count = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
                 let name = crate::pipeline::shaders_of(pipeline);
-                crate::capture::read_indirect(list, (&clamped, 0), count, (kind, stride, max), name, always);
+                crate::capture::read_indirect(
+                    list,
+                    (&clamped, dst_offset),
+                    count,
+                    (kind, stride, max),
+                    name,
+                    always,
+                );
             }
         }
-        crate::indirect::done(list, &clamped);
+        if needs_done {
+            crate::indirect::done(list, &clamped);
+        }
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3847,6 +3953,123 @@ void main() { dst.Store4(0, asuint(src[0])); }
         }
     }
 
+    /// A table slot the title wrote once (as it writes its materials' tables
+    /// at load) keeps its view, a constant buffer view or a placed view,
+    /// however many views without a resource object the title makes after it
+    /// (the world makes ~5,000 more a second). A view table that freed the
+    /// oldest of them past a cap left such a slot null: shaders read zeros
+    /// and the world drew black once the cap was reached (#414, ~284 s in).
+    /// #414's cap failed this with `VICTORY_OWNERLESS_VIEWS=64`.
+    #[test]
+    fn a_slot_written_once_keeps_its_view_past_newer_ownerless_views() {
+        slot_keeps_its_view_past(4096, 0x7ff0_0000_0000);
+    }
+
+    /// The same past #414's default cap (2^20), which it failed.
+    #[test]
+    #[ignore = "makes 2^20 views (~10 s under Wine, ~300 MB kept for the run): run by name"]
+    fn a_slot_written_once_keeps_its_view_past_two_to_the_twenty_ownerless_views() {
+        slot_keeps_its_view_past((1 << 20) + 64, 0x7e00_0000_0000);
+    }
+
+    /// Writes a constant buffer view and a placed buffer view of the same
+    /// title buffer once, each into a table of its own, reads both through
+    /// a dispatch, makes `newer` constant buffer views of other memory from
+    /// address `base` on, and reads both again.
+    fn slot_keeps_its_view_past(newer: u64, base: u64) {
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let (a, out) = (buffer(256), buffer(256));
+        let (a_bytes, _) = crate::resource::buffer_bytes(a).unwrap();
+        let (out_bytes, _) = crate::resource::buffer_bytes(out).unwrap();
+        let (a_bytes, out_bytes) = (a_bytes as u64, out_bytes as u64);
+        let out_copy = crate::shadow::find(out_bytes, 256).expect("the output's host copy");
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        // A raw shader view of `a` placed by address: R32_TYPELESS, buffer,
+        // the default mapping, 64 elements, raw; then the address.
+        let mut placed = [0u32; 16];
+        placed[..10].copy_from_slice(&[39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]);
+        (placed[10], placed[11]) = (a_bytes as u32, (a_bytes >> 32) as u32);
+        let buffer_desc: [u32; 14] = [1, 0, 0, 0, 256, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
+        let (root, pso) = compile();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        // A shader-visible view heap of 4 slots (no memory of its own) for
+        // each view: the view in slot 0, the output in slot 1.
+        let heaps = [false, true].map(|placed_view| {
+            let heap_desc: [u32; 8] = [0, 4, 1, 0, 0, 0, 0, 0];
+            let mut heap = null;
+            assert_eq!(
+                crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &iid, &mut heap),
+                S_OK
+            );
+            let start = crate::descriptor::heap(heap).start;
+            if placed_view {
+                crate::descriptor::create_placed_srv(null, &buffer_desc, &placed, start);
+            } else {
+                let desc = [a_bytes as u32, (a_bytes >> 32) as u32, 256, 0];
+                crate::descriptor::create_cbv(null, &desc, start);
+            }
+            crate::descriptor::create_uav(null, out, null, &raw, start + 32);
+            heap
+        });
+        let read = |heap: This, value: u32| {
+            let title_heap = crate::descriptor::heap(heap);
+            let host_heap = title_heap.host().expect("a host view heap");
+            // SAFETY: inside the title buffer.
+            unsafe { (a_bytes as *mut u32).write(value) };
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_table(true, 0, title_heap.start);
+            assert!(
+                state
+                    .tables(&list, &[used(ResourceType::Srv)], &[], true)
+                    .is_empty(),
+                "an in-place table"
+            );
+            // SAFETY: an open list and live objects of ours.
+            unsafe {
+                list.list
+                    .SetDescriptorHeaps(&[Some(host_heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, host_heap.gpu(0));
+                list.list.SetComputeRootDescriptorTable(1, host_heap.gpu(1));
+                list.list
+                    .SetComputeRoot32BitConstants(2, 2, [0u32; 2].as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            out_copy.read_host(out_bytes, 1)[0]
+        };
+        // The constant buffer view's table, then the placed view's.
+        let before = heaps.map(|heap| read(heap, 0x1111_1111));
+        assert_eq!(before, [0x1111_1111; 2], "before");
+        // Views of other memory, written elsewhere.
+        let mut record = [0u32; 8];
+        for k in 0..newer {
+            let address = base + 256 * k;
+            let desc = [address as u32, (address >> 32) as u32, 256, 0];
+            crate::descriptor::create_cbv(null, &desc, record.as_mut_ptr() as u64);
+        }
+        let after = heaps.map(|heap| read(heap, 0x2222_2222));
+        assert_eq!(after, [0x2222_2222; 2], "after {newer} newer views");
+        for heap in heaps {
+            assert_eq!(
+                crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+                0
+            );
+        }
+    }
+
     /// Slots of a shader-visible view heap of ours.
     struct Slots(ID3D12DescriptorHeap, u32);
 
@@ -4606,6 +4829,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 bias_as_gradients: false,
                 host_wave32: false,
                 narrow_waves: false,
+                uav_size_level0: false,
             },
         )
         .unwrap();

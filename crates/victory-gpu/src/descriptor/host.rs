@@ -60,6 +60,12 @@ thread_local! {
     /// one, takes an empty one).
     static SYNC_SCRATCH: std::cell::Cell<Scratch> = const { std::cell::Cell::new(Scratch::new()) };
 }
+
+fn sync_fast_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
+}
+
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
 /// targeting a released heap's recycled address never free a newer heap's slots.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -575,6 +581,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        let view_is_sampler = is_sampler(view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            self.make_null(index);
+            return;
+        }
         let (kept, mark) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -933,12 +945,14 @@ impl HostHeap {
         if first >= last {
             return;
         }
+        let fast = sync_fast_enabled();
         let at = |i: u32| start + u64::from(i) * step;
         let forgot = views_forgot();
         let b_first = first / SYNC_BLOCK_SLOTS;
         let b_last = (last - 1) / SYNC_BLOCK_SLOTS;
-        let blocks_verified = (b_first..=b_last)
-            .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
+        let blocks_verified = fast
+            && (b_first..=b_last)
+                .all(|b| self.block_forgot[b as usize].load(Ordering::Acquire) == forgot);
 
         let buf_end = buf_start.saturating_add(buf.len() as u64);
         let mut scratch = SYNC_SCRATCH.take();
@@ -956,15 +970,25 @@ impl HostHeap {
                 let off = (addr - buf_start) as usize;
                 // SAFETY: `off + 12 <= buf.len()`, unaligned copy of 12 bytes.
                 unsafe { buf.as_ptr().add(off).cast::<[u32; 3]>().read_unaligned() }
+            } else if !buf.is_empty() {
+                let mut raw = [0u8; 12];
+                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                    continue;
+                }
+                [
+                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
+                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
+                ]
             } else {
-                // SAFETY: record in title heap memory the caller found mapped.
+                // SAFETY: direct test path (`sync_slots`) in committed memory.
                 unsafe { (addr as *const [u32; 3]).read_unaligned() }
             };
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::SyncNoView, 1);
-                if self.made_is_nonzero(i) {
+                if !fast || self.made_is_nonzero(i) {
                     stale.push(i);
                 }
                 continue;
@@ -1017,11 +1041,13 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         drop(making);
 
-        for b in b_first..=b_last {
-            let b_start = b * SYNC_BLOCK_SLOTS;
-            let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
-            if first <= b_start && last >= b_end {
-                self.block_forgot[b as usize].store(forgot, Ordering::Release);
+        if fast {
+            for b in b_first..=b_last {
+                let b_start = b * SYNC_BLOCK_SLOTS;
+                let b_end = ((b + 1) * SYNC_BLOCK_SLOTS).min(self.count);
+                if first <= b_start && last >= b_end {
+                    self.block_forgot[b as usize].store(forgot, Ordering::Release);
+                }
             }
         }
     }
@@ -1092,6 +1118,7 @@ impl HostHeap {
         if tag == VIEW_TAG
             && self.ready[index as usize].load(Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
+            && is_sampler(&view) == self.sampler
             && !self.needs_remake(index, &view, for_draw)
         {
             return Some(view);
@@ -1108,6 +1135,12 @@ impl HostHeap {
             self.unmake_locked(&mut made, index);
             return None;
         };
+        let view_is_sampler = is_sampler(&view);
+        if view_is_sampler != self.sampler {
+            warn_heap_mismatch(index, self.sampler, view_is_sampler);
+            self.unmake_locked(&mut made, index);
+            return None;
+        }
         // A placed texture's view left null below is made when a draw reads
         // the slot through a table; until then the slot is not made again
         // (heap syncs revisit it at every submission). Also re-mirror if a
@@ -1222,6 +1255,7 @@ impl HostHeap {
             let [tag, i, generation] = record;
             let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
             if let Some(view) = &view
+                && is_sampler(view) == self.sampler
                 && !is_placed_texture(view)
             {
                 prepare(view);
@@ -1247,6 +1281,12 @@ impl HostHeap {
                 }
                 match view.as_deref() {
                     None => self.unmake_locked(&mut made, index),
+                    // As in `mirror`: a record of the other heap kind is
+                    // cleared, never made (#414).
+                    Some(view) if is_sampler(view) != self.sampler => {
+                        warn_heap_mismatch(index, self.sampler, !self.sampler);
+                        self.unmake_locked(&mut made, index);
+                    }
                     Some(view) => {
                         let [_, i, generation] = *record;
                         let key = u64::from(generation) << 32 | u64::from(i);
@@ -2258,6 +2298,24 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 buffer_srv(address, len, srv_desc(words), at)
             }
         }
+    }
+}
+
+/// Whether `view` is a sampler descriptor (must only be created on a sampler
+/// heap, never on a CBV/SRV/UAV heap).
+fn is_sampler(view: &View) -> bool {
+    matches!(view, View::Sampler(_) | View::ConsoleSampler(_))
+}
+
+fn warn_heap_mismatch(index: u32, sampler_heap: bool, sampler_view: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            index,
+            sampler_heap,
+            sampler_view,
+            "descriptor record kind mismatches host heap type; clearing slot"
+        );
     }
 }
 
@@ -3747,6 +3805,113 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    /// Mismatched descriptor kinds (a sampler record in a CBV/SRV/UAV heap or
+    /// a CBV/SRV record in a sampler heap) must be cleared/skipped instead of
+    /// calling `CreateSampler` / `CreateShaderResourceView` on the wrong heap
+    /// handle type.
+    #[test]
+    fn mismatched_heap_kind_views_are_cleared_not_created() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let Some(view_heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let Some(sampler_heap) = HostHeap::new(true, 4) else {
+            return;
+        };
+        let null = std::ptr::null();
+        let sampler_desc: [u32; 13] = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut console_sampler = [0u32; 27];
+        console_sampler[6..9].copy_from_slice(&[3, 3, 3]);
+
+        // View heap: valid view in slot 0, then overwritten with sampler records.
+        let mut view_slots = [[0u32; 8]; 4];
+        let v0 = view_slots[0].as_mut_ptr() as u64;
+        let v1 = view_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], v0);
+        assert!(view_heap.mirror(0, v0, false).is_some());
+        assert!(view_heap.made(0));
+        assert!(view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler(null, &sampler_desc, v0);
+        assert!(view_heap.mirror(0, v0, false).is_none());
+        assert!(!view_heap.made(0));
+        assert!(!view_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_sampler_x(null, &console_sampler, v1);
+        assert!(view_heap.mirror(1, v1, true).is_none());
+        assert!(!view_heap.made(1));
+
+        let dyn_slot = view_heap.dynamic(1).expect("a dynamic slot");
+        view_heap.make_at(dyn_slot, &View::Sampler(sampler_desc));
+        assert!(!view_heap.kept(dyn_slot));
+        view_heap.release(view_heap.id(), dyn_slot, 1);
+
+        // Sampler heap: valid sampler in slot 0, then overwritten with CBV/SRV records.
+        let mut sampler_slots = [[0u32; 4]; 4];
+        let s0 = sampler_slots[0].as_mut_ptr() as u64;
+        let s1 = sampler_slots[1].as_mut_ptr() as u64;
+        crate::descriptor::create_sampler(null, &sampler_desc, s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_some());
+        assert!(sampler_heap.made(0));
+        assert!(sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], s0);
+        assert!(sampler_heap.mirror(0, s0, false).is_none());
+        assert!(!sampler_heap.made(0));
+        assert!(!sampler_heap.made_is_nonzero(0));
+
+        crate::descriptor::create_srv(null, null, std::ptr::null(), s1);
+        assert!(sampler_heap.mirror(1, s1, true).is_none());
+        assert!(!sampler_heap.made(1));
+
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A heap sync clears a slot whose record is of the other heap kind, as
+    /// `mirror` does, instead of making it on the wrong heap: its slots are
+    /// made under one hold of the slot lock, without `mirror`.
+    #[test]
+    fn heap_syncs_clear_records_of_the_other_heap_kind() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (Some(view_heap), Some(sampler_heap)) =
+            (HostHeap::new(false, 4), HostHeap::new(true, 4))
+        else {
+            return;
+        };
+        let null = std::ptr::null();
+        let sampler_desc: [u32; 13] = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+        let mut view_slots = [[0u32; 8]; 4];
+        let v0 = view_slots[0].as_mut_ptr() as u64;
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], v0);
+        view_heap.sync_slots(0, 1, v0, 32);
+        assert!(view_heap.made(0), "a view made in a view heap");
+        crate::descriptor::create_sampler(null, &sampler_desc, v0);
+        view_heap.sync_slots(0, 1, v0, 32);
+        assert!(
+            !view_heap.made(0),
+            "a sampler record in a view heap is cleared"
+        );
+
+        let mut sampler_slots = [[0u32; 4]; 4];
+        let s0 = sampler_slots[0].as_mut_ptr() as u64;
+        crate::descriptor::create_sampler(null, &sampler_desc, s0);
+        sampler_heap.sync_slots(0, 1, s0, 16);
+        assert!(sampler_heap.made(0), "a sampler made in a sampler heap");
+        crate::descriptor::create_cbv(null, &[0, 0, 256, 0], s0);
+        sampler_heap.sync_slots(0, 1, s0, 16);
+        assert!(
+            !sampler_heap.made(0),
+            "a view record in a sampler heap is cleared"
+        );
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
     }
 
     /// The unsigned twin of a 16-bit float or signed format has its layout,

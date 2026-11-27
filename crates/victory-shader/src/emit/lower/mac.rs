@@ -90,6 +90,29 @@
 //!   64-bit atomics are all `umax`, and no program with one stores to an
 //!   image.
 //!
+//! Descriptor dwords read as data ([`Mac::descriptor_as_data`],
+//! `emit::Options::descriptor_as_data`; from ScarlettMac 4921b7e6): a
+//! program that reads a descriptor's dwords as numbers, never as a resource,
+//! had its translation stopped where the descriptor's source could not
+//! answer a dword ([`Lower::view_addresses`]' dwords of a slot,
+//! [`Lower::descriptor_data`]). With this setting the two ends that can
+//! answer them do:
+//!
+//! * a buffer's dword 2, its record count (bytes for a raw view), is filled
+//!   into the host's view-address table by the host itself, from the view
+//!   the slot holds (`descriptor/host.rs`, `address_words`), and the program
+//!   reads it from the same table as dwords 0-1;
+//! * a scalar load through a root descriptor's address reads the resource
+//!   itself, the memory the load names (`emit`, "Root parameters past the
+//!   user SGPRs": a root descriptor is a title address), through the title
+//!   memory page table, as a scalar load from memory is; the program's
+//!   root views are then title memory too (`root_memory`).
+//!
+//! What stays refused is what the host cannot answer from the view: a
+//! buffer's dword 3 (its console format words) and an image's dwords 4-7
+//! (its depth, base level and sample count), so a program that reads one is
+//! still stopped instead of computing with a made-up value.
+//!
 //! The register's bit names are AMD's (as in Mesa's `sid.h`), written from
 //! memory: the tree has no table of them.
 
@@ -164,6 +187,12 @@ pub(crate) struct Mac {
     /// structures are never built here (the builder held back): its walks
     /// then end at the root instead of in whatever lies in that memory.
     pub bvh_miss: bool,
+    /// A descriptor's dwords that the program only reads as numbers come
+    /// from the descriptor's own source rather than stopping the program
+    /// (`emit::Options::descriptor_as_data`, [`Lower::view_addresses`],
+    /// [`Lower::memory_smem`]; the module notes, "Descriptor dwords read as
+    /// data").
+    pub descriptor_as_data: bool,
 }
 
 thread_local! {
@@ -176,6 +205,24 @@ thread_local! {
 /// Counts a size query on a writable image whose answer the program
 /// uses, whatever [`Mac::uav_level0`] says (for `translate --list`, which
 /// names the title's programs that have one; `notes/uav-size.md`).
+impl Mac {
+    /// With [`Mac::descriptor_as_data`]: whether root parameter `param` is a
+    /// root descriptor, whose address a scalar load reads as the resource's
+    /// own memory (the module notes, "Descriptor dwords read as data"); the
+    /// program's root views are then title memory (`root_memory`).
+    pub(super) fn root_as_memory(&self, layout: &[crate::native::RootParam], param: usize) -> bool {
+        self.descriptor_as_data && matches!(layout.get(param).map(|p| p.root), Some(RootType::Descriptor))
+    }
+
+    /// How many leading dwords of a buffer descriptor the host's view
+    /// addresses answer ([`Lower::view_addresses`]): the address (0-1), and
+    /// with [`Mac::descriptor_as_data`] the record count (2), which the host
+    /// fills in too (`descriptor/host.rs`, `address_words`).
+    pub(super) fn buffer_words(&self) -> u32 {
+        if self.descriptor_as_data { 3 } else { 2 }
+    }
+}
+
 pub(super) fn note_uav_size_query(resinfo: bool) {
     UAV_SIZE_QUERIES.with(|q| {
         let mut n = q.get();

@@ -220,6 +220,26 @@ pub fn halves_walk() -> bool {
     crate::mac_switches::walk()
 }
 
+/// From ScarlettMac 4921b7e6: whether a descriptor's dwords a program only
+/// reads as numbers come from the descriptor's source instead of stopping
+/// the program (`victory_shader::emit::Options::descriptor_as_data`; the
+/// host then fills a buffer's record count into the view addresses,
+/// `descriptor::host`): only with `VICTORY_DESCRIPTOR_AS_DATA=1`, off by
+/// default.
+pub fn descriptor_as_data() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_DESCRIPTOR_AS_DATA");
+        if on {
+            tracing::info!(
+                "VICTORY_DESCRIPTOR_AS_DATA=1: a program reading a descriptor's dwords as numbers \
+                 is translated where the descriptor's source answers them"
+            );
+        }
+        on
+    })
+}
+
 /// Whether, with half-local reads, the Mac port's hand-over across the
 /// halves comes before them (`victory_shader::emit::Options::halves_across`,
 /// `VICTORY_HALVES_ACROSS=1`; the rule is in `mac_switches`).
@@ -383,6 +403,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And descriptor dwords read as data (`VICTORY_DESCRIPTOR_AS_DATA=1`):
+    // a program it translates is refused without it. Off, nothing.
+    let key = if options.descriptor_as_data {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"descriptor as data");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -431,6 +461,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         wide_loads: crate::mac_switches::wide_loads(),
         bvh_miss: crate::mac_switches::bvh_miss(),
         lds_rounds: crate::mac_switches::lds_rounds(),
+        descriptor_as_data: descriptor_as_data(),
     }
 }
 
@@ -758,6 +789,18 @@ mod tests {
         let on = victory_shader::emit::Options { bvh_miss: true, ..off };
         assert_ne!(translation_build(off), translation_build(on));
         assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { bvh_miss: false, ..off }));
+    }
+
+    /// `VICTORY_DESCRIPTOR_AS_DATA` changes the translation, so the cache
+    /// keys on it; off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_descriptor_as_data() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { descriptor_as_data: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        let bvh = victory_shader::emit::Options { bvh_miss: true, ..off };
+        assert_ne!(translation_build(bvh), translation_build(victory_shader::emit::Options { descriptor_as_data: true, ..bvh }));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { descriptor_as_data: false, ..off }));
     }
 
     fn shader() -> HostShader {

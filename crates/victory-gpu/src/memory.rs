@@ -82,6 +82,45 @@ impl Map {
     }
 }
 
+/// The most bytes of a copy one piece of it is named for in a page table,
+/// and the most its views show: a raw view holds 2^27 elements (512 MiB).
+const PIECE: u64 = 256 << 20;
+const PIECE_VIEWED: u64 = 512 << 20;
+
+/// The pieces a page table names the copy of title memory `(start, len)`
+/// in: each piece's start, the bytes it is named for, and the bytes its
+/// views show from there. A copy a view can hold whole is one piece. A
+/// longer one is named 256 MiB at a time, and each piece's views show up to
+/// 512 MiB from its start, so an access that begins in a piece's last
+/// bytes reads on through them.
+fn pieces((start, len): (u64, u64)) -> impl Iterator<Item = (u64, u64, u64)> {
+    let whole = len <= PIECE_VIEWED;
+    let count = if whole { 1 } else { len.div_ceil(PIECE) };
+    (0..count).map(move |n| {
+        if whole {
+            (start, len, len)
+        } else {
+            let at = n * PIECE;
+            (start + at, PIECE.min(len - at), PIECE_VIEWED.min(len - at))
+        }
+    })
+}
+
+#[test]
+fn long_copies_are_named_in_pieces() {
+    const MIB: u64 = 1 << 20;
+    assert_eq!(pieces((0x1000, 4 * MIB)).collect::<Vec<_>>(), [(0x1000, 4 * MIB, 4 * MIB)]);
+    assert_eq!(pieces((0, 512 * MIB)).collect::<Vec<_>>(), [(0, 512 * MIB, 512 * MIB)]);
+    assert_eq!(
+        pieces((64 * MIB, 700 * MIB)).collect::<Vec<_>>(),
+        [
+            (64 * MIB, 256 * MIB, 512 * MIB),
+            (320 * MIB, 256 * MIB, 444 * MIB),
+            (576 * MIB, 188 * MIB, 188 * MIB),
+        ]
+    );
+}
+
 /// What a heap's page table names: the copies, the level-1 index of each
 /// block (block 0 is the null one), and the copy each entry names (or none).
 #[derive(Default)]
@@ -200,7 +239,7 @@ struct Shared {
     /// The pair of null views entries without a copy name.
     null: u32,
     /// Each copy's view pair (its first slot), by copy.
-    pairs: HashMap<usize, u32>,
+    pairs: HashMap<(usize, u32), u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
     layout: Arc<Layout>,
@@ -422,7 +461,7 @@ impl Shared {
         let (table, data) = crate::host::host()?.upload_buffer(bytes)?;
         crate::host::name(&table, || "title memory page table".into());
         let null = heap.pair()?;
-        heap.raw_pair_at(null, None, 0);
+        heap.raw_pair_at(null, None, 0, 0);
         // SAFETY: a live buffer.
         let gpu = unsafe { table.GetGPUVirtualAddress() };
         Some(Shared {
@@ -445,34 +484,41 @@ impl Shared {
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
         let copies = crate::shadow::all();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
-        self.pairs.retain(|copy, &mut slot| {
+        self.pairs.retain(|(copy, _), &mut slot| {
             let keep = live.contains(copy);
             if !keep {
-                heap.raw_pair_at(slot, None, 0);
+                heap.raw_pair_at(slot, None, 0, 0);
                 heap.free_pair(slot);
             }
             keep
         });
         let (mut named, mut slots) = (Vec::with_capacity(copies.len()), Vec::with_capacity(copies.len()));
+        let mut ranges: Vec<(u64, u64)> = Vec::with_capacity(copies.len());
         for c in copies {
             let key = Arc::as_ptr(&c) as usize;
-            let slot = match self.pairs.get(&key) {
-                Some(&slot) => slot,
-                None => {
-                    let Some(slot) = heap.pair() else {
-                        static ONCE: std::sync::Once = std::sync::Once::new();
-                        ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
-                        continue;
-                    };
-                    heap.raw_pair_at(slot, Some(&c.buffer), c.range().1.next_multiple_of(4));
-                    self.pairs.insert(key, slot);
-                    slot
-                }
-            };
-            named.push(c);
-            slots.push(slot);
+            // A copy longer than a view holds is named in pieces, each
+            // with views of its own from where it starts in the copy's
+            // buffer (which need not be the buffer's start: memory in
+            // place lies inside its heap's).
+            for (n, (start, len, viewed)) in pieces(c.range()).enumerate() {
+                let slot = match self.pairs.get(&(key, n as u32)) {
+                    Some(&slot) => slot,
+                    None => {
+                        let Some(slot) = heap.pair() else {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| tracing::warn!("no descriptor slots for a title memory copy's views: it reads as missing"));
+                            continue;
+                        };
+                        heap.raw_pair_at(slot, Some(&c.buffer), c.offset(start), viewed.next_multiple_of(4));
+                        self.pairs.insert((key, n as u32), slot);
+                        slot
+                    }
+                };
+                named.push(c.clone());
+                slots.push(slot);
+                ranges.push((start, len));
+            }
         }
-        let ranges: Vec<(u64, u64)> = named.iter().map(|c| c.range()).collect();
         // The last table's blocks and owners, built back into if no list
         // still reads them (a reader clones the layout, under the lock
         // this holds); their buffers are kept between rewrites.
@@ -530,7 +576,12 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
     // Copies the title has not written since they took it are passed by
     // without touching them (the table names every copy, ~4,700 in the world).
     for l in layout.iter() {
+        let mut last = std::ptr::null();
         for (c, bit) in l.copies.iter().zip(&l.bits) {
+            // A copy named in pieces is there once per piece, in a row.
+            if std::mem::replace(&mut last, Arc::as_ptr(c)) == Arc::as_ptr(c) {
+                continue;
+            }
             if !c.clean() && !crate::watch::clean_bit(*bit) {
                 let (start, len) = c.range();
                 add(c, start as usize, len as usize);
@@ -983,7 +1034,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             .find(|(k, _)| *k == key)?
             .1
             .pairs
-            .get(&(Arc::as_ptr(copy) as usize))
+            .get(&(Arc::as_ptr(copy) as usize, 0))
             .copied()
     }
 

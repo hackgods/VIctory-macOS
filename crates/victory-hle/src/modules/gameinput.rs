@@ -1233,6 +1233,8 @@ mod host {
         refocus: super::mac::Refocus,
         /// macOS port: `VICTORY_INPUT_WATCH`.
         watch: super::mac::Watch,
+        /// macOS port: `VICTORY_PAD_REARM`.
+        rearm: super::mac::PadRearm,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1250,20 +1252,25 @@ mod host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 self.watch.pad(slot, None, now());
-                return None;
+                return self.rearm.pad(slot, Some(None), now());
+            }
+            // macOS port: XInput is not asked while `VICTORY_PAD_REARM`
+            // re-arms its reads; the slot reports what the watchdog says.
+            if !self.rearm.may_ask(now()) {
+                return self.rearm.pad(slot, None, now());
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 self.watch.pad(slot, None, now());
-                return None;
+                return self.rearm.pad(slot, Some(None), now());
             }
             self.empty_until[slot] = None;
             let pad = convert(&state.Gamepad);
             let packet = state.dwPacketNumber;
             self.watch.pad(slot, Some((pad, packet)), now());
-            Some(pad)
+            self.rearm.pad(slot, Some(Some((pad, packet))), now())
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1300,6 +1307,12 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            self.watch.rumble(slot, low, high, now());
+            // macOS port: `VICTORY_PAD_RUMBLE=0` drops it; not while
+            // `VICTORY_PAD_REARM` re-arms XInput.
+            if super::mac::rumble_dropped() || !self.rearm.rumble(slot, low, high, now()) {
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1324,7 +1337,10 @@ mod host {
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let (key, held) = match key.split_once(':') {
-                    Some((key, held)) => (key, Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?),
+                    Some((key, held)) => (
+                        key,
+                        Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?,
+                    ),
                     None => (key, Duration::from_millis(200)),
                 };
                 let vk = match key.trim() {
@@ -1835,7 +1851,10 @@ mod tests {
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(
             pad(r),

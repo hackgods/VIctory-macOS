@@ -29,7 +29,52 @@
 //! key is down, one log line (`input watch`) with what the host reports: each
 //! such pad's sticks, triggers and buttons, how long its value has been
 //! exactly the same and how long XInput's packet number has (a pad whose
-//! reports stopped keeps both still), and the keys down. Changes nothing.
+//! reports stopped keeps both still), and the keys down; also the rumble the
+//! title set on each slot (calls since the last line, the last speeds), with a
+//! line for rumble calls alone. Changes nothing.
+//!
+//! `VICTORY_PAD_REARM=1`: a watchdog for a host pad whose reading stopped
+//! while off rest (27 November: right trigger at 1.00 and packet 78 for 56 s
+//! while the player pressed other things). Wine's XInput (`xinput1_3/main.c`)
+//! keeps a pad's last state and its "connected" until its read thread
+//! (`wine_xinput_hid_update`) takes the next HID report; if that thread stops
+//! issuing reads (a read that ended in an error it does not expect, or was
+//! cancelled because the thread that issued it ended) or stops altogether (a
+//! failed wait ends it), the state never changes again. Three steps:
+//! - A second XInput module (`xinput1_3.dll`, its own handles and read thread
+//!   in Wine) reads the same pads all along. Its packet number moving while
+//!   ours stays still means our read is behind: the slot shows its reading.
+//! - A pad off rest with the same packet number for `REARM_STILL`, or behind
+//!   the second module, gets its read re-armed: `XInputEnable(FALSE)` then
+//!   `TRUE`, which cancels each pad's read and issues a new one and keeps the
+//!   state, so a trigger really held keeps reading held. It runs on a thread
+//!   of its own that never ends (Wine cancels a thread's reads when it ends),
+//!   and XInput is not asked while it runs (it holds XInput's pad locks).
+//! - No new packet `REARM_WAIT` after the re-arm, and the second module finds
+//!   no pad in that slot (or the re-arm never returned: Wine's input stack
+//!   does not answer): the slot reads at rest until a reading moves again.
+//!
+//! Reports that stop below XInput (Wine's HID bus, SDL, the pad's radio)
+//! reach neither module, look like a pad held still, and are kept. One
+//! `pad frozen:` line each time a step fires.
+//!
+//! `VICTORY_PAD_STALE_REST=<seconds>` (with `VICTORY_PAD_REARM`, at least 5):
+//! on the SDL path nothing on our side tells a pad held still from one whose
+//! reports stopped, so this is a bound, off unless set: a kept pad still off
+//! rest that long after its last packet reads at rest until a reading moves.
+//! A trigger really held that long reads released until the pad changes.
+//!
+//! `VICTORY_PAD_RUMBLE=0`: the title's rumble is not sent to XInput. On the
+//! SDL path (read in SDL 2.32.10) a rumble report goes out on SDL's rumble
+//! thread holding the pad's device lock (`SDL_hidapi_rumble.c`), and SDL's
+//! update skips a pad whose lock is taken (`SDL_hidapijoystick.c:1347`): a
+//! write that blocks (`IOHIDDeviceSetReport` has no timeout, `hidapi/mac`)
+//! stops the pad's input with no disconnect. Wine turns PS4 rumble over
+//! Bluetooth on (`bus_sdl.c`, "CW HACK 19629"). Without our rumble SDL still
+//! writes at open and, in its enhanced mode, a keep-alive after 0.5 s without
+//! a report; `SDL_JOYSTICK_HIDAPI_PS4_RUMBLE=0` in the environment beats
+//! Wine's hint (`SDL_hints.c:58`) and keeps a pad switched on afresh out of
+//! that mode (a pad already in it stays there until switched off).
 
 use super::{FALLBACK, PADS, PadState};
 
@@ -160,6 +205,17 @@ struct Watched {
     packet_changed: u64,
 }
 
+/// Rumble the title set on one host slot, for `VICTORY_INPUT_WATCH`.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct WatchedRumble {
+    low: u16,
+    high: u16,
+    /// Calls since the last line, and the last one (µs).
+    calls: u32,
+    last: u64,
+}
+
 /// The input watch; see the module notes.
 #[cfg(any(windows, test))]
 #[derive(Debug, Default)]
@@ -167,6 +223,7 @@ pub(super) struct Watch {
     /// `None` until the environment was read.
     on: Option<bool>,
     pads: [Option<Watched>; PADS],
+    rumble: [Option<WatchedRumble>; PADS],
     /// The last line (µs).
     logged: u64,
 }
@@ -214,6 +271,22 @@ impl Watch {
         });
     }
 
+    /// The title set host slot `slot`'s rumble (whether or not it was sent).
+    pub(super) fn rumble(&mut self, slot: usize, low: u16, high: u16, now: u64) {
+        if !self.on() {
+            return;
+        }
+        if let Some(r) = self.rumble.get_mut(slot) {
+            let calls = r.map_or(0, |r| r.calls) + 1;
+            *r = Some(WatchedRumble {
+                low,
+                high,
+                calls,
+                last: now,
+            });
+        }
+    }
+
     /// The keys down (virtual keys) after the pads of one poll; the line
     /// logged, if one is due.
     pub(super) fn keys(&mut self, keys: &[u8], now: u64) -> Option<String> {
@@ -236,8 +309,15 @@ impl Watch {
         };
         let secs = |since: u64| now.saturating_sub(since) as f64 / 1e6;
         let mut line = String::new();
-        for (slot, w) in self.pads.iter().enumerate() {
-            let Some(w) = w.filter(|w| off_rest(&w.pad)) else {
+        for slot in 0..PADS {
+            let shown = self.pads[slot].filter(|w| off_rest(&w.pad));
+            // Rumble: calls since the last line, or set while a pad shows.
+            let rumble = self.rumble[slot]
+                .filter(|r| r.calls > 0 || (shown.is_some() && (r.low | r.high) != 0));
+            let Some(w) = shown else {
+                if let Some(r) = rumble {
+                    let _ = write!(line, "{}", rumble_part(slot, r, secs(r.last)));
+                }
                 continue;
             };
             let p = w.pad;
@@ -255,6 +335,9 @@ impl Watch {
                 w.packet,
                 secs(w.packet_changed),
             );
+            if let Some(r) = rumble {
+                let _ = write!(line, "{}", rumble_part(slot, r, secs(r.last)));
+            }
         }
         if !keys.is_empty() {
             let _ = write!(line, "keys {keys:02x?}");
@@ -262,10 +345,568 @@ impl Watch {
         if line.is_empty() {
             return None;
         }
+        for r in self.rumble.iter_mut().flatten() {
+            r.calls = 0;
+        }
         self.logged = now;
         tracing::info!("input watch: {line}");
         Some(line)
     }
+}
+
+/// `VICTORY_PAD_REARM`: a pad off rest whose packet number stayed the same
+/// this long (µs) gets its read re-armed. XInput's packet number moves with
+/// each HID report, and Wine's SDL bus sends one only when a value changes: a
+/// thumb on a stick changes it many times a second, but a trigger held down
+/// reads 255 and a button 1 in each report, so a pad held still can keep one
+/// packet for seconds (4 s with the trigger held, 27 November 16:58:23). The
+/// re-arm keeps the reading, so this only sets how soon a still pad is tried.
+const REARM_STILL: u64 = 3_000_000;
+/// After a re-arm, this long (µs) without a new packet before the second
+/// module decides.
+const REARM_WAIT: u64 = 2_000_000;
+/// The second module's packet moved this long ago (µs) and ours has not
+/// since: our read is behind. Both modules get each report within
+/// milliseconds of each other.
+const REARM_BEHIND: u64 = 500_000;
+/// A re-arm still running after this long (µs) never returns. It cancels and
+/// reissues up to four reads, a few milliseconds.
+const REARM_HUNG: u64 = 2_000_000;
+
+/// What the second XInput module says about a slot.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Probe {
+    /// No second module (not loaded, or not asked).
+    Off,
+    /// Its `XInputGetState` failed (1167: no pad in that slot).
+    Error(u32),
+    /// Its reading and packet number.
+    Reading(PadState, u32),
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum Stage {
+    /// Our reading.
+    #[default]
+    Watching,
+    /// Still while off rest, re-armed: waiting for a new packet.
+    Rearmed,
+    /// Nothing shows the pad gone: our reading until its packet moves.
+    Kept,
+    /// The second module's reading: ours is behind.
+    Second,
+    /// At rest: the pad is gone, or Wine's input stack does not answer.
+    Rest,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, Default)]
+struct RearmSlot {
+    /// Our module's last reading, and when its packet number moved (µs).
+    main: Option<(PadState, u32)>,
+    moved: u64,
+    /// The second module's last reading, and when its packet number moved
+    /// (not counting the first one seen).
+    second: Option<(PadState, u32)>,
+    second_moved: Option<u64>,
+    /// The second module's packet number when ours last moved: the same
+    /// report reaches the two a poll apart at times.
+    second_at_move: Option<u32>,
+    /// The second module read this slot since our pad connected; the error it
+    /// gives now.
+    second_seen: bool,
+    second_error: Option<u32>,
+    stage: Stage,
+    /// When this still spell's re-arm was asked (one per spell).
+    rearmed: Option<u64>,
+    /// Rumble last set: when (µs), low and high speed.
+    rumble: Option<(u64, u16, u16)>,
+}
+
+/// The `VICTORY_PAD_REARM` decisions, apart from XInput; see the module notes.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+pub(super) struct Rearm {
+    slots: [RearmSlot; PADS],
+    /// Re-arms asked of the helper thread, and when the last one was (µs).
+    asked: u64,
+    asked_at: u64,
+    /// A slot wants a re-arm.
+    wanted: bool,
+    /// A re-arm never returned: our module is not asked again.
+    hung: bool,
+    /// `VICTORY_PAD_STALE_REST` (µs).
+    stale: Option<u64>,
+}
+
+/// A pad is off rest: a button, a trigger, or a stick past drift.
+#[cfg(any(windows, test))]
+fn off_rest(p: &PadState) -> bool {
+    p.buttons != 0
+        || p.left_trigger.max(p.right_trigger) > 0.1
+        || p.left_x.hypot(p.left_y).max(p.right_x.hypot(p.right_y)) > 0.25
+}
+
+#[cfg(any(windows, test))]
+fn describe(p: &PadState) -> String {
+    format!(
+        "left {:+.2} {:+.2} right {:+.2} {:+.2} triggers {:.2} {:.2} buttons {:#x}",
+        p.left_x, p.left_y, p.right_x, p.right_y, p.left_trigger, p.right_trigger, p.buttons
+    )
+}
+
+#[cfg(any(windows, test))]
+fn secs(us: u64) -> f64 {
+    us as f64 / 1e6
+}
+
+#[cfg(any(windows, test))]
+impl Rearm {
+    /// Whether our module may be asked about pads: not while a re-arm runs
+    /// (`finished` of `asked` done), and never again after one did not return.
+    pub(super) fn may_ask(&mut self, finished: u64, now: u64) -> bool {
+        if !self.hung && finished < self.asked && now.saturating_sub(self.asked_at) >= REARM_HUNG {
+            self.hung = true;
+            tracing::warn!(
+                "pad frozen: the re-arm (XInputEnable off and on) has not returned after {:.1} s, so Wine's input stack does not answer; XInput is not asked again, pads read through the second module or at rest",
+                secs(now - self.asked_at)
+            );
+        }
+        !self.hung && finished >= self.asked
+    }
+
+    /// A re-arm wanted since the last call, counted as asked at `now`.
+    pub(super) fn take_wanted(&mut self, now: u64) -> bool {
+        if !std::mem::take(&mut self.wanted) || self.hung {
+            return false;
+        }
+        self.asked += 1;
+        self.asked_at = now;
+        true
+    }
+
+    /// The title set slot `slot`'s rumble (for the log lines).
+    pub(super) fn rumble(&mut self, slot: usize, low: u16, high: u16, now: u64) {
+        if let Some(s) = self.slots.get_mut(slot) {
+            s.rumble = Some((now, low, high));
+        }
+    }
+
+    /// One poll of host slot `slot`. `main`: our module's answer when it was
+    /// asked (`Some(None)`: no pad), `None` when it was not; `second`: the
+    /// second module's. What the slot reports.
+    pub(super) fn slot(
+        &mut self,
+        slot: usize,
+        main: Option<Option<(PadState, u32)>>,
+        second: Probe,
+        now: u64,
+    ) -> Option<PadState> {
+        let (hung, stale) = (self.hung, self.stale);
+        let s = self.slots.get_mut(slot)?;
+        match main {
+            Some(None) => {
+                *s = RearmSlot {
+                    rumble: s.rumble,
+                    ..RearmSlot::default()
+                };
+                return None;
+            }
+            Some(Some((pad, packet))) => {
+                match s.main {
+                    Some((_, old)) if old == packet => {}
+                    Some((_, old)) => {
+                        if s.stage != Stage::Watching || s.rearmed.is_some() {
+                            let after = s.rearmed.map_or(String::new(), |t| {
+                                format!(", {:.1} s after the re-arm", secs(now - t))
+                            });
+                            tracing::info!(
+                                "pad frozen: pad {slot} reads again (packet {old} -> {packet}{after})"
+                            );
+                        }
+                        s.stage = Stage::Watching;
+                        s.rearmed = None;
+                        s.moved = now;
+                        s.second_at_move = s.second.map(|(_, k)| k);
+                    }
+                    None => {
+                        s.moved = now;
+                        s.second_at_move = s.second.map(|(_, k)| k);
+                    }
+                }
+                s.main = Some((pad, packet));
+            }
+            None => {}
+        }
+        let (pad, packet) = s.main?;
+        match second {
+            Probe::Reading(p, k) => {
+                if s.second.is_some_and(|(_, old)| old != k) {
+                    s.second_moved = Some(now);
+                }
+                s.second = Some((p, k));
+                s.second_at_move.get_or_insert(k);
+                s.second_seen = true;
+                s.second_error = None;
+            }
+            Probe::Error(e) => {
+                s.second = None;
+                s.second_at_move = None;
+                s.second_error = Some(e);
+            }
+            Probe::Off => {}
+        }
+        // Decisions need a fresh answer from our module, or know it is dead.
+        if main.is_some() || hung {
+            let gone = s.second_error.filter(|_| s.second_seen);
+            // Newer input in the second module: it moved after ours, a while
+            // ago, to another reading or by two reports or more.
+            let ahead = s.second.is_some_and(|(p, k)| {
+                s.second_moved
+                    .is_some_and(|t| t > s.moved && now.saturating_sub(t) >= REARM_BEHIND)
+                    && (p != pad || s.second_at_move.is_some_and(|m| k.wrapping_sub(m) >= 2))
+            });
+            let waited = s
+                .rearmed
+                .is_some_and(|t| now.saturating_sub(t) >= REARM_WAIT);
+            let still = secs(now.saturating_sub(s.moved));
+            let next = match s.stage {
+                Stage::Watching | Stage::Rearmed | Stage::Kept | Stage::Rest if ahead => {
+                    let k = s.second.map_or(0, |(_, k)| k);
+                    tracing::info!(
+                        "pad frozen: pad {slot} packet {packet} unchanged for {still:.1} s while the second XInput module read newer input (its packet {k}); its reading is shown until ours moves"
+                    );
+                    Some(Stage::Second)
+                }
+                Stage::Kept | Stage::Second if gone.is_some() => {
+                    tracing::warn!(
+                        "pad frozen: pad {slot} still packet {packet}, and the second XInput module finds no pad there (error {}); reported at rest until a reading moves",
+                        gone.unwrap_or_default()
+                    );
+                    Some(Stage::Rest)
+                }
+                Stage::Watching | Stage::Rearmed | Stage::Kept if hung => {
+                    tracing::warn!(
+                        "pad frozen: pad {slot} at packet {packet}: XInput does not answer; reported at rest until the second XInput module reads newer input"
+                    );
+                    Some(Stage::Rest)
+                }
+                Stage::Watching if off_rest(&pad) && still >= secs(REARM_STILL) => {
+                    let rumble = match s.rumble {
+                        Some((at, low, high)) => format!(
+                            "rumble {:.2} {:.2} set {:.1} s ago",
+                            f32::from(low) / 65535.0,
+                            f32::from(high) / 65535.0,
+                            secs(now.saturating_sub(at))
+                        ),
+                        None => "no rumble set".into(),
+                    };
+                    tracing::info!(
+                        "pad frozen: pad {slot} packet {packet} unchanged for {still:.1} s while off rest ({}; {rumble}); re-arming the read (XInputEnable off and on)",
+                        describe(&pad)
+                    );
+                    Some(Stage::Rearmed)
+                }
+                Stage::Rearmed if waited => {
+                    if let Some(e) = gone {
+                        tracing::warn!(
+                            "pad frozen: pad {slot} still packet {packet} {:.1} s after the re-arm, and the second XInput module finds no pad there (error {e}); reported at rest until a reading moves",
+                            secs(REARM_WAIT)
+                        );
+                        Some(Stage::Rest)
+                    } else {
+                        let second = match (s.second, s.second_error) {
+                            (Some((p, k)), _) if p == pad => {
+                                format!("the second XInput module reads the same (packet {k})")
+                            }
+                            (Some((_, k)), _) => format!(
+                                "the second XInput module reads otherwise but nothing newer (packet {k})"
+                            ),
+                            (None, Some(e)) => {
+                                format!("the second XInput module never read this slot (error {e})")
+                            }
+                            (None, None) => "there is no second XInput module".into(),
+                        };
+                        tracing::info!(
+                            "pad frozen: pad {slot} still packet {packet} {:.1} s after the re-arm; {second}: kept as it reads (held still, or reports stopped below XInput)",
+                            secs(REARM_WAIT)
+                        );
+                        Some(Stage::Kept)
+                    }
+                }
+                Stage::Kept
+                    if off_rest(&pad)
+                        && stale.is_some_and(|b| now.saturating_sub(s.moved) >= b) =>
+                {
+                    tracing::warn!(
+                        "pad frozen: pad {slot} packet {packet} unchanged for {still:.1} s while off rest ({}), with nothing newer in either XInput module; reported at rest (VICTORY_PAD_STALE_REST) until a reading moves",
+                        describe(&pad)
+                    );
+                    Some(Stage::Rest)
+                }
+                _ => None,
+            };
+            if let Some(next) = next {
+                if matches!(next, Stage::Rearmed | Stage::Second) && s.rearmed.is_none() && !hung {
+                    s.rearmed = Some(now);
+                    self.wanted = true;
+                }
+                s.stage = next;
+            }
+        }
+        match s.stage {
+            Stage::Second => s.second.map(|(p, _)| p).or(Some(PadState::default())),
+            Stage::Rest => Some(PadState::default()),
+            _ => Some(pad),
+        }
+    }
+}
+
+/// `VICTORY_PAD_RUMBLE` (its value): `0` or `off` drops the title's rumble.
+#[cfg(any(windows, test))]
+fn rumble_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim(), "0" | "off"))
+}
+
+/// Whether the title's rumble is dropped (`VICTORY_PAD_RUMBLE=0`); see the
+/// module notes.
+#[cfg(windows)]
+pub(super) fn rumble_dropped() -> bool {
+    static DROPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DROPPED.get_or_init(|| {
+        let dropped = rumble_off(std::env::var("VICTORY_PAD_RUMBLE").ok().as_deref());
+        if dropped {
+            tracing::info!(
+                "pad rumble: the title's rumble is not sent to XInput (VICTORY_PAD_RUMBLE=0)"
+            );
+        }
+        dropped
+    })
+}
+
+/// `VICTORY_PAD_REARM` on the host: the switch, the decisions, and the helper
+/// thread that re-arms XInput and holds the second module.
+#[cfg(windows)]
+#[derive(Default)]
+pub(super) struct PadRearm {
+    /// `None` until the environment was read.
+    on: Option<bool>,
+    rearm: Rearm,
+    helper: Option<helper::Helper>,
+}
+
+#[cfg(windows)]
+impl PadRearm {
+    fn on(&mut self) -> bool {
+        if let Some(on) = self.on {
+            return on;
+        }
+        let mut on =
+            std::env::var("VICTORY_PAD_REARM").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+        if on && let Ok(v) = std::env::var("VICTORY_PAD_STALE_REST") {
+            match v.trim().parse::<f64>() {
+                Ok(s) if s >= secs(REARM_STILL + REARM_WAIT) && s.is_finite() => {
+                    tracing::info!(
+                        seconds = s,
+                        "pad rearm: a kept pad still off rest this long reads at rest (VICTORY_PAD_STALE_REST)"
+                    );
+                    self.rearm.stale = Some((s * 1e6) as u64);
+                }
+                _ => tracing::warn!(
+                    value = v,
+                    "VICTORY_PAD_STALE_REST wants seconds, at least 5"
+                ),
+            }
+        }
+        if on {
+            match helper::Helper::start() {
+                Ok(helper) => {
+                    tracing::info!(
+                        still_s = secs(REARM_STILL),
+                        wait_s = secs(REARM_WAIT),
+                        "pad rearm: a host pad off rest with the same packet number re-arms its read; a pad still frozen that the second XInput module finds gone reads at rest (VICTORY_PAD_REARM)"
+                    );
+                    self.helper = Some(helper);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "pad rearm: no helper thread; VICTORY_PAD_REARM is off");
+                    on = false;
+                }
+            }
+        }
+        self.on = Some(on);
+        on
+    }
+
+    /// Whether XInput may be asked about pads, or set their rumble, now.
+    pub(super) fn may_ask(&mut self, now: u64) -> bool {
+        if !self.on() {
+            return true;
+        }
+        let finished = self.helper.as_ref().map_or(0, helper::Helper::finished);
+        self.rearm.may_ask(finished, now)
+    }
+
+    /// The title set slot `slot`'s rumble; whether XInput may be told now.
+    pub(super) fn rumble(&mut self, slot: usize, low: u16, high: u16, now: u64) -> bool {
+        if self.on() {
+            self.rearm.rumble(slot, low, high, now);
+        }
+        self.may_ask(now)
+    }
+
+    /// What host slot `slot` reports, from XInput's answer (`Some(None)`: no
+    /// pad; `None`: not asked).
+    pub(super) fn pad(
+        &mut self,
+        slot: usize,
+        main: Option<Option<(PadState, u32)>>,
+        now: u64,
+    ) -> Option<PadState> {
+        if !self.on() {
+            return main.flatten().map(|(pad, _)| pad);
+        }
+        let second = match self.helper.as_ref().and_then(helper::Helper::second) {
+            Some(get) if main != Some(None) => {
+                let mut state =
+                    windows_sys::Win32::UI::Input::XboxController::XINPUT_STATE::default();
+                // SAFETY: the second module's `XInputGetState`, room for the state.
+                match unsafe { get(slot as u32, &mut state) } {
+                    0 => Probe::Reading(super::host::convert(&state.Gamepad), state.dwPacketNumber),
+                    e => Probe::Error(e),
+                }
+            }
+            _ => Probe::Off,
+        };
+        let shown = self.rearm.slot(slot, main, second, now);
+        if self.rearm.take_wanted(now)
+            && let Some(helper) = &self.helper
+        {
+            helper.rearm();
+        }
+        shown
+    }
+}
+
+/// The thread that re-arms XInput's reads and holds the second module.
+#[cfg(windows)]
+mod helper {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, OnceLock, mpsc};
+    use std::time::Instant;
+
+    use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    use windows_sys::Win32::UI::Input::XboxController::{XINPUT_STATE, XInputEnable};
+
+    pub(super) type GetState = unsafe extern "system" fn(u32, *mut XINPUT_STATE) -> u32;
+
+    /// Modules with an XInput of their own in Wine (`PARENTSRC` of
+    /// `xinput1_3`); ours is `xinput1_4.dll`.
+    const SECOND: [&str; 3] = ["xinput1_3.dll", "xinput1_2.dll", "xinput1_1.dll"];
+
+    pub(super) struct Helper {
+        requests: mpsc::Sender<()>,
+        finished: Arc<AtomicU64>,
+        second: Arc<OnceLock<Option<GetState>>>,
+    }
+
+    /// The second module's `XInputGetState`; its first call starts its read
+    /// thread, which opens the pads there.
+    fn load_second() -> Option<GetState> {
+        for name in SECOND {
+            let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+            // SAFETY: a nul-terminated name; the module stays loaded.
+            let module = unsafe { LoadLibraryW(wide.as_ptr()) };
+            if module.is_null() {
+                continue;
+            }
+            // SAFETY: a loaded module and a nul-terminated name.
+            let Some(proc) = (unsafe { GetProcAddress(module, c"XInputGetState".as_ptr().cast()) })
+            else {
+                continue;
+            };
+            // SAFETY: `XInputGetState`'s documented signature.
+            let get: GetState = unsafe { std::mem::transmute(proc) };
+            let slots: Vec<u32> = (0..4)
+                .filter(|&slot| {
+                    let mut state = XINPUT_STATE::default();
+                    // SAFETY: room for the state.
+                    unsafe { get(slot, &mut state) == 0 }
+                })
+                .collect();
+            tracing::info!(module = name, pads = ?slots, "pad rearm: second XInput module ready");
+            return Some(get);
+        }
+        tracing::warn!(
+            "pad rearm: no second XInput module; frozen pads are re-armed but never put at rest"
+        );
+        None
+    }
+
+    impl Helper {
+        pub(super) fn start() -> std::io::Result<Helper> {
+            let (requests, asked) = mpsc::channel::<()>();
+            let finished = Arc::new(AtomicU64::new(0));
+            let second = Arc::new(OnceLock::new());
+            let (done, module) = (finished.clone(), second.clone());
+            std::thread::Builder::new()
+                .name("pad rearm".into())
+                .spawn(move || {
+                    let _ = module.set(load_second());
+                    // `XInputEnable(TRUE)` issues each pad's next read from
+                    // this thread, and Wine cancels the reads of a thread
+                    // that ends: this one never does.
+                    loop {
+                        if asked.recv().is_err() {
+                            loop {
+                                std::thread::park();
+                            }
+                        }
+                        let start = Instant::now();
+                        // SAFETY: plain calls.
+                        unsafe {
+                            XInputEnable(0);
+                            XInputEnable(1);
+                        }
+                        done.fetch_add(1, Ordering::Release);
+                        tracing::info!(
+                            ms = start.elapsed().as_secs_f64() * 1e3,
+                            "pad frozen: reads re-armed (XInputEnable off and on)"
+                        );
+                    }
+                })?;
+            Ok(Helper {
+                requests,
+                finished,
+                second,
+            })
+        }
+
+        pub(super) fn finished(&self) -> u64 {
+            self.finished.load(Ordering::Acquire)
+        }
+
+        pub(super) fn second(&self) -> Option<GetState> {
+            self.second.get().copied().flatten()
+        }
+
+        pub(super) fn rearm(&self) {
+            let _ = self.requests.send(());
+        }
+    }
+}
+
+/// The watch line's rumble part for one slot.
+#[cfg(any(windows, test))]
+fn rumble_part(slot: usize, r: WatchedRumble, ago: f64) -> String {
+    format!(
+        "rumble {slot}: {:.2} {:.2}, {} calls since the last line, last {ago:.1} s ago; ",
+        f32::from(r.low) / 65535.0,
+        f32::from(r.high) / 65535.0,
+        r.calls
+    )
 }
 
 /// The switches and what they keep; `Default` is all off.
@@ -475,6 +1116,30 @@ mod tests {
     }
 
     #[test]
+    fn the_watch_shows_rumble_calls() {
+        let mut watch = Watch {
+            on: Some(true),
+            ..Watch::default()
+        };
+        // At rest: a line only for the calls.
+        watch.rumble(0, 0x8000, 0, 500_000);
+        watch.rumble(0, 0xFFFF, 0, 900_000);
+        let line = watch.keys(&[], 1_000_000).unwrap();
+        assert_eq!(
+            line,
+            "rumble 0: 1.00 0.00, 2 calls since the last line, last 0.1 s ago; "
+        );
+        assert_eq!(watch.keys(&[], 2_000_000), None, "no calls since");
+        // A pad off rest shows rumble still set, with no calls.
+        watch.pad(0, Some((pad(0, 1.0).unwrap(), 9)), 2_500_000);
+        let line = watch.keys(&[], 3_000_000).unwrap();
+        assert!(
+            line.ends_with("rumble 0: 1.00 0.00, 0 calls since the last line, last 2.1 s ago; "),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn sticks_near_the_centre_read_centred() {
         let mut pads = [pad(0, 0.0), None, None, None];
         pads[0].as_mut().unwrap().right_y = -1.0;
@@ -500,6 +1165,279 @@ mod tests {
         let mut pads = [pad(0, 0.0), None, None, None];
         Mac::default().dead_zones(&mut pads);
         assert_eq!(pads[0].unwrap().left_x, 0.25);
+    }
+
+    const S: u64 = 1_000_000;
+
+    fn held() -> PadState {
+        PadState {
+            right_trigger: 1.0,
+            left_x: -0.04,
+            ..Default::default()
+        }
+    }
+
+    /// Polls slot 0 every 8 ms from `from` to `to` (µs) with our module at
+    /// `main` and the second at `second`, re-arms finishing at once; the
+    /// re-arms asked and the last reading shown.
+    fn run(
+        rearm: &mut Rearm,
+        from: u64,
+        to: u64,
+        main: Option<(PadState, u32)>,
+        second: Probe,
+    ) -> (u32, Option<PadState>) {
+        let (mut asked, mut shown) = (0, None);
+        let mut t = from;
+        while t < to {
+            let main = rearm.may_ask(rearm.asked, t).then_some(main);
+            shown = rearm.slot(0, main, second, t);
+            if rearm.take_wanted(t) {
+                asked += 1;
+            }
+            t += 8_000;
+        }
+        (asked, shown)
+    }
+
+    #[test]
+    fn a_trigger_held_still_is_rearmed_once_and_keeps_reading_held() {
+        let mut rearm = Rearm::default();
+        let main = Some((held(), 73));
+        let second = Probe::Reading(held(), 9);
+        let (asked, shown) = run(&mut rearm, 0, REARM_STILL - 10_000, main, second);
+        assert_eq!((asked, shown), (0, Some(held())), "not before REARM_STILL");
+        let (asked, shown) = run(&mut rearm, REARM_STILL - 10_000, 60 * S, main, second);
+        assert_eq!(asked, 1, "one re-arm per still spell");
+        assert_eq!(shown, Some(held()), "the second module agrees: kept");
+        assert_eq!(rearm.slots[0].stage, Stage::Kept);
+        // Let go: a new packet, back to watching.
+        let (asked, shown) = run(
+            &mut rearm,
+            60 * S,
+            61 * S,
+            Some((PadState::default(), 74)),
+            second,
+        );
+        assert_eq!((asked, shown), (0, Some(PadState::default())));
+        assert_eq!(rearm.slots[0].stage, Stage::Watching);
+    }
+
+    #[test]
+    fn a_pad_at_rest_or_drifting_is_never_rearmed() {
+        let mut rearm = Rearm::default();
+        let drift = PadState {
+            left_x: 0.2,
+            right_y: -0.1,
+            ..Default::default()
+        };
+        for pad in [PadState::default(), drift] {
+            let (asked, shown) = run(&mut rearm, 0, 30 * S, Some((pad, 5)), Probe::Off);
+            assert_eq!((asked, shown), (0, Some(pad)));
+        }
+    }
+
+    #[test]
+    fn a_read_behind_the_second_module_shows_its_reading_and_is_rearmed() {
+        let mut rearm = Rearm::default();
+        let main = Some((held(), 78));
+        run(&mut rearm, 0, S, main, Probe::Reading(held(), 9));
+        // Let go: only the second module sees it.
+        let let_go = Probe::Reading(PadState::default(), 10);
+        let (asked, shown) = run(&mut rearm, S, S + REARM_BEHIND - 10_000, main, let_go);
+        assert_eq!((asked, shown), (0, Some(held())), "not before REARM_BEHIND");
+        let (asked, shown) = run(&mut rearm, S + REARM_BEHIND - 10_000, 10 * S, main, let_go);
+        assert_eq!((asked, shown), (1, Some(PadState::default())));
+        // Ours moves again: ours is shown.
+        let (_, shown) = run(&mut rearm, 10 * S, 11 * S, Some((held(), 79)), let_go);
+        assert_eq!(shown, Some(held()));
+        assert_eq!(rearm.slots[0].stage, Stage::Watching);
+    }
+
+    #[test]
+    fn a_report_the_second_module_takes_a_poll_later_is_not_newer() {
+        let mut rearm = Rearm::default();
+        // A stick nudged, inside the drift bound: no re-arm of its own.
+        let a = PadState {
+            left_x: 0.2,
+            ..Default::default()
+        };
+        run(
+            &mut rearm,
+            0,
+            S,
+            Some((PadState::default(), 79)),
+            Probe::Reading(PadState::default(), 9),
+        );
+        // Ours takes the report at 1 s, the second module 8 ms later.
+        rearm.slot(
+            0,
+            Some(Some((a, 80))),
+            Probe::Reading(PadState::default(), 9),
+            S,
+        );
+        let (asked, shown) = run(
+            &mut rearm,
+            S + 8_000,
+            10 * S,
+            Some((a, 80)),
+            Probe::Reading(a, 10),
+        );
+        assert_eq!(
+            (asked, shown, rearm.slots[0].stage),
+            (0, Some(a), Stage::Watching)
+        );
+        // A tap our module missed (down and up, the same reading again) is newer.
+        let (_, _) = run(
+            &mut rearm,
+            10 * S,
+            11 * S,
+            Some((a, 80)),
+            Probe::Reading(a, 12),
+        );
+        assert_eq!(rearm.slots[0].stage, Stage::Second);
+    }
+
+    #[test]
+    fn a_frozen_pad_the_second_module_lost_reads_at_rest_until_it_moves() {
+        let mut rearm = Rearm::default();
+        let main = Some((held(), 78));
+        run(&mut rearm, 0, S, main, Probe::Reading(held(), 9));
+        // From 1 s the second module finds no pad; ours has been still since 0.
+        let gone = Probe::Error(1167);
+        let waiting = REARM_STILL + REARM_WAIT - 20_000;
+        let (asked, shown) = run(&mut rearm, S, waiting, main, gone);
+        assert_eq!((asked, shown), (1, Some(held())), "re-armed, still waiting");
+        let (_, shown) = run(&mut rearm, waiting, 30 * S, main, gone);
+        assert_eq!(shown, Some(PadState::default()), "at rest");
+        // The pad comes back in the second module and moves: its reading.
+        run(
+            &mut rearm,
+            30 * S,
+            31 * S,
+            main,
+            Probe::Reading(PadState::default(), 0),
+        );
+        let a = PadState {
+            buttons: A,
+            ..Default::default()
+        };
+        let (_, shown) = run(&mut rearm, 31 * S, 32 * S, main, Probe::Reading(a, 1));
+        assert_eq!(shown, Some(a));
+        // Ours moves: ours.
+        let (_, shown) = run(
+            &mut rearm,
+            32 * S,
+            33 * S,
+            Some((a, 79)),
+            Probe::Reading(a, 1),
+        );
+        assert_eq!((shown, rearm.slots[0].stage), (Some(a), Stage::Watching));
+    }
+
+    #[test]
+    fn no_pad_in_the_second_module_counts_only_after_it_read_one() {
+        let mut rearm = Rearm::default();
+        let (asked, shown) = run(
+            &mut rearm,
+            0,
+            30 * S,
+            Some((held(), 78)),
+            Probe::Error(1167),
+        );
+        assert_eq!((asked, shown), (1, Some(held())));
+        assert_eq!(rearm.slots[0].stage, Stage::Kept);
+        // Without a second module at all: the same.
+        let mut rearm = Rearm::default();
+        let (asked, shown) = run(&mut rearm, 0, 30 * S, Some((held(), 78)), Probe::Off);
+        assert_eq!((asked, shown), (1, Some(held())));
+    }
+
+    #[test]
+    fn a_rearm_that_never_returns_stops_asking_and_rests_the_pad() {
+        let mut rearm = Rearm::default();
+        let main = Some((held(), 78));
+        let second = Probe::Reading(held(), 9);
+        let mut t = 0;
+        while !rearm.take_wanted(t) {
+            assert!(rearm.may_ask(rearm.asked, t));
+            rearm.slot(0, Some(main), second, t);
+            t += 8_000;
+        }
+        // The helper never finishes.
+        let mut shown = None;
+        while t < 20 * S {
+            assert!(rearm.asked == 1 && !rearm.take_wanted(t));
+            let main = rearm.may_ask(0, t).then_some(main);
+            assert!(
+                main.is_none() || t < rearm.asked_at + REARM_HUNG,
+                "not asked while it runs"
+            );
+            shown = rearm.slot(0, main, second, t);
+            t += 8_000;
+        }
+        assert!(rearm.hung);
+        assert_eq!(shown, Some(PadState::default()));
+        // The second module still reads: once it moves, its reading.
+        let a = PadState {
+            buttons: A,
+            ..Default::default()
+        };
+        let mut last = None;
+        while t < 21 * S {
+            assert!(!rearm.may_ask(0, t));
+            last = rearm.slot(0, None, Probe::Reading(a, 10), t);
+            t += 8_000;
+        }
+        assert_eq!(last, Some(a));
+    }
+
+    #[test]
+    fn the_stale_bound_rests_a_kept_pad_only_when_set() {
+        let main = Some((held(), 78));
+        let second = Probe::Reading(held(), 9);
+        let mut rearm = Rearm::default();
+        let (_, shown) = run(&mut rearm, 0, 120 * S, main, second);
+        assert_eq!(shown, Some(held()), "off by default");
+        let mut rearm = Rearm {
+            stale: Some(15 * S),
+            ..Rearm::default()
+        };
+        let (_, shown) = run(&mut rearm, 0, 15 * S - 10_000, main, second);
+        assert_eq!((shown, rearm.slots[0].stage), (Some(held()), Stage::Kept));
+        let (_, shown) = run(&mut rearm, 15 * S - 10_000, 20 * S, main, second);
+        assert_eq!(shown, Some(PadState::default()));
+        // Any change brings it back.
+        let (_, shown) = run(&mut rearm, 20 * S, 21 * S, Some((held(), 79)), second);
+        assert_eq!(shown, Some(held()));
+    }
+
+    #[test]
+    fn a_disconnect_forgets_the_spell() {
+        let mut rearm = Rearm::default();
+        run(
+            &mut rearm,
+            0,
+            10 * S,
+            Some((held(), 78)),
+            Probe::Error(1167),
+        );
+        assert_eq!(rearm.slot(0, Some(None), Probe::Off, 10 * S), None);
+        assert_eq!(rearm.slots[0].stage, Stage::Watching);
+        let (asked, _) = run(
+            &mut rearm,
+            10 * S,
+            10 * S + REARM_STILL - 10_000,
+            Some((held(), 1)),
+            Probe::Off,
+        );
+        assert_eq!(asked, 0, "a new connection starts a new spell");
+    }
+
+    #[test]
+    fn rumble_is_dropped_only_when_asked() {
+        assert!(rumble_off(Some("0")) && rumble_off(Some(" off ")));
+        assert!(!rumble_off(None) && !rumble_off(Some("1")) && !rumble_off(Some("")));
     }
 
     #[test]

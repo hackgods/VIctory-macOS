@@ -33,6 +33,7 @@ mod packed;
 mod round_mode;
 mod mesh;
 mod predicate;
+mod retry;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
@@ -42,6 +43,11 @@ pub(crate) use meet::MeetSite;
 use super::bitcode::Rmw;
 use packed::packed_half;
 use round_mode::{round16, round16_after};
+#[cfg(any(test, all(windows, feature = "host")))]
+pub(crate) use retry::lower;
+#[cfg(all(test, windows))]
+pub(crate) use retry::lower_literal;
+pub(crate) use retry::lower_pruned;
 
 type Why = &'static str;
 
@@ -213,109 +219,6 @@ enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
     Fail(ShaderError),
-}
-
-#[cfg(any(test, all(windows, feature = "host")))]
-pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_pruned(parts, None, false, false)
-}
-
-pub(crate) fn lower_pruned(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-    literal_halves: bool,
-) -> Result<Lowered, ShaderError> {
-    // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center);
-    if !literal_halves
-        || !parts.host_wave32
-        || !parts.native.wave64
-        || !matches!(&parts.native.io, StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64)
-        || !matches!(
-            &original,
-            Err(ShaderError::Unsupported {
-                what: halves::MASK_ACROSS
-                    | LANE_MASK
-                    | MASK_CYCLE
-                    | MASK_ELSEWHERE
-                    | halves::LDS_ACROSS
-                    | halves::REDUCTION_ACROSS
-                    | halves::FIRST_ACROSS
-                    | halves::READ_ACROSS
-                    | halves::WRITE_ACROSS,
-                ..
-            })
-        )
-    {
-        return original;
-    }
-    lower_literal(parts, keep, per_vertex_center)
-}
-
-/// The whole-wave translation of a 64-thread wave64 compute program on a
-/// 32-lane host, tried when the per-lane halves translation refuses it.
-pub(crate) fn lower_literal(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let native = parts.native;
-    // Register-relative move bounds and resource paths must use the same
-    // control flow as lowering. The per-lane move bounds do not apply here.
-    let p = crate::ir::build(&native.patched_code(), true, native.vgprs)?;
-    let st = crate::structure::split_literal(&p)?;
-    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st))?;
-    if !res.waterfall.reads.is_empty() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "a resource waterfall in literal wave64 halves",
-        });
-    }
-    let io = crate::io::raise(&p, native)?;
-    lower_with_structure(
-        &Parts {
-            p: &p,
-            st: &st,
-            res: &res,
-            io: &io,
-            ..parts.clone()
-        },
-        keep,
-        per_vertex_center,
-    )
-}
-
-fn lower_with_structure(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
-    // Divergent sites where the halves meet (`lower::meet`): a pass that
-    // finds new ones goes again with them laid out.
-    let mut plan: Set<MeetSite> = Set::default();
-    loop {
-        let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run();
-        let found = found.into_inner();
-        if !found.is_empty() {
-            plan.extend(found);
-            continue;
-        }
-        match r {
-            Ok(l) => return Ok(l),
-            Err(Stop::Retry(v, why)) => {
-                if bad.insert(v, why).is_some() {
-                    return Err(ShaderError::Unsupported {
-                        offset: 0,
-                        what: "a phi that does not settle",
-                    });
-                }
-            }
-            Err(Stop::Fail(e)) => return Err(e),
-        }
-    }
 }
 
 const TWO_PI: f32 = std::f32::consts::TAU;

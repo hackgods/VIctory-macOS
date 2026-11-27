@@ -544,6 +544,13 @@ pub struct Options {
     /// reader's own half. Without half-local reads that hand-over is always
     /// made, as in VIctory-macOS. The shader cache keys on it.
     pub halves_across: bool,
+    /// The dwords of one console load (`s_buffer_load_dwordx2` to `x16`
+    /// from a raw view, `global_load_dwordx2` to `x4`) are read by one
+    /// `rawBufferLoad` for every four of them, not one each, where the
+    /// four's offset is a constant they all lie below 2^32 from
+    /// (`lower::Mac::wide_loads`; after 64bitMango 759c4d6b and
+    /// fxceless/victory-fork c36971b2). The shader cache keys on it. Mac.
+    pub wide_loads: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1019,6 +1026,7 @@ fn emit_form(
             uav_level0: options.uav_size_level0,
             walk: options.halves_walk,
             across: options.halves_across,
+            wide_loads: options.wide_loads,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

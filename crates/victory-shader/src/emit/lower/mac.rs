@@ -145,6 +145,14 @@ pub(crate) struct Mac {
     /// and only elsewhere answered from the reader's own half. Without
     /// half-local reads that hand-over is made whatever this says.
     pub across: bool,
+    /// The dwords of one console load are read four a call where the
+    /// four's offset is a constant below 2^32 (`Lower::raw_dwords`,
+    /// `emit::Options::wide_loads`). The console reads each dword past a
+    /// view's end as zero and keeps those before; D3DMetal answers a
+    /// four-dword call reaching past the end the same way, dword by dword
+    /// (64bitMango 759c4d6b measured it, and Metal's bounds-checked pool
+    /// views). Table and heap views on Metal are not measured.
+    pub wide_loads: bool,
 }
 
 thread_local! {

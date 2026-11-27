@@ -340,6 +340,15 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And the four-dword loads (`VICTORY_SHADER_OPT=64`); off, nothing.
+    let key = if options.wide_loads {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"wide loads");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -385,6 +394,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         uav_size_level0: crate::mac_switches::uav_size_level0(),
         halves_walk: crate::mac_switches::walk(),
         halves_across: crate::mac_switches::across(),
+        wide_loads: crate::mac_switches::wide_loads(),
     }
 }
 

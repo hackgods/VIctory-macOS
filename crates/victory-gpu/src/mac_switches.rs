@@ -320,6 +320,49 @@ pub(crate) fn dispatch_clamps() -> bool {
     })
 }
 
+/// Whether the dwords of one console load are read four a call
+/// (`victory_shader::emit::Options::wide_loads`): bit 64 of
+/// `VICTORY_SHADER_OPT`, as in 64bitMango 759c4d6b and
+/// fxceless/victory-fork (a number, decimal or `0x` hex; its other bits are
+/// the fork's and not read here). Off by default. 64bitMango measured 19
+/// to 29 ms less GPU time of about 150 in a recorded frame on the same Wine
+/// and D3DMetal route.
+pub(crate) fn wide_loads() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = shader_opt_wide(std::env::var("VICTORY_SHADER_OPT").ok().as_deref());
+        if on {
+            tracing::info!("VICTORY_SHADER_OPT=64: the dwords of one console load are read four a call where that is exact");
+        }
+        on
+    })
+}
+
+/// `VICTORY_SHADER_OPT`'s bit 64; off when unset or unreadable.
+fn shader_opt_wide(value: Option<&str>) -> bool {
+    let bits = value.map(str::trim).and_then(|v| match v.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
+    });
+    bits.is_some_and(|b: u32| b & 64 != 0)
+}
+
+#[cfg(test)]
+mod wide_load_tests {
+    use super::shader_opt_wide;
+
+    #[test]
+    fn the_shader_opt_bit_is_read_or_off() {
+        assert!(!shader_opt_wide(None));
+        assert!(!shader_opt_wide(Some("0")));
+        assert!(shader_opt_wide(Some(" 64 ")));
+        assert!(shader_opt_wide(Some("0x40")));
+        assert!(shader_opt_wide(Some("127")));
+        assert!(!shader_opt_wide(Some("31")), "the fork's other bits are not this one");
+        assert!(!shader_opt_wide(Some("on")));
+    }
+}
+
 /// `VICTORY_DISPATCH_CLAMPS`'s rule: on only for `1`.
 fn dispatch_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")

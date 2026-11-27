@@ -659,6 +659,25 @@ impl Module {
         out
     }
 
+    /// Mac: argument `arg` of each written call of functions named `name`
+    /// where it is an integer constant of any width (an `i8` mask, say).
+    #[cfg(test)]
+    pub fn int_call_args(&self, name: &str, arg: usize) -> Vec<Option<i64>> {
+        let plan = self.plan();
+        let mut out = Vec::new();
+        for &b in &plan.layout {
+            for &i in &self.blocks[b].body {
+                if plan.live[i as usize]
+                    && let Op::Call(f, args) = &self.insts[i as usize].op
+                    && self.funcs[*f as usize].name == name
+                {
+                    out.push(self.int_value(args[arg]));
+                }
+            }
+        }
+        out
+    }
+
     /// `v` as [`Module::constant_call_args`] works an argument out.
     #[cfg(test)]
     pub fn constant_value(&self, v: V) -> Option<u32> {

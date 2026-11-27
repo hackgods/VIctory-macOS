@@ -1192,12 +1192,13 @@ fn windows() -> &'static [Vec<f32>; 3] {
 /// the previous block's tail, the second half the current block's head.
 fn window_overlap(block: &mut [f32], window: &[f32]) {
     let len = block.len() / 2;
-    for k in 0..len {
-        let (i, j) = (k, 2 * len - 1 - k);
-        let (s0, s1) = (block[i], block[2 * len - 1 - k]);
-        let (wi, wj) = (window[i], window[j]);
-        block[i] = s0 * wj - s1 * wi;
-        block[j] = s0 * wi + s1 * wj;
+    let (left, right) = block[..2 * len].split_at_mut(len);
+    let lanes = left.iter_mut().zip(right.iter_mut().rev())
+        .zip(window[..len].iter().zip(window[len..2 * len].iter().rev()));
+    for ((a, b), (&wi, &wj)) in lanes {
+        let (s0, s1) = (*a, *b);
+        *a = s0 * wj - s1 * wi;
+        *b = s0 * wi + s1 * wj;
     }
 }
 
@@ -1208,6 +1209,47 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_overlap() {
+        use std::{hint::black_box, time::Instant};
+        for n in [128, 512] {
+            let window = sine_window(n);
+            let mut samples = Vec::new();
+            let mut block: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            for round in 0..35 {
+                let start = Instant::now();
+                for _ in 0..8192 {
+                    window_overlap(black_box(&mut block), black_box(&window));
+                }
+                if round >= 4 {
+                    samples.push(start.elapsed().as_nanos());
+                }
+            }
+            println!("overlap_{n}_8192_ns {samples:?}");
+        }
+    }
+
+    #[test]
+    fn overlap_matches_scalar_operations_bit_for_bit() {
+        for n in [0, 128, 256, 512] {
+            let window = sine_window(n);
+            let original: Vec<f32> = (0..n).map(|i| (i as f32 * 0.07).sin()).collect();
+            let mut actual = original.clone();
+            let mut expected = original.clone();
+            for k in 0..n / 2 {
+                let j = n - 1 - k;
+                expected[k] = original[k] * window[j] - original[j] * window[k];
+                expected[j] = original[k] * window[k] + original[j] * window[j];
+            }
+            window_overlap(&mut actual, &window);
+            assert_eq!(
+                actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {

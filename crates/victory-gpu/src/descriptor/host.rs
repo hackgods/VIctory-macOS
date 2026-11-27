@@ -249,6 +249,11 @@ impl UploadQueue {
 /// heaps). Remaining slots hold per-batch templates for repeated views.
 const STAGING_NULL_SLOTS: u32 = 17;
 const STAGING_TOTAL_SLOTS: u32 = 256;
+/// Slots of the heap a sync makes a page's views in before it takes the slot
+/// lock (`VICTORY_VIEWS_UNLOCKED`): the null templates, then a view for each
+/// view record of a page (64 KiB of 32-byte slots) and as many again; the
+/// views of records past them are made under the lock, as without it.
+const PREMADE_SLOTS: u32 = STAGING_NULL_SLOTS + 4096;
 
 fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
@@ -257,6 +262,62 @@ fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
 fn fast_heap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| fast_heap_sync_value(std::env::var_os("VICTORY_FAST_HEAP_SYNC").as_deref()))
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_VIEWS_UNLOCKED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether [`HostHeap::mirror`] makes a slot's view outside the heap's slot
+/// lock and copies it in under the lock (`VICTORY_VIEWS_UNLOCKED=1`; off by
+/// default). The lock is the heap's: every title thread mirroring any slot
+/// (a draw reading a table the title copied records into, a device call
+/// writing a view) and the submission's heap sync take it, and the host's
+/// view creation (`Create*View`, ~1 us under Wine, more under contention)
+/// held it for each slot made. A descriptor is what the host made of a
+/// resource and a description, and copying it (`CopyDescriptorsSimple`,
+/// ~20 ns) gives the view a fresh make would: the heap sync's view
+/// templates already copy views made in a CPU-only heap the same way.
+fn views_unlocked() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_VIEWS_UNLOCKED.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_VIEWS_UNLOCKED"))
+}
+
+thread_local! {
+    /// This thread's CPU-only view slot, for [`views_unlocked`]: made on
+    /// first use; none if the host has no device or refuses the heap.
+    static SCRATCH: std::cell::OnceCell<Option<(ID3D12DescriptorHeap, D3D12_CPU_DESCRIPTOR_HANDLE)>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// This thread's CPU-only view slot ([`SCRATCH`]).
+fn scratch() -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
+    SCRATCH.with(|s| {
+        s.get_or_init(|| {
+            let host = host()?;
+            // SAFETY: a CPU-only heap of one view, a source for copies.
+            let heap: ID3D12DescriptorHeap = unsafe {
+                host.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: 1,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                        NodeMask: 0,
+                    })
+            }
+            .ok()?;
+            // SAFETY: a plain query of a live heap.
+            let at = unsafe { heap.GetCPUDescriptorHandleForHeapStart() };
+            Some((heap, at))
+        })
+        .as_ref()
+        .map(|&(_, at)| at)
+    })
 }
 
 /// CPU-only (`D3D12_DESCRIPTOR_HEAP_FLAG_NONE`) staging heap holding null
@@ -272,6 +333,11 @@ struct StagingHeap {
 
 impl StagingHeap {
     fn new(sampler: bool, step: u32) -> Option<Self> {
+        Self::with_slots(sampler, step, STAGING_TOTAL_SLOTS)
+    }
+
+    /// [`StagingHeap::new`] with `count` slots, the null templates first.
+    fn with_slots(sampler: bool, step: u32, count: u32) -> Option<Self> {
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -284,7 +350,7 @@ impl StagingHeap {
             host.device
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: kind,
-                    NumDescriptors: STAGING_TOTAL_SLOTS,
+                    NumDescriptors: count,
                     Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
                     NodeMask: 0,
                 })
@@ -297,7 +363,7 @@ impl StagingHeap {
             start,
             step,
             kind,
-            count: STAGING_TOTAL_SLOTS,
+            count,
         };
         if sampler {
             null_sampler(staging.cpu(0));
@@ -517,6 +583,10 @@ pub(crate) struct HostHeap {
     /// CPU-only staging heap for null and repeated-view template copies during
     /// batched heap syncs, created on first use.
     staging: std::sync::OnceLock<Option<StagingHeap>>,
+    /// With `VICTORY_VIEWS_UNLOCKED`, the CPU-only heap a heap sync makes a
+    /// page's views in before it takes the slot lock ([`PREMADE_SLOTS`]),
+    /// one sync at a time; created on first use.
+    premade: std::sync::OnceLock<Option<Mutex<StagingHeap>>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
@@ -721,6 +791,7 @@ impl HostHeap {
                 .collect(),
             ready: (0..count).map(|_| AtomicU64::new(0)).collect(),
             staging: std::sync::OnceLock::new(),
+            premade: std::sync::OnceLock::new(),
             kept: Mutex::new(Paged::new((count + extra) as usize)),
             nulled_unordered: Mutex::new(Vec::new()),
             next: Mutex::new((0, vec![0; (extra as usize).div_ceil(64)])),
@@ -1447,6 +1518,16 @@ impl HostHeap {
         self.sync_slots_bytes_with(first..last, start, step, buf_start, buf, fast_heap_sync());
     }
 
+    /// The heap a sync makes a page's views in before the slot lock
+    /// (`premade`), if the host makes it.
+    fn premade(&self) -> Option<&Mutex<StagingHeap>> {
+        self.premade
+            .get_or_init(|| {
+                StagingHeap::with_slots(false, self.step, PREMADE_SLOTS).map(Mutex::new)
+            })
+            .as_ref()
+    }
+
     fn staging(&self) -> Option<&StagingHeap> {
         self.staging
             .get_or_init(|| StagingHeap::new(self.sampler, self.step))
@@ -1732,10 +1813,53 @@ impl HostHeap {
         let mut again: Vec<u32> = Vec::new();
         let mut retired: Vec<ID3D12Resource> = Vec::new();
 
+        let mut templates: Vec<Option<CachedTemplate>> =
+            (0..unique_keys.len()).map(|_| None).collect();
+        // With `VICTORY_VIEWS_UNLOCKED`, the views of the page's records whose
+        // slots do not show them yet are made here, in a heap of their own,
+        // before the slot lock that title threads mirroring slots wait on:
+        // under it the slots are only copied from them (as from the templates
+        // below), after the same re-read of the title's records. A view made
+        // for a slot another thread made meanwhile goes unused. The heap is
+        // held, so no other sync makes views in it, until the copies are made.
+        let premade = (views_unlocked() && !self.sampler && staging.is_some())
+            .then(|| self.premade())
+            .flatten()
+            .map(|heap| heap.lock().unwrap_or_else(|e| e.into_inner()));
+        if let (Some(pre), Some(st)) = (premade.as_deref(), staging) {
+            let mut wanted = vec![false; unique_keys.len()];
+            for (entry_idx, &(index, _)) in stale.iter().enumerate() {
+                if let Some(kidx) = slot_key_idx[entry_idx]
+                    && self.synced[index as usize].load(Ordering::Acquire) != unique_keys[kidx]
+                {
+                    wanted[kidx] = true;
+                }
+            }
+            let mut next = STAGING_NULL_SLOTS;
+            for kidx in 0..unique_keys.len() {
+                let Some(view) = pins[kidx].as_deref() else {
+                    continue;
+                };
+                if !wanted[kidx] || is_placed[kidx] || is_sampler(view) {
+                    continue;
+                }
+                if next >= pre.count {
+                    break;
+                }
+                let at = pre.cpu(next);
+                next += 1;
+                let (kept, mark) = make_marked(view, at);
+                let src = if kept.is_none() {
+                    st.cpu(null_slot_index(false, Some(view)))
+                } else {
+                    at
+                };
+                templates[kidx] = Some(CachedTemplate { src, kept, mark });
+            }
+        }
+
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
-            let mut templates: Vec<Option<CachedTemplate>> =
-                (0..unique_keys.len()).map(|_| None).collect();
             let mut next_template = if self.sampler { 1 } else { STAGING_NULL_SLOTS };
             let mut kept_updates: Vec<(u32, Kept)> = Vec::with_capacity(stale.len());
             let mut copy_dsts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::with_capacity(stale.len());
@@ -1833,6 +1957,13 @@ impl HostHeap {
                         }
                     }
                     (None, None)
+                } else if premade.is_some()
+                    && let Some(tpl) = &templates[kidx]
+                {
+                    // Made before the lock (`VICTORY_VIEWS_UNLOCKED`).
+                    copy_dsts.push(self.cpu(index));
+                    copy_srcs.push(tpl.src);
+                    (tpl.kept.clone(), tpl.mark)
                 } else if key_counts[kidx] >= 2
                     && let (Some(_), Some(st)) = (host, staging)
                 {
@@ -2112,13 +2243,23 @@ impl HostHeap {
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
         let later = !for_draw && is_placed_texture(&view);
+        // The view made in this thread's CPU-only slot, copied into the
+        // slot below (`VICTORY_VIEWS_UNLOCKED`).
+        let mut premade = None;
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
             // binding and writing views wait on (run evict5).
             drop(made);
             prepare(&view);
+            if !self.sampler
+                && views_unlocked()
+                && let Some(at) = scratch()
+            {
+                premade = Some((at, make_marked(&view, at)));
+            }
             made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+
             // The title may have written another record there meanwhile (and
             // another thread made it): that one is the slot's.
             // SAFETY: as above.
@@ -2144,6 +2285,23 @@ impl HostHeap {
             self.set_made_nonzero(index, true);
             let (kept, mark) = if later {
                 (None, None)
+            } else if let Some((at, (kept, mark))) = premade {
+                // A view was made there (else the slot is made null below).
+                if kept.is_some()
+                    && let Some(host) = host()
+                {
+                    // SAFETY: a slot of our heap, and our CPU-only slot
+                    // holding a view of live resources (`kept` holds them).
+                    unsafe {
+                        host.device.CopyDescriptorsSimple(
+                            1,
+                            self.cpu(index),
+                            at,
+                            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        )
+                    };
+                }
+                (kept, mark)
             } else {
                 make_marked(&view, self.cpu(index))
             };
@@ -3044,6 +3202,8 @@ thread_local! {
 /// buffer view whose writes shaders mark (`victory_shader::emit`, "Write
 /// marks").
 fn make_marked(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> (Option<Kept>, Option<(u32, u32)>) {
+    #[cfg(test)]
+    tests::while_making();
     MARK.with(|m| m.set(None));
     let kept = make(view, at);
     (kept, MARK.with(std::cell::Cell::take))
@@ -3586,6 +3746,284 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `VICTORY_VIEWS_UNLOCKED=1` the views a draw's mirror makes
+    /// outside the slot lock and copies in read as the views made in place:
+    /// a constant buffer (a raw view of its data), a typed buffer view and a
+    /// raw unordered view, mirrored by one thread and by four at once (each
+    /// copying from its own CPU-only slot, the slots made again from new
+    /// records), and a slot whose record changes to another view reads the
+    /// new one. Off, the same shader reads the same.
+    #[test]
+    fn views_made_outside_the_slot_lock_read_as_views_made_in_place() {
+        const SHADER: &str = r#"
+ByteAddressBuffer cbv_raw : register(t0);
+Buffer<uint> typed_u32 : register(t1);
+Buffer<uint> other_typed : register(t2);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(0, cbv_raw.Load(8));
+    dst.Store(4, typed_u32[3]);
+    dst.Store(8, other_typed[3]);
+}
+"#;
+        let Some(host) = host() else {
+            return;
+        };
+        let src = crate::resource::test_buffer(4096);
+        let dst = crate::resource::test_buffer(256);
+        let (src_ptr, src_len) = crate::resource::buffer_bytes(src).expect("src bytes");
+        let (dst_ptr, dst_len) = crate::resource::buffer_bytes(dst).expect("dst bytes");
+        // SAFETY: 4096 bytes of test buffer memory.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_ptr.cast::<u32>(), 1024);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0xC000_0000 + i as u32;
+            }
+        }
+        crate::shadow::register(src as usize, src_ptr as u64, src_len);
+        crate::shadow::register(dst as usize, dst_ptr as u64, dst_len);
+        let src_shadow = crate::shadow::find(src_ptr as u64, src_len).expect("src shadow");
+        src_shadow.update(src_ptr as usize, src_len as usize);
+        let dst_shadow = crate::shadow::find(dst_ptr as u64, dst_len).expect("dst shadow");
+
+        const SLOTS: u32 = 4;
+        let mut title_heap = vec![0u8; SLOTS as usize * 32];
+        let start = title_heap.as_mut_ptr() as u64;
+        let at = |i: u32| start + u64::from(i) * 32;
+        let null = std::ptr::null();
+        let mem = src_ptr as u64;
+        // R32_UINT views of elements 2.. and 6.. of the buffer.
+        let typed = |first: u32| [42u32, 1, 0x1688, 0, first, 0, 16, 0, 0, 0];
+        let write_views = |second: u32| {
+            crate::descriptor::create_cbv(
+                null,
+                &[(mem + 16) as u32, ((mem + 16) >> 32) as u32, 64, 0],
+                at(0),
+            );
+            crate::descriptor::create_srv(null, src, &typed(2), at(1));
+            crate::descriptor::create_srv(null, src, &typed(second), at(2));
+            crate::descriptor::create_uav(
+                null,
+                dst,
+                null,
+                &[39, 1, 0, 0, 16, 0, 0, 0, 1, 0],
+                at(3),
+            );
+        };
+
+        use crate::compute::{Param, srv, uav};
+        let params = &[Param::Table(&[srv(0, 3), uav(0, 1)])];
+        let (root, pso) =
+            crate::compute::pipeline(SHADER, windows::core::s!("views_unlocked_eq"), 0, params)
+                .expect("compute pipeline");
+        let read = |heap: &HostHeap| -> [u32; 3] {
+            let list = host.new_list().expect("list");
+            // SAFETY: open list, live heap/root/pso.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.defer_heap(&heap.viewed);
+            list.close();
+            host.execute(&[&list]);
+            dst_shadow
+                .read_host(dst_ptr as u64, 3)
+                .try_into()
+                .expect("3 dwords")
+        };
+        let mirror_all = |heap: &HostHeap, unlocked: bool| {
+            TEST_VIEWS_UNLOCKED.set(Some(unlocked));
+            for i in 0..SLOTS {
+                assert!(heap.mirror(i, at(i), true).is_some(), "slot {i} has a view");
+            }
+            TEST_VIEWS_UNLOCKED.set(None);
+        };
+        let first = [0xC000_0006, 0xC000_0005, 0xC000_0009];
+        let second = [0xC000_0006, 0xC000_0005, 0xC000_000B];
+        for unlocked in [false, true] {
+            write_views(6);
+            let heap = HostHeap::new(false, SLOTS).expect("host heap");
+            mirror_all(&heap, unlocked);
+            assert_eq!(read(&heap), first, "one thread, unlocked {unlocked}");
+            // Slot 2 now holds a record of another view: made again.
+            write_views(8);
+            mirror_all(&heap, unlocked);
+            assert_eq!(read(&heap), second, "a changed record, unlocked {unlocked}");
+            // Four threads mirror the slots of a new heap at once.
+            write_views(6);
+            let heap = HostHeap::new(false, SLOTS).expect("host heap");
+            std::thread::scope(|s| {
+                for _ in 0..4 {
+                    s.spawn(|| mirror_all(&heap, unlocked));
+                }
+            });
+            assert_eq!(read(&heap), first, "four threads, unlocked {unlocked}");
+        }
+        // SAFETY: plain device health check.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop((src_shadow, dst_shadow));
+        crate::object::release_ref(src);
+        crate::object::release_ref(dst);
+    }
+
+    thread_local! {
+        /// Run at each `make_marked` on this thread (`while_making`).
+        static WHILE_MAKING: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn while_making() {
+        WHILE_MAKING.with_borrow(|work| {
+            if let Some(work) = work {
+                work();
+            }
+        });
+    }
+
+    /// With `VICTORY_VIEWS_UNLOCKED=1` a heap sync makes a page's views
+    /// before it takes the slot lock, and a draw's mirror makes its view
+    /// before it takes it again: no view is made with the lock held, which
+    /// title threads mirroring any slot of the heap wait on, where without
+    /// the switch every one is. The shader reads the same through the views
+    /// either way.
+    #[test]
+    fn views_unlocked_are_made_outside_the_slot_lock() {
+        const SHADER: &str = r#"
+ByteAddressBuffer cbv_raw : register(t0);
+Buffer<uint> typed_u32 : register(t1);
+Buffer<uint> dup_typed : register(t2);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    dst.Store(0, cbv_raw.Load(8));
+    dst.Store(4, typed_u32[3]);
+    dst.Store(8, dup_typed[3]);
+}
+"#;
+        let Some(host) = host() else {
+            return;
+        };
+        let src = crate::resource::test_buffer(4096);
+        let dst = crate::resource::test_buffer(256);
+        let (src_ptr, src_len) = crate::resource::buffer_bytes(src).expect("src bytes");
+        let (dst_ptr, dst_len) = crate::resource::buffer_bytes(dst).expect("dst bytes");
+        // SAFETY: 4096 bytes of test buffer memory.
+        unsafe {
+            let words = std::slice::from_raw_parts_mut(src_ptr.cast::<u32>(), 1024);
+            for (i, w) in words.iter_mut().enumerate() {
+                *w = 0xD000_0000 + i as u32;
+            }
+        }
+        crate::shadow::register(src as usize, src_ptr as u64, src_len);
+        crate::shadow::register(dst as usize, dst_ptr as u64, dst_len);
+        let src_shadow = crate::shadow::find(src_ptr as u64, src_len).expect("src shadow");
+        src_shadow.update(src_ptr as usize, src_len as usize);
+        let dst_shadow = crate::shadow::find(dst_ptr as u64, dst_len).expect("dst shadow");
+
+        const SLOTS: u32 = 4;
+        let mut title_heap = vec![0u8; SLOTS as usize * 32];
+        let start = title_heap.as_mut_ptr() as u64;
+        let at = |i: u32| start + u64::from(i) * 32;
+        let null = std::ptr::null();
+        let mem = src_ptr as u64;
+        crate::descriptor::create_cbv(
+            null,
+            &[(mem + 16) as u32, ((mem + 16) >> 32) as u32, 64, 0],
+            at(0),
+        );
+        let typed_desc = [42u32, 1, 0x1688, 0, 2, 0, 16, 0, 0, 0];
+        crate::descriptor::create_srv(null, src, &typed_desc, at(1));
+        crate::descriptor::create_srv(null, src, &typed_desc, at(2));
+        crate::descriptor::create_uav(null, dst, null, &[39, 1, 0, 0, 16, 0, 0, 0, 1, 0], at(3));
+
+        use crate::compute::{Param, srv, uav};
+        let params = &[Param::Table(&[srv(0, 3), uav(0, 1)])];
+        let (root, pso) =
+            crate::compute::pipeline(SHADER, windows::core::s!("views_unlocked_sync"), 0, params)
+                .expect("compute pipeline");
+        let read = |heap: &HostHeap| -> [u32; 3] {
+            let list = host.new_list().expect("list");
+            // SAFETY: open list, live heap/root/pso.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.defer_heap(&heap.viewed);
+            list.close();
+            host.execute(&[&list]);
+            dst_shadow
+                .read_host(dst_ptr as u64, 3)
+                .try_into()
+                .expect("3 dwords")
+        };
+        // Counts this thread's makes with `heap`'s slot lock held and free.
+        let counting = |heap: &HostHeap| {
+            let counts = std::sync::Arc::new([AtomicU64::new(0), AtomicU64::new(0)]);
+            let (seen, made) = (counts.clone(), std::ptr::from_ref(&heap.made) as usize);
+            WHILE_MAKING.set(Some(Box::new(move || {
+                // SAFETY: the heap outlives the work, which is cleared first.
+                let made = unsafe { &*(made as *const Mutex<Vec<u64>>) };
+                let free = made.try_lock().is_ok();
+                seen[usize::from(free)].fetch_add(1, Ordering::Relaxed);
+            })));
+            move || {
+                WHILE_MAKING.set(None);
+                counts.each_ref().map(|n| n.load(Ordering::Relaxed))
+            }
+        };
+        let want = [0xD000_0006, 0xD000_0005, 0xD000_0005];
+        for unlocked in [false, true] {
+            {
+                let what = format!("unlocked {unlocked}");
+                TEST_VIEWS_UNLOCKED.set(Some(unlocked));
+                let heap = HostHeap::new(false, SLOTS).expect("host heap");
+                let done = counting(&heap);
+                heap.sync_slots_bytes_with(0..SLOTS, start, 32, start, &title_heap, true);
+                let [held, free] = done();
+                TEST_VIEWS_UNLOCKED.set(None);
+                assert_eq!(read(&heap), want, "a sync, {what}");
+                assert!(held + free > 0, "a sync makes views, {what}");
+                assert_eq!(
+                    held == 0,
+                    unlocked,
+                    "a sync, {what}: {held} made with the lock held"
+                );
+            }
+            // A draw's mirror of a slot made again from a new record.
+            TEST_VIEWS_UNLOCKED.set(Some(unlocked));
+            let heap = HostHeap::new(false, SLOTS).expect("host heap");
+            let done = counting(&heap);
+            for i in 0..SLOTS {
+                assert!(heap.mirror(i, at(i), true).is_some(), "slot {i} has a view");
+            }
+            let [held, free] = done();
+            TEST_VIEWS_UNLOCKED.set(None);
+            assert_eq!(read(&heap), want, "a draw's mirror, unlocked {unlocked}");
+            assert_eq!(
+                held + free,
+                u64::from(SLOTS),
+                "a draw's mirror makes each slot"
+            );
+            assert_eq!(
+                held == 0,
+                unlocked,
+                "a draw's mirror: {held} made with the lock held"
+            );
+        }
+        // SAFETY: plain device health check.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        drop((src_shadow, dst_shadow));
+        crate::object::release_ref(src);
+        crate::object::release_ref(dst);
+    }
 
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.

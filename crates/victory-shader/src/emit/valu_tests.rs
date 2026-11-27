@@ -159,6 +159,7 @@ fn lower_valu_cs(native: &NativeProgram) -> Result<HostShader, crate::ShaderErro
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })?;
 
     let shader = HostShader {
@@ -1759,6 +1760,7 @@ fn lower_cs32_with(
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
     let shader = HostShader {
@@ -2948,6 +2950,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
     assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
@@ -3121,6 +3124,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
+            loop_entry_exit: false,
         })
         .expect("lower")
     };
@@ -3253,6 +3257,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             uav_size_level0: false,
             host_wave32: false,
             view_marks: false,
+            loop_entry_exit: false,
         })
         .expect("lower");
         HostShader {

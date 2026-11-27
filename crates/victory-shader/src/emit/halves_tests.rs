@@ -189,6 +189,7 @@ fn lower_halves_limited(
             uav_size_level0: false,
             halves_rendezvous: true,
             host_wave32,
+            loop_entry_exit: false,
     };
     let threads = match &native.io {
         StageIo::Cs(cs) => cs.threads.iter().product::<u32>(),
@@ -3135,6 +3136,7 @@ fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
                 host_wave32: true,
                 narrow_waves: false,
                 uav_size_level0: false,
+                loop_entry_exit: false,
             })
             .expect("lower")
         })
@@ -3479,6 +3481,7 @@ fn lane_masks_in_divergent_code_meet_between_halves() {
         narrow_waves: false,
         halves_rendezvous: false,
         host_wave32: true,
+        loop_entry_exit: false,
     });
     let why = off.err().map(|e| e.to_string()).unwrap_or_else(|| "translated".into());
     assert!(
@@ -4714,6 +4717,156 @@ fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu()
                     found
                         .into_iter()
                         .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+
+/// [`lowered_with`] in halves with narrow waves (the game's form under
+/// D3DMetal), early-exited lanes leaving later loops at once where `on`
+/// (`emit::Options::loop_entry_exit`, `lower::entry_exit`).
+fn lowered_entry_exit(
+    native: &NativeProgram,
+    on: bool,
+) -> Result<lower::Lowered, crate::ShaderError> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let parts = lower::Parts {
+        native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        view_marks: false,
+        atomic_locks: true,
+        atomic_lock_rounds: true,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        narrow_waves: true,
+        uav_size_level0: false,
+        halves_rendezvous: true,
+        host_wave32: true,
+        loop_entry_exit: on,
+    };
+    lower::lower_limited(&parts, None, false, false, false)
+}
+
+/// `CS_VisHair`'s shape ([`lower::entry_exit::fixture`]): lanes an early
+/// exit left run no pass of the later loop on the console. In halves they
+/// are kept on predicated, and their stale positive counter never meets
+/// the loop's test: without the switch they run to the loop limit, with it
+/// they leave at the first test. Both give the console's results on every
+/// hardware adapter (and the one-wave64 form where the adapter has 64-lane
+/// waves); with the switch, many groups of the program also finish in a
+/// fraction of the time.
+#[test]
+#[cfg(windows)]
+fn early_exited_lanes_leave_a_later_loop_as_the_console_on_every_gpu() {
+    use lower::entry_exit::{Spoiler, console_fixture, fixture};
+    let words = fixture(Spoiler::None);
+    let n = native(&words, true, 64, 0);
+    let on = lowered_entry_exit(&n, true).expect("halves, entry exit");
+    let off = lowered_entry_exit(&n, false).expect("halves");
+    assert_eq!((on.loop_entry_exits, off.loop_entry_exits), (1, 0));
+    assert_eq!((on.wave_size, off.wave_size), (Some(32), Some(32)));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for l in [&on, &off] {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+    let forms = [
+        ("halves, entry exit", shader(on)),
+        ("halves", shader(off)),
+        (
+            "wave64",
+            shader(lowered_with(&n, false, true).expect("one wave64")),
+        ),
+    ];
+    let want: Vec<u32> = (0..64).flat_map(console_fixture).collect();
+    let views = [
+        View::Texture(1, 1, &[[0.0; 4]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(64 * 8),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts = Host::each_hardware();
+    if hosts.is_empty() {
+        eprintln!("no SM 6.6 hardware device; skipped");
+    }
+    let mut failed = Vec::new();
+    for (adapter, host) in &hosts {
+        let wave32 = host.wave32().unwrap_or(false);
+        let mut took = Vec::new();
+        for (form, shader) in &forms {
+            let label = format!("{adapter} ({form})");
+            if *form == "wave64" && wave32 {
+                eprintln!("{label}: one wave64 on a host of 32-lane waves; skipped");
+                continue;
+            }
+            let Ok((root, pso)) = host.compute_pipeline(shader) else {
+                panic!("{label}: no pipeline");
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let run = |groups: u32| {
+                let start = std::time::Instant::now();
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![(0, Root::Constants(ud.clone()))],
+                            views: &views,
+                            samplers: &[],
+                            groups: [groups, 1, 1],
+                        },
+                    )
+                    .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+                (out, start.elapsed())
+            };
+            let (out, _) = run(1);
+            let wrong: Vec<String> = out[0]
+                .chunks(8)
+                .zip(want.chunks(2))
+                .enumerate()
+                .filter(|(_, (got, want))| got[..2] != **want)
+                .map(|(l, (got, want))| {
+                    format!("{label}: lane {l}: {:?}, the console {want:?}", &got[..2])
+                })
+                .collect();
+            eprintln!(
+                "{label}: {} lanes of 64 differ from the console",
+                wrong.len()
+            );
+            failed.extend(wrong);
+            if form.starts_with("halves") {
+                // The faster of two runs of many groups, each writing the
+                // same results.
+                let time = (0..2).map(|_| run(32768).1).min().expect("two runs");
+                eprintln!("{label}: 32768 groups in {time:?}");
+                took.push(time);
+            }
+        }
+        if let [on, off] = took[..] {
+            // Only where the loop limit's cost shows over the dispatch's own.
+            if off > std::time::Duration::from_millis(40) {
+                assert!(
+                    on * 3 < off,
+                    "{adapter}: {on:?} with the switch, {off:?} without"
                 );
             }
         }

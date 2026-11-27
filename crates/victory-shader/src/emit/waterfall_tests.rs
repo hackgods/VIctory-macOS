@@ -78,6 +78,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
+        loop_entry_exit: false,
     })
     .expect("lower");
     // One access with each lane's own heap index, no wave operation.

@@ -249,6 +249,7 @@ impl Host {
             #[cfg(test)]
             super::tests::native_call(group.len() - first);
             queue.ExecuteCommandLists(&group[first..]);
+            crate::awake::sent(&self.device);
             match queue.Signal(&self.fence, fence_value).and_then(|()| {
                 self.fence.SetEventOnCompletion(fence_value, self.event)?;
                 self.fence

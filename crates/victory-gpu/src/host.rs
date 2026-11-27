@@ -1155,6 +1155,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn keep_deduplicates_repeated_objects_until_reset() {
+        let Some(host) = host() else { return };
+        let Ok(list) = host.new_list() else { return };
+        let Some((a, _)) = host.mapped_buffer(256, false) else {
+            list.close();
+            return;
+        };
+        let Some((b, _)) = host.mapped_buffer(256, false) else {
+            list.close();
+            return;
+        };
+
+        list.keep(&a);
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+
+        list.keep(&b);
+        assert_eq!(list.deferred().kept.len(), 2);
+        assert_eq!(list.deferred().kept_ptrs.len(), 2);
+
+        list.close();
+        list.reset();
+        assert!(list.deferred().kept.is_empty());
+        assert!(list.deferred().kept_ptrs.is_empty());
+
+        list.keep(&a);
+        assert_eq!(list.deferred().kept.len(), 1);
+        assert_eq!(list.deferred().kept_ptrs.len(), 1);
+        list.close();
+    }
+
+    #[test]
     fn fill_scratch_reuses_upload_until_title_copy_and_reset() {
         let Some(host) = host() else { return };
         let Ok(list) = host.new_list() else { return };
@@ -1485,6 +1518,8 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Raw COM pointers already pushed into [`Self::kept`] by [`HostList::keep`].
+    kept_ptrs: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHasher>>,
     /// Pipelines [`HostList::bind_pipeline`] already kept and noted since reset.
     bound_pipelines: std::collections::HashSet<usize>,
     /// Unaligned root-CBV scratch copies (`(source, bytes)` → host GPU address)
@@ -3862,8 +3897,16 @@ impl HostList {
 
     /// Keeps `object` alive until the list is reset.
     pub(crate) fn keep(&self, object: &impl Interface) {
-        if let Ok(object) = object.cast::<windows::core::IUnknown>() {
-            self.deferred().kept.push(object);
+        let raw = object.as_raw() as usize;
+        let mut deferred = self.deferred();
+        if !deferred.kept_ptrs.insert(raw) {
+            return;
+        }
+        match object.cast::<windows::core::IUnknown>() {
+            Ok(object) => deferred.kept.push(object),
+            Err(_) => {
+                deferred.kept_ptrs.remove(&raw);
+            }
         }
     }
 

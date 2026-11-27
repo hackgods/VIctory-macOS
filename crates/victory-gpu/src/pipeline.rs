@@ -731,6 +731,13 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// mac: [`making`] for victory-hle (`VICTORY_KEYS=menu:`): the frame line's
+/// "being made" count, one atomic load.
+#[cfg(windows)]
+pub fn waiting() -> u64 {
+    making()
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

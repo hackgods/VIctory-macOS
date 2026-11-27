@@ -316,6 +316,8 @@ struct Stats {
     unmapped_pages: u64,
     /// Copies made of mapped pages shaders missed, for the lists after.
     copies_made: u64,
+    /// Copies made ahead of programs' root constants ([`prefetch`]).
+    prefetched: u64,
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -420,6 +422,7 @@ fn retake_dropped() {
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MISSED_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
+    *PREFETCHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     retake_dropped();
     let s = stats(std::mem::take);
     if s.uses.is_empty()
@@ -468,7 +471,7 @@ pub(crate) fn log_frame() {
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
          and {} 256 MiB regions with no copy (first: {}); {} pages read as unmapped tiles (zeros, no \
-         miss), {} copies made of missed pages",
+         miss), {} copies made of missed pages, {} ahead of root constants",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -480,6 +483,7 @@ pub(crate) fn log_frame() {
         missed.join(" "),
         s.unmapped_pages,
         s.copies_made,
+        s.prefetched,
     );
 }
 
@@ -558,6 +562,98 @@ fn copy_missed(at: u64) -> bool {
         return false;
     }
     crate::shadow::find(at, crate::watch::PAGE as u64).is_some()
+}
+
+/// Whether copies are made ahead of what a program using title memory is
+/// handed (`VICTORY_MEMORY_PREFETCH=1`; [`prefetch`]).
+pub(crate) fn prefetching() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MEMORY_PREFETCH").as_deref() == Ok("1"))
+}
+
+/// The bytes of a block of constants [`prefetch`] looks for addresses in.
+const PREFETCH_BLOCK: usize = 1024;
+
+/// Pages [`prefetch`] has looked at since the last frame line.
+static PREFETCHED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+/// The 40-bit addresses in root constants `words` (`(slot, dword, value)`):
+/// a dword and the low byte of the next dword of its slot, as the
+/// acceleration-structure builder's programs take the address of their
+/// block of constants.
+fn addresses_in(words: &[(u8, u32, u32)]) -> impl Iterator<Item = u64> + '_ {
+    words.iter().filter_map(|&(slot, dword, low)| {
+        let &(_, _, high) = words.iter().find(|w| w.0 == slot && w.1 == dword + 1)?;
+        let at = u64::from(low) | u64::from(high & 0xff) << 32;
+        (at >= crate::watch::PAGE as u64).then_some(at)
+    })
+}
+
+/// The 40-bit addresses among the qwords of `block`, at every dword (the
+/// builder's programs load theirs at 0x4c and on).
+fn addresses_of(block: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    block
+        .windows(8)
+        .step_by(4)
+        .map(|q| u64::from_le_bytes(q.try_into().expect("8 bytes")))
+        .filter(|&at| at >= crate::watch::PAGE as u64 && at < 1 << 40)
+}
+
+/// A program using title memory is handed root constants `words` (`(slot,
+/// dword, value)`): copies are made now of the memory they name and of what
+/// that memory names in turn, where such memory is the title's to write.
+///
+/// The builder's programs take a 40-bit address from their constants, load
+/// the addresses of their buffers from the block there and read and write
+/// those raw: no view names any of it, so no copy exists until one of them
+/// missed it, and what they computed from zeros meanwhile is withheld. A
+/// guess, and only ever of what to copy: a copy of memory nothing reads
+/// costs memory, a page with no copy is still a miss.
+pub(crate) fn prefetch(words: &[(u8, u32, u32)]) {
+    let page = crate::watch::PAGE as u64;
+    let mut seen = PREFETCHED.lock().unwrap_or_else(|e| e.into_inner());
+    let seen = seen.get_or_insert_with(HashSet::new);
+    let mut made = 0;
+    let mut copy = |at: u64, seen: &mut HashSet<u64>| -> bool {
+        if !seen.insert(at / page) || !writable(at) {
+            return false;
+        }
+        let before = crate::shadow::generation();
+        let found = crate::shadow::find(at, 1).is_some();
+        made += u64::from(found && crate::shadow::generation() != before);
+        found
+    };
+    for at in addresses_in(words) {
+        if !copy(at, seen) {
+            continue;
+        }
+        let len = (PREFETCH_BLOCK as u64).min(page - at % page) as usize & !7;
+        // SAFETY: the page is committed and readable (`writable`), and the
+        // bytes end in it; the title may write them meanwhile (plain bytes).
+        let block: Vec<u8> = (0..len).map(|i| unsafe { ((at as usize + i) as *const u8).read_volatile() }).collect();
+        for named in addresses_of(&block) {
+            copy(named, seen);
+        }
+    }
+    if made > 0 {
+        stats(|s| s.prefetched += made);
+    }
+}
+
+/// Whether the page at `at` is committed memory the title reads and writes
+/// (private or a view; not an image, not read-only).
+fn writable(at: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    let asked = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    asked != 0
+        && info.State == MEM_COMMIT
+        && info.Type != MEM_IMAGE
+        && info.Protect == PAGE_READWRITE
 }
 
 /// What the memory at `at` is now, for the missed addresses of the frame
@@ -1213,6 +1309,47 @@ mod tests {
         MISSED_COPIES.store(MISSED_COPIES_MAX, Relaxed);
         assert!(!copy_missed(at), "past the frame's limit");
         MISSED_COPIES.store(0, Relaxed);
+    }
+
+    /// Root constants name a block, the block names a buffer: both get
+    /// copies before any shader ran; small numbers, an address past 40 bits
+    /// and unmapped memory do not.
+    #[test]
+    fn memory_named_by_root_constants_is_copied_ahead() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let words = [(2u8, 0u32, 0x1234_0000u32), (2, 1, 0xabcd_ef05), (3, 0, 7), (3, 1, 0)];
+        assert_eq!(addresses_in(&words).collect::<Vec<_>>(), [0x5_1234_0000]);
+        let mut block = vec![0u8; 4];
+        for q in [0u64, 0x20, 0x7_0000_1000, 1 << 40, 0xff_ffff_fff8] {
+            block.extend_from_slice(&q.to_le_bytes());
+            block.extend_from_slice(&[0; 8]);
+        }
+        assert_eq!(addresses_of(&block).collect::<Vec<_>>(), [0x7_0000_1000, 0xff_ffff_fff8]);
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let page = crate::watch::PAGE;
+        // SAFETY: fresh allocations of ours, kept (their copies may outlive the test).
+        let alloc = || unsafe {
+            VirtualAlloc(std::ptr::null(), page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as u64
+        };
+        let (constants, buffer) = (alloc(), alloc());
+        assert!(constants != 0 && buffer != 0 && buffer < 1 << 40 && constants < 1 << 40);
+        // SAFETY: inside the fresh allocation.
+        unsafe { ((constants + 0x4c) as *mut u64).write_unaligned(buffer + 0x80) };
+        let before = crate::shadow::generation();
+        prefetch(&[(0, 4, constants as u32 + 0x20), (0, 5, (constants >> 32) as u32 | 0x100)]);
+        assert!(crate::shadow::generation() != before, "copies made");
+        for at in [constants, buffer] {
+            let before = crate::shadow::generation();
+            crate::shadow::find(at, 1).expect("a copy");
+            assert_eq!(crate::shadow::generation(), before, "made ahead: {at:#x}");
+        }
+        let before = crate::shadow::generation();
+        prefetch(&[(0, 0, 0x30_0000), (0, 1, 0xff)]);
+        assert_eq!(crate::shadow::generation(), before, "nothing mapped there");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

@@ -1136,6 +1136,8 @@ impl State {
             let mut roots = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
+                let ahead = stage.memory.is_some() && crate::memory::prefetching();
+                let mut constants = Vec::new();
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
                         && u.dword == 0
@@ -1186,6 +1188,12 @@ impl State {
                         }
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                    if ahead && u.root == RootType::Constants {
+                        constants.push((u.slot, u.dword, values[u.index as usize]));
+                    }
+                }
+                if !constants.is_empty() {
+                    crate::memory::prefetch(&constants);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {

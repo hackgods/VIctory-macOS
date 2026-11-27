@@ -465,6 +465,19 @@ fn epoch(value: Option<&str>) -> bool {
     setting(value, false)
 }
 
+/// From ScarlettMac 4921b7e6: `VICTORY_TEXTURE_WORKERS`'s rule
+/// (`crate::texture`'s worker threads): a count of 2 or more, at most the
+/// CPUs, asks for that many; anything else (and unset) leaves the quarter
+/// of the CPUs, four at most, as before. `None` where that is fewer than
+/// two: the work runs on the submitting thread.
+pub(crate) fn texture_workers(value: Option<&str>, cpus: usize) -> Option<usize> {
+    let threads = match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(asked) if asked >= 2 => asked.min(cpus.max(1)),
+        _ => (cpus / 4).clamp(1, 4),
+    };
+    (threads >= 2).then_some(threads)
+}
+
 /// Whether a heap sync pass also holds the census updates of the slots
 /// `HostHeap::mirror` and `HostHeap::make_null` make in it, and enters them
 /// a batch at a time (`crate::bindless::Pass`, `crate::census_fast::Hold`)
@@ -709,7 +722,27 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
+    use super::{
+        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, texture_workers, uav_size,
+        writers,
+    };
+
+    #[test]
+    fn texture_workers_are_a_quarter_of_the_cpus_unless_asked_for() {
+        for off in [None, Some(""), Some("0"), Some("1"), Some("many")] {
+            assert_eq!(texture_workers(off, 18), Some(4), "{off:?}");
+            assert_eq!(texture_workers(off, 14), Some(3), "{off:?}");
+            assert_eq!(texture_workers(off, 8), Some(2), "{off:?}");
+            assert_eq!(texture_workers(off, 4), None, "{off:?}");
+            assert_eq!(texture_workers(off, 1), None, "{off:?}");
+        }
+        assert_eq!(texture_workers(Some("6"), 18), Some(6));
+        assert_eq!(texture_workers(Some(" 6 "), 14), Some(6));
+        assert_eq!(texture_workers(Some("64"), 14), Some(14));
+        assert_eq!(texture_workers(Some("2"), 18), Some(2));
+        // Two asked for on a one-CPU machine: none, as before.
+        assert_eq!(texture_workers(Some("2"), 1), None);
+    }
 
     #[test]
     fn the_epoch_skip_is_on_only_when_asked_for() {

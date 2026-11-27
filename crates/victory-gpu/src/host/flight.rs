@@ -17,11 +17,18 @@
 //! holding `HELD` or `Host::submitted`, then acquires `Host::submitted` to
 //! land the completed flight so fence waiters and BoP pollers wake promptly
 //! even when the title submits no further work.
+//!
+//! With `VICTORY_FLIGHT1_PREWARM=1`, Flight N+1's wait for Flight N is not
+//! idle: the buffer copies its lists ask for that Flight N cannot write are
+//! brought up to date first (`Host::prewarm`), which is most of what its
+//! preparation copies, so preparing overlaps the GPU. The `overlap:` frame
+//! line says how much of the host GPU's time the CPU waited for.
 
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use super::{Batch, Holding, Host, HostList, Mark};
+use super::{Batch, Holding, Host, HostList, Mark, Step};
 use crate::object::This;
 
 /// Whether Wait-Before-Prep Flight-1 overlap is enabled (`VICTORY_FLIGHT1=1`,
@@ -78,6 +85,218 @@ pub(crate) fn async_submit_enabled() -> bool {
 
 fn async_submit_env() -> bool {
     std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1")
+}
+
+/// Whether, while a flight runs on the host GPU, the buffer copies the next
+/// submission's lists ask for are brought up to date ([`Host::prewarm`]):
+/// `VICTORY_FLIGHT1_PREWARM=1`, off by default, and nothing without
+/// Flight-1. The fork's `VICTORY_ASYNC_PREWARM` (halfwave50 02618e8, after
+/// Belobug's design), here in the wait for Flight N that Flight N+1 starts
+/// with.
+pub(crate) fn prewarm_enabled() -> bool {
+    #[cfg(test)]
+    if TEST_PREWARM.with(std::cell::Cell::get) {
+        return flight1_enabled();
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    flight1_enabled()
+        && *ON.get_or_init(|| {
+            let on = crate::switch::on("VICTORY_FLIGHT1_PREWARM");
+            if on {
+                tracing::info!(
+                    "VICTORY_FLIGHT1_PREWARM: while a flight runs on the host GPU, the buffer copies the next \
+                     submission's lists ask for are brought up to date, but for those the flight may write"
+                );
+            }
+            on
+        })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `VICTORY_FLIGHT1_PREWARM` on for this thread's submissions.
+    pub(crate) static TEST_PREWARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the last frame line, every host submission (the overlap line):
+/// `[0]` how many, `[1]` of them flights, `[2]` microseconds the host GPU
+/// ran them (from their launch to when they were seen to have run), `[3]`
+/// microseconds a thread of the title's or ours waited for it to. What ran
+/// and was not waited for ran while the CPU did other work.
+static OVERLAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// A host submission ran on the GPU for `ran`, `waited` of it waited for by
+/// a thread of the title's or ours (the overlap line).
+pub(super) fn ran_for(ran: Duration, waited: Duration, flight: bool) {
+    OVERLAP[0].fetch_add(1, Ordering::Relaxed);
+    OVERLAP[1].fetch_add(u64::from(flight), Ordering::Relaxed);
+    OVERLAP[2].fetch_add(ran.as_micros() as u64, Ordering::Relaxed);
+    OVERLAP[3].fetch_add(waited.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Since the last frame line, of [`Host::prewarm`]: times it had a running
+/// flight and lists to look at; of those, times it did nothing as a running
+/// list uses title memory, and times the GPU finished first; copies brought
+/// up to date and their bytes; copies left alone as the flight may write
+/// them, and as their memory is not tracked; microseconds.
+static EARLY: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// [`EARLY`] summed since the start (tests: the frame line takes it in
+/// turns).
+#[cfg(test)]
+static EARLY_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// [`EARLY_TOTAL`] (tests).
+#[cfg(test)]
+pub(crate) fn early_counts() -> [u64; 8] {
+    EARLY_TOTAL.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
+/// Tests: the host queue runs nothing given to it after this is made until
+/// [`Gate::open`] (or the drop): a flight given meanwhile stays in the air.
+#[cfg(test)]
+pub(crate) struct Gate(Option<windows::Win32::Graphics::Direct3D12::ID3D12Fence>);
+
+// SAFETY: D3D12 fences are free-threaded.
+#[cfg(test)]
+unsafe impl Send for Gate {}
+
+#[cfg(test)]
+impl Gate {
+    pub(crate) fn hold(host: &Host) -> Gate {
+        // SAFETY: plain creation; our queue waits on our fence.
+        unsafe {
+            let fence: windows::Win32::Graphics::Direct3D12::ID3D12Fence = host
+                .device
+                .CreateFence(
+                    0,
+                    windows::Win32::Graphics::Direct3D12::D3D12_FENCE_FLAG_NONE,
+                )
+                .expect("a gate fence");
+            host.queue()
+                .Wait(&fence, 1)
+                .expect("the queue waits on the gate");
+            Gate(Some(fence))
+        }
+    }
+
+    pub(crate) fn open(&mut self) {
+        if let Some(fence) = self.0.take() {
+            // SAFETY: our fence.
+            unsafe { fence.Signal(1) }.expect("the gate opens");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for Gate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// The copies that took pages early, held until the flight that ran
+/// meanwhile is landed (`crate::shadow::forget_early`).
+static EARLY_HELD: std::sync::Mutex<Vec<Arc<crate::shadow::Shadow>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The frame lines of host submissions (`frames` since the last one): how
+/// much of the host GPU's time the CPU waited for and how much ran hidden
+/// behind its work, and with the prewarm on, what it did.
+pub(super) fn log(frames: f64) {
+    let per = |a: &AtomicU64| a.swap(0, Ordering::Relaxed) as f64 / frames;
+    let [n, flights, ran, waited] = OVERLAP.each_ref().map(per);
+    let (ran, waited) = (ran / 1000.0, waited / 1000.0);
+    let hidden = (ran - waited).max(0.0);
+    tracing::info!(
+        "overlap: {n:.1} host submissions/frame ({flights:.1} of them flights, VICTORY_FLIGHT1); the GPU ran them \
+         {ran:.1} ms/frame; threads waited {waited:.1} ms/frame for it; {hidden:.1} ms/frame ({:.0}%) ran hidden \
+         behind CPU work",
+        if ran > 0.0 { 100.0 * hidden / ran } else { 0.0 }
+    );
+    if !prewarm_enabled() {
+        return;
+    }
+    let early: [f64; 8] = std::array::from_fn(|i| per(&EARLY[i]));
+    let marked = per(&crate::shadow::EARLY_MARKED);
+    tracing::info!(
+        "prewarm: {:.1} ms/frame of the next lists' preparation done while the host GPU ran a flight, in {:.1} \
+         goes/frame ({:.1} of them did nothing: a running list uses title memory; {:.1} stopped as the GPU \
+         finished first): {:.0} buffer copies/frame brought up to date early ({:.2} MB/frame), {:.0} left alone as \
+         the flight may write them and {:.0} as their memory is not tracked; {marked:.1} pages/frame taken early \
+         were marked as written by the flight's shaders all the same (the title's bytes kept; 0 if the rule holds)",
+        early[7] / 1000.0,
+        early[0],
+        early[1],
+        early[2],
+        early[3],
+        early[4] / 1e6,
+        early[5],
+        early[6],
+    );
+}
+
+/// What [`Host::prewarm`] gathers: the ranges of each copy to bring up to
+/// date (ranges less than a page apart as one, as a submission's own
+/// refreshes), and the copies left alone.
+#[derive(Default)]
+struct Early {
+    wanted: Vec<(Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+    /// Where each copy is in `wanted`, by copy.
+    index: std::collections::HashMap<usize, usize>,
+    /// Copies the flight's heaps view for unordered access.
+    written: std::collections::HashSet<usize>,
+    /// Title memory whose copies hold shader writes kept from it: where
+    /// each stretch starts and ends, in order, none touching the next.
+    kept: Vec<(usize, usize)>,
+    /// Copies decided against, and how many: as the flight may write them,
+    /// as their memory is not tracked.
+    left: std::collections::HashSet<usize>,
+    alone: [u64; 2],
+}
+
+impl Early {
+    fn add(&mut self, copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        // Nothing to copy, as for a submission's own refreshes.
+        if len == 0 || copy.clean() {
+            return;
+        }
+        let key = Arc::as_ptr(copy) as usize;
+        if self.left.contains(&key) {
+            return;
+        }
+        let i = match self.index.get(&key) {
+            Some(&i) => i,
+            None => {
+                let (start, bytes) = copy.range();
+                let (start, end) = (start as usize, (start + bytes) as usize);
+                let why = if copy.dirty_bit().is_none() {
+                    Some(1)
+                } else if !copy.idle()
+                    || self.written.contains(&key)
+                    || self
+                        .kept
+                        .get(self.kept.partition_point(|&(_, e)| e <= start))
+                        .is_some_and(|&(s, _)| s < end)
+                {
+                    Some(0)
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    self.left.insert(key);
+                    self.alone[why] += 1;
+                    return;
+                }
+                self.wanted.push((copy.clone(), Default::default()));
+                self.index.insert(key, self.wanted.len() - 1);
+                self.wanted.len() - 1
+            }
+        };
+        self.wanted[i]
+            .1
+            .insert(address, address + len, crate::watch::PAGE);
+    }
 }
 
 #[cfg(test)]
@@ -147,6 +366,9 @@ pub(super) struct FlightState {
 struct InFlight {
     fence_value: u64,
     segments: Vec<Arc<HostList>>,
+    /// Whether one of its lists runs programs that use title memory, which
+    /// write host copies at addresses they compute (`crate::memory`).
+    memory: bool,
     uploads: Option<crate::bindless::Uploads>,
     batch: Batch,
     heaps: Vec<Arc<crate::bindless::Viewed>>,
@@ -183,6 +405,12 @@ impl Host {
 
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        // While Flight N-1 still runs, the buffer copies these lists ask for
+        // that it cannot write are brought up to date
+        // (`VICTORY_FLIGHT1_PREWARM`): their preparation below finds them done.
+        if prewarm_enabled() {
+            self.prewarm(&segments);
+        }
         // Wait-Before-Prep: drain Flight N-1 completely before Flight N
         // touches any shared Shadow, descriptor heap, upload staging pool, or
         // Mark buffer.
@@ -264,9 +492,16 @@ impl Host {
         drop(split_pool);
 
         let split_count = native_boundaries.len();
+        let memory = segments.iter().any(|l| {
+            l.deferred()
+                .copies
+                .iter()
+                .any(|s| matches!(s, Step::Memory(_)))
+        });
         let flight = InFlight {
             fence_value,
             segments,
+            memory,
             uploads: prep.uploads,
             batch: prep.batch,
             heaps: prep.heaps,
@@ -362,10 +597,13 @@ impl Host {
             return false;
         };
 
+        let mut waited = Duration::ZERO;
         let gpu_done = if flight.waited {
             // SAFETY: plain fence completion query.
             if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                let asked = Instant::now();
                 self.wait_for(flight.fence_value);
+                waited = asked.elapsed();
                 std::time::Instant::now()
             } else {
                 waited_at.unwrap_or_else(std::time::Instant::now)
@@ -374,6 +612,7 @@ impl Host {
             std::time::Instant::now()
         };
         let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
+        ran_for(gpu_duration, waited, true);
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
 
@@ -427,6 +666,10 @@ impl Host {
             );
         }
 
+        // What copies took early while it ran is as anything else now (its
+        // copy-back, above, kept the title's bytes on such pages).
+        crate::shadow::forget_early();
+        EARLY_HELD.lock().unwrap_or_else(|e| e.into_inner()).clear();
         // Return the upload list to `bindless::LIST` and recycle host lists
         // only after the GPU fence and post-GPU work have finished.
         drop(flight.uploads);
@@ -442,6 +685,153 @@ impl Host {
         }
         state.active = false;
         true
+    }
+}
+
+impl Host {
+    /// While the flight on the host GPU still runs: brings up to date the
+    /// buffer copies `next` (the lists of the submission after it) will ask
+    /// for, as their own preparation does after landing it (their refresh
+    /// steps, and what their heaps' views reach), so that preparation finds
+    /// them done. Under the submission lock, before the flight is landed;
+    /// stops when the GPU has run it.
+    ///
+    /// A copy is left alone, for the lists' own preparation, if the flight
+    /// may write it or its early refresh could differ from the one after:
+    ///
+    /// - a list submitted declared that its shaders write it (a range
+    ///   pending or a snapshot kept, `Shadow::idle`): title memory there is
+    ///   older than the copy until the copy-back;
+    /// - a heap the flight's lists take views from views it for unordered
+    ///   access: their shaders may write it with no list declaring it;
+    /// - every copy, if a flight's list uses title memory: its programs
+    ///   write copies at addresses they compute;
+    /// - it holds shader writes kept out of title memory until the frame's
+    ///   end (`crate::memory::kept`): a refresh drops them from the pages
+    ///   the title wrote, and the flight may read them;
+    /// - its memory is not tracked or is aliased: copied whole at each use,
+    ///   or never.
+    ///
+    /// The others take the pages the title wrote since they last took them.
+    /// What the flight reads of them it read from pages its own preparation
+    /// took; a page the title writes after that, while the GPU reads it, is
+    /// a race on the console too, where the GPU reads title memory itself.
+    /// A page taken early that the flight's shaders marked as written all
+    /// the same is counted and keeps the title's bytes
+    /// (`Shadow::kept_early`).
+    ///
+    /// Not done early: steps that write title memory or upload memory
+    /// (their order with the flight's copy-back counts), texture uploads
+    /// (the staging the flight's upload list reads is reused), the heaps'
+    /// descriptor sync and the title-memory tables (the flight's shaders
+    /// read both), steps of ours.
+    pub(super) fn prewarm(&self, next: &[Arc<HostList>]) {
+        let (value, memory, heaps) = {
+            let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(flight) = state.in_flight.as_ref().filter(|f| f.waited) else {
+                return;
+            };
+            (flight.fence_value, flight.memory, flight.heaps.clone())
+        };
+        // SAFETY: a plain query of our fence.
+        let ran = || unsafe { self.fence.GetCompletedValue() } >= value;
+        if ran() {
+            return;
+        }
+        let started = Instant::now();
+        EARLY[0].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        EARLY_TOTAL[0].fetch_add(1, Ordering::Relaxed);
+        if memory {
+            EARLY[1].fetch_add(1, Ordering::Relaxed);
+            #[cfg(test)]
+            EARLY_TOTAL[1].fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let mut early = Early::default();
+        for heap in &heaps {
+            crate::bindless::written(heap, |copy| {
+                early.written.insert(Arc::as_ptr(copy) as usize);
+            });
+        }
+        // In order and joined, to be searched once per copy.
+        let mut kept = crate::memory::kept();
+        kept.sort_unstable();
+        for (at, n) in kept {
+            match early.kept.last_mut() {
+                Some((_, end)) if at <= *end => *end = (*end).max(at + n),
+                _ => early.kept.push((at, at + n)),
+            }
+        }
+        let mut cut = false;
+        for list in next {
+            if ran() {
+                cut = true;
+                break;
+            }
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(copy, address, len) => early.add(copy, *address, *len),
+                    Step::Slot(viewed, index) => {
+                        crate::bindless::refresh_slot(viewed, *index, |c, a, l| early.add(c, a, l))
+                    }
+                    Step::Heap(viewed) => {
+                        crate::bindless::refresh(viewed, |c, a, l| early.add(c, a, l))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (mut copies, mut bytes) = (0, 0);
+        let mut held = Vec::with_capacity(early.wanted.len());
+        // The fence is asked at most every 200 microseconds.
+        let mut asked = Instant::now();
+        for (copy, ranges) in early.wanted {
+            if cut {
+                break;
+            }
+            if asked.elapsed() >= Duration::from_micros(200) {
+                asked = Instant::now();
+                if ran() {
+                    cut = true;
+                    break;
+                }
+            }
+            let mut taken = Some(0);
+            for (from, to) in ranges.iter() {
+                taken = taken.and_then(|n| Some(n + copy.update_early(from, to - from)?));
+            }
+            match taken {
+                Some(n) => {
+                    copies += 1;
+                    bytes += n as u64;
+                    held.push(copy);
+                }
+                None => early.alone[0] += 1,
+            }
+        }
+        // Held until the flight is landed: the pages they took are noted by
+        // their addresses.
+        EARLY_HELD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(held);
+        EARLY[2].fetch_add(u64::from(cut), Ordering::Relaxed);
+        let counted = [
+            0,
+            0,
+            u64::from(cut),
+            copies,
+            bytes,
+            early.alone[0],
+            early.alone[1],
+            started.elapsed().as_micros() as u64,
+        ];
+        for (i, n) in counted.into_iter().enumerate().skip(2) {
+            EARLY[i].fetch_add(n, Ordering::Relaxed);
+            #[cfg(test)]
+            EARLY_TOTAL[i].fetch_add(n, Ordering::Relaxed);
+        }
     }
 }
 
@@ -662,6 +1052,78 @@ mod tests {
         assert_eq!(unsafe { (&raw const bop_word).read_volatile() }, 0x1234_5678);
         assert_eq!(title_buf[0], 0xCAFE_BABE);
         assert!(!host.has_in_flight());
+    }
+
+    /// `VICTORY_FLIGHT1_PREWARM`: while a flight is held on the host GPU
+    /// (its queue waits on a fence of ours), the next submission's
+    /// preparation takes the pages the title wrote of a copy the flight
+    /// only reads, and leaves the copy the flight declared it writes alone;
+    /// once the flight lands, the next one's own refresh does that one.
+    #[test]
+    fn prewarm_takes_only_copies_the_flight_cannot_write() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, false);
+        let page = crate::watch::PAGE;
+        let [read, written] = [0, 1].map(|_| {
+            let p = crate::watch::tests::pool(1);
+            crate::shadow::register(p, p as u64, page as u64);
+            let copy = crate::shadow::find(p as u64, page as u64).expect("a host copy");
+            copy.update(p, page);
+            (p, copy)
+        });
+        // Flight N reads one copy and declares that its shaders write the
+        // other.
+        let n = Arc::new(host.new_list().expect("host list"));
+        read.1.refresh(&n, read.0 as u64, 256);
+        written.1.refresh(&n, written.0 as u64, 256);
+        written.1.gpu_writes(&n, written.0 as u64, 256, false);
+        n.close();
+        // The GPU holds it until the gate opens.
+        let mut gate = Gate::hold(host);
+        host.execute_flight1(vec![n], vec![]);
+        assert!(host.has_in_flight());
+        // The title writes both copies' memory meanwhile.
+        for (p, _) in [&read, &written] {
+            // SAFETY: bytes of our pools.
+            unsafe { (*p as *mut u32).write_volatile(0x7177_0001) };
+        }
+        let m = Arc::new(host.new_list().expect("host list"));
+        read.1.refresh(&m, read.0 as u64, 256);
+        written.1.refresh(&m, written.0 as u64, 256);
+        m.close();
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            gate.open();
+        });
+        let before = early_counts();
+        TEST_PREWARM.with(|p| p.set(true));
+        // Prewarms beside flight N, then waits for the gate and lands it.
+        host.execute_flight1(vec![m], vec![]);
+        TEST_PREWARM.with(|p| p.set(false));
+        opener.join().unwrap();
+        host.finish_flight_now();
+        let after = early_counts();
+        let d: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        assert_eq!(d[0], 1, "one go beside the held flight: {d:?}");
+        assert_eq!(d[2], 0, "not cut short: the flight was held {d:?}");
+        assert!(
+            d[3] >= 1,
+            "the copy the flight only reads was taken early: {d:?}"
+        );
+        assert!(
+            d[5] >= 1,
+            "the copy the flight writes was left alone: {d:?}"
+        );
+        for (p, copy) in [&read, &written] {
+            assert_eq!(
+                copy.read_host(*p as u64, 1)[0],
+                0x7177_0001,
+                "the next flight read the title's write"
+            );
+            crate::shadow::unregister(*p, *p as u64);
+        }
     }
 
     /// `Host::quiet()` drains any active Flight-1 work cleanly before

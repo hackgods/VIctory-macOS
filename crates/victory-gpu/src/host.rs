@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-mod flight;
+pub(crate) mod flight;
 pub(crate) use flight::{async_submit_enabled, flight1_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -697,12 +697,21 @@ pub(crate) mod tests {
     }
 
     thread_local! {
+        /// `VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE` on for this thread's
+        /// submissions.
+        pub(crate) static SPLIT_PRELUDES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
         static NATIVE_CALLS: std::cell::RefCell<Option<NativeCallTrace>> =
             const { std::cell::RefCell::new(None) };
 
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Submissions that did not run to their marks so far.
+    pub(crate) fn lost_so_far() -> u64 {
+        LOST[0].load(Ordering::Relaxed)
     }
 
     /// The barriers built on this thread since the last call.
@@ -1574,6 +1583,10 @@ fn timing() -> bool {
 /// On D3DMetal, a separate native queue call before a deferred UAV-to-SRV
 /// prelude can make the preceding producer's writes visible.
 fn split_uav_srv_prelude() -> bool {
+    #[cfg(test)]
+    if tests::SPLIT_PRELUDES.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE"))
 }
@@ -2183,7 +2196,10 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        let launched = std::time::Instant::now();
                         self.wait_for(*submitted);
+                        let ran = launched.elapsed();
+                        flight::ran_for(ran, ran, false);
                         true
                     }
                     Err(e) => {
@@ -5581,6 +5597,7 @@ impl Meter {
                  {hoisted:.0} hoisted, {inline:.0} inline)",
                 making = crate::pipeline::making()
             );
+            flight::log(report_frames);
             crate::ray_skip::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

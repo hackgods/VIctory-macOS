@@ -3099,10 +3099,26 @@ impl HostList {
         let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
         let events = std::mem::take(&mut *pending);
         let mut expanded = Vec::new();
-        for event in events {
+        // mac: with `VICTORY_CENSUS_FAST=1` a heap's ranges once a barrier,
+        // where its last draw stood (`crate::census_fast::last_of_each`):
+        // every draw of a heap before the barrier stands for the same ranges,
+        // and of equal writes only the last decides what a widened view gets.
+        let last = crate::mac_switches::census_fast().then(|| {
+            crate::census_fast::last_of_each(events.iter().map(|event| match event {
+                WidenedEvent::Heap(heap) => Some(std::sync::Arc::as_ptr(heap) as usize),
+                WidenedEvent::Write(_) => None,
+            }))
+        });
+        for (k, event) in events.into_iter().enumerate() {
             match event {
                 WidenedEvent::Write(write) => expanded.push(WidenedEvent::Write(write)),
+                WidenedEvent::Heap(_) if last.as_ref().is_some_and(|last| !last[k]) => {}
                 WidenedEvent::Heap(heap) => {
+                    // mac: the kept answer with `VICTORY_CENSUS_FAST=1`.
+                    if let Some(writes) = crate::bindless::unordered_writes(&heap) {
+                        expanded.extend(writes.iter().cloned().map(WidenedEvent::Write));
+                        continue;
+                    }
                     expanded.extend(
                         crate::bindless::widened_writes(&heap)
                             .into_iter()

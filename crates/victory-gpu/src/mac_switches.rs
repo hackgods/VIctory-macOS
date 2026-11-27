@@ -325,6 +325,46 @@ fn dispatch_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// Whether view heaps' censuses (`crate::bindless::Viewed`) take their lock
+/// less (`crate::census_fast`): the ranges a heap's unordered views write
+/// are kept apart and their answer kept until they change, so a list's
+/// heap-writing draws no longer walk every range of the census under its
+/// lock at each barrier, and a heap sync enters the slots of a pass a batch
+/// at a time, not one lock a slot. Only with `VICTORY_CENSUS_FAST=1`, read
+/// once (at the first view heap). What a slot shows, what a submission
+/// refreshes and what widened views get stay as they are.
+pub(crate) fn census_fast() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = census_rule(std::env::var("VICTORY_CENSUS_FAST").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_CENSUS_FAST=1: view heap censuses keep their unordered ranges apart with a kept answer, and heap syncs enter their slots in batches"
+            );
+        }
+        on
+    })
+}
+
+/// `VICTORY_CENSUS_FAST`'s rule: on only for `1`.
+fn census_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::census_rule;
+
+    #[test]
+    fn the_census_switch_is_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("true"), Some("2")] {
+            assert!(!census_rule(off), "{off:?}");
+        }
+        assert!(census_rule(Some("1")));
+        assert!(census_rule(Some(" 1 ")));
+    }
+}
+
 #[cfg(test)]
 mod clamp_tests {
     use super::{clamps, dispatch_rule};

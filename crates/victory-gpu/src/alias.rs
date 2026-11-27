@@ -674,8 +674,16 @@ pub(crate) fn in_place_shadow(
         }
     }
     let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
-    if map.insert(start, start + len).is_none() {
-        IN_PLACE_COUNT.fetch_add(1, Ordering::Release);
+    // Two buffers may start at one address: keep the longer end.
+    match map.entry(start) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(start + len);
+            IN_PLACE_COUNT.fetch_add(1, Ordering::Release);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let end = entry.get_mut();
+            *end = (*end).max(start + len);
+        }
     }
     IN_PLACE_SPAN.fetch_max(len, Ordering::Relaxed);
     drop(map);
@@ -1336,6 +1344,10 @@ mod tests {
         assert!(!is_in_place(start - 64, 20));
         assert!(clamp_in_place_inline(start + 8, 20, None));
         assert!(clamp_in_place_inline(start - 64, 20, Some(start + 4)));
+        // A shorter buffer from the same start found in place too leaves the
+        // longer one's end in place.
+        assert!(in_place_shadow(start, PAGE as u64).is_some());
+        assert!(is_in_place(start + PAGE as u64 + 8, 20));
         // The title writes through the other view; the GPU reads it there.
         let bytes: Vec<u8> = (0..256).map(|i| (i * 7) as u8).collect();
         // SAFETY: inside the second view.

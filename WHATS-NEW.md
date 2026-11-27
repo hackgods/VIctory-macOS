@@ -1,0 +1,83 @@
+# What's new on `main-mac`
+
+The `main-mac` branch runs VIctory on Apple Silicon. It starts from VIctory for macOS (Wine plus D3DMetal) and adds fixes from the Windows forks that already run the game well. Every change is tested on one MacBook Pro (M4 Pro, 48 GB) with the Xbox Series X profile.
+
+This repository has source code only. It contains nothing from the game. Bring your own copy of the game and build the code yourself.
+
+## Where it stands (27 November 2026)
+
+- **Picture.** The sun now lights surfaces. Shadows have clean edges, rooms have fill light, characters and their clothes draw, and screen reflections reach the picture. The picture is close to the console at the checkpoints we compare against. Car interiors at night are lit, and at the boat the water simulation now runs, so the wake and spray show. It is not the same everywhere: night streets and rooms look flatter than on the console (our fill light's minimum level outweighs the lamps; the launcher's lower minimum brings back part of the contrast), distant trees and buildings appear 5 to 35 s late after a camera cut, a black patch on water in one boat shot is still open, and one ray-traced reflection pass is left out for now. The late distant world is the game's streaming running slowly here, not missing detail levels; a larger map budget doesn't help.
+- **Free roam.** From a free-roam save, the house, the street and the interiors look right, at about 2 fps. Some objects flicker black for one frame, mostly indoors. The main cause found so far has a fix in the launcher (see below). In the prison cell the log counts no empty reads with it, but it is not yet checked by eye in free roam. The game caps each frame's time step at 1/15 s, so at 2 to 4 fps the world ran at 15 to 25% of normal speed; the launcher now allows 0.25 s. Held buttons (doors) worked; short taps (sprint, climb) were lost, and the launcher now keeps them. Neither fix is tried in play yet.
+- **Speed.** On the default launcher settings:
+
+  | Place | Frames a minute | About |
+  |---|---|---|
+  | Prison checkpoint, still view | 184 to 204 | 3.1–3.4 fps |
+  | Boat | 240 | 4.0 fps |
+  | Prison, 1920x1080 output | 179 | 3.0 fps |
+  | Boat, 1920x1080 output | 295 | 4.9 fps |
+
+  The prison row comes from runs on today's settings and counts the still view once the camera has settled; the first minute is slower (138 to 165 frames). The boat rows count its first minute on today's newest settings. The boat is slower than this morning (282 frames, and 361 at 1920x1080); why is not known yet. Some prison runs used to go 10 to 30% slower because the game submitted its GPU work in more pieces; since this afternoon's launcher changes that is rare (one of about ten runs on the default settings), but not gone. The prison 1920x1080 row was measured before the census change below. At 1920x1080 the game's interface is drawn twice too large. `VICTORY_OUTPUT=3840x2160 VICTORY_RENDER_SCALE=0.5` keeps it right but is 30% slower in the cell. For about half of each frame, the thread that submits GPU work waits for the GPU. Preparing work and GPU time don't overlap yet.
+- **Goal.** First, 5 fps on the Series X profile with the picture right. Then 10 fps at 1080p output. 30 fps is out of reach on this hardware with any code known today.
+
+## Recent changes
+
+- **Water simulation.** One program of the shallow-water simulation reads raw descriptor data as numbers. Our shader translator refused it, so the simulation ran without its time step. It now translates (`VICTORY_DESCRIPTOR_AS_DATA=1`, from ScarlettMac, a launcher default): at the boat the wake and spray show, at the same speed (240 against 244 frames a minute). The first run after the switch changes rebuilds shaders. `VICTORY_DESCRIPTOR_AS_DATA=0` turns it off.
+- **Ray tracing, first steps (off by default).** The game's programs that build its ray-tracing structures now translate and run (`VICTORY_BVH_BUILDER=1`). At the boat, draws dropped for lack of a structure fell from about 340 to 8 a frame, with no hang or crash, but the GPU takes 25 to 30% longer. If the GPU stops a submission while the builder runs, the builder is switched off for the rest of the run. The picture doesn't gain yet: the left-out reflection pass still draws blocks on water with a real structure, and window glass still doesn't reflect characters (rays read some memory the port doesn't map yet). Work continues.
+- **Two small speed-ups together.** `VICTORY_CENSUS_BATCH=1` (the remaining slot-list updates batched too) and `VICTORY_SHADER_OPT=64` (console loads read four values at a time, from 64bitMango's fork) were each under our 3% bar alone. Together, in blocks of three runs each, the prison cell went from 3.19 to 3.33 fps (+4.5%). Both are launcher defaults; set either to 0 to turn it off. The first run after `VICTORY_SHADER_OPT` changes rebuilds shaders.
+- **Fill light at night.** The fill light's minimum level (0.3) won in nearly all of the night picture and flattened the lamps. With the stand-in off, the night street gets the console's red, teal and magenta light. The launcher now uses `VICTORY_AMBIENT_FLOOR=0.1`: part of the contrast comes back at night, and the prison cell and the boat stay lit.
+- **One-frame black flickers.** When the game moves a texture to a new address and rewrites its shader slot, the slot stayed empty until a shader had read it once. Draws that picked it read zeros for one frame: black with white specks, about half a second on screen at 2 fps. `VICTORY_PLACED_AT_ONCE=keep` keeps the old texture in the slot until the new one is ready, and `=all` (the launcher default) gives every rewritten slot its new texture at once, so new objects aren't black on their first frame either. In free roam, the log's count of slots read while being rewritten fell from 2,162 to 0; in the prison cell `=all` also took the empty first views from 5,839 to 0. No cost on the still view; the first minute after loading looks about 10% slower in our runs. A check by eye in free roam is still to come. `VICTORY_FLICKER_WATCH=1` logs such empty reads, and `VICTORY_PLACED_AT_ONCE=0` turns the fix off.
+- **Exact hair shadow mask.** One hair-shadow program now keeps its shared memory in order across loop rounds (`VICTORY_HALVES_LDS_ROUNDS=1`, a launcher default). Hair looks the same or slightly cleaner, at no speed cost.
+- **Screen reflections.** The game writes its reflection image through one texture and the lighting reads the same memory through a second view in another format. The port gave the two views separate GPU textures and copied nothing between them, so no reflection ever reached the picture: steel looked black and water reflected nothing. The view now uses the written texture (`VICTORY_PLACED_TWIN=1`), and a minimum reflection level of 0.15 gives reflections some light (`VICTORY_AMBIENT_REFLECT_FLOOR=0.15`). In the prison cell the steel box and plate get light; at the boat the water reflects the sky. One ray-traced reflection pass then drew rectangular blocks on the water. Its results are wrong anyway while the ray-tracing structure is held back, so the launcher leaves it out (`VICTORY_SKIP_PIPELINES=6d7fe7745ab9c6d8`). No speed cost. All three are launcher defaults.
+- **Game speed for playing by hand.** `VICTORY_TIME_STEP_MAX=0.25` lets the game step its clock up to 0.25 s a frame, so the world runs closer to real time at low frame rates. A scripted walk in free roam went several times further. It is on in the launcher for playing; measured runs keep the game's own step. `VICTORY_TIME_STEP_MAX=` turns it off.
+- **Fewer waits on one lock.** Threads that write GPU descriptors waited on a lock that guards the list of what each shader resource slot reads. The list is now updated in batches and checked once per barrier (`VICTORY_CENSUS_FAST=1`, a launcher default). Lock waits fell by half or more, and the prison cell got about 20% faster (no change at the boat). `VICTORY_CENSUS_FAST=0` turns it off.
+- **Input for playing by hand** (on in the launcher, not yet tried in play; set any of them to 0 to turn it off):
+  - `VICTORY_INPUT_LATCH=1`: the game reads the pad once a frame (250 to 500 ms here), so taps between two readings were lost. They are kept now.
+  - `VICTORY_INPUT_REFOCUS=1`: keys held down while another app had focus wait for their release.
+  - `VICTORY_STICK_DEADZONE=0.15`: a round dead zone on the sticks.
+  - `VICTORY_INPUT_WATCH=1`: a log line a second with what the pad sends.
+- **Zero-copy buffers.** Many of the game's buffers are now shared with the GPU instead of being copied every frame (`VICTORY_ALIAS_BUFFERS=1`, a launcher default). Copies fell from about 372 to 292 MB a frame, and the boat went from 257 to 280 frames a minute. It uses 1 to 2 GB more memory. `VICTORY_ALIAS_BUFFERS=0` turns it off.
+- **Direct sunlight.** The lighting multiplies the sun by a texture that a compute pass writes. D3DMetal cannot store to that texture's format (B5G5R5A1), so the writes were lost and the sun came out black. The fix gives such textures a format that Metal can store (taken from Belobug's AMD fork).
+- **Black bands in sunlit areas.** Four tile-list programs now run in their exact form (`VICTORY_HALVES_WALK=1`, a launcher default).
+- **Fill light.** The console lights rooms by tracing rays. Here a stand-in estimates the light from the scene, with a minimum level so dark rooms don't go black (`VICTORY_AMBIENT=estimate`; `VICTORY_AMBIENT_FLOOR`, 0.3 in the code, 0.1 in the launcher).
+- **Characters and clothes.** About 60 character pipelines had vertex data a little over one of Apple's size limits, so they were dropped without a warning. They draw now.
+- **Blocky sun edges in the prison yard.** One shadow program asks a writable image for its size and gets 0, so whole 16x16 tiles were lit or shadowed together. `VICTORY_UAV_SIZE_LEVEL0=07f451a14b13fecb` gives that one program the right size. It is a launcher default now.
+- **Tools.**
+  - Frame replay plays back one recorded frame without the game, so GPU changes can be measured in seconds.
+  - A watch on the request list.
+  - A sampling profiler of the game's threads (`VICTORY_PROFILE`, from Belobug's fork). It now tells threads that wait inside Wine, on registry watches or on file reads from threads that run.
+  - The per-frame log line also counts waits for the page-guard lock, time in memory-protection calls and the exceptions the write-fault handler sees.
+  - Optional switches that are off by default: `VICTORY_BVH_MISS` (from trustno1-coder's fork), and the ones listed below.
+  - New optional switches, off by default and not measured yet:
+    - From VIctory for macOS: `VICTORY_METAL_BC_CASTS` (compressed textures viewed in another format), `VICTORY_WIDENED_IN_PLACE` (no copy of a list's history at barriers; only two such views are live in our runs), `VICTORY_SNAPSHOT_SPANS` (write snapshots copy only new bytes), and `VICTORY_UNMAPPED_SPLIT` (texture uploads).
+    - From ScarlettMac: `VICTORY_TEXTURE_TRIM`.
+
+## What we tried that didn't help
+
+Runs vary a lot, so some of these may get a second look.
+
+- `VICTORY_OPENED_FAULTS`, `VICTORY_VETTED_PAGES` and `VICTORY_WATCH_RUNS` together (fewer lock waits and Wine calls when memory pages are guarded; two ideas from 64bitMango's fork): 104 and 148 frames a minute at the cell against 136 and 152.
+- `VICTORY_HALVES_LDS_ORDER=1` (an exact order for one hair-shadow program's shared memory): 2% slower.
+- `VICTORY_ASYNC_SETTLE_ALL=0`: no change, so it stays on.
+- `VICTORY_DSTORAGE_WORKERS=6` (six file readers instead of one a core, from ScarlettMac): slower in the opening, 156 and 157 frames a minute against 173 and 171.
+- `VICTORY_UNMAPPED_SPLIT`, `VICTORY_DIRTY_ROWS` and `VICTORY_HEAP_WORKER` together (texture uploads, from VIctory for macOS): the game crashed in both runs, about 3 minutes in. One run on the default settings later crashed at the same place, so it is a rare crash that was already there. Alone, `VICTORY_DIRTY_ROWS=1` was faster once and then slower in repeats (3.19 against 3.44 fps); it stays off.
+- `VICTORY_VIEW_INLINE=1` (constant buffer views kept out of the view table, from hyphennn's fork): about 10% slower in the prison cell.
+- `VICTORY_SYNC_EPOCH=1` (from ScarlettMac): slower in the cell (3.06 against 3.36 fps). With `VICTORY_TEXTURE_WORKERS=6` and `VICTORY_DEPTH_NO_TWIN=1` added: 3% slower.
+- `VICTORY_FLUSH_OVERLAPPING=1` (a title copy refreshes only what it can change, from VIctory for macOS): +2.9% in the cell, under our 3% bar.
+- `VICTORY_UI_SIZE` (another size for the game's largest display mode): no visible effect.
+- `VICTORY_BVH_MISS=1` (every ray-tracing node test misses): the blocks on water stayed.
+- `VICTORY_UAV_SIZE_LEVEL0=1` (the image-size fix for every program instead of one): faces are clean now, but most runs went into the game's slower mode. It stays on one program.
+- `VICTORY_FLIGHTS` gave no gain: the waiting just moved somewhere else.
+- `VICTORY_DISPATCH_CLAMPS` cut clamp dispatches from 993 to 141 a frame but was no faster (139 frames a minute against 144 and 148).
+- `VICTORY_COPY_BACK_SPLIT` left copying back at 42 ms a frame (146 frames a minute).
+- `VICTORY_TIME_STEP_MAX=1` breaks physics at the boat. 0.25 keeps the boat whole and is the launcher's value.
+
+## Credits
+
+This builds on the work of:
+
+- Marvisak (VIctory)
+- pragyaangaur and the contributors to VIctory for macOS
+- The forks by hyphennn, Belobug, DexNom, myokex, avatarmanz, 64bitMango, darkworldhm, trustno1-coder and paveledits (ScarlettMac), and the fault write-ups by ZSlayerHQ
+
+Each borrowed commit names its source at the start of its message. The licence is unchanged (see `LICENSE`).

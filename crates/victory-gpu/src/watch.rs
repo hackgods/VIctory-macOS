@@ -911,12 +911,13 @@ impl Tracked {
         if pages.iter().all(Vec::is_empty) {
             return vec![(Vec::new(), Vec::new()); ranges.len()];
         }
-        let whole: Vec<usize> = pages
+        // Any range that covers a whole page already includes that page in
+        // its snapshot. Partial occurrences in other ranges add no aliases.
+        let whole: Vec<usize> = clipped
             .iter()
-            .flatten()
-            .copied()
-            .filter(|&p| {
-                clipped.iter().any(|&(from, to)| {
+            .zip(&pages)
+            .flat_map(|(&(from, to), pages)| {
+                pages.iter().copied().filter(move |&p| {
                     (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to
                 })
             })
@@ -2358,6 +2359,32 @@ pub(crate) mod tests {
         assert!(batched.clean(), "the final range takes the remaining partial page");
         drop(batched);
         free(p);
+    }
+
+    #[test]
+    fn a_later_whole_range_guards_its_alias_after_a_partial_take() {
+        use windows_sys::Win32::System::Memory::{MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile};
+
+        let (a, b) = twin_views(2);
+        let tracked = track(a, 2 * PAGE, true).expect("views are tracked");
+        let ranges = [(a + PAGE / 2, a + PAGE), (a + PAGE, a + 2 * PAGE), (a, a + PAGE)];
+        assert_eq!(
+            tracked.take_split_many(&ranges),
+            ranges.map(|range| (vec![range], vec![])),
+        );
+        assert!(tracked.clean());
+        // SAFETY: write through the second view of the first tracked page.
+        unsafe { (b as *mut u8).write_volatile(1) };
+        assert_eq!(tracked.take(a, a + 2 * PAGE), [(a, a + PAGE)]);
+        drop(tracked);
+        for view in [a, b] {
+            let unmapping = title_memory_unmapping(view, 2 * PAGE);
+            // SAFETY: these views belong to the fixture and the tracker is gone.
+            let unmapped =
+                unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
+            assert_ne!(unmapped, 0);
+            drop(unmapping);
+        }
     }
 
     /// Pages of the ranges armed keep their bytes from before the first

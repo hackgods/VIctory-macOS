@@ -106,6 +106,13 @@ pub(crate) fn gpu_records() -> u8 {
     })
 }
 
+/// Sets, for tests on this thread, the view kinds shaders read from the
+/// title's records (`None`: as `VICTORY_GPU_RECORDS` says).
+#[cfg(test)]
+pub(crate) fn gpu_records_for_test(kinds: Option<u8>) {
+    tests::GPU_RECORDS.with(|k| k.set(kinds));
+}
+
 /// The address and bytes of the constant buffer view that record words
 /// name whole; `None` for any other record.
 pub(crate) fn constant_record(i: u32, generation: u32) -> Option<(u64, u32)> {

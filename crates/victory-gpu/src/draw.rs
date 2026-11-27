@@ -93,6 +93,10 @@ pub(crate) struct State {
     /// The title-memory page table made for this list (`crate::memory`)
     /// and its view heap.
     memory: Option<(usize, crate::memory::Map)>,
+    /// The page table alone, bound for this list's shaders that take views
+    /// from the title's records (`crate::memory::bind_table`), and its view
+    /// heap.
+    records_table: Option<(usize, u64)>,
     /// Views made for root SRVs and UAVs in this list ([`State::root_view`]):
     /// (view heap, host copy, unordered access) → dynamic slot.
     root_slots: std::collections::HashMap<(usize, usize, bool), u32>,
@@ -630,6 +634,7 @@ impl State {
         self.entry_memo.clear();
         self.root_slots.clear();
         self.memory = None;
+        self.records_table = None;
         let fixed = std::mem::take(&mut self.fixed);
         if fixed.topology {
             self.set_topology(list, self.topology);
@@ -980,7 +985,7 @@ impl State {
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         // What its shaders write is withheld only if the program uses title
         // memory and a list using it misses (`crate::memory::withholding`).
-        let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory.is_some()));
+        let _writer = list.writer_uses_memory(p.stages.iter().any(|s| s.memory_dirty.is_some()));
         let l = &list.list;
         // A depth copy of ours (`crate::twin`) since the last one ran a
         // compute pipeline.
@@ -1029,7 +1034,7 @@ impl State {
             };
             // Shaders using title memory mark in a bitmap of their own, held
             // back while their results are (`crate::memory::withholding`).
-            let memory = p.stages.iter().any(|s| s.memory.is_some());
+            let memory = p.stages.iter().any(|s| s.memory_dirty.is_some());
             let (Some(table), Some(bitmap)) = (heap.and_then(|h| h.marks()), crate::shadow::view_writes(memory)) else {
                 once!("a shader marking its writes without a view heap: dropped");
                 not_run("write marks without a view heap");
@@ -1307,7 +1312,32 @@ impl State {
                     }
                 }
             }
-            if let Some(param) = stage.memory {
+            if let (Some(param), None) = (stage.memory, stage.memory_dirty) {
+                // Views taken from the title's records: the page table
+                // alone (every title-memory access also marks pages).
+                let heap = match self.heaps[0] {
+                    0 => MEMORY_HEAP,
+                    h => h,
+                };
+                let table = match self.records_table {
+                    Some((h, table)) if h == heap => Some(table),
+                    _ => crate::memory::bind_table(list, heap),
+                };
+                let Some(table) = table else {
+                    once!("a shader reading the title's records dropped: no view heap or page table");
+                    not_run("title records without a view heap or page table");
+                    return false;
+                };
+                self.records_table = Some((heap, table));
+                // SAFETY: an open list; the list keeps the table.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, table);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, table);
+                    }
+                }
+            } else if let Some(param) = stage.memory {
                 let Some((table, dirty)) = self.memory_map(list) else {
                     once!("a shader reading title memory dropped: no view heap or page table");
                     not_run("title memory without a view heap or page table");
@@ -6742,5 +6772,246 @@ void main() {
         assert_ne!(p, 0);
         run_shadow_preserve_gpu_write_repro(p, len);
         crate::watch::tests::free(p);
+    }
+
+    /// What a translated shader reads through a constant buffer view taken
+    /// from the resource heap, with the title's records read on the GPU
+    /// (`VICTORY_GPU_RECORDS=cb`) and with the host's own views (the legacy
+    /// path), for the same sequence of title actions: a view the title
+    /// created in the slot, a record it copied there as bytes from memory of
+    /// its own, constants it rewrote in place, a view that is a table entry
+    /// (not named whole), and a slot it cleared. Returns what each step read
+    /// and whether the slot had a host view after each.
+    fn heap_constant_steps(records: bool) -> Option<Vec<(u32, bool)>> {
+        use crate::pipeline::{Shader, Translated, host::HostPipeline};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, RootParam, RootType, emit, io, ir, resource,
+            structure,
+        };
+        let host = crate::host::host()?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: valid feature support query.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if ok.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return None;
+        }
+        crate::descriptor::gpu_records_for_test(Some(u8::from(records)));
+        // User data: s0 the heap index of a constant buffer (a root
+        // constant), s1 the resource heap, s2 a table with a raw UAV. Each
+        // lane stores dword 2 of the constant buffer to dword `lane` of the
+        // UAV (victory-shader's `HEAP_CONSTANT_WAVE32`).
+        let code: &[u32] = &[
+            0x8F04_8500, // s_lshl_b32 s4, s0, 5
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0203,
+            0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
+            0xBE8C_0302, // s_mov_b32 s12, s2
+            0xBE8D_0380, // s_mov_b32 s13, 0
+            0xF408_0406,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0504,
+            0xFA00_0008, // s_buffer_load_dword s20, s[8:11], 0x8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E02_0214, // v_mov_b32 v1, s20
+            0x3404_0082, // v_lshlrev_b32 v2, 2, v0
+            0xE070_1000,
+            0x8004_0102, // buffer_store_dword v1, v2, s[16:19], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let param = |root, user_data| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data,
+            slot: user_data,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                param(RootType::Constants, 0),
+                param(RootType::ResourceHeap, 1),
+                param(RootType::Table, 2),
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 2,
+                slot: 2,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut container = vec![0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[20..24].copy_from_slice(&1u32.to_le_bytes());
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let c = Container::parse(&container).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let options = emit::Options {
+            gpu_records: u8::from(records),
+            ..Default::default()
+        };
+        let hs = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
+        assert_eq!(hs.root_srvs.contains(&emit::HEAP_RECORDS), records);
+        assert_eq!(hs.memory, records);
+        assert!(!hs.memory_writes);
+        let shader = Shader::for_test(
+            "compute",
+            Translated {
+                host: hs,
+                used: native.used,
+                used_written: Vec::new(),
+                write_unknown: true,
+                threads: None,
+            },
+        );
+        let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("the pipeline");
+
+        // A view heap in the title's own memory, and title buffers: two of
+        // constants, one the shader writes.
+        let memory = crate::watch::tests::pool(1);
+        #[repr(C)]
+        struct Extended {
+            desc: [u32; 4],
+            address: u64,
+            size: u64,
+        }
+        let extended = Extended {
+            desc: [0, 4, 1, 0],
+            address: memory as u64,
+            size: 4 * 32,
+        };
+        let mut heap = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&extended.desc).cast(),
+                &iid,
+                &mut heap,
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let host_heap = title_heap.host().expect("a host view heap");
+        let (a, b, big, out) = (buffer(256), buffer(256), buffer(0x8000), buffer(256));
+        let bytes = |buffer| crate::resource::buffer_bytes(buffer).unwrap().0 as u64;
+        let (a_bytes, b_bytes, big_bytes, out_bytes) = (bytes(a), bytes(b), bytes(big), bytes(out));
+        let out_copy = crate::shadow::find(out_bytes, 256).expect("the output's host copy");
+        // SAFETY: inside the title buffers.
+        unsafe {
+            (a_bytes as *mut u32).add(2).write(0xA000_0002);
+            (b_bytes as *mut u32).add(2).write(0xB000_0002);
+            (big_bytes as *mut u32).add(2).write(0xC000_0002);
+        }
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(std::ptr::null(), out, std::ptr::null(), &raw, title_heap.start);
+        let slot = title_heap.start + 32;
+        let constants = |address: u64, size: u32| [address as u32, (address >> 32) as u32, size, 0];
+        let run = || {
+            // SAFETY: inside the output buffer.
+            unsafe { (out_bytes as *mut u32).write(0xDEAD_BEEF) };
+            let list = host.new_list().unwrap();
+            let mut state = State::default();
+            state.set_heaps(&[heap]);
+            state.set_constants(true, 0, &[1], 0);
+            state.set_table(true, 2, title_heap.start);
+            assert!(state.bind(&list, &hp, true), "the dispatch is bound");
+            // SAFETY: an open list with everything bound.
+            unsafe { list.list.Dispatch(1, 1, 1) };
+            list.close();
+            host.execute(&[&list]);
+            (out_copy.read_host(out_bytes, 1)[0], host_heap.made(1))
+        };
+        let mut steps = Vec::new();
+        // The title creates a view in the slot.
+        crate::descriptor::create_cbv(std::ptr::null(), &constants(a_bytes, 256), slot);
+        steps.push(run());
+        // It copies a record there as bytes, from memory of its own.
+        let mut record = [0u32; 8];
+        crate::descriptor::create_cbv(std::ptr::null(), &constants(b_bytes, 256), record.as_mut_ptr() as u64);
+        // SAFETY: one 32-byte record in each of our allocations.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
+        steps.push(run());
+        // It rewrites the constants in place: no record changes.
+        // SAFETY: inside the title buffer.
+        unsafe { (b_bytes as *mut u32).add(2).write(0xB111_0002) };
+        steps.push(run());
+        // A view too large and uneven to be named whole: a table entry,
+        // read through the host's own view either way.
+        crate::descriptor::create_cbv(std::ptr::null(), &constants(big_bytes, 0x4004), record.as_mut_ptr() as u64);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
+        steps.push(run());
+        // A view named whole again, past the end of which dword 2 lies.
+        crate::descriptor::create_cbv(std::ptr::null(), &constants(a_bytes, 8), record.as_mut_ptr() as u64);
+        // SAFETY: as above.
+        unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
+        steps.push(run());
+        // The title clears the slot.
+        // SAFETY: the slot's 32 bytes.
+        unsafe { std::ptr::write_bytes(slot as *mut u8, 0, 32) };
+        steps.push(run());
+
+        drop(out_copy);
+        crate::descriptor::gpu_records_for_test(None);
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        crate::watch::tests::free(memory);
+        Some(steps)
+    }
+
+    /// Constant buffer views read from the title's records on the GPU give
+    /// what the host's own views give, step for step, and take no host view
+    /// where the record names the view whole.
+    #[test]
+    fn constant_buffers_from_the_titles_records_read_as_host_views_do() {
+        let Some(legacy) = heap_constant_steps(false) else {
+            return; // no host GPU with SM 6.6 here
+        };
+        let records = heap_constant_steps(true).expect("the same host");
+        let read = |steps: &[(u32, bool)]| steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        assert_eq!(
+            read(&legacy),
+            [0xA000_0002, 0xB000_0002, 0xB111_0002, 0xC000_0002, 0, 0],
+            "the host's own views"
+        );
+        assert_eq!(read(&records), read(&legacy), "records read on the GPU");
+        let made = |steps: &[(u32, bool)]| steps.iter().map(|s| s.1).collect::<Vec<_>>();
+        assert_eq!(made(&legacy), [true, true, true, true, true, false]);
+        // The first view was made before the heap's records were read on the
+        // GPU; after that only the table entry's record has a host view.
+        assert_eq!(made(&records), [true, false, false, true, false, false]);
     }
 }

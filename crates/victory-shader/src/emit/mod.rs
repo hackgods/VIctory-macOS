@@ -113,6 +113,30 @@
 //!   host then keeps everything the heap's views reach current, and
 //!   copies back what such views may have written.
 //!
+//! * **Views from the title's records** ([`Options::gpu_records`]; off by
+//!   default). The title copies descriptors as bytes, hundreds of
+//!   thousands a frame, and each copied record was a host slot made again.
+//!   With bit 0, a read through a raw buffer view taken from a heap or a
+//!   table first reads the title's own record at the view's heap index:
+//!   the heap-info table (root SRV `t`[`HEAP_RECORDS`] in
+//!   [`ROOT_CBV_SPACE`], listed in [`HostShader::root_srvs`]) gives the
+//!   title address of the bound view heap's first descriptor and its
+//!   slots, and the record's three dwords are read through the title page
+//!   table ("Title memory"; `t0` of the memory space, so
+//!   [`HostShader::memory`] is set, but not
+//!   [`HostShader::memory_writes`]: nothing is marked). A record that
+//!   names a constant buffer view whole (its tag, then kind 1 in the top
+//!   two bits of its third dword: a 47-bit address and 15 bits of size)
+//!   is read at the memory the page table names at that address plus the
+//!   access's offset, and its dwords past the view's size read 0, as each
+//!   did through a host view of that size. Any other record, an index at
+//!   or past the heap's slots (a table the host made afresh in its own
+//!   slots) or a heap of no slots reads the host's view at the index, as
+//!   without the option. The host keeps the title heap's memory in a copy
+//!   the page table names, and makes no view for a record named whole.
+//!   shortcut: one page lookup per access, as title memory: its bytes are
+//!   taken to lie in the memory that holds its first byte's page.
+//!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the
 //!   host's view at that index must be an R32 integer view. Global loads

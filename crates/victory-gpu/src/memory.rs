@@ -551,6 +551,37 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
 /// table (made on first use) and a page bitmap of the list's, the table
 /// brought up to date at each submission of the list, its written pages
 /// copied back after.
+/// The page table of view heap `key` alone, for a list whose shaders only
+/// look addresses up in it (views taken from the title's records, which
+/// mark nothing): its host GPU address. As [`bind`], the table is rewritten
+/// and the copies it names brought up to date at each submission of the
+/// list; no bitmap, nothing checked or copied back after it.
+pub(crate) fn bind_table(list: &HostList, key: usize) -> Option<u64> {
+    let table = table_of(list, key)?;
+    list.defer_memory(key);
+    Some(table)
+}
+
+/// The page table of view heap `key`, kept by `list`: made the first time.
+fn table_of(list: &HostList, key: usize) -> Option<u64> {
+    with_heap(key, |heap| {
+        let mut shared = shared();
+        let host = std::ptr::from_ref(heap) as usize;
+        if let Some((_, s)) = shared.iter().find(|(k, s)| *k == key && s.host == host) {
+            list.keep(&s.table);
+            return Some(s.gpu);
+        }
+        // A released heap's table goes with it (lists that name it hold it).
+        shared.retain(|(k, _)| *k != key);
+        let s = Shared::new(heap)?;
+        list.keep(&s.table);
+        let gpu = s.gpu;
+        shared.push((key, s));
+        Some(gpu)
+    })
+    .flatten()
+}
+
 pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let table = with_heap(key, |heap| {
         let mut shared = shared();

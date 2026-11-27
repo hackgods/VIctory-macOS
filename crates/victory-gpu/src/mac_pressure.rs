@@ -75,7 +75,7 @@ fn read() -> Option<Pressure> {
 /// written, or None if the kernel refused. Only under Rosetta, where the
 /// x86-64 XNU syscall ABI is what `syscall` reaches.
 #[cfg(target_arch = "x86_64")]
-fn sysctl_by_name(name: &[u8], out: &mut [u8]) -> Option<usize> {
+pub(crate) fn sysctl_by_name(name: &[u8], out: &mut [u8]) -> Option<usize> {
     use core::arch::asm;
     const BSD: u64 = 0x0200_0000;
     const SYSCTLBYNAME: u64 = 274;
@@ -106,7 +106,7 @@ fn sysctl_by_name(name: &[u8], out: &mut [u8]) -> Option<usize> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn sysctl_by_name(_: &[u8], _: &mut [u8]) -> Option<usize> {
+pub(crate) fn sysctl_by_name(_: &[u8], _: &mut [u8]) -> Option<usize> {
     None
 }
 

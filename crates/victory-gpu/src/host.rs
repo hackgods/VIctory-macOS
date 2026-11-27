@@ -2392,6 +2392,7 @@ impl Host {
         gpu_timing: bool,
     ) -> PreparedSubmission {
         let started = std::time::Instant::now();
+        let place = crate::cores::sample();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -2530,6 +2531,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let _ = submitted;
         let prepared = std::time::Instant::now();
+        crate::cores::note_preparation(place);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(
             crate::copystat::C::FaultsPrep,
@@ -5880,6 +5882,7 @@ impl Meter {
                  running it: {}",
                 held.join(", ")
             );
+            crate::cores::log(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

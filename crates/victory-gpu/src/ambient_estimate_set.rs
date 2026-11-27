@@ -193,6 +193,20 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// (`RESOLVES` and its siblings).
 pub(crate) const KEEPS: u8 = 8;
 pub(crate) const LIGHTS_AIR: u8 = 16;
+pub(crate) const BLURS_REFLECTIONS: u8 = 32;
+
+/// The program that writes the reflections the lighting reads, by the
+/// start of its name, and where (the same place as `CS_UpdateHistory`'s,
+/// `crate::ambient_set::REFLECTIONS`: the same table layout, the same
+/// register u31). In the denoiser `sr_denoising` the temporal resolve, the
+/// spatial filter, this blur and `CS_UpdateHistory` run in that order, then
+/// the lighting. The blur reads the resolved reflections (t389) and others
+/// and writes u31 and u36; `CS_UpdateHistory` reads the same t389 and writes
+/// only u31 of its own table, the history the next frame's temporal resolve
+/// reads (both read in their code; `notes/black-objects.md`, "Reflection
+/// floor (prep42): why it did nothing"). A hold after `CS_UpdateHistory`
+/// alone changes the history, not what the lighting reads.
+pub(crate) const BLUR_PROGRAM: &[u8] = b"CS_BilateralBlur_e877ef6e";
 
 /// `VICTORY_AMBIENT_AIR=<multiple>`: the most the air scatters, as a
 /// multiple of the light around; unset or 0: what the title has.
@@ -217,6 +231,9 @@ pub(crate) fn role_of(container: &[u8]) -> u8 {
     if has(AIR_PROGRAM) {
         role |= LIGHTS_AIR;
     }
+    if has(BLUR_PROGRAM) {
+        role |= BLURS_REFLECTIONS;
+    }
     role
 }
 
@@ -225,6 +242,7 @@ pub(crate) fn role_name(role: u8) -> &'static str {
     match role {
         KEEPS => "keeps the light visible surfaces send out",
         LIGHTS_AIR => "adds the lamps' light to what the air scatters",
+        BLURS_REFLECTIONS => "writes the reflections the lighting reads (held with VICTORY_AMBIENT_REFLECT_FLOOR)",
         _ => "several",
     }
 }
@@ -1421,6 +1439,10 @@ mod tests {
         assert_eq!(constant::role_of(RADIANCE_PROGRAM) | constant::role_of(AIR_PROGRAM), 0);
         assert_eq!((KEEPS | LIGHTS_AIR) & (constant::RESOLVES | constant::ENDS_REFLECTIONS | constant::DRAWS_SKY), 0);
         assert_eq!(KEEPS & LIGHTS_AIR, 0);
+        assert_eq!(role_of(b"..sr_denoising:CS_BilateralBlur_e877ef6e_Wrapped.."), BLURS_REFLECTIONS);
+        assert_eq!(role_of(constant::REFLECTED), 0);
+        assert_eq!(BLURS_REFLECTIONS & (KEEPS | LIGHTS_AIR | constant::RESOLVES | constant::ENDS_REFLECTIONS | constant::DRAWS_SKY), 0);
+        assert_eq!(constant::role_of(BLUR_PROGRAM), 0);
         assert_eq!(role_of(constant::PROGRAM) | role_of(constant::REFLECTED) | role_of(constant::SKY), 0);
     }
 

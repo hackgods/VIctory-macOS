@@ -112,13 +112,21 @@ pub(crate) fn on() -> bool {
 /// The roles the estimate follows programs in beside the constant
 /// stand-in's (bits; 0 while it is off).
 pub(crate) fn roles() -> u8 {
-    if on() { KEEPS | LIGHTS_AIR } else { 0 }
+    if on() { KEEPS | LIGHTS_AIR | blurred() } else { 0 }
+}
+
+/// With the reflection floor, the blur that writes the reflections the
+/// lighting reads is followed too (`set::BLUR_PROGRAM`): the hold, and so
+/// the floor, runs on its output as well as on the history. Off without the
+/// floor, so that the default picture stays as it was.
+fn blurred() -> u8 {
+    if reflect_floor() > 0.0 { set::BLURS_REFLECTIONS } else { 0 }
 }
 
 /// What the program of shader container `container` is to the estimate
 /// alone (0 while it is off: the container is not searched).
 pub(crate) fn role_of(container: &[u8]) -> u8 {
-    if on() { set::role_of(container) } else { 0 }
+    if on() { set::role_of(container) & (KEEPS | LIGHTS_AIR | blurred()) } else { 0 }
 }
 
 /// The creases' shade, as the constant stand-in's
@@ -229,6 +237,7 @@ pub(crate) fn announce() {
         if reflect_floor() > 0.0 {
             tracing::info!(
                 least = reflect_floor(),
+                also_after = "CS_BilateralBlur",
                 held = reflect_part(),
                 "VICTORY_AMBIENT_REFLECT_FLOOR: no reflection holds less than this part of the light around \
                  the point seen there (the light the hold's cap is a part of); a darker one is replaced by it \

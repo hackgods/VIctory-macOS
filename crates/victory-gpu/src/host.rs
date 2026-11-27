@@ -266,6 +266,20 @@ static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// splits.
 static WORK_SWITCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `queue.ExecuteCommandLists(lists)`, timed with `VICTORY_RECORD_TIMING=1`
+/// for a submission of `draws` draws (`crate::record_timing`).
+///
+/// # Safety
+/// As `ExecuteCommandLists`: closed lists whose resources live until they run.
+unsafe fn execute_native(queue: &ID3D12CommandQueue, lists: &[Option<ID3D12CommandList>], draws: u64) {
+    let timed = crate::record_timing::on().then(std::time::Instant::now);
+    // SAFETY: the caller's.
+    unsafe { queue.ExecuteCommandLists(lists) };
+    if let Some(at) = timed {
+        crate::record_timing::submitted(at.elapsed().as_nanos() as u64, draws);
+    }
+}
+
 /// [`WORK_SWITCHES`] since the last call.
 pub(crate) fn take_work_switches() -> u64 {
     WORK_SWITCHES.swap(0, Ordering::Relaxed)
@@ -1525,6 +1539,11 @@ pub(crate) struct HostList {
     /// What the last draw or dispatch recorded was ([`HostList::note_work`]):
     /// 0 nothing yet, 1 a draw, 2 compute.
     work: std::sync::atomic::AtomicU8,
+    /// Draws recorded since the reset, and with `VICTORY_RECORD_TIMING=1`
+    /// the timed calls and their nanoseconds (`crate::record_timing`).
+    draws: std::sync::atomic::AtomicU32,
+    timed_calls: std::sync::atomic::AtomicU32,
+    timed_ns: std::sync::atomic::AtomicU64,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// inline execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
@@ -2127,6 +2146,9 @@ impl HostGpu for Host {
                 id,
                 budget: OnceLock::new(),
                 work: 0.into(),
+                draws: 0.into(),
+                timed_calls: 0.into(),
+                timed_ns: 0.into(),
                 arguments: Mutex::new(None),
                 clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2259,6 +2281,7 @@ impl Host {
                 group.push(mark.list());
             }
             let queue = self.queue();
+            let draws: u64 = runs.iter().map(|l| u64::from(l.draws())).sum();
             // SAFETY: closed lists; the fence and event are ours.
             let waited = unsafe {
                 // All native calls share the existing fence signal and wait.
@@ -2269,12 +2292,12 @@ impl Host {
                     marked.push(mark.list());
                     #[cfg(test)]
                     tests::native_call(marked.len());
-                    queue.ExecuteCommandLists(&marked);
+                    execute_native(&queue, &marked, draws);
                     first = end;
                 }
                 #[cfg(test)]
                 tests::native_call(group.len() - first);
-                queue.ExecuteCommandLists(&group[first..]);
+                execute_native(&queue, &group[first..], draws);
                 let waited = queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
@@ -3302,6 +3325,13 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        if crate::record_timing::on() {
+            crate::record_timing::closed(
+                self.draws(),
+                self.timed_calls.load(Ordering::Relaxed),
+                self.timed_ns.load(Ordering::Relaxed),
+            );
+        }
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count =
@@ -3349,6 +3379,9 @@ impl HostList {
         self.trim_scratch();
         self.reset_hoisted_clamps();
         self.work.store(0, Ordering::Relaxed);
+        self.draws.store(0, Ordering::Relaxed);
+        self.timed_calls.store(0, Ordering::Relaxed);
+        self.timed_ns.store(0, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -4445,6 +4478,20 @@ impl HostList {
         if self.work.swap(now, Ordering::Relaxed) == 2 && !compute {
             WORK_SWITCHES.fetch_add(1, Ordering::Relaxed);
         }
+        if !compute {
+            self.draws.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Draws recorded since the reset.
+    pub(crate) fn draws(&self) -> u32 {
+        self.draws.load(Ordering::Relaxed)
+    }
+
+    /// A title call recording into the list took `took` (`crate::record_timing`).
+    pub(crate) fn note_recording(&self, took: std::time::Duration) {
+        self.timed_calls.fetch_add(1, Ordering::Relaxed);
+        self.timed_ns.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
     }
 
     /// What keeps the clamp of an indirect execution reading `[arguments,
@@ -5895,6 +5942,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);
+            crate::record_timing::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();

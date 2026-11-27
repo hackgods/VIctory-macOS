@@ -83,6 +83,8 @@ mod ranges;
 mod ray_skip;
 #[cfg(any(windows, test))]
 mod recent;
+#[cfg(windows)]
+mod record_timing;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]

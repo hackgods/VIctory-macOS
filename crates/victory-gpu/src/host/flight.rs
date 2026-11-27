@@ -233,6 +233,7 @@ impl Host {
             group.push(mark.list());
         }
         let queue = self.queue();
+        let draws: u64 = segments.iter().map(|l| u64::from(l.draws())).sum();
         let launched = std::time::Instant::now();
         // SAFETY: closed lists; fence and events are ours.
         let waited = unsafe {
@@ -243,12 +244,12 @@ impl Host {
                 marked.push(m.list());
                 #[cfg(test)]
                 super::tests::native_call(marked.len());
-                queue.ExecuteCommandLists(&marked);
+                super::execute_native(&queue, &marked, draws);
                 first = end;
             }
             #[cfg(test)]
             super::tests::native_call(group.len() - first);
-            queue.ExecuteCommandLists(&group[first..]);
+            super::execute_native(&queue, &group[first..], draws);
             match queue.Signal(&self.fence, fence_value).and_then(|()| {
                 self.fence.SetEventOnCompletion(fence_value, self.event)?;
                 self.fence

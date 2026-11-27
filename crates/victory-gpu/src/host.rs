@@ -5,6 +5,8 @@
 //! overlap them with per-submission fences once more than clears run.
 
 mod flight;
+#[cfg(test)]
+pub(crate) use flight::{Gate, ModeGuard};
 pub(crate) use flight::{async_submit_enabled, flight1_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};

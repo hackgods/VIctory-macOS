@@ -2253,6 +2253,7 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
             );
         }
         entry.shadow = Some(Shadow::new(buffer, data, gpu, key.0, len));
+        crate::alias::note_coverage(false, len);
         released().remade(key.0);
         changed();
     }
@@ -2387,6 +2388,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Shadow::new(buffer, data, gpu, start, len);
+    crate::alias::note_coverage(false, len);
     released().remade(start);
     LOOSE_SPAN.fetch_max(len, Ordering::Relaxed);
     map.insert((start, len), shadow.clone());

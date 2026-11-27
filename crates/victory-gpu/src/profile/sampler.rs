@@ -84,6 +84,10 @@ const WAITS: [(&str, &[&str]); 2] = [
             "NtReplyWaitReceivePort",
             "NtWaitForDebugEvent",
             "NtWaitForWorkViaWorkerFactory",
+            // mac: a registry watcher waits in these (Wine's notification
+            // thread, always "running" in the first profile).
+            "NtNotifyChangeKey",
+            "NtNotifyChangeMultipleKeys",
         ],
     ),
     (
@@ -96,6 +100,10 @@ const WAITS: [(&str, &[&str]); 2] = [
         ],
     ),
 ];
+/// mac: kernel calls that read files: a thread in one is in I/O, neither
+/// running nor waiting (the streaming workers spent 261 ms a frame there in
+/// the first profile).
+const IO: [(&str, &[&str]); 1] = [("ntdll.dll", &["NtReadFile", "NtReadFileScatter"])];
 const STUB: u64 = 0x20;
 /// By thread (its id's place): the id of the last thread there that ended
 /// the normal way, through the image's thread detach.
@@ -211,6 +219,8 @@ pub(super) struct Sampler {
     rounds: u64,
     late: u64,
     waits: Vec<(u64, u64)>,
+    /// mac: the file-read calls' stubs.
+    io: Vec<(u64, u64)>,
     /// Function starts by instruction pointer.
     functions: HashMap<u64, u64>,
     all: Totals,
@@ -368,7 +378,8 @@ impl Sampler {
             pending: Vec::new(),
             rounds: 0,
             late: 0,
-            waits: wait_functions(),
+            waits: stubs(&WAITS),
+            io: stubs(&IO),
             functions: HashMap::new(),
             all: Totals::with_callers(),
             marks: VecDeque::new(),
@@ -682,7 +693,13 @@ impl Sampler {
 
     /// What a thread standing at `rip` is doing.
     fn state_of(&self, rip: u64) -> State {
-        if self.is_wait(rip) { State::Waiting } else { State::Running }
+        if self.is_wait(rip) {
+            State::Waiting
+        } else if self.io.iter().any(|&(from, to)| rip >= from && rip < to) {
+            State::Io
+        } else {
+            State::Running
+        }
     }
 
     /// Where the function holding `rip` starts, by unwind data; 0 if none.
@@ -1101,9 +1118,10 @@ fn interval_us(rate: f64, risk: f64, exposure_us: f64) -> u64 {
 }
 
 /// The address ranges of the wait functions' stubs.
-fn wait_functions() -> Vec<(u64, u64)> {
+/// The stubs of the kernel calls `calls` names, by module.
+fn stubs(calls: &[(&str, &[&str])]) -> Vec<(u64, u64)> {
     let mut list = Vec::new();
-    for (dll, names) in WAITS {
+    for &(dll, names) in calls {
         let wide: Vec<u16> = dll.encode_utf16().chain([0]).collect();
         // SAFETY: a plain query for a loaded module.
         let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
@@ -1460,6 +1478,102 @@ mod tests {
                 "thread {} read as running: {acc:?}",
                 t.id
             );
+        }
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreatePipe(read: *mut HANDLE, write: *mut HANDLE, attributes: *const c_void, size: u32) -> i32;
+        fn ReadFile(file: HANDLE, buffer: *mut u8, len: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
+        fn WriteFile(file: HANDLE, buffer: *const u8, len: u32, written: *mut u32, overlapped: *mut c_void) -> i32;
+    }
+
+    /// mac: a thread blocked in a file read reads as in I/O, and one
+    /// blocked in a registry watch as waiting; neither as running.
+    #[test]
+    fn file_reads_and_registry_watches_are_not_running() {
+        use windows_sys::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_ALL_ACCESS, REG_NOTIFY_CHANGE_LAST_SET, REG_OPTION_VOLATILE, REG_SZ,
+            RegCloseKey, RegCreateKeyExW, RegDeleteKeyW, RegNotifyChangeKeyValue, RegSetValueExW,
+        };
+        let (mut read, mut write): (HANDLE, HANDLE) = (null_mut(), null_mut());
+        // SAFETY: out pointers to two handles.
+        assert_ne!(unsafe { CreatePipe(&mut read, &mut write, null(), 0) }, 0);
+        let name: Vec<u16> = "Software\\victory-profile-test".encode_utf16().chain([0]).collect();
+        let mut key: HKEY = null_mut();
+        // SAFETY: a volatile key of our own under the test prefix's user hive.
+        assert_eq!(
+            unsafe {
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    name.as_ptr(),
+                    0,
+                    null(),
+                    REG_OPTION_VOLATILE,
+                    KEY_ALL_ACCESS,
+                    null(),
+                    &mut key,
+                    null_mut(),
+                )
+            },
+            0
+        );
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
+        let (read_at, key_at) = (read as usize, key as usize);
+        let reader = std::thread::spawn({
+            let tx = tx.clone();
+            move || {
+                // SAFETY: a plain query.
+                tx.send((0, unsafe { GetCurrentThreadId() })).unwrap();
+                let (mut byte, mut got) = (0u8, 0u32);
+                // SAFETY: the pipe lives until after the join; one byte of room.
+                unsafe { ReadFile(read_at as HANDLE, &mut byte, 1, &mut got, null_mut()) };
+                got
+            }
+        });
+        let watcher = std::thread::spawn(move || {
+            // SAFETY: a plain query.
+            tx.send((1, unsafe { GetCurrentThreadId() })).unwrap();
+            // SAFETY: the key lives until after the join; a synchronous watch.
+            unsafe { RegNotifyChangeKeyValue(key_at as HKEY, 0, REG_NOTIFY_CHANGE_LAST_SET, null_mut(), 0) }
+        });
+        let mut ids = [0u32; 2];
+        for _ in 0..2 {
+            let (which, id) = rx.recv().unwrap();
+            ids[which] = id;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let filter = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let mut s = Sampler::new(config(&filter, "NUL"), Vec::new()).unwrap();
+        run_for(&mut s, Duration::from_millis(600));
+        let value: Vec<u16> = "x".encode_utf16().chain([0]).collect();
+        // SAFETY: our pipe and key; a value of two UTF-16 units.
+        unsafe {
+            let mut written = 0;
+            WriteFile(write, [1u8].as_ptr(), 1, &mut written, null_mut());
+            RegSetValueExW(key, value.as_ptr(), 0, REG_SZ, value.as_ptr().cast(), 4);
+        }
+        assert_eq!(reader.join().unwrap(), 1);
+        assert_eq!(watcher.join().unwrap(), 0);
+        // SAFETY: handles and key made above, not used again.
+        unsafe {
+            CloseHandle(read);
+            CloseHandle(write);
+            RegCloseKey(key);
+            RegDeleteKeyW(HKEY_CURRENT_USER, name.as_ptr());
+        }
+        eprintln!("file read and registry watch: {}; {} I/O calls known", stats(&s), s.io.len());
+        assert!(!s.io.is_empty());
+        for t in &s.threads {
+            let acc = t.totals.acc;
+            eprintln!("  thread {}: {acc:?}", t.id);
+            assert!(acc.all.samples >= 50, "{acc:?}");
+            assert!(acc.running.samples * 10 <= acc.all.samples, "thread {} read as running: {acc:?}", t.id);
+            if t.id == ids[0] {
+                assert!(acc.io.samples * 10 >= acc.all.samples * 9, "the reader is not in I/O: {acc:?}");
+            } else {
+                assert_eq!(acc.io.samples, 0, "the watcher is in I/O: {acc:?}");
+            }
         }
     }
 

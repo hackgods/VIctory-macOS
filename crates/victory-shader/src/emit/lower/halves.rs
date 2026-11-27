@@ -376,6 +376,80 @@ impl Lower<'_> {
         Ok((lo, hi))
     }
 
+    /// [`Lower::exchange_halves`] of two dwords at once, `a` and `b`, between
+    /// one pair of group barriers: `b` in group-shared dwords of its own
+    /// (`half_words_b`), as many as `a`'s. For each, (lower half's, upper
+    /// half's); a console wave with no upper half reads 0 for it. `None`
+    /// where group-shared memory has no room for both.
+    pub(super) fn exchange_halves_pair(
+        &mut self,
+        a: V,
+        b: V,
+        at: usize,
+    ) -> Option<((V, V), (V, V))> {
+        let group: u32 = self.s.threads.map_or(0, |t| t.iter().product());
+        let dwords = group.div_ceil(2 * HALF) * 2;
+        if self.s.lds_dwords + 2 * dwords > GROUP_SHARED_DWORDS {
+            return None;
+        }
+        let i32t = self.s.t.i32;
+        let f = self.relabelled_flat();
+        let words = match self.half_words {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(dwords, i32t);
+                let g = self.s.m.global("half_words", arr, 3);
+                self.half_words = Some(g);
+                g
+            }
+        };
+        let words_b = match self.half_words_b {
+            Some(g) => g,
+            None => {
+                let arr = self.s.m.array(dwords, i32t);
+                let g = self.s.m.global("half_words_b", arr, 3);
+                self.half_words_b = Some(g);
+                g
+            }
+        };
+        // Host wave `2w + h` holds console wave `w`'s half `h`.
+        let five = self.s.m.i32(5);
+        let slot = self.s.m.bin(at, Bin::LShr, f, five);
+        let not_one = self.s.m.i32(!1);
+        let low = self.s.m.bin(at, Bin::And, slot, not_one);
+        let one = self.s.m.i32(1);
+        let high = self.s.m.bin(at, Bin::Or, slot, one);
+        let sync = |l: &mut Self| {
+            // Group sync with a group-shared memory fence.
+            let mode = l.s.m.i32(1 | 8);
+            let void = l.s.t.void;
+            l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        };
+        sync(self);
+        for (g, own) in [(words, a), (words_b, b)] {
+            let mine = self.s.m.element(at, g, slot);
+            self.s.m.store(at, mine, own);
+        }
+        sync(self);
+        let zero = self.s.m.i32(0);
+        let read = |l: &mut Self, g: V| {
+            let lo = l.s.m.element(at, g, low);
+            let lo = l.s.m.load(at, lo);
+            let hi = l.s.m.element(at, g, high);
+            let mut hi = l.s.m.load(at, hi);
+            if !group.is_multiple_of(2 * HALF) {
+                let first = l.s.m.bin(at, Bin::Shl, high, five);
+                let n = l.s.m.i32(group);
+                let there = l.s.m.cmp(at, pred::IULT, first, n);
+                hi = l.s.m.select(at, there, hi, zero);
+            }
+            (lo, hi)
+        };
+        let ra = read(self, words);
+        let rb = read(self, words_b);
+        Some((ra, rb))
+    }
+
     /// `v_readlane_b32` of `x` at console lane `lane` (the low 6 bits), in
     /// halves ([`Lower::across_here`]): each half reads the lane with that
     /// index in it, and the lane's own half gives the value.
@@ -421,8 +495,16 @@ impl Lower<'_> {
         let bit = self.unary_bits(c, 32, ballot);
         let lane = self.s.m.select(c, own_any, bit, zero);
         let own = self.read_lane(x, lane);
-        let (lo_val, hi_val) = self.exchange_halves(own, zero, c)?;
-        let (lo_ballot, hi_ballot) = self.exchange_halves(ballot, zero, c)?;
+        // The value and the ballot pass between the halves together, in one
+        // exchange where group-shared memory has room for both.
+        let ((lo_val, hi_val), (lo_ballot, hi_ballot)) =
+            match crate::emit::halves_proofs().then(|| self.exchange_halves_pair(own, ballot, c)) {
+                Some(Some(pair)) => pair,
+                _ => (
+                    self.exchange_halves(own, zero, c)?,
+                    self.exchange_halves(ballot, zero, c)?,
+                ),
+            };
         let lo_empty = self.s.m.cmp(c, pred::EQ, lo_ballot, zero);
         let hi_any = self.s.m.cmp(c, pred::NE, hi_ballot, zero);
         let pick_hi = self.s.m.bin(c, Bin::And, lo_empty, hi_any);
@@ -923,6 +1005,10 @@ fn uniform_entry_tids(x: &Parts) -> Vec<Value> {
 /// alike never is.
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
+    // The wider proofs (`crate::emit::halves_proofs`): an operand's check
+    // reads only its own dwords, and [`FULL_DWORD_VALU`] ops replace their
+    // destination.
+    let proofs = crate::emit::halves_proofs();
     let wave_tid = wave_tid(x);
     let entry_tids = uniform_entry_tids(x);
     let regions = branch_regions(p, st);
@@ -1509,7 +1595,9 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                         | "v_bfm_b32"
                         | "v_bfi_b32"
                         | "v_cndmask_b32"
-                );
+                ) || proofs
+                    && FULL_DWORD_VALU.contains(&name)
+                    && matches!(&inst.fields, Fields::Valu(v) if v.opsel == 0);
                 let src_regs: Vec<Reg> = ops
                     .iter()
                     .flat_map(|op| match *op {
@@ -1529,12 +1617,18 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
                 };
                 let guarded = st.guards[b][i].is_some();
                 let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword the instruction reads from that register on
+                    Operand::Vector { reg, dwords } => {
+                        // every dword the instruction reads from that register
+                        // on; with the proofs, only the operand's own (the old
+                        // destination, a higher register, is checked below
+                        // with what may replace it)
                         let read: Vec<Value> = inst
                             .reads
                             .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
+                            .filter(|r| {
+                                matches!(r.0, Reg::V(x) if x >= reg
+                                    && (!proofs || u32::from(x) < u32::from(reg) + u32::from(dwords)))
+                            })
                             .map(|r| r.1)
                             .collect();
                         !read.is_empty() && read.iter().all(|x| known(&next, x))
@@ -1842,6 +1936,80 @@ fn lds_write_hazards(p: &Program, ds_writes: &impl Fn(&Inst) -> bool) -> Vec<Vec
 /// waves can observe another lane's store between them. A lane mask read is
 /// not one either: only a compare of alike values makes a mask alike, and
 /// compares write masks, not SGPRs.
+/// VALU ops that write every bit of their 32-bit destination dwords from
+/// their explicit operands alone (never an accumulator, a carry or a lane
+/// mask, and not 16-bit or packed results), beyond the integer ops
+/// [`lane_uniform`] always counts: with the proofs, an unguarded one
+/// replaces its old destination like those. SDWA and DPP forms never count
+/// (`lane_uniform` takes no VALU op with either).
+const FULL_DWORD_VALU: &[&str] = &[
+    "v_add_f32",
+    "v_sub_f32",
+    "v_subrev_f32",
+    "v_mul_f32",
+    "v_mul_legacy_f32",
+    "v_fma_f32",
+    "v_fma_legacy_f32",
+    "v_min_f32",
+    "v_max_f32",
+    "v_min3_f32",
+    "v_max3_f32",
+    "v_med3_f32",
+    "v_floor_f32",
+    "v_ceil_f32",
+    "v_trunc_f32",
+    "v_rndne_f32",
+    "v_fract_f32",
+    "v_exp_f32",
+    "v_log_f32",
+    "v_rcp_f32",
+    "v_rcp_iflag_f32",
+    "v_rsq_f32",
+    "v_sqrt_f32",
+    "v_sin_f32",
+    "v_cos_f32",
+    "v_ldexp_f32",
+    "v_frexp_mant_f32",
+    "v_frexp_exp_i32_f32",
+    "v_cvt_f32_i32",
+    "v_cvt_f32_u32",
+    "v_cvt_i32_f32",
+    "v_cvt_u32_f32",
+    "v_cvt_f32_f16",
+    "v_cvt_flr_i32_f32",
+    "v_cvt_rpi_i32_f32",
+    "v_cvt_f32_ubyte0",
+    "v_cvt_f32_ubyte1",
+    "v_cvt_f32_ubyte2",
+    "v_cvt_f32_ubyte3",
+    "v_mul_i32_i24",
+    "v_mul_hi_i32",
+    "v_mul_hi_i32_i24",
+    "v_mul_hi_u32_u24",
+    "v_min_i32",
+    "v_max_i32",
+    "v_min_u32",
+    "v_max_u32",
+    "v_min3_i32",
+    "v_max3_i32",
+    "v_min3_u32",
+    "v_max3_u32",
+    "v_med3_i32",
+    "v_med3_u32",
+    "v_not_b32",
+    "v_xnor_b32",
+    "v_bfrev_b32",
+    "v_alignbit_b32",
+    "v_alignbyte_b32",
+    "v_xad_u32",
+    "v_or3_b32",
+    "v_xor3_b32",
+    "v_ffbh_u32",
+    "v_ffbl_b32",
+    "v_ffbh_i32",
+    "v_bcnt_u32_b32",
+];
+
 const SCALAR_ALOP: &[&str] = &[
     "s_mov_b32",
     "s_movk_i32",

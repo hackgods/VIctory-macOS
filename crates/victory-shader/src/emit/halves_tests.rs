@@ -4221,3 +4221,133 @@ fn a_first_lane_read_in_a_while_loop_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// `v_readfirstlane_b32 s12, v21` inside an `s_and_saveexec_b64` region
+/// whose EXEC is `mask_words`'s, of `v21 = 1.0 + v6` (`v6` = 41.0) made by
+/// every lane before it over a lane-varying `v21` (a copy of the thread id),
+/// and `v2 = s12` made in the region (lanes outside it keep `v2 = 0`, a
+/// scalar the region writes being read only by its own lanes, as compiled
+/// code reads one: `structure`'s notes) and stored by every lane.
+fn readfirstlane_of_an_alike_value_in_branch(mask_words: &[u32], with_mbcnt: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E2A_0300, // v_mov_b32 v21, v0
+        0x7E0C_02FF,
+        0x4224_0000, // v_mov_b32 v6, 41.0
+        0x062A_0CF2, // v_add_f32 v21, 1.0, v6
+        0xBE8C_0380, // s_mov_b32 s12, 0
+    ]);
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    w.extend(mask_words);
+    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
+    w.push(0xBF88_0002); // s_cbranch_execz (past the read and its use)
+    w.push(0x7E18_0515); // v_readfirstlane_b32 s12, v21
+    w.push(0x7E04_020C); // v_mov_b32 v2, s12
+    w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_alike_value_readfirstlane_programs_are_what_their_comments_say() {
+    let words = readfirstlane_of_an_alike_value_in_branch(&MASK_LANES_40_41, true);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_mov_b32 v21, v0",
+        "v_add_f32 v21, 1.0, v6",
+        "s_mov_b32 s12, 0",
+        "s_and_saveexec_b64 s[0:1], vcc",
+        "s_cbranch_execz",
+        "v_readfirstlane_b32 s12, v21",
+        "v_mov_b32 v2, s12",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// With the halves proofs, `v21 = 1.0 + v6` over a lane-varying `v21` is the
+/// same in every lane (an operand's check reads only its own register, and
+/// `v_add_f32` replaces its whole destination), so the first-lane read of
+/// it passes nothing between the halves: two group barriers fewer per
+/// read than the exchange of value and ballot it takes without them.
+#[test]
+fn a_first_lane_read_of_an_overwritten_register_needs_no_exchange_with_the_halves_proofs() {
+    for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
+        let words = readfirstlane_of_an_alike_value_in_branch(mask, true);
+        let on = lowered(&native(&words, true, 64, 0), true).expect("in halves");
+        let off = crate::emit::with_halves_proofs(false, || {
+            lowered(&native(&words, true, 64, 0), true).expect("in halves")
+        });
+        assert_eq!(on.wave_size, Some(32));
+        assert!(
+            off.barriers >= on.barriers + 4,
+            "{} {}",
+            off.barriers,
+            on.barriers
+        );
+    }
+}
+
+/// With the halves proofs, a first-lane read of a lane-varying value under
+/// a guard passes its value and its ballot between the halves in one
+/// exchange: two group barriers fewer than the two exchanges without them.
+#[test]
+fn a_guarded_first_lane_read_passes_value_and_ballot_in_one_exchange() {
+    for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
+        let words = readfirstlane_in_branch(mask, true, true);
+        let on = lowered(&native(&words, true, 64, 0), true).expect("in halves");
+        let off = crate::emit::with_halves_proofs(false, || {
+            lowered(&native(&words, true, 64, 0), true).expect("in halves")
+        });
+        assert_eq!(off.barriers, on.barriers + 2);
+    }
+}
+
+/// The read of an overwritten register gives the console's lanes on every
+/// GPU, with the halves proofs and without: 42.0 in the lanes that ran the
+/// read, else 0.
+#[cfg(windows)]
+#[test]
+fn halves_proofs_reads_match_the_console_on_every_gpu() {
+    let value = 42.0f32.to_bits();
+    let mut failed = Vec::new();
+    for on in [true, false] {
+        let lower: fn(u32) -> bool = |l| l >> 1 == 4;
+        let upper: fn(u32) -> bool = |l| l >> 1 == 20;
+        let both: fn(u32) -> bool = |l| l & 31 == 12;
+        let none: fn(u32) -> bool = |_| false;
+        for (label, mask, active) in [
+            ("lower_8_9", &MASK_LANES_8_9, lower),
+            ("upper_40_41", &MASK_LANES_40_41, upper),
+            ("both_12_44", &MASK_LANES_12_44, both),
+            ("empty", &MASK_EMPTY, none),
+        ] {
+            for with_mbcnt in [false, true] {
+                let words = readfirstlane_of_an_alike_value_in_branch(mask, with_mbcnt);
+                let want: Vec<u32> = (0..64).map(|l| if active(l) { value } else { 0 }).collect();
+                let found =
+                    crate::emit::with_halves_proofs(on, || differences(&words, 64, 1, &want));
+                failed.extend(
+                    found
+                        .into_iter()
+                        .map(|m| format!("proofs={on} {label}(mbcnt={with_mbcnt}): {m}")),
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

@@ -411,6 +411,10 @@ struct Lower<'a> {
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
+    /// A second set of [`Lower::half_words`]' dwords, for the second value
+    /// of a pair passed between the halves at once
+    /// ([`Lower::exchange_halves_pair`]).
+    half_words_b: Option<V>,
     /// In halves, a group of more than one host wave: the divergent
     /// regions where the halves can meet (`lower::meet`).
     meet: Option<meet::Meet>,
@@ -939,6 +943,7 @@ impl<'a> Lower<'a> {
             group_scalars,
             cap_escaped,
             half_words: None,
+            half_words_b: None,
             meet,
             meet_plan,
             meet_found,

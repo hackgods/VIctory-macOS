@@ -279,6 +279,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
+    // Only where programs run in halves do the halves proofs change them.
+    let no_proofs = options.host_wave32 && !victory_shader::emit::halves_proofs();
     if !locks
         && !bias
         && !narrow
@@ -287,10 +289,11 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !apart
         && !cap_barriers
         && !limits
+        && !no_proofs
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,7 +303,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | usize::from(no_proofs) << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -333,6 +337,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if limits {
             h.update(b"thread limits");
+        }
+        if no_proofs {
+            h.update(b"no halves proofs");
         }
         *h.finalize().as_bytes()
     })

@@ -518,6 +518,50 @@ fn cap_barriers_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// Whether the 32-lane halves of a console wave64 prove more VGPRs the
+/// same in every lane, and pass a first-lane read's value and ballot
+/// between them in one exchange (`lower::halves`). On by default;
+/// `VICTORY_HALVES_PROOFS=0` turns it off, for A/B runs of one binary.
+/// Tests run with it on unless they turn it off ([`with_halves_proofs`]).
+pub fn halves_proofs() -> bool {
+    #[cfg(test)]
+    {
+        HALVES_PROOFS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            halves_proofs_from(std::env::var("VICTORY_HALVES_PROOFS").ok().as_deref())
+        })
+    }
+}
+
+/// `VICTORY_HALVES_PROOFS`'s value as a switch: only `0` turns it off.
+#[cfg_attr(test, allow(dead_code))]
+fn halves_proofs_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static HALVES_PROOFS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `f` with [`halves_proofs`] set to `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_halves_proofs<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HALVES_PROOFS.with(|c| c.set(self.0));
+        }
+    }
+    let prev = HALVES_PROOFS.with(|c| c.replace(on));
+    let _restore = Restore(prev);
+    f()
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -1267,6 +1311,15 @@ mod tests {
         assert!(!super::cap_barriers_from(Some("0")));
         assert!(!super::cap_barriers_from(Some("")));
         assert!(super::cap_barriers_from(Some("1")));
+    }
+
+    /// The halves proofs are on unless the switch says `0`.
+    #[test]
+    fn the_halves_proofs_are_opt_out() {
+        assert!(super::halves_proofs_from(None));
+        assert!(super::halves_proofs_from(Some("1")));
+        assert!(super::halves_proofs_from(Some("")));
+        assert!(!super::halves_proofs_from(Some("0")));
     }
 
     use super::bitcode::Attr;

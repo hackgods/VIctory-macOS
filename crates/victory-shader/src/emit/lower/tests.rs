@@ -3157,6 +3157,87 @@ fn refused_in_halves(w: &[u32]) -> bool {
     matches!(lower_halves(w), Err(crate::ShaderError::Unsupported { what, .. }) if what == first_across)
 }
 
+/// Programs for the halves proofs' tests: `v21` and `v3` start lane-varying
+/// (copies of the thread id), `v6` an alike literal, then `op` makes the
+/// value [`divergent_read`] reads first (`v_readfirstlane_b32 s6, <read>`).
+fn first_read_of(op: &[u32], read: u32) -> Vec<u32> {
+    let mut w = vec![
+        0x7E2A_0300, // v_mov_b32 v21, v0
+        0x7E06_0300, // v_mov_b32 v3, v0
+        0x7E0C_02FF,
+        0x0000_0029, // v_mov_b32 v6, 0x29
+    ];
+    w.extend(op);
+    divergent_read(&mut w, read, 0xBF07_8006); // s_cmp_lg_u32 s6, 0
+    w
+}
+
+const READ_V21: u32 = 0x7E0C_0515; // v_readfirstlane_b32 s6, v21
+const READ_V3: u32 = 0x7E0C_0503; // v_readfirstlane_b32 s6, v3
+
+#[test]
+fn the_halves_proofs_programs_are_what_their_comments_say() {
+    for (op, read, want) in [
+        (&[0x4A2A_0C81][..], READ_V21, "v_add_nc_u32 v21, 1, v6"),
+        (&[0x1006_0CF4], READ_V3, "v_mul_f32 v3, 2.0, v6"),
+        (&[0x562A_0D06], READ_V21, "v_fmac_f32 v21, v6, v6"),
+        (&[0x7E2A_1506], READ_V21, "v_cvt_f16_f32 v21, v6"),
+    ] {
+        let words = first_read_of(op, read);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = crate::gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let read_text = if read == READ_V21 {
+            "v_readfirstlane_b32 s6, v21"
+        } else {
+            "v_readfirstlane_b32 s6, v3"
+        };
+        for want in ["v_mov_b32 v21, v0", "v_mov_b32 v3, v0", want, read_text] {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// An unguarded VALU op over alike operands is alike whatever its old
+/// destination held, where it writes every bit of that destination: the
+/// halves proofs read only an operand's own registers (not a higher
+/// destination's old value, as `v_add_nc_u32 v21, 1, v6` has), and count
+/// full-dword float ops like the integer ones (`v_mul_f32 v3, 2.0, v6`).
+/// So the first-lane read of either in a divergent block, where an
+/// exchange between the halves would be refused, needs none; without the
+/// proofs it is refused.
+#[test]
+fn a_full_dword_overwrite_of_a_lane_varying_register_is_alike_with_the_halves_proofs() {
+    for (op, read) in [(&[0x4A2A_0C81][..], READ_V21), (&[0x1006_0CF4], READ_V3)] {
+        let w = first_read_of(op, read);
+        let l = lower_halves(&w).expect("alike with the proofs");
+        assert_eq!(l.wave_size, Some(32), "the console wave ran as two halves");
+        assert_eq!(l.shape.barriers, 0, "no exchange between the halves");
+        assert!(
+            crate::emit::with_halves_proofs(false, || refused_in_halves(&w)),
+            "refused without the proofs"
+        );
+    }
+}
+
+/// An op that keeps or consumes its old destination is not alike over a
+/// lane-varying one, with the proofs too: `v_fmac_f32` adds to it, and
+/// `v_cvt_f16_f32` writes only its low 16 bits.
+#[test]
+fn an_accumulator_or_a_16_bit_write_over_a_lane_varying_register_keeps_the_refusal() {
+    for op in [0x562A_0D06, 0x7E2A_1506] {
+        let w = first_read_of(&[op], READ_V21);
+        assert!(
+            refused_in_halves(&w),
+            "{op:#x} keeps the first-lane refusal"
+        );
+    }
+}
+
 /// A `global_load_dword` at an address every lane of the console wave holds
 /// alike, in a divergent block whose active lanes are in both halves (a
 /// branch true everywhere but lane 5, and a `v_writelane_b32` into the

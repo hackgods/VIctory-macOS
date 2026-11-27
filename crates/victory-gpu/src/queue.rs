@@ -536,6 +536,29 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
+/// mac: the last presented frame, for `VICTORY_KEYS=menu:` (victory-hle's
+/// input thread): its number (high 40 bits) and the draws run on the host
+/// since the frame before (low 24 bits, saturated), in one word so a reader
+/// never pairs one frame's number with another frame's draws.
+static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+const LAST_FRAME_DRAWS: u64 = (1 << 24) - 1;
+
+/// mac: notes frame `frame`'s draws (`drawn`: the host's draws so far).
+#[cfg(windows)]
+fn note_last_frame(frame: u64, drawn: u64) {
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let draws = drawn.saturating_sub(DRAWN.swap(drawn, Ordering::Relaxed));
+    LAST_FRAME.store((frame << 24) | draws.min(LAST_FRAME_DRAWS), Ordering::Relaxed);
+}
+
+/// mac: frames the title presented so far and the draws the last of them
+/// ran on the host (the frame line's count, per frame); (0, 0) before the
+/// first. One atomic load, no lock: cheap to ask at any rate.
+pub fn last_presented() -> (u64, u64) {
+    let word = LAST_FRAME.load(Ordering::Relaxed);
+    (word >> 24, word & LAST_FRAME_DRAWS)
+}
+
 /// Every plane's resources. Only the start of a plane description is
 /// known (token, count, resources), so the planes after the first are
 /// found by their stride: the first offset past the first plane where the
@@ -682,6 +705,9 @@ extern "system" fn present(
     #[cfg(windows)]
     unwaited::settle(unwaited::By::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // mac: the frame's draws, for `VICTORY_KEYS=menu:` (`last_presented`).
+    #[cfg(windows)]
+    note_last_frame(frame, crate::draw::drawn());
     // mac: `VICTORY_AB` (`crate::ab`): the frame's lines name the side its
     // work ran on, and the side may flip here for the frames after.
     #[cfg(windows)]

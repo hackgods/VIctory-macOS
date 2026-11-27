@@ -53,8 +53,8 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time, and whether the host's waves are 32 lanes at most,
-/// [`host_wave32`]).
+/// change at run time, whether the host's waves are 32 lanes at most,
+/// [`host_wave32`], and `VICTORY_CAP_BARRIERS=1`).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -65,13 +65,23 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
-        key(
+        let k = key(
             victory_shader::SOURCE_HASH,
             ENCODING,
             limit,
             host_wave32(),
             victory_shader::emit::thread_ticket(),
-        )
+        );
+        if !victory_shader::emit::cap_barriers_refused() {
+            return k;
+        }
+        tracing::warn!(
+            "VICTORY_CAP_BARRIERS=1: shaders with a barrier a lane may miss at a loop's iteration limit are refused"
+        );
+        let mut h = blake3::Hasher::new();
+        h.update(&k);
+        h.update(b"cap barriers refused");
+        *h.finalize().as_bytes()
     })
 }
 

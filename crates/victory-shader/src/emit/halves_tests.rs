@@ -2963,9 +2963,10 @@ fn capped_loop_then_s_barrier() -> Vec<u32> {
     ])
 }
 
-/// An `s_barrier` after a per-lane loop with a capped back edge is refused
-/// in the per-lane translation (a lane may have left the program at the
-/// cap, #408). In exactly one console wave64 the whole-wave retry takes it:
+/// With `VICTORY_CAP_BARRIERS=1`, an `s_barrier` after a per-lane loop with
+/// a capped back edge is refused in the per-lane translation (a lane may
+/// have left the program at the cap, #408); by default it is kept. Refused,
+/// in exactly one console wave64 the whole-wave retry takes it:
 /// every lane follows the console wave's blocks there, so every lane goes
 /// round the loop the same number of times and all leave at the cap
 /// together, and the barrier stays. A group of more console waves keeps the
@@ -2996,21 +2997,32 @@ fn literal_wave64_recovers_an_s_barrier_after_a_capped_per_lane_loop() {
         assert!(all.contains(want), "{want:?} not in:\n{all}");
     }
     const CAP: &str = "an s_barrier where a lane may have left the program early";
-    let n = native(&words, true, 64, 512);
-    let why = lowered_with(&n, true, true)
-        .err()
-        .expect("per-lane refusal");
-    assert!(why.to_string().contains(CAP), "{why}");
-    let l = lower_halves(&n, true, true, true).expect("whole-wave retry");
-    assert_eq!(l.wave_size, Some(32));
-    assert!(l.barriers > 0, "no dx.op.barrier written");
-    for threads in [128, 256] {
-        let n = native(&words, true, threads, 512);
-        let why = lower_halves(&n, true, true, true)
+    // With VICTORY_CAP_BARRIERS=1.
+    super::with_cap_barriers(true, || {
+        let n = native(&words, true, 64, 512);
+        let why = lowered_with(&n, true, true)
             .err()
-            .expect("several console waves keep the refusal");
-        assert!(why.to_string().contains(CAP), "{threads}: {why}");
-    }
+            .expect("per-lane refusal");
+        assert!(why.to_string().contains(CAP), "{why}");
+        let l = lower_halves(&n, true, true, true).expect("whole-wave retry");
+        assert_eq!(l.wave_size, Some(32));
+        assert!(l.barriers > 0, "no dx.op.barrier written");
+        for threads in [128, 256] {
+            let n = native(&words, true, threads, 512);
+            let why = lower_halves(&n, true, true, true)
+                .err()
+                .expect("several console waves keep the refusal");
+            assert!(why.to_string().contains(CAP), "{threads}: {why}");
+        }
+    });
+    // By default every group size keeps the barrier per lane.
+    super::with_cap_barriers(false, || {
+        for threads in [64, 128, 256] {
+            let n = native(&words, true, threads, 512);
+            let l = lowered_with(&n, true, true).expect("barrier kept");
+            assert!(l.barriers > 0, "{threads}: no dx.op.barrier written");
+        }
+    });
 }
 
 #[test]

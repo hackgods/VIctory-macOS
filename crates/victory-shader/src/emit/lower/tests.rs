@@ -2035,18 +2035,26 @@ fn an_s_barrier_on_the_sibling_of_a_closed_capped_self_loop_is_refused() {
             .count(),
         1
     );
-    for why in [
-        lowered_halves(&w, 64).err().expect("refused in halves"),
-        lowered_result(&w, 64, false)
-            .err()
-            .expect("refused as one wave64"),
-    ] {
-        let why = why.to_string();
-        assert!(
-            why.contains("an s_barrier where a lane may have left the program early"),
-            "{why}"
-        );
-    }
+    // With VICTORY_CAP_BARRIERS=1.
+    crate::emit::with_cap_barriers(true, || {
+        for why in [
+            lowered_halves(&w, 64).err().expect("refused in halves"),
+            lowered_result(&w, 64, false)
+                .err()
+                .expect("refused as one wave64"),
+        ] {
+            let why = why.to_string();
+            assert!(
+                why.contains("an s_barrier where a lane may have left the program early"),
+                "{why}"
+            );
+        }
+    });
+    // By default the barrier is kept, as before #408.
+    crate::emit::with_cap_barriers(false, || {
+        assert!(lowered_halves(&w, 64).expect("kept in halves").barriers > 0);
+        assert!(lowered(&w, 64, false).barriers > 0, "kept as one wave64");
+    });
 }
 
 /// The same closed self-loop, but the `s_barrier` sits before the
@@ -2242,18 +2250,26 @@ fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
 #[test]
 fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
     let w = a_divergent_capped_loop_then_an_s_barrier_at_the_join();
-    for why in [
-        lowered_halves(&w, 64).err().expect("refused in halves"),
-        lowered_result(&w, 64, false)
-            .err()
-            .expect("refused as one wave64"),
-    ] {
-        let why = why.to_string();
-        assert!(
-            why.contains("an s_barrier where a lane may have left the program early"),
-            "{why}"
-        );
-    }
+    // With VICTORY_CAP_BARRIERS=1.
+    crate::emit::with_cap_barriers(true, || {
+        for why in [
+            lowered_halves(&w, 64).err().expect("refused in halves"),
+            lowered_result(&w, 64, false)
+                .err()
+                .expect("refused as one wave64"),
+        ] {
+            let why = why.to_string();
+            assert!(
+                why.contains("an s_barrier where a lane may have left the program early"),
+                "{why}"
+            );
+        }
+    });
+    // By default the barrier is kept, as before #408.
+    crate::emit::with_cap_barriers(false, || {
+        assert!(lowered_halves(&w, 64).expect("kept in halves").barriers > 0);
+        assert!(lowered(&w, 64, false).barriers > 0, "kept as one wave64");
+    });
 }
 
 /// The same `s_barrier` where no lane can have left early — a uniform loop

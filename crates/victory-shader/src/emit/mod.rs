@@ -358,6 +358,44 @@ pub fn loop_limit() -> u32 {
     })
 }
 
+/// Whether a program is refused for an explicit `s_barrier` a lane may miss
+/// by leaving a loop at its iteration limit (#408; in exactly one console
+/// wave64 on a 32-lane host the whole-wave form takes it instead). Off
+/// unless `VICTORY_CAP_BARRIERS=1`: such barriers are kept, as before #408,
+/// and a lane that left at the cap is missing at them. On Grand Theft Auto
+/// VI the refusals took 11 lighting and exposure programs, groups of more
+/// than one console wave, and world frames were black. The setting is part
+/// of the translation, so the shader cache must key on it (`victory-gpu`'s
+/// does).
+pub fn cap_barriers_refused() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CAP_BARRIERS_SET.with(std::cell::Cell::get) {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_cap_barriers(std::env::var("VICTORY_CAP_BARRIERS").ok().as_deref()))
+}
+
+/// `VICTORY_CAP_BARRIERS`'s value: only `1` refuses. Pure, for testing.
+fn parse_cap_barriers(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`cap_barriers_refused`] for this test thread, if set.
+    static CAP_BARRIERS_SET: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with [`cap_barriers_refused`] as `refused` on this thread.
+#[cfg(test)]
+pub(crate) fn with_cap_barriers<R>(refused: bool, f: impl FnOnce() -> R) -> R {
+    let before = CAP_BARRIERS_SET.with(|c| c.replace(Some(refused)));
+    let r = f();
+    CAP_BARRIERS_SET.with(|c| c.set(before));
+    r
+}
+
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
@@ -1196,7 +1234,17 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_cap_barriers, parse_loop_limit};
+
+    #[test]
+    fn the_cap_barrier_switch_refuses_only_at_1() {
+        assert!(!parse_cap_barriers(None));
+        assert!(parse_cap_barriers(Some("1")));
+        assert!(parse_cap_barriers(Some(" 1 ")));
+        for other in ["", "0", "on", "off"] {
+            assert!(!parse_cap_barriers(Some(other)), "{other:?}");
+        }
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

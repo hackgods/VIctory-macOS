@@ -376,12 +376,14 @@ pub(crate) fn log_frame() {
     if pointer_pages::on() {
         let [pages, regions, left] = pointer_pages::take();
         let (over_budget, held_mb) = pointer_pages::take_over();
+        let unallocated = pointer_pages::take_unallocated();
         tracing::info!(
             pages,
             regions,
             left,
             over_budget,
             held_mb,
+            unallocated,
             "title memory reached by pointers this frame (VICTORY_POINTER_PAGES): copies asked for missed pages and regions, and misses left with none (not committed)"
         );
     }
@@ -567,6 +569,20 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             if pointer_pages::null_page_free() && pointer_pages::is_null_page(&l.blocks, entry, BLOCK) {
                 continue;
             }
+            // Mac (`VICTORY_POINTER_PAGES=3`): memory no one allocated is no
+            // miss either.
+            if pointer_pages::unallocated_free() {
+                let missed = match l.blocks.get(block) {
+                    _ if block == 0 => Some(pointer_pages::Missed::Region((entry as u64) << 28)),
+                    Some(&l1) if l.owner.get(entry).is_none_or(|o| o.is_none()) => {
+                        Some(pointer_pages::Missed::Page((l1 << 28 | (entry % BLOCK) << 16) as u64))
+                    }
+                    _ => None,
+                };
+                if missed.is_some_and(pointer_pages::is_never_allocated) {
+                    continue;
+                }
+            }
             if block == 0
                 || l.blocks.get(block).is_none()
                 || l.owner.get(entry).is_none_or(|o| o.is_none())
@@ -623,6 +639,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // Mac (`VICTORY_POINTER_PAGES=1`): every miss, for copies of them.
         let learning = pointer_pages::on();
         let null_free = pointer_pages::null_page_free();
+        let unallocated = pointer_pages::unallocated_free();
         let mut learn = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -636,6 +653,12 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
                 // Block 0's bits are 256 MiB regions with no block.
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                    if unallocated
+                        && block == 0
+                        && pointer_pages::never_allocated(pointer_pages::Missed::Region((entry as u64) << 28))
+                    {
+                        continue;
+                    }
                     regions += 1;
                     missed.push((entry as u64) << 28);
                     if learning {
@@ -648,6 +671,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
                     _ if null_free && pointer_pages::is_null_page(blocks, entry, BLOCK) => {}
+                    _ if unallocated && pointer_pages::never_allocated(pointer_pages::Missed::Page(at)) => {}
                     _ => {
                         pages += 1;
                         missed.push(at);

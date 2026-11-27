@@ -244,6 +244,7 @@ impl Bits<'_> {
 struct Vlc {
     /// Left-aligned code, length, symbol; sorted by code.
     codes: Vec<(u32, u8, i32)>,
+    short: [u16; 256],
 }
 
 impl Vlc {
@@ -254,12 +255,24 @@ impl Vlc {
             codes.push((code as u32, len, symbol));
             code += 1 << (32 - len);
         }
-        Vlc { codes }
+        let mut short = [u16::MAX; 256];
+        for (index, &(code, len, _)) in codes.iter().enumerate() {
+            if len <= 8 {
+                let first = (code >> 24) as usize;
+                short[first..first + (1 << (8 - len))].fill(index as u16);
+            }
+        }
+        Vlc { codes, short }
     }
 
     fn read(&self, bits: &mut Bits) -> i32 {
         let v = bits.peek32();
-        let i = self.codes.partition_point(|c| c.0 <= v) - 1;
+        let short = self.short[(v >> 24) as usize];
+        let i = if short != u16::MAX {
+            usize::from(short)
+        } else {
+            self.codes.partition_point(|c| c.0 <= v) - 1
+        };
         let (_, len, symbol) = self.codes[i];
         bits.pos += len as usize;
         symbol
@@ -1211,6 +1224,68 @@ fn to_i16(v: f32) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_vlc() {
+        use std::{hint::black_box, time::Instant};
+        let tables = codes();
+        for (name, vlc) in [("scale", &tables.scale), ("coef", &tables.coef[0])] {
+            let mut samples = Vec::new();
+            for round in 0..35 {
+                let start = Instant::now();
+                let mut sum = 0i32;
+                for i in 0..32768usize {
+                    let value = (i as u32).wrapping_mul(2654435761).to_be_bytes();
+                    let mut bits = Bits {
+                        data: black_box(&value),
+                        pos: 0,
+                        end: 32,
+                    };
+                    sum = sum.wrapping_add(black_box(vlc.read(&mut bits)));
+                }
+                black_box(sum);
+                if round >= 4 {
+                    samples.push(start.elapsed().as_nanos());
+                }
+            }
+            println!("vlc_{name}_32768_ns {samples:?}");
+        }
+    }
+
+    #[test]
+    fn vlc_matches_code_search_at_all_prefixes_and_boundaries() {
+        let tables = codes();
+        for vlc in [
+            &tables.scale,
+            &tables.scale_rl,
+            &tables.coef[0],
+            &tables.coef[1],
+            &tables.vec4,
+            &tables.vec2,
+            &tables.vec1,
+        ] {
+            let check = |v: u32| {
+                let data = v.to_be_bytes();
+                let mut bits = Bits {
+                    data: &data,
+                    pos: 0,
+                    end: 32,
+                };
+                let i = vlc.codes.partition_point(|c| c.0 <= v) - 1;
+                let (_, len, expected) = vlc.codes[i];
+                assert_eq!(vlc.read(&mut bits), expected);
+                assert_eq!(bits.pos, usize::from(len));
+            };
+            for v in 0..65536u32 {
+                check(v << 16);
+            }
+            for &(code, len, _) in &vlc.codes {
+                check(code);
+                check(code | (u32::MAX.checked_shr(u32::from(len)).unwrap_or(0)));
+            }
+        }
+    }
 
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {

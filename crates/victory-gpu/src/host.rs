@@ -67,6 +67,8 @@ pub(crate) fn as_holder<R>(holds: bool, f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) mod unwaited;
+// mac: `VICTORY_COALESCE_PIECES` (VIctory-macOS #419).
+pub(crate) mod joined;
 // mac: `VICTORY_WIDENED_IN_PLACE` (VIctory-macOS #520).
 mod widened_in_place;
 
@@ -102,6 +104,9 @@ pub(crate) struct Host {
     mark: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
+    /// mac: barrier lists put between segments of a piece joined across
+    /// queues (`VICTORY_COALESCE_PIECES`, [`joined`]).
+    joined_barriers: Mutex<Vec<joined::BarrierList>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -411,6 +416,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
+            joined_barriers: Mutex::new(Vec::new()),
             event,
             rtvs,
             rtv_size,
@@ -1880,13 +1886,15 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        self.run(runs, None);
+        self.run(runs, None, &[]);
     }
 
     /// [`Host::execute`]. `title`: the lists are the title's own, held so
     /// (with the queue they are of), and may be left to the host GPU
     /// without waiting for it ([`unwaited`]): whether they were.
-    fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>) -> bool {
+    /// `barriers`: mac, of a piece joined across queues ([`joined`], else
+    /// empty): whether a UAV barrier goes before each of `runs`.
+    fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>, barriers: &[bool]) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         // The one before, if the host GPU was not waited for, is finished
@@ -1975,6 +1983,11 @@ impl Host {
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        // mac: the barriers of a joined piece, by run (an upload list first
+        // has none).
+        let barrier_lists = self.joined_barriers(barriers.iter().filter(|&&b| b).count());
+        let barriers: Vec<bool> = uploads.as_ref().map(|_| false).into_iter().chain(barriers.iter().copied()).collect();
+        let mut barrier_lists = barrier_lists.into_iter();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -2009,11 +2022,11 @@ impl Host {
         let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let mut native_boundaries = Vec::new();
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(3 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch { overlap_only: crate::mac_switches::flush_overlapping(), ..Batch::default() };
-        for list in runs {
+        for (i, list) in runs.iter().enumerate() {
             // Its first title copy opens a list the copy-order split cut.
             batch.cut = list.after_copy();
             self.poll_beside(&mut submitted, &mut beside);
@@ -2024,6 +2037,12 @@ impl Host {
                 list.run_deferred(&mut batch, None);
             }
             firsts.push(lists.len());
+            if barriers.get(i).copied().unwrap_or(false)
+                && !lists.is_empty()
+                && let Some(barrier) = barrier_lists.next()
+            {
+                lists.push(barrier);
+            }
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
@@ -5239,6 +5258,9 @@ impl Meter {
             // mac: where the refreshes were made (`VICTORY_FLUSH_OVERLAPPING`,
             // from VIctory-macOS #452), always.
             let flushes = flush_line(report_frames);
+            // mac: the queues' pieces, joined or not (`VICTORY_COALESCE_PIECES`,
+            // from VIctory-macOS #419), always.
+            let pieces = joined::frame_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5263,7 +5285,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}",
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{pieces}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

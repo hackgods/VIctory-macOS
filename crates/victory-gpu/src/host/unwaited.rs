@@ -209,8 +209,19 @@ static LEFT: Mutex<Option<Left>> = Mutex::new(None);
 /// Its fence value while it is not finished, else 0: read without a lock.
 static VALUE: AtomicU64 = AtomicU64::new(0);
 
-/// The title queue it is of (meaningful while [`VALUE`] is not 0).
+/// The title queue it is of (meaningful while [`VALUE`] is not 0), or
+/// [`MIXED`].
 static QUEUE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// mac: the queue of a piece joined across several queues
+/// (`VICTORY_COALESCE_PIECES`): it is every queue's.
+pub(crate) const MIXED: usize = usize::MAX;
+
+/// Whether the submission left is `queue`'s (or several queues').
+fn of_queue(queue: usize) -> bool {
+    let left = QUEUE.load(Acquire);
+    left == queue || left == MIXED
+}
 
 /// Since the last frame line: Signals of other queues, and waits it owed
 /// no write to, that went on without finishing it.
@@ -270,7 +281,7 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
     // Read after the value: a submission of `queue` cannot be left
     // meanwhile, as its Signal and its submissions come one at a time.
     // mac: with flights, every queue's Signal goes behind it (`signal_after`).
-    if QUEUE.load(Acquire) != queue && !(all() && !flights::on()) {
+    if !of_queue(queue) && !(all() && !flights::on()) {
         SPARED[0].fetch_add(1, Relaxed);
         return false;
     }
@@ -288,7 +299,7 @@ pub(crate) fn settle_signal(queue: usize) -> bool {
 pub(crate) fn signal_behind(queue: usize, fence: usize, value: u64) -> bool {
     // mac: with flights, any queue's (hyphennn 578d459: a fence signalled
     // while flights are in the air is set behind them).
-    if !signals() || VALUE.load(Acquire) == 0 || (QUEUE.load(Acquire) != queue && !flights::on()) {
+    if !signals() || VALUE.load(Acquire) == 0 || (!of_queue(queue) && !flights::on()) {
         return false;
     }
     crate::fence::keep(fence as crate::object::This);
@@ -647,13 +658,25 @@ impl Host {
         queue: usize,
         lists: Vec<std::sync::Arc<HostList>>,
     ) -> Vec<std::sync::Arc<HostList>> {
+        self.execute_title_with(queue, lists, &[])
+    }
+
+    /// [`Host::execute_title`], mac: with a UAV barrier before each list
+    /// `barriers` names (a piece joined across queues, `crate::hold::joined`;
+    /// `queue` is [`MIXED`] for several).
+    pub(crate) fn execute_title_with(
+        &self,
+        queue: usize,
+        lists: Vec<std::sync::Arc<HostList>>,
+        barriers: &[bool],
+    ) -> Vec<std::sync::Arc<HostList>> {
         let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
         if !on() {
-            self.execute(&runs);
+            self.run(&runs, None, barriers);
             drop(runs);
             return lists;
         }
-        let left = self.run(&runs, Some((queue, &lists)));
+        let left = self.run(&runs, Some((queue, &lists)), barriers);
         drop(runs);
         let mut done = take_done();
         if !left {

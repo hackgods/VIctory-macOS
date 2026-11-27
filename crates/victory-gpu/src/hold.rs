@@ -54,7 +54,16 @@ impl ValueWait {
         if !(NEVER..=ALWAYS).contains(&self.comparison) {
             return None;
         }
-        let value = read(self.address, self.bytes)? & self.mask;
+        self.holds_for(read(self.address, self.bytes)?)
+    }
+
+    /// Whether it holds for the memory value `raw` (masked here): `None` for
+    /// a comparison we do not know.
+    pub(crate) fn holds_for(&self, raw: u64) -> Option<bool> {
+        if !(NEVER..=ALWAYS).contains(&self.comparison) {
+            return None;
+        }
+        let value = raw & self.mask;
         let reference = self.reference;
         Some(match self.comparison {
             NEVER => false,
@@ -90,6 +99,15 @@ pub(crate) struct Pumped {
     pub(crate) waited: Vec<(usize, Duration)>,
     /// Waits with a comparison we do not know (taken as holding).
     pub(crate) unknown: u32,
+    /// mac: with pieces joined across queues ([`Joining`], else 0): the
+    /// segments that joined a piece of another queue's; of their waits,
+    /// those met by a bottom-of-pipe write of the piece, and fence waits met
+    /// by a Signal behind it; pieces given early, as the next segment could
+    /// not join them (an order the submission cannot keep, or the cap).
+    pub(crate) crossed: u32,
+    pub(crate) met_by_piece: u32,
+    pub(crate) fences_by_piece: u32,
+    pub(crate) splits: u32,
 }
 
 /// Every queue's held work.
@@ -134,7 +152,35 @@ pub(crate) struct World<'a, S> {
     pub(crate) owed: &'a mut dyn FnMut(&[ValueWait], &[&S]) -> bool,
     /// Whether `owed` wants to know what runs next.
     pub(crate) ahead: bool,
+    /// mac: pieces joined across queues (`VICTORY_COALESCE_PIECES=1`, from
+    /// VIctory-macOS #419), else `None`: each queue's piece runs alone.
+    pub(crate) joining: Option<Joining<'a, S>>,
 }
+
+/// mac: what the pump needs to join ready segments of several queues into
+/// one host submission ([`joined`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct Joining<'a, S> {
+    /// What a segment's bottom-of-pipe writes leave where a wait reads, by
+    /// the last of them that reaches its bytes: `None` if none does,
+    /// `Some(Some(holds))` if that one stores all of them as a known value,
+    /// else `Some(None)` (a timestamp, or part of the bytes).
+    pub(crate) leaves: &'a dyn Fn(&S, &ValueWait) -> Option<Option<bool>>,
+    /// Whether a segment may join a piece (not empty) that holds segments of
+    /// another queue, or that it joins through the piece's writes or
+    /// Signals: the order of what the submission does on the CPU, and a cap.
+    pub(crate) can_join: CanJoin<'a, S>,
+    /// Runs a joined piece (its queue, or `None` for several), each segment
+    /// with whether a barrier goes before it (it joined through the piece's
+    /// writes or Signals), the bottom-of-pipe writes included.
+    pub(crate) run: &'a mut dyn FnMut(Option<usize>, Vec<(S, bool)>),
+}
+
+/// [`Joining::can_join`]: the piece so far, the segment.
+pub(crate) type CanJoin<'a, S> = &'a dyn Fn(&[(S, bool)], &S) -> bool;
+
+/// mac: the pump that joins pieces across queues.
+pub(crate) mod joined;
 
 impl<S> Held<S> {
     /// Appends `item` to `queue`'s FIFO, marked fresh: whether it waited is
@@ -149,6 +195,9 @@ impl<S> Held<S> {
 
     /// Runs every queue's heads that may run, until none can.
     pub(crate) fn pump(&mut self, w: &mut World<S>) -> Pumped {
+        if w.joining.is_some() {
+            return self.pump_joined(w);
+        }
         let mut done = Pumped::default();
         loop {
             let mut moved = false;
@@ -336,7 +385,7 @@ mod tests {
             f.fences.insert(fence, value);
             f.log.push(format!("signal {fence} {value}"));
         };
-        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed, ahead: true })
+        held.pump(&mut World { read: &read, fence: &fence, run: &mut run, signal: &mut signal, owed: &mut owed, ahead: true, joining: None })
     }
 
     #[test]
@@ -346,7 +395,9 @@ mod tests {
         let expect = [(NEVER, false), (LESS, false), (EQUAL, true), (LESS_EQUAL, true), (GREATER, false), (NOT_EQUAL, false), (GREATER_EQUAL, true), (ALWAYS, true)];
         for (cmp, holds) in expect {
             assert_eq!(w(cmp, 5).holds(&read), Some(holds), "comparison {cmp}");
+            assert_eq!(w(cmp, 5).holds_for(0x1_0000_0005), Some(holds), "holds_for {cmp}");
         }
+        assert_eq!(w(0, 5).holds_for(5), None);
         assert_eq!(w(LESS, 6).holds(&read), Some(true));
         assert_eq!(w(GREATER, 4).holds(&read), Some(true));
         assert_eq!(w(0, 5).holds(&read), None, "unknown comparison");

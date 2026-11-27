@@ -48,4 +48,14 @@ cargo build --quiet --manifest-path tests/fixtures/hle-probe/Cargo.toml \
     --target-dir target/fixtures --target "$TARGET"
 VICTORY_HLE_PROBE="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\fixtures\\$TARGET\\debug\\hle_probe.dll"
 export VICTORY_HLE_PROBE
+# victory-metal's bridge to Metal (#221): Wine finds its unixlib through
+# WINEDLLPATH, and its tests load it from VICTORY_METAL_BRIDGE. They say so
+# and pass where it is missing, so a Mac that cannot build it runs the rest.
+if tools/macos/build-metal-bridge.sh "$ROOT/target/metal-bridge"; then
+    export WINEDLLPATH="$ROOT/target/metal-bridge${WINEDLLPATH:+:$WINEDLLPATH}"
+    VICTORY_METAL_BRIDGE="Z:$(printf '%s' "$ROOT" | tr / '\\')\\target\\metal-bridge\\x86_64-windows\\victory_metal.dll"
+    export VICTORY_METAL_BRIDGE
+else
+    echo "test-wine.sh: the Metal bridge did not build; its tests will be skipped" >&2
+fi
 cargo test --target "$TARGET" "$@"

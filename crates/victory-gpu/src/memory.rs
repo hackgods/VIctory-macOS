@@ -471,7 +471,13 @@ impl Shared {
     /// back, the table rewritten. Only while no submission runs (the GPU
     /// reads the table and the views).
     fn rewrite(&mut self, heap: &HostHeap, now: u64) {
-        let copies = crate::shadow::all();
+        // Not memory in place: programs write through the table, and
+        // shaders never write title memory in place (`crate::alias::reached`
+        // lets it go where a program reaches it).
+        let copies: Vec<_> = crate::shadow::all()
+            .into_iter()
+            .filter(|c| names(c))
+            .collect();
         let live: HashSet<usize> = copies.iter().map(|c| Arc::as_ptr(c) as usize).collect();
         self.pairs.retain(|(copy, _), &mut slot| {
             let keep = live.contains(copy);
@@ -534,6 +540,12 @@ impl Shared {
         });
         stats(|s| s.tables += 1);
     }
+}
+
+/// Whether the title page table names `copy`: every host copy of title
+/// memory, not memory in place.
+pub(crate) fn names(copy: &Shadow) -> bool {
+    !crate::alias::holds_in_place(copy)
 }
 
 /// The page table of view heap `key`, as the last submission using it
@@ -654,6 +666,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    crate::alias::reached((entry as u64) << 28, 1 << 28);
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
@@ -663,6 +676,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                     _ => {
                         pages += 1;
                         missed.push(at);
+                        crate::alias::reached(at, 1 << 16);
                     }
                 }
             }

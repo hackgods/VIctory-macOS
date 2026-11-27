@@ -2975,6 +2975,8 @@ fn buffer_uav(
         return None;
     }
     let start = address + buffer.FirstElement * element;
+    // Shaders never write title memory in place (`crate::alias::written`).
+    crate::alias::written(start, u64::from(buffer.NumElements) * element);
     let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;

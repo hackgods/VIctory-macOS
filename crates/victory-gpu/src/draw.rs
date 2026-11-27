@@ -510,7 +510,11 @@ fn bind_cache_enabled() -> bool {
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
 fn root_view(list: &HostList, address: u64, srv: bool, uav: bool) -> Option<u64> {
-    let shadow = crate::shadow::find(address, 1)?;
+    let mut shadow = crate::shadow::find(address, 1)?;
+    // Shaders never write title memory in place (`crate::alias::written`).
+    if uav && crate::alias::written(address, shadow.left(address).min(1 << 20)) {
+        shadow = crate::shadow::find(address, 1)?;
+    }
     let len = shadow
         .left(address)
         .min(if srv || uav { 1 << 20 } else { 1 << 16 });
@@ -1146,7 +1150,17 @@ impl State {
                                 && r.root == RootType::Descriptor
                                 && r.kind == ResourceType::Uav
                         });
-                        roots.push((*address, uav.then_some(shadow)));
+                        // Never written in place (`crate::alias::written`).
+                        let shadow = if uav
+                            && crate::alias::written(*address, shadow.left(*address).min(1 << 20))
+                        {
+                            crate::shadow::find(*address, 1)
+                        } else {
+                            Some(shadow)
+                        };
+                        if let Some(shadow) = shadow {
+                            roots.push((*address, uav.then_some(shadow)));
+                        }
                     }
                     let fresh = made
                         .iter()
@@ -1367,10 +1381,18 @@ impl State {
             }
             return index.map(|slot| (slot, 0));
         }
-        let Some(shadow) = crate::shadow::find(address, 1) else {
+        let Some(mut shadow) = crate::shadow::find(address, 1) else {
             not_run("a root view outside title buffers");
             return None;
         };
+        // Shaders never write title memory in place (`crate::alias::written`).
+        if uav && crate::alias::written(address, shadow.left(address)) {
+            let Some(copy) = crate::shadow::find(address, 1) else {
+                not_run("a root view outside title buffers");
+                return None;
+            };
+            shadow = copy;
+        }
         let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
             not_run("a root view 4 GiB or more into its copy");
             return None;
@@ -2884,17 +2906,25 @@ fn readable_entry(list: &HostList, u: &UsedResource, view: &View, marked: bool, 
     // what shaders write through unordered access goes back to it after.
     // Constant buffers (raw views) to their copy's end at most; others in
     // the copy their host view reads.
-    let range = match *view {
+    let lookup = || match *view {
         View::Constant(address, size) => crate::shadow::find(address, 1).and_then(|s| {
             let len = u64::from(size).min(s.left(address));
             crate::shadow::find(address, len).map(|s| (s, address, len))
         }),
         _ => crate::descriptor::host::view_copy(view),
     };
+    let uav_writes = u.kind == ResourceType::Uav && writes;
+    let mut range = lookup();
+    // Shaders never write title memory in place (`crate::alias::written`).
+    if uav_writes
+        && let Some((_, address, len)) = range
+        && crate::alias::written(address, len)
+    {
+        range = lookup();
+    }
     if let Some((shadow, address, len)) = range
         && len > 0
     {
-        let uav_writes = u.kind == ResourceType::Uav && writes;
         let (refresh_at, refresh_len) = if uav_writes && marked && shadow.marked() {
             shadow.page_range(address, len)
         } else {

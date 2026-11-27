@@ -254,14 +254,25 @@ fn seen(view: &View) -> Option<Seen> {
         return texture.title_written().then_some(Seen::Texture(*resource));
     }
     // The copy the host view reads.
-    let (shadow, address, len) = match *view {
+    let lookup = || match *view {
         View::Constant(address, size) => {
             let len = u64::from(size);
-            ((len > 0).then(|| crate::shadow::find(address, len)).flatten()?, address, len)
+            Some((
+                (len > 0)
+                    .then(|| crate::shadow::find(address, len))
+                    .flatten()?,
+                address,
+                len,
+            ))
         }
-        _ => crate::descriptor::host::view_copy(view)?,
+        _ => crate::descriptor::host::view_copy(view),
     };
     let uav = matches!(view, View::Unordered(..) | View::Placed(true, ..));
+    let (mut shadow, address, len) = lookup()?;
+    // Shaders never write title memory in place (`crate::alias::written`).
+    if uav && crate::alias::written(address, len) {
+        shadow = lookup()?.0;
+    }
     if len == 0 {
         return None;
     }

@@ -160,6 +160,18 @@
 //!   bits 0-13 and 14-29), first and last level (dword 3 bits 12-15, 16-19)
 //!   and type (bits 28-31) with an identity swizzle; zeros for anything
 //!   else.
+//! * **Descriptors read as data** (with [`Options::descriptor_as_data`],
+//!   added 2026-11-27 from ScarlettMac 4921b7e6): a program that reads a
+//!   descriptor's dwords as numbers and never as a resource is refused
+//!   where a dword has no value (the console compiler reads a buffer's size
+//!   out of its V#). With the option the host's table above also holds a
+//!   buffer's dword 2, the view's record count (bytes for a raw view,
+//!   records for a structured one), filled from the view the slot holds,
+//!   and a scalar load through a root descriptor's address reads the
+//!   resource's own memory through the title memory page table ("Title
+//!   memory"), as the console's load does. A buffer's dword 3 and an image's
+//!   dwords 4-7 have no host value: a program that reads one is still
+//!   refused, rather than given a made-up one.
 //! * **Write marks** ([`HostShader::view_marks`], with
 //!   [`Options::view_marks`]; added 2026-11-25): every store or atomic
 //!   through an unordered buffer view from the heap (tables, the heap
@@ -245,6 +257,8 @@ mod container;
 mod crosslane_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
+#[cfg(test)]
+mod descriptor_as_data_tests;
 #[cfg(test)]
 mod exchange_tests;
 #[cfg(all(test, windows))]
@@ -559,6 +573,14 @@ pub struct Options {
     /// 24a479d3, `VICTORY_BVH_MISS`). For hosts where the title's
     /// structures are never built. The shader cache keys on it. Mac.
     pub bvh_miss: bool,
+    /// A descriptor's dwords the program only reads as numbers come from
+    /// the descriptor's source instead of stopping it at the first dword
+    /// the source cannot answer (`lower::mac`, "Descriptor dwords read as
+    /// data"; from ScarlettMac 4921b7e6): a buffer's record count from the
+    /// host's view of the slot, and the resource itself for a scalar load
+    /// through a root descriptor. Off, a program that reads a buffer's
+    /// dword 2 is refused. The shader cache keys on it. Mac.
+    pub descriptor_as_data: bool,
     /// A compute group of one console wave that shares LDS across the
     /// rounds of a loop, with lanes that leave the program before it (the
     /// title's hair shadow masks), gets group barriers in the blocks every
@@ -1045,6 +1067,7 @@ fn emit_form(
             across: options.halves_across,
             wide_loads: options.wide_loads,
             bvh_miss: options.bvh_miss,
+            descriptor_as_data: options.descriptor_as_data,
             lds_rounds: options.lds_rounds,
         },
     };

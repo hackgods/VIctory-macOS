@@ -1929,17 +1929,80 @@ fn element_size(desc: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> u64 {
 /// Writes slot `index`'s words into the view addresses at `data` (the
 /// caller keeps `index` below [`HostHeap::address_slots`]), 16 bytes a
 /// slot: a buffer view's title address (dword 0 low, dword 1 bits 0-15
-/// high), a texture view's size fields ([`texture_words`]), zeros for
+/// high) and, with `VICTORY_DESCRIPTOR_AS_DATA=1`, its record count (dword
+/// 2), a texture view's size fields ([`texture_words`]), zeros for
 /// anything else.
 fn write_address(data: usize, index: usize, view: Option<&View>) {
-    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-    let words = match view.and_then(texture_words) {
-        Some(words) => words,
-        None => [address as u32, (address >> 32) as u32 & 0xFFFF, 0, 0],
-    };
+    let words = address_words(view, crate::shader_cache::descriptor_as_data());
     // SAFETY: the mapped view addresses hold 16 bytes per title and dynamic
     // slot (below `address_slots`).
     unsafe { ((data + 16 * index) as *mut [u32; 4]).write_unaligned(words) };
+}
+
+/// The four dwords [`write_address`] leaves for a slot of `view`; `records`:
+/// a buffer view's dword 2 is its record count (from ScarlettMac 4921b7e6,
+/// for programs that read a descriptor's dwords as data,
+/// `victory_shader::emit::Options::descriptor_as_data`), else 0 as before.
+fn address_words(view: Option<&View>, records: bool) -> [u32; 4] {
+    let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
+    match view.and_then(texture_words) {
+        Some(words) => words,
+        None => [
+            address as u32,
+            (address >> 32) as u32 & 0xFFFF,
+            if records {
+                view.and_then(buffer_records).unwrap_or(0)
+            } else {
+                0
+            },
+            0,
+        ],
+    }
+}
+
+/// From ScarlettMac 4921b7e6: a buffer view's size as the console's
+/// descriptor dword 2 holds it, its record count: its bytes for a raw view,
+/// its elements for a structured or typed one (`None` for anything else).
+/// The value a size query on the view answers with, so a program reading
+/// the dword out of the descriptor computes with what it would have asked.
+fn buffer_records(view: &View) -> Option<u32> {
+    let (_, len) = buffer_range(view)?;
+    let element = u64::from(view_stride(view));
+    if element == 0 {
+        return None;
+    }
+    // A raw view's count is in bytes (`buffer_element` reads it as 4-byte
+    // elements), a structured or typed one's in those elements.
+    let count = if raw_buffer(view) { len } else { len / element };
+    u32::try_from(count).ok()
+}
+
+/// Whether a buffer view is raw: no format of its own, its elements 4 bytes
+/// wide whatever its stride field says.
+fn raw_buffer(view: &View) -> bool {
+    let (unordered, words): (bool, &[u32; 10]) = match view {
+        View::Constant(..) => return true,
+        View::Shader(_, Some(desc)) => (false, desc),
+        View::Unordered(_, _, Some(desc)) => (true, desc),
+        View::Placed(unordered, resource, desc) if resource[0] == 1 => match desc[..10].try_into() {
+            Ok(words) => (*unordered, words),
+            Err(_) => return false,
+        },
+        _ => return false,
+    };
+    if words[1] != 1 {
+        return false;
+    }
+    if unordered {
+        let desc = uav_desc(words);
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { desc.Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0
+    } else {
+        // SAFETY: a buffer view's union member.
+        let buffer = unsafe { srv_desc(words).Anonymous.Buffer };
+        buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0
+    }
 }
 
 /// A texture view's console image descriptor dwords 0-3 as far as its size
@@ -3444,6 +3507,38 @@ mod tests {
         assert_eq!(unsafe { past.read_unaligned() }, mark);
         // SAFETY: a plain device query.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// From ScarlettMac 4921b7e6: a buffer view's record count, which the
+    /// view addresses carry in a descriptor's dword 2 for shaders that read
+    /// it as data (`VICTORY_DESCRIPTOR_AS_DATA=1`): its elements for a
+    /// structured or typed view, its bytes for a raw one; and 0 there, as
+    /// before, without the switch.
+    #[test]
+    fn a_buffer_views_record_count_is_its_size() {
+        let address = 0xd_6013_e000u64;
+        let placed = |stride: u32, elements: u32, raw: bool| {
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, 64);
+            let mut desc = [0u32; 16];
+            (desc[1], desc[6], desc[7]) = (1, elements, stride);
+            desc[8] = if raw { D3D12_BUFFER_SRV_FLAG_RAW.0 as u32 } else { 0 };
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, resource, desc)
+        };
+        assert_eq!(buffer_records(&placed(4, 16, false)), Some(16));
+        assert_eq!(buffer_records(&placed(16, 4, false)), Some(4));
+        // A raw view counts its bytes: 16 elements of 4.
+        assert_eq!(buffer_records(&placed(0, 16, true)), Some(64));
+        // Not a buffer view: no record count.
+        assert_eq!(buffer_records(&View::Constant(address, 64)), None);
+        assert_eq!(buffer_records(&View::Sampler([0; 13])), None);
+        // The slot's words: the count only when asked for.
+        let view = placed(16, 4, false);
+        let [lo, hi, two, three] = address_words(Some(&view), true);
+        assert_eq!((u64::from(lo) | u64::from(hi) << 32, two, three), (address, 4, 0));
+        assert_eq!(address_words(Some(&view), false), [lo, hi, 0, 0], "as before without it");
+        assert_eq!(address_words(None, true), [0; 4]);
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.

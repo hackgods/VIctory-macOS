@@ -252,6 +252,11 @@ pub fn run(
     if lds_rounds {
         println!("LDS          of one-wave groups ordered across loop rounds where it can be (VICTORY_HALVES_LDS_ROUNDS=1)");
     }
+    if victory_gpu::shader_cache::descriptor_as_data() {
+        println!(
+            "descriptors  dwords a program only reads as numbers come from their source (VICTORY_DESCRIPTOR_AS_DATA=1)"
+        );
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -669,6 +674,7 @@ fn translate(
                         halves_across: checks.across,
                         wide_loads: checks.wide,
                         lds_rounds: checks.lds_rounds,
+                        descriptor_as_data: victory_gpu::shader_cache::descriptor_as_data(),
                         ..Default::default()
                     };
                     let _ = emit::uav_size_queries();

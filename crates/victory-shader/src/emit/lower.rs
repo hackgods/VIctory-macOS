@@ -760,7 +760,8 @@ impl<'a> Lower<'a> {
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
         let root_memory = x.res.scalar.iter().any(|s| matches!(s.1.param, MEMORY | USER_DATA))
-            || insts().any(|i| i.name().starts_with("image_bvh"));
+            || insts().any(|i| i.name().starts_with("image_bvh"))
+            || x.res.scalar.iter().any(|s| x.mac.root_as_memory(&x.native.layout, s.1.param));
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut split_barriers = Set::default();
@@ -4697,6 +4698,12 @@ impl<'a> Lower<'a> {
             return self.memory_smem(inst, a);
         }
         let Some(rest) = name.strip_prefix("s_buffer_load_dword") else {
+            // `Mac::root_as_memory`: the resource's own dwords.
+            if let Some(a) = self.scalar.get(&site).copied()
+                && self.x.mac.root_as_memory(&self.x.native.layout, a.param)
+            {
+                return self.memory_smem(inst, a);
+            }
             return self.descriptor_data(inst, site);
         };
         let count = match rest {
@@ -5615,9 +5622,9 @@ impl<'a> Lower<'a> {
     // shortcut: dword 1 holds the address bits only (stride and swizzle read
     // 0) or a texture's width bits, dword 3 a texture's size fields (format,
     // tiling and swizzle choice read 0 or the identity); dword 4 on and a
-    // buffer's dwords 2-3 (record count, format) stop the program when read;
-    // the table offset's computed part is taken as whole descriptors
-    // (32-byte multiples).
+    // buffer's dwords 2-3 (record count, format) stop the program when read
+    // (dword 2 not with `Mac::descriptor_as_data`); the table offset's
+    // computed part is taken as whole descriptors (32-byte multiples).
     fn view_addresses(&mut self, inst: &Inst, site: Site, code: u8, count: u32) -> Result<(), Why> {
         const OTHER: Why = "a descriptor read only as data";
         let a = *self.scalar.get(&site).ok_or("a descriptor read only as data")?;
@@ -5628,8 +5635,8 @@ impl<'a> Lower<'a> {
             return Err("a descriptor read only as data");
         }
         // The compiler loads image descriptors whole, buffer ones as four
-        // dwords.
-        let known = if count == 8 && a.offset.is_multiple_of(32) { 4 } else { 2 };
+        // dwords (`Mac::buffer_words`).
+        let known = if count == 8 && a.offset.is_multiple_of(32) { 4 } else { self.x.mac.buffer_words() };
         let views = self.s.view_addresses_handle();
         for k in 0..count {
             let word = (a.offset / 4 + k) % 8;

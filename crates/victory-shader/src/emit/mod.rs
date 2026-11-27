@@ -621,9 +621,13 @@ pub struct Options {
     /// code leaves in their VGPRs (`walk`, "Whole-wave code"); and a
     /// first-lane read under a narrowed EXEC is handed over across the
     /// halves: the console's EXEC as a ballot, then its first lane's value
-    /// (`lower::exchange`). The title's ray bin offsets
-    /// (`sr_tracing:CS_GenerateRayBinOffsets`) then count their packets
-    /// over the whole console wave. Mac; the shader cache keys on it.
+    /// (`lower::exchange`); and a group of one console wave whose LDS no
+    /// barrier orders asks the walk to open the code round its accesses,
+    /// which barriers then order (the walked form must not race). The
+    /// title's ray bin offsets (`sr_tracing:CS_GenerateRayBinOffsets`) then
+    /// count their packets over the whole console wave, and its ray
+    /// budgeting (`CS_RayBudgeting_Cull_RayBinning`) counts every lane's
+    /// rays. Mac; the shader cache keys on it.
     pub halves_whole_wave: bool,
 }
 

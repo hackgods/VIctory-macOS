@@ -145,6 +145,28 @@ pub(crate) fn wanted<T>(lowering: impl FnOnce() -> T) -> (T, Vec<usize>) {
     (made, blocks)
 }
 
+/// Mac ([`Mac::whole_wave`]): while [`wanted`] runs a lowering of a one-wave
+/// group whose LDS no barrier orders yet, the blocks that access LDS, so
+/// that `emit::walk` opens the skips round them and the walked form can
+/// place its barriers where every lane runs (`split_wave_barriers`).
+pub(super) fn want_lds(p: &Program) {
+    WANTED.with(|w| {
+        if let Some(blocks) = w.borrow_mut().as_mut() {
+            for (b, block) in p.blocks.iter().enumerate() {
+                let lds = block.insts.iter().any(|i| {
+                    let name = i.name();
+                    matches!(i.fields, Fields::Ds { .. })
+                        && !name.starts_with("ds_swizzle")
+                        && !name.contains("permute")
+                });
+                if lds {
+                    blocks.push(b);
+                }
+            }
+        }
+    });
+}
+
 /// The exchanges of one program.
 #[derive(Default)]
 pub(super) struct State {

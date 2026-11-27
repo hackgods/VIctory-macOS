@@ -1219,6 +1219,34 @@ impl Shadow {
                 .is_empty()
     }
 
+    /// Arms the pages of `[address, address + len)` (tracked memory only)
+    /// for shaders that may write them through views no list declared (a
+    /// flight's heaps and title-memory programs, `crate::host::flight`): a
+    /// title write there before the copy-back saves the page's bytes from
+    /// before it, so that [`Shadow::copy_back_marked`] keeps both writers'
+    /// bytes, as for a declared marked write ([`Shadow::writing`]), instead
+    /// of the title's page whole.
+    pub(crate) fn arm_undeclared(&self, address: usize, len: usize) {
+        if let Some(t) = &self.tracked {
+            t.arm(address, address.saturating_add(len));
+        }
+    }
+
+    /// The flight that armed the copy ([`Shadow::arm_undeclared`]) has been
+    /// copied back: nothing stays armed or saved, unless a submitted list
+    /// still declares writes there (its own copy-back disarms it then).
+    pub(crate) fn disarm_undeclared(&self) {
+        if let Some(t) = &self.tracked
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+        {
+            t.disarm();
+        }
+    }
+
     /// Whether a submitted list declared that its shaders write the copy and
     /// it is not copied back yet (a range pending or a snapshot kept).
     pub(crate) fn busy(&self) -> bool {

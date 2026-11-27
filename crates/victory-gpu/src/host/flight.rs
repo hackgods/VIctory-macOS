@@ -484,6 +484,13 @@ pub(super) fn log(frames: f64) {
         syncs / frames,
         sync_us / 1000.0 / frames,
     );
+    let armed = per(&ARMED);
+    if flight1_enabled() {
+        tracing::info!(
+            "flights armed {armed:.0} copies/frame for writes their shaders make with no list declaring them (a \
+             title write to such a page during the flight saves it, and the copy-back keeps both writers' bytes)"
+        );
+    }
     if !prewarm_enabled() {
         return;
     }
@@ -656,6 +663,9 @@ struct InFlight {
     signals: Vec<(usize, u64)>,
     /// Which mark it ends with (0 the host's, 1 [`SECOND_MARK`]).
     slot: usize,
+    /// Copies whose pages it armed for its shaders' undeclared writes
+    /// ([`arm_undeclared`]), disarmed once it has landed.
+    armed: Vec<Arc<crate::shadow::Shadow>>,
     uploads: Option<crate::bindless::Uploads>,
     batch: Batch,
     heaps: Vec<Arc<crate::bindless::Viewed>>,
@@ -809,6 +819,9 @@ impl Host {
             mark.arm(fence_value);
             group.push(mark.list());
         }
+        // Armed before the GPU may write: a title write from here on saves
+        // its page.
+        let armed = arm_undeclared(&segments, &prep.heaps);
         let queue = self.queue();
         let launched = std::time::Instant::now();
         // SAFETY: closed lists; fence and events are ours.
@@ -856,6 +869,7 @@ impl Host {
             uav,
             signals: Vec::new(),
             slot,
+            armed,
             uploads: prep.uploads,
             batch: prep.batch,
             heaps: prep.heaps,
@@ -1188,6 +1202,10 @@ impl Host {
             );
         }
 
+        // Its copy-back is done: what it armed is as anything else again.
+        for copy in &flight.armed {
+            copy.disarm_undeclared();
+        }
         // What copies took early while it ran is as anything else now (its
         // copy-back, above, kept the title's bytes on such pages).
         crate::shadow::forget_early();
@@ -1368,6 +1386,50 @@ impl Host {
         }
     }
 }
+
+/// Before a flight is given to the host GPU: the pages its shaders may
+/// write with no list declaring them are armed (`Shadow::arm_undeclared`),
+/// the unordered views of its heaps (the bindless path) and every copy the
+/// page tables of its title-memory programs name. Their writes are marked
+/// and go back by the pages marked (`Shadow::copy_back_marked`), and a page
+/// the title wrote since the copy took it, and that nothing saved, keeps
+/// the title's bytes whole, the shaders' there dropped. Waited for, the
+/// title's thread that submits cannot write meanwhile; a flight lets it go
+/// on, and it writes a frame's data into pages the GPU writes too (on the
+/// console both land, byte by byte). Armed, the first title write to such
+/// a page saves its bytes from before, and the copy-back keeps both. The
+/// copies armed, to disarm when it lands.
+fn arm_undeclared(
+    segments: &[Arc<HostList>],
+    heaps: &[Arc<crate::bindless::Viewed>],
+) -> Vec<Arc<crate::shadow::Shadow>> {
+    let mut armed: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut arm = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
+        copy.arm_undeclared(address, len);
+        if seen.insert(Arc::as_ptr(copy) as usize) {
+            armed.push(copy.clone());
+        }
+    };
+    for heap in heaps {
+        crate::bindless::written_ranges(heap, &mut arm);
+    }
+    for list in segments {
+        for step in &list.deferred().copies {
+            if let &Step::Memory(key) = step {
+                crate::memory::copies(key, |copy| {
+                    let (start, len) = copy.range();
+                    arm(copy, start as usize, len as usize);
+                });
+            }
+        }
+    }
+    ARMED.fetch_add(armed.len() as u64, Ordering::Relaxed);
+    armed
+}
+
+/// Copies armed for undeclared writes since the last frame line.
+static ARMED: AtomicU64 = AtomicU64::new(0);
 
 /// What the lists of a flight may write (`InFlight::writes`, `uav`): the
 /// title memory they declared that their shaders write, and the copies

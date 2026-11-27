@@ -539,6 +539,17 @@ pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
     }
 }
 
+/// [`written`] with each unordered view's range in its copy (address,
+/// bytes): what the heap's shaders may write with no list declaring it.
+pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, uav, _) in inner.hulls.values() {
+        if *uav {
+            each(shadow, *address as usize, *len as usize);
+        }
+    }
+}
+
 /// Per submission: the buffer range of the view currently in `index`. A
 /// table draw may have been recorded with another view in that slot.
 pub(crate) fn refresh_slot(

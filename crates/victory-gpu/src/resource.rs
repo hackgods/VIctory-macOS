@@ -1870,10 +1870,49 @@ fn ram_excess(available: u64, total: u64) -> u64 {
     }
 }
 
+/// From ScarlettMac 4921b7e6, `VICTORY_TEXTURE_TRIM=1`: a card budget larger
+/// than the computer's whole memory is read as the computer's memory
+/// ([`one_memory`]), so host textures fed from title memory are given up
+/// under RAM pressure ([`RAM_LOW`]) instead of never. Under D3DMetal on a 24
+/// GB M5 Pro the card offered 38139 MB against 19070 MB non-local, which read
+/// as a card of its own: nothing was given up while host textures grew to
+/// 7.2 GB and the system swapped (ScarlettMac). Where both segments offer
+/// one budget (this 48 GB M4 Pro: 40201 MB each) the memory is unified
+/// already and the switch changes nothing. Off by default.
+#[cfg(windows)]
+fn texture_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_TRIM").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!(
+                "VICTORY_TEXTURE_TRIM: a card budget above the computer's memory is the \
+                 computer's memory, so host textures are given up under RAM pressure"
+            );
+        }
+        on
+    })
+}
+
+/// The computer's memory in MB, 0 if the system does not say.
+#[cfg(windows)]
+fn physical_mb() -> f64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data, its length set as the call asks.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a valid out pointer.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0.0;
+    }
+    m.ullTotalPhys as f64 / 1e6
+}
+
 /// Whether the host card's memory is the computer's own, logged once: its
 /// architecture's UMA, or its local and non-local segments offering one
 /// and the same budget (D3DMetal reports no UMA on Apple silicon, and both
-/// segments as the same 12713 MB on a 16 GB Mac).
+/// segments as the same 12713 MB on a 16 GB Mac), or with
+/// `VICTORY_TEXTURE_TRIM=1` a budget above the computer's memory.
 #[cfg(windows)]
 fn unified() -> bool {
     static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1900,22 +1939,28 @@ fn unified() -> bool {
     }
     .is_ok()
         && a.UMA.as_bool();
-    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other));
+    // The computer's memory, for the rule that a card's budget larger than
+    // it is the computer's own ([`texture_trim`]): none without the switch.
+    let physical = if texture_trim() { physical_mb() } else { 0.0 };
+    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other, physical));
     tracing::info!(
         unified,
         uma,
         local_mb = local,
         non_local_mb = other,
+        physical_mb = physical,
         "host card memory unified with the computer's: host textures also kept under its free memory"
     );
     unified
 }
 
-/// [`unified`]'s rule: the architecture says so, or both segments' budgets
-/// (MB) are one.
+/// [`unified`]'s rule: the architecture says so, both segments' budgets
+/// (MB) are one, or the card's budget is more than the computer's whole
+/// memory (`physical` in MB, 0 to leave that rule out): a card of its own
+/// cannot offer more memory than the computer has.
 #[cfg(windows)]
-fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
-    uma || (local > 0.0 && local == non_local)
+fn one_memory(uma: bool, local: f64, non_local: f64, physical: f64) -> bool {
+    uma || (local > 0.0 && local == non_local) || (physical > 0.0 && local > physical)
 }
 
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
@@ -2928,17 +2973,23 @@ mod tests {
         }
     }
 
-    /// Unified: by the architecture, or by one budget for both segments.
+    /// Unified: by the architecture, by one budget for both segments, or
+    /// (`VICTORY_TEXTURE_TRIM=1`) by a budget above the computer's memory.
     #[cfg(windows)]
     #[test]
     fn one_budget_for_both_segments_is_one_memory() {
-        assert!(one_memory(true, 8192.0, 16384.0));
+        assert!(one_memory(true, 8192.0, 16384.0, 0.0));
         assert!(
-            one_memory(false, 12713.0, 12713.0),
+            one_memory(false, 12713.0, 12713.0, 0.0),
             "D3DMetal on a 16 GB Mac"
         );
-        assert!(!one_memory(false, 8192.0, 16384.0), "a card of its own");
-        assert!(!one_memory(false, 0.0, 0.0));
+        assert!(!one_memory(false, 8192.0, 16384.0, 0.0), "a card of its own");
+        assert!(!one_memory(false, 0.0, 0.0, 0.0));
+        // D3DMetal on a 24 GB M5 Pro, `VICTORY_TEXTURE_TRIM=1`: the card's
+        // 38139 MB is more than the machine has.
+        assert!(one_memory(false, 38139.0, 19070.0, 24576.0));
+        assert!(!one_memory(false, 38139.0, 19070.0, 0.0), "the rule left out: as before");
+        assert!(!one_memory(false, 8188.0, 24576.0, 24576.0), "a card of its own, smaller than the memory");
     }
 
     /// Below [`RAM_LOW`] of the computer's memory free, what is given up

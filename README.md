@@ -189,6 +189,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_LITERAL_HALVES=0` | disable the literal translation retry for 64-thread wave64 compute shaders on 32-lane hosts (separate shader cache entries) |
+| `VICTORY_CAP_BARRIERS=1` | refuse a compute shader with an `s_barrier` that a lane may miss by leaving a loop at its iteration limit, as #408 did ("an s_barrier where a lane may have left the program early"); by default such barriers are kept, as before #408 (separate shader cache entries; see [docs/macos.md](docs/macos.md#barriers-after-a-loops-iteration-limit)) |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 

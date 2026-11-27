@@ -2007,6 +2007,8 @@ fn closed_self_loop_next_to_an_s_barrier() -> Vec<u32> {
 /// at the cap still reaches the sibling — in halves and as one wave64 alike.
 #[test]
 fn an_s_barrier_on_the_sibling_of_a_closed_capped_self_loop_is_refused() {
+    // #408's refusal, which takes VICTORY_CAP_BARRIERS=1.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let w = closed_self_loop_next_to_an_s_barrier();
     // The words decode to what the comments say: one capped back edge (the
     // self-loop) and the s_barrier on the sibling path.
@@ -2071,6 +2073,9 @@ fn an_s_barrier_before_the_branch_of_a_closed_self_loop() -> Vec<u32> {
 /// wave64 alike.
 #[test]
 fn an_s_barrier_before_the_branch_of_a_closed_capped_self_loop_translates() {
+    // With #408's refusal on (VICTORY_CAP_BARRIERS=1): the barrier is not
+    // marked escaped, so it is kept even then.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let w = an_s_barrier_before_the_branch_of_a_closed_self_loop();
     let l = lowered_halves(&w, 64).expect("translated in halves");
     assert_eq!(l.wave_size, Some(32));
@@ -2121,6 +2126,9 @@ fn an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop() -> Vec<u32
 /// at the join. It translates in halves and as one wave64 alike.
 #[test]
 fn an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop_translates() {
+    // With #408's refusal on (VICTORY_CAP_BARRIERS=1): the barrier is not
+    // marked escaped, so it is kept even then.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let w = an_s_barrier_at_an_earlier_join_before_a_closed_capped_self_loop();
     // The words give one capped back edge (the self-loop) and one s_barrier
     // at the earlier join.
@@ -2189,6 +2197,9 @@ fn an_s_barrier_on_the_sibling_behind_a_uniform_branch() -> Vec<u32> {
 /// escaped either: the branch sends every lane the same way.
 #[test]
 fn an_s_barrier_on_the_sibling_behind_a_uniform_branch_translates() {
+    // With #408's refusal on (VICTORY_CAP_BARRIERS=1): the barrier is not
+    // marked escaped, so it is kept even then.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let w = an_s_barrier_on_the_sibling_behind_a_uniform_branch();
     let l = lowered_halves(&w, 64).expect("translated in halves");
     assert_eq!(l.wave_size, Some(32));
@@ -2241,6 +2252,8 @@ fn a_divergent_capped_loop_then_an_s_barrier_at_the_join() -> Vec<u32> {
 /// refused, in halves and as one wave64 alike.
 #[test]
 fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
+    // #408's refusal, which takes VICTORY_CAP_BARRIERS=1.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let w = a_divergent_capped_loop_then_an_s_barrier_at_the_join();
     for why in [
         lowered_halves(&w, 64).err().expect("refused in halves"),
@@ -2263,6 +2276,9 @@ fn an_s_barrier_after_a_divergent_capped_loop_is_refused() {
 /// `s_barrier` goes just before `s_endpgm`.
 #[test]
 fn an_s_barrier_after_a_uniform_capped_loop_translates() {
+    // With #408's refusal on (VICTORY_CAP_BARRIERS=1): the barrier is not
+    // marked escaped, so it is kept even then.
+    let _refused = crate::emit::cap_barriers_on_this_thread(true);
     let mut w = capped_back_edge_in_a_uniform_loop();
     // Keep the v_readlane at the join (word 6), so halves really runs, and
     // put the explicit s_barrier where the s_nop before s_endpgm was.
@@ -2286,6 +2302,58 @@ fn an_s_barrier_after_a_uniform_capped_loop_translates() {
         without.barriers + 1,
         "the s_barrier adds exactly one dx.op.barrier"
     );
+}
+
+/// `VICTORY_CAP_BARRIERS`: the `s_barrier`s #408 refuses because a lane may
+/// have left a loop at its cap before them (on the sibling of a closed
+/// capped self-loop, and at the join after a divergent capped loop) are
+/// kept by default, one `dx.op.barrier` each, in halves and as one wave64
+/// alike, and refused with the switch on. The same programs with an `s_nop`
+/// in the barrier's place translate alike either way.
+#[test]
+fn an_s_barrier_after_a_capped_loop_is_kept_unless_the_switch_refuses_it() {
+    const CAP: &str = "an s_barrier where a lane may have left the program early";
+    for w in [
+        closed_self_loop_next_to_an_s_barrier(),
+        a_divergent_capped_loop_then_an_s_barrier_at_the_join(),
+    ] {
+        let at: Vec<usize> = (0..w.len()).filter(|&i| w[i] == 0xBF8A_0000).collect();
+        assert_eq!(at.len(), 1, "one s_barrier");
+        let mut nop = w.clone();
+        nop[at[0]] = 0xBF80_0000; // s_nop instead of the s_barrier
+        // By default (VICTORY_CAP_BARRIERS unset or 0).
+        let kept = crate::emit::cap_barriers_on_this_thread(false);
+        let halves = lowered_halves(&w, 64).expect("kept in halves");
+        assert_eq!(halves.wave_size, Some(32));
+        let whole = lowered_result(&w, 64, false).expect("kept as one wave64");
+        assert_eq!(whole.wave_size, Some(64));
+        let halves_nop = lowered_halves(&nop, 64).expect("s_nop: translated in halves");
+        let whole_nop = lowered(&nop, 64, false);
+        assert_eq!(
+            halves.barriers,
+            halves_nop.barriers + 1,
+            "the s_barrier adds exactly one dx.op.barrier in halves"
+        );
+        assert_eq!(
+            whole.barriers,
+            whole_nop.barriers + 1,
+            "the s_barrier adds exactly one dx.op.barrier as one wave64"
+        );
+        drop(kept);
+        // VICTORY_CAP_BARRIERS=1.
+        let _refused = crate::emit::cap_barriers_on_this_thread(true);
+        for why in [
+            lowered_halves(&w, 64).err().expect("refused in halves"),
+            lowered_result(&w, 64, false)
+                .err()
+                .expect("refused as one wave64"),
+        ] {
+            assert!(why.to_string().contains(CAP), "{why}");
+        }
+        let refusing_nop = lowered_halves(&nop, 64).expect("s_nop: translated in halves");
+        assert_eq!(refusing_nop.barriers, halves_nop.barriers);
+        assert_eq!(lowered(&nop, 64, false).barriers, whole_nop.barriers);
+    }
 }
 
 #[test]

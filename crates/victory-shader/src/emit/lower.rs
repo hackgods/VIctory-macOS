@@ -4251,9 +4251,15 @@ impl<'a> Lower<'a> {
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // A lane may have left the program early at a capped back
                 // edge's iteration limit before this block; a group barrier
-                // here would wait for lanes that are gone.
-                if self.cap_escaped.get(b).copied().unwrap_or(false) {
-                    Err("an s_barrier where a lane may have left the program early at a loop's iteration limit")
+                // here would wait for lanes that are gone. With
+                // VICTORY_CAP_BARRIERS=1 that refuses the program (#408);
+                // by default the barrier is kept, as before #408.
+                if self.cap_escaped.get(b).copied().unwrap_or(false)
+                    && super::cap_barriers_refused()
+                {
+                    Err(
+                        "an s_barrier where a lane may have left the program early at a loop's iteration limit",
+                    )
                 } else {
                     self.group_barrier();
                     Ok(())

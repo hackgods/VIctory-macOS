@@ -53,8 +53,9 @@ pub fn counts() -> (u64, u64) {
 /// (`victory_shader::SOURCE_HASH`: its sources, manifest, the lock file and
 /// the compiler), the entry's encoding (this file's text) and the
 /// translation settings (the loop limit, which a diagnostics build can
-/// change at run time, and whether the host's waves are 32 lanes at most,
-/// [`host_wave32`]).
+/// change at run time, whether the host's waves are 32 lanes at most,
+/// [`host_wave32`], and whether `VICTORY_CAP_BARRIERS=1` refuses barriers
+/// a lane may miss at a loop's iteration limit).
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
@@ -65,12 +66,19 @@ fn build() -> &'static [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        let cap_barriers = victory_shader::emit::cap_barriers_refused();
+        if cap_barriers {
+            tracing::warn!(
+                "VICTORY_CAP_BARRIERS=1: shaders with a barrier a lane may miss at a loop's iteration limit are refused"
+            );
+        }
         key(
             victory_shader::SOURCE_HASH,
             ENCODING,
             limit,
             host_wave32(),
             victory_shader::emit::thread_ticket(),
+            cap_barriers,
         )
     })
 }
@@ -91,12 +99,17 @@ fn key(
     limit: u32,
     wave32: bool,
     thread_ticket: bool,
+    cap_barriers: bool,
 ) -> [u8; 32] {
     let mut h = blake3::Hasher::new();
     h.update(translator.as_bytes());
     h.update(blake3::hash(encoding).as_bytes());
     h.update(&limit.to_le_bytes());
-    h.update(&[u8::from(wave32), u8::from(thread_ticket)]);
+    h.update(&[
+        u8::from(wave32),
+        u8::from(thread_ticket),
+        u8::from(cap_barriers),
+    ]);
     *h.finalize().as_bytes()
 }
 
@@ -803,17 +816,21 @@ mod tests {
     }
 
     /// The key's parts: a change to any of them (the translator's sources,
-    /// this file's encoding, the loop limit, the host's wave width) makes
-    /// another key, so no entry written before it is read.
+    /// this file's encoding, the loop limit, the host's wave width, the
+    /// thread ticket, `VICTORY_CAP_BARRIERS=1`) makes another key, so no
+    /// entry written before it is read.
     #[test]
     fn the_key_covers_translator_encoding_and_settings() {
-        let k = key("0123456789abcdef", b"encoding", 1 << 20, false, true);
-        assert_eq!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdee", b"encoding", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding.", 1 << 20, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 19, false, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, true, true));
-        assert_ne!(k, key("0123456789abcdef", b"encoding", 1 << 20, false, false));
+        const T: &str = "0123456789abcdef";
+        const E: &[u8] = b"encoding";
+        let k = key(T, E, 1 << 20, false, true, false);
+        assert_eq!(k, key(T, E, 1 << 20, false, true, false));
+        assert_ne!(k, key("0123456789abcdee", E, 1 << 20, false, true, false));
+        assert_ne!(k, key(T, b"encoding.", 1 << 20, false, true, false));
+        assert_ne!(k, key(T, E, 1 << 19, false, true, false));
+        assert_ne!(k, key(T, E, 1 << 20, true, true, false));
+        assert_ne!(k, key(T, E, 1 << 20, false, false, false));
+        assert_ne!(k, key(T, E, 1 << 20, false, true, true));
         assert_eq!(
             *build(),
             key(
@@ -822,6 +839,7 @@ mod tests {
                 victory_shader::emit::loop_limit(),
                 host_wave32(),
                 victory_shader::emit::thread_ticket(),
+                victory_shader::emit::cap_barriers_refused(),
             )
         );
         // The encoding part is this file as built.

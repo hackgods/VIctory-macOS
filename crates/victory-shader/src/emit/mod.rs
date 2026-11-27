@@ -334,6 +334,53 @@ pub(crate) fn with_thread_ticket<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// Whether a compute program is refused for an explicit `s_barrier` that a
+/// lane may miss by having left the program at a loop's iteration limit
+/// (#408): only with `VICTORY_CAP_BARRIERS=1`. By default such a barrier is
+/// kept, as before #408. A lane that left at the cap is then missing at it,
+/// which only a loop run all the way to the limit reaches. On Macs the
+/// refusal took about 15 of the game's compute programs (tile lists,
+/// lighting, temporal resolve, exposure), and world frames drew black or
+/// white (#497). The setting is part of the translation, so the shader
+/// cache must key on it (`victory-gpu`'s does).
+pub fn cap_barriers_refused() -> bool {
+    #[cfg(test)]
+    if let Some(refused) = TEST_CAP_BARRIERS.with(std::cell::Cell::get) {
+        return refused;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| parse_cap_barriers(std::env::var("VICTORY_CAP_BARRIERS").ok().as_deref()))
+}
+
+/// `VICTORY_CAP_BARRIERS`'s value: only `1` refuses. Pure, for testing.
+fn parse_cap_barriers(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CAP_BARRIERS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`cap_barriers_refused`] as set for this thread, until it drops.
+#[cfg(test)]
+pub(crate) struct CapBarriers(Option<bool>);
+
+#[cfg(test)]
+impl Drop for CapBarriers {
+    fn drop(&mut self) {
+        TEST_CAP_BARRIERS.with(|c| c.set(self.0));
+    }
+}
+
+/// Makes [`cap_barriers_refused`] answer `refused` on this thread (each test
+/// runs on its own, so other tests are untouched) until the guard drops.
+#[cfg(test)]
+#[must_use = "the setting ends when the guard drops"]
+pub(crate) fn cap_barriers_on_this_thread(refused: bool) -> CapBarriers {
+    CapBarriers(TEST_CAP_BARRIERS.with(|c| c.replace(Some(refused))))
+}
+
 /// The loop limit without an override: 2^14.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
@@ -1196,7 +1243,34 @@ fn signature(part: &[u8]) -> Result<Vec<container::SigElement>, ShaderError> {
 mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::parse_loop_limit;
+    use super::{parse_cap_barriers, parse_loop_limit};
+
+    #[test]
+    fn the_cap_barrier_switch_refuses_only_at_1() {
+        assert!(!parse_cap_barriers(None));
+        assert!(parse_cap_barriers(Some("1")));
+        assert!(parse_cap_barriers(Some(" 1 ")));
+        for other in ["", "0", "on", "true", "2"] {
+            assert!(!parse_cap_barriers(Some(other)), "{other:?}");
+        }
+    }
+
+    /// The per-thread setting holds on this thread only and ends with its
+    /// guard, the outer one back once an inner one drops.
+    #[test]
+    fn the_cap_barrier_setting_is_per_thread_and_scoped() {
+        let outer = super::cap_barriers_on_this_thread(true);
+        assert!(super::cap_barriers_refused());
+        {
+            let _inner = super::cap_barriers_on_this_thread(false);
+            assert!(!super::cap_barriers_refused());
+            let other = std::thread::spawn(|| super::TEST_CAP_BARRIERS.with(std::cell::Cell::get));
+            assert_eq!(other.join().unwrap(), None, "another thread has no setting");
+        }
+        assert!(super::cap_barriers_refused());
+        drop(outer);
+        assert_eq!(super::TEST_CAP_BARRIERS.with(std::cell::Cell::get), None);
+    }
 
     #[test]
     fn the_loop_limit_switch_parses_or_falls_back() {

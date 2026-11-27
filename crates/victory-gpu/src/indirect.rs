@@ -68,6 +68,67 @@ pub(crate) fn batch_clamps_enabled() -> bool {
     })
 }
 
+/// Whether an indirect execution whose clamp its host list's prelude cannot
+/// take (an earlier command of the list wrote its arguments, may have, or
+/// clamped inline) goes on in a new host list instead (a clamp cut,
+/// `crate::list`), whose prelude clamps it and the executions after it in
+/// one compute pass ahead of their draws (`VICTORY_CLAMP_GROUPS=1`; off by
+/// default). Inline, each clamp is a compute dispatch between two draws:
+/// the host ends the render pass for it and starts another after it, two
+/// Metal encoders on D3DMetal for each of ~4,000 executions a world frame.
+/// Needs the batched clamps (`VICTORY_BATCH_CLAMPS`, on by default).
+pub(crate) fn groups_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = TEST_CLAMP_GROUPS.with(std::cell::Cell::get) {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_GROUPS"))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_CLAMP_GROUPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_clamp_groups<R>(enabled: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CLAMP_GROUPS.with(|c| c.set(self.0));
+        }
+    }
+    let previous = TEST_CLAMP_GROUPS.with(|c| c.replace(Some(enabled)));
+    let _restore = Restore(previous);
+    f()
+}
+
+/// A clamp cut was made (`crate::list`).
+pub(crate) fn note_cut() {
+    GROUPS[0].fetch_add(1, Ordering::Relaxed);
+}
+
+/// An inline clamp, kept out of its list's prelude by `blocker`.
+pub(crate) fn note_inline(blocker: Option<crate::host::Blocker>) {
+    use crate::host::Blocker;
+    let at = match blocker {
+        None => return,
+        Some(Blocker::Inline) => 1,
+        Some(Blocker::Unknown) => 2,
+        Some(Blocker::Written) => 3,
+    };
+    GROUPS[at].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Since the last call: clamp cuts, and inline clamps after an inline
+/// clamp, after a command that may write any title buffer, and over bytes
+/// an earlier command of the list wrote.
+pub(crate) fn take_groups() -> [u64; 4] {
+    GROUPS.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
+}
+static GROUPS: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
 /// Whether the argument clamp compute pipeline is available on this host.
 pub(crate) fn available() -> bool {
     clamp().is_some()
@@ -556,6 +617,7 @@ fn bound_with(
             transition(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT),
         ]);
     }
+    list.note_work(true);
     Some(out)
 }
 
@@ -1243,6 +1305,20 @@ void main(uint3 g : SV_GroupID) {
         });
     }
 
+    /// Clamp groups are a switch (`VICTORY_CLAMP_GROUPS=1`), off unless set;
+    /// tests turn them on and off per thread.
+    #[test]
+    fn clamp_groups_switch_toggles_per_thread() {
+        super::with_clamp_groups(true, || {
+            assert!(super::groups_enabled());
+            super::with_clamp_groups(false, || assert!(!super::groups_enabled()));
+            assert!(super::groups_enabled());
+        });
+        if std::env::var_os("VICTORY_CLAMP_GROUPS").is_none() {
+            assert!(!super::groups_enabled(), "off by default");
+        }
+    }
+
     #[test]
     fn write_hazard_tracks_overlaps_coalescing_and_order() {
         let mut h = crate::host::WriteHazard::default();
@@ -1707,6 +1783,218 @@ void main() {
             }
         }
         crate::shadow::unregister(addr_a as usize, addr_a);
+        assert_eq!(host.log_messages(), None);
+    }
+
+    /// What keeps a clamp out of the prelude is named, and a clamp cut is
+    /// wanted the first time, then once a cut's list holds a group (two
+    /// hoisted clamps) or after 32 inline ones.
+    #[test]
+    fn hazards_name_their_blocker_and_cuts_wait_for_a_group() {
+        use crate::host::{Blocker, WriteHazard, clamp_cut_wanted as wanted};
+        let mut h = WriteHazard::default();
+        assert_eq!(h.blocker(0x1000, 16, None), None);
+        h.note_write(0x1000, 16);
+        assert_eq!(h.blocker(0x1000, 16, None), Some(Blocker::Written));
+        assert_eq!(h.blocker(0x2000, 16, Some(0x100c)), Some(Blocker::Written), "the count word");
+        assert_eq!(h.blocker(0x2000, 16, Some(0x1010)), None);
+        h.note_unknown();
+        assert_eq!(h.blocker(0x9000, 4, None), Some(Blocker::Unknown));
+        h.note_inline();
+        assert_eq!(h.blocker(0x9000, 4, None), Some(Blocker::Inline));
+        h.clear();
+        assert_eq!(h.blocker(0x1000, 16, None), None);
+
+        assert!(!wanted(None, false, 0, 0), "nothing blocks: hoisted where it is");
+        assert!(wanted(Some(Blocker::Written), false, 0, 0), "a list no cut made");
+        assert!(wanted(Some(Blocker::Unknown), false, 0, 0));
+        assert!(!wanted(Some(Blocker::Written), true, 1, 0), "a cut for one clamp gains nothing");
+        assert!(wanted(Some(Blocker::Written), true, 2, 0));
+        assert!(!wanted(Some(Blocker::Inline), true, 1, 31));
+        assert!(wanted(Some(Blocker::Inline), true, 1, 32), "tried again after 32 inline");
+    }
+
+    /// The groups in a world frame's lists come after the compute passes
+    /// that write their arguments: a list A (the producer: a dispatch that
+    /// writes every record over stale words, then an inline clamp spending
+    /// half the budget) cut for clamps, then a list B clamping every
+    /// execution in its prelude. Run as one submission, B's clamps read what
+    /// A wrote, and write word for word what inline clamps after the same
+    /// producer in one list write: across kinds, a count, an empty
+    /// execution, and records the budget A spent part of runs empty. B's
+    /// own fresh tracker lets every clamp into its prelude.
+    #[test]
+    fn a_clamp_cut_clamps_after_its_producer_as_inline_clamps_do() {
+        use super::*;
+        use crate::compute::Param;
+        const PRODUCE: &str = r#"
+StructuredBuffer<uint> src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+cbuffer Count : register(b0) { uint n; };
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    for (uint i = id.x; i < n; i += 64u) {
+        dst.Store(i * 4u, src[i]);
+    }
+}
+"#;
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let (root, pso) = crate::compute::pipeline(
+            PRODUCE,
+            s!("produce"),
+            0,
+            &[Param::Srv { register: 0, space: 0 }, Param::Uav { register: 0 }, Param::Constants { register: 0, count: 1 }],
+        )
+        .unwrap();
+        // (kind, stride, records, words, count)
+        type Case = (u32, u32, u32, Vec<u32>, Option<u32>);
+        let cases: Vec<Case> = vec![
+            (0, 16, 3, vec![12, 2, 0, 0, 1 << 25, 10, 1, 2, 5, 1, 3, 4], None),
+            (1, 20, 4, [100, 3, 7, 8, 9].repeat(4), Some(1)),
+            (2, 12, 2, vec![widest() + 5, 1, 1, 128, 2, 1], None),
+            (10, 12, 2, vec![100, 5, 3, 70_000, 1, 1], None),
+            (2, 12, 0, vec![7, 1, 1], None),
+            (0, 16, 4, vec![1 << 22, 16, 0, 0, 1 << 22, 16, 0, 0, 3, 1, 0, 0, 3, 1, 0, 0], None),
+        ];
+        const STALE: u32 = 0x5a5a_5a5a;
+        // Per case: the title's buffer (stale until produced) and the words
+        // its producer writes; and a record spending half the budget.
+        let inputs: Vec<_> = cases
+            .iter()
+            .map(|(_, _, _, words, count)| {
+                let bytes = (words.len() * 4) as u64;
+                let (title, title_ptr) = host.shared_buffer(bytes).unwrap();
+                let (produced, produced_ptr) = host.shared_buffer(bytes).unwrap();
+                let (counter, counter_ptr) = host.shared_buffer(4).unwrap();
+                // SAFETY: our mapped buffers, written before any list runs.
+                unsafe {
+                    for (i, &w) in words.iter().enumerate() {
+                        produced_ptr.cast::<u32>().add(i).write_volatile(w);
+                    }
+                    counter_ptr.cast::<u32>().write_volatile(count.unwrap_or(0));
+                }
+                (title, title_ptr, produced, counter, words.len() as u32)
+            })
+            .collect();
+        let (half, half_ptr) = host.shared_buffer(16).unwrap();
+        // SAFETY: as above.
+        unsafe { half_ptr.cast::<[u32; 4]>().write_volatile([1 << 22, 16, 0, 0]) };
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let stale = || {
+            for (_, ptr, _, _, n) in &inputs {
+                // SAFETY: our mapped buffers; no list is running.
+                unsafe { (0..*n as usize).for_each(|i| ptr.cast::<u32>().add(i).write_volatile(STALE)) };
+            }
+        };
+        // The producer, then an inline clamp spending half the budget.
+        let produce = |list: &HostList| {
+            let l = &list.list;
+            // SAFETY: an open list; our pipeline and live buffers.
+            unsafe {
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                for (title, _, produced, _, n) in &inputs {
+                    l.SetComputeRootShaderResourceView(0, gpu(produced));
+                    l.SetComputeRootUnorderedAccessView(1, gpu(title));
+                    l.SetComputeRoot32BitConstants(2, 1, (&raw const *n).cast(), 0);
+                    l.Dispatch(1, 1, 1);
+                }
+                l.ResourceBarrier(&[uav_barrier()]);
+            }
+            list.note_unknown_gpu_write();
+            let spent = bound(list, gpu(&half), (0, 16, 1), None).unwrap();
+            list.note_inline_clamp();
+            done(list, &spent);
+        };
+        let count_of = |(_, _, _, _, count): &Case, counter: &ID3D12Resource| {
+            count.map(|_| gpu(counter))
+        };
+        let read = |buffer: &ID3D12Resource, offset: u64, words: usize| -> Vec<u32> {
+            let mut p = std::ptr::null_mut();
+            // SAFETY: a mapped buffer of ours; the lists have run.
+            unsafe {
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let base = p.cast::<u8>().add(offset as usize).cast::<u32>();
+                let out = (0..words).map(|i| base.add(i).read_volatile()).collect();
+                buffer.Unmap(0, None);
+                out
+            }
+        };
+        let walked = |(_, stride, records, _, count): &Case| {
+            count.map_or(*records, |c| c.min(*records)) as usize * (*stride as usize / 4)
+        };
+
+        // Cut: A produces, B clamps in its prelude.
+        stale();
+        let a = host.new_list().unwrap();
+        produce(&a);
+        let (title0, ..) = &inputs[0];
+        assert!(a.wants_clamp_cut(gpu(title0), 48, None), "the producer's list cannot hoist");
+        let b = host.new_list().unwrap();
+        b.follow_clamp_cut(&a);
+        assert_eq!(b.budget(), a.budget(), "one budget across the cut");
+        a.close();
+        let hoisted: Vec<_> = cases
+            .iter()
+            .zip(&inputs)
+            .map(|(case @ (kind, stride, records, ..), (title, _, _, counter, _))| {
+                let len = u64::from(*stride) * u64::from((*records).max(1));
+                assert_eq!(b.clamp_blocker(gpu(title), len, count_of(case, counter)), None);
+                enqueue(&b, gpu(title), (*kind, *stride, *records), count_of(case, counter)).unwrap()
+            })
+            .collect();
+        b.close();
+        host.execute(&[&a, &b]);
+        let after_cut: Vec<Vec<u32>> = cases
+            .iter()
+            .zip(&hoisted)
+            .map(|(case, (buffer, offset))| read(buffer, *offset, walked(case)))
+            .collect();
+
+        // Inline: the producer and every clamp in one list C.
+        stale();
+        let c = host.new_list().unwrap();
+        produce(&c);
+        let copies: Vec<_> = cases
+            .iter()
+            .zip(&inputs)
+            .map(|(case @ (kind, stride, records, ..), (title, _, _, counter, _))| {
+                let out = bound(&c, gpu(title), (*kind, *stride, *records), count_of(case, counter)).unwrap();
+                c.note_inline_clamp();
+                let bytes = u64::from(*stride) * u64::from((*records).max(1));
+                let (copy, _) = host.shared_buffer(bytes).unwrap();
+                // SAFETY: an open list; live buffers.
+                unsafe {
+                    c.list.ResourceBarrier(&[transition(
+                        &out,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    c.list.CopyBufferRegion(&copy, 0, &out, 0, bytes);
+                    c.list.ResourceBarrier(&[transition(
+                        &out,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                    )]);
+                }
+                done(&c, &out);
+                copy
+            })
+            .collect();
+        c.close();
+        host.execute(&[&c]);
+        for (i, (case, copy)) in cases.iter().zip(&copies).enumerate() {
+            let inline = read(copy, 0, walked(case));
+            assert_eq!(after_cut[i], inline, "case {i} kind {}", case.0);
+            assert!(!inline.contains(&STALE), "case {i} read the producer's words");
+        }
+        // A spent half the budget: of the last case's two half-budget
+        // records the first no longer fits, in both.
+        assert_eq!(after_cut[5][0], 0, "the budget is A's, spent before B");
+        assert_eq!(after_cut[5][8], 3);
         assert_eq!(host.log_messages(), None);
     }
 

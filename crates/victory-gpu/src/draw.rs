@@ -1588,6 +1588,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_work(true);
         self.ambient(list);
     }
 
@@ -1836,6 +1837,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.note_work(false);
                     true
                 }
                 Err(_) => false,
@@ -2457,6 +2459,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2553,6 +2556,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2563,6 +2567,33 @@ impl State {
 }
 
 impl State {
+    /// With clamp groups on (`crate::indirect::groups_enabled`): whether the
+    /// indirect execution [`State::execute_indirect`] is about to record
+    /// should go on in a new host list (a clamp cut, `crate::list`), as it
+    /// has a host pipeline to run with and its clamp cannot go into
+    /// `list`'s prelude ([`HostList::wants_clamp_cut`]).
+    pub(crate) fn wants_clamp_cut(
+        &self,
+        list: &HostList,
+        (stride, max): (u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+    ) -> bool {
+        let pipeline = self.pipeline as This;
+        #[cfg(feature = "diagnostics")]
+        if crate::pipeline::is_skipped(pipeline) {
+            return false;
+        }
+        if !crate::indirect::batch_clamps_enabled()
+            || crate::pipeline::held_back(pipeline)
+            || crate::pipeline::host_pipeline(pipeline).is_none()
+        {
+            return false;
+        }
+        let len = u64::from(stride) * u64::from(max.max(1));
+        list.wants_clamp_cut(arguments, len, count)
+    }
+
     /// Indirect execution of a one-argument signature of `kind` (PC
     /// numbering: 0 draw, 1 indexed draw, 2 dispatch, 10 mesh dispatch) with
     /// records `stride` bytes apart at title address `arguments`, and the
@@ -2661,8 +2692,9 @@ impl State {
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
         // Decide hoisting before `prepare`/`bind`, which record *this* call's
         // own GPU writes (those only constrain subsequent indirect calls).
-        let hoist = crate::indirect::batch_clamps_enabled()
-            && list.can_hoist_clamp(arguments, len, count);
+        let blocker = crate::indirect::batch_clamps_enabled()
+            .then(|| list.clamp_blocker(arguments, len, count));
+        let hoist = blocker == Some(None);
         let inline_clamped = if hoist {
             None
         } else {
@@ -2675,6 +2707,7 @@ impl State {
                 return false;
             };
             list.note_inline_clamp();
+            crate::indirect::note_inline(blocker.flatten());
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
             Some(clamped)
@@ -2768,10 +2801,12 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            list.note_work(true);
             self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         true
     }

@@ -261,6 +261,16 @@ static LOST: [std::sync::atomic::AtomicU64; 2] = [
 /// (`crate::shadow::take_gave_up`).
 static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Draws recorded after compute work in the same host list since the last
+/// frame-rate line ([`HostList::note_work`]): the render passes compute
+/// splits.
+static WORK_SWITCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`WORK_SWITCHES`] since the last call.
+pub(crate) fn take_work_switches() -> u64 {
+    WORK_SWITCHES.swap(0, Ordering::Relaxed)
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -1512,6 +1522,14 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// After a clamp cut: the budget of the host list the title list was
+    /// recording into before ([`HostList::follow_clamp_cut`]), used instead
+    /// of `budget` and zeroed by that list alone, so the title list's
+    /// executions are charged in one budget in recorded order across the cut.
+    shared_budget: Mutex<Option<(ID3D12Resource, usize)>>,
+    /// What the last draw or dispatch recorded was ([`HostList::note_work`]):
+    /// 0 nothing yet, 1 a draw, 2 compute.
+    work: std::sync::atomic::AtomicU8,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// inline execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
@@ -1680,6 +1698,19 @@ pub(crate) struct WriteHazard {
     /// Set once an inline clamp has been recorded in this list so subsequent
     /// clamps stay inline and charge the shared budget in recorded order.
     inline_used: bool,
+    /// Inline clamps recorded in this list (`crate::indirect` clamp groups).
+    inlines: u32,
+}
+
+/// Why an indirect execution's clamp cannot go into its list's prelude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Blocker {
+    /// An inline clamp came first: later clamps keep the budget's order.
+    Inline,
+    /// An earlier command may write any title buffer (heap views, memory).
+    Unknown,
+    /// An earlier command wrote the arguments' or the count's bytes.
+    Written,
 }
 
 impl WriteHazard {
@@ -1722,6 +1753,7 @@ impl WriteHazard {
 
     pub(crate) fn note_inline(&mut self) {
         self.inline_used = true;
+        self.inlines = self.inlines.saturating_add(1);
     }
 
     pub(crate) fn overlaps(&self, start: u64, len: u64) -> bool {
@@ -1736,26 +1768,48 @@ impl WriteHazard {
         pos < self.ranges.len() && self.ranges[pos].0 < end
     }
 
+    #[cfg(test)]
     pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
-        if self.inline_used || self.unknown {
-            return false;
+        self.blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps a clamp of `[arguments, arguments + len)` (and the 4-byte
+    /// `count`) out of the prelude, if anything.
+    pub(crate) fn blocker(&self, arguments: u64, len: u64, count: Option<u64>) -> Option<Blocker> {
+        if self.inline_used {
+            return Some(Blocker::Inline);
         }
-        if self.overlaps(arguments, len) {
-            return false;
+        if self.unknown {
+            return Some(Blocker::Unknown);
         }
-        if let Some(at) = count
-            && self.overlaps(at, 4)
-        {
-            return false;
-        }
-        true
+        let written = self.overlaps(arguments, len) || count.is_some_and(|at| self.overlaps(at, 4));
+        written.then_some(Blocker::Written)
     }
 
     pub(crate) fn clear(&mut self) {
         self.ranges.clear();
         self.unknown = false;
         self.inline_used = false;
+        self.inlines = 0;
     }
+}
+
+/// Hoisted clamps a list made by a clamp cut needs before its next cut: one
+/// cut costs about what one inline clamp does (a render pass ended and a
+/// compute pass between), so a group of one gains nothing.
+const GROUP_LEAST: usize = 2;
+
+/// Inline clamps after which a list tries a clamp cut again, whatever its
+/// group held: draws that each write what the next reads cost one cut per
+/// this many clamps at most.
+const GROUP_RETRY: u32 = 32;
+
+/// Whether a list whose next clamp is held out of its prelude by `blocker`
+/// goes on in a new host list (a clamp cut, `crate::indirect` clamp groups):
+/// always the first time; in a list a cut made, once its group has
+/// [`GROUP_LEAST`] clamps or after [`GROUP_RETRY`] inline ones.
+pub(crate) fn clamp_cut_wanted(blocker: Option<Blocker>, cut_made: bool, hoisted: usize, inlines: u32) -> bool {
+    blocker.is_some() && (!cut_made || hoisted >= GROUP_LEAST || inlines >= GROUP_RETRY)
 }
 
 #[derive(Default)]
@@ -1768,6 +1822,8 @@ struct HoistedClamps {
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
+    /// The list was made by a clamp cut ([`HostList::follow_clamp_cut`]).
+    cut_made: bool,
 }
 
 impl HoistedClamps {
@@ -2030,6 +2086,8 @@ impl HostGpu for Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                shared_budget: Mutex::new(None),
+                work: 0.into(),
                 arguments: Mutex::new(None),
                 clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -3251,6 +3309,8 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        *self.shared_budget.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.work.store(0, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -3958,6 +4018,7 @@ impl HostList {
     /// Whether an indirect execution reading `[arguments, arguments + len)`
     /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
     /// inline clamp in this list and may be clamped in `prelude`.
+    #[cfg(test)]
     pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
         self.clamps
             .lock()
@@ -4059,6 +4120,7 @@ impl HostList {
             clamps.pending.clear();
             clamps.budget_gpu = 0;
             clamps.hazard.clear();
+            clamps.cut_made = false;
             let kept = (clamps.touched + 1).min(clamps.chunks.len());
             let spent_chunks = clamps.chunks.split_off(kept);
             let spent_oversized = std::mem::take(&mut clamps.oversized);
@@ -4301,6 +4363,18 @@ impl HostList {
     /// dwords at bytes 64..320 for the 64-lane clamp), zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
+        self.budget_word().map(|(buffer, _)| {
+            // SAFETY: a live buffer.
+            unsafe { buffer.GetGPUVirtualAddress() }
+        })
+    }
+
+    /// The budget's buffer and mapped word (zeroed as [`HostList::budget`]
+    /// says, by the list that made it).
+    fn budget_word(&self) -> Option<(ID3D12Resource, usize)> {
+        if let Some(shared) = &*self.shared_budget.lock().unwrap_or_else(|e| e.into_inner()) {
+            return Some(shared.clone());
+        }
         let (buffer, data) = self
             .budget
             .get_or_init(|| {
@@ -4317,8 +4391,54 @@ impl HostList {
                 (at as *mut u32).write_volatile(0)
             })));
         }
-        // SAFETY: a live buffer.
-        Some(unsafe { buffer.GetGPUVirtualAddress() })
+        Some((buffer.clone(), *data))
+    }
+
+    /// The title list goes on in this host list after a clamp cut from
+    /// `before` (`crate::list`): its indirect executions are charged to the
+    /// budget of `before` (which zeroes it at its submissions; the two run
+    /// in order in one submission, as segments with no wait between them
+    /// do), and its next clamp cut waits for a group ([`clamp_cut_wanted`]).
+    pub(crate) fn follow_clamp_cut(&self, before: &HostList) {
+        let budget = before.budget_word();
+        if let Some((buffer, _)) = &budget {
+            // The word lives as long as either list may run.
+            self.keep(buffer);
+        }
+        *self.shared_budget.lock().unwrap_or_else(|e| e.into_inner()) = budget;
+        self.clamps.lock().unwrap_or_else(|e| e.into_inner()).cut_made = true;
+    }
+
+    /// A draw (`compute` false) or compute work was recorded: a draw after
+    /// compute in one host list is counted ([`take_work_switches`]), as the
+    /// host ends a render pass for the compute and starts another after it
+    /// (D3DMetal does, one Metal encoder each).
+    pub(crate) fn note_work(&self, compute: bool) {
+        let now = if compute { 2 } else { 1 };
+        if self.work.swap(now, Ordering::Relaxed) == 2 && !compute {
+            WORK_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// With clamp groups on: the indirect execution about to be recorded
+    /// reads `[arguments, arguments + len)` (and the 4-byte `count`), which
+    /// keeps its clamp out of this list's prelude, and the title list should
+    /// go on in a new host list whose prelude clamps it ([`clamp_cut_wanted`]).
+    pub(crate) fn wants_clamp_cut(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
+        let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        let blocker = clamps.hazard.blocker(arguments, len, count);
+        clamp_cut_wanted(blocker, clamps.cut_made, clamps.pending.len(), clamps.hazard.inlines)
+    }
+
+    /// What keeps the clamp of an indirect execution reading `[arguments,
+    /// arguments + len)` (and the 4-byte `count`) out of this list's
+    /// prelude, if anything.
+    pub(crate) fn clamp_blocker(&self, arguments: u64, len: u64, count: Option<u64>) -> Option<Blocker> {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .blocker(arguments, len, count)
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
@@ -5571,6 +5691,9 @@ impl Meter {
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
             let [hoisted, inline] =
                 crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
+            let [cuts, after_inline, after_unknown, over_written] =
+                crate::indirect::take_groups().map(|n| n as f64 / report_frames);
+            let switches = take_work_switches() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5578,7 +5701,9 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count; clamps \
-                 {hoisted:.0} hoisted, {inline:.0} inline)",
+                 {hoisted:.0} hoisted, {inline:.0} inline: {after_inline:.0} after an inline \
+                 one, {after_unknown:.0} after a write anywhere, {over_written:.0} over written \
+                 bytes; {cuts:.0} clamp cuts); {switches:.0} draws after compute/frame",
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);

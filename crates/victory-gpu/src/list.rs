@@ -226,6 +226,39 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// A clamp cut (`crate::indirect::groups_enabled`): when `wanted` says the
+/// indirect execution about to be recorded cannot have its arguments
+/// clamped in the current host list's prelude (an earlier command of it
+/// wrote them, may have, or clamped inline), the title list goes on in its
+/// next host list, as at a wait but with nothing to wait for. That list's
+/// prelude runs after this one, so after whatever wrote the arguments, and
+/// clamps this execution and the ones after it that read nothing written
+/// since, in one compute pass ahead of their draws, instead of one compute
+/// dispatch between each two draws. It shares this list's budget
+/// ([`crate::host::HostList::follow_clamp_cut`]): the executions are
+/// charged in the order they were recorded, as inline. The new host list.
+#[cfg(windows)]
+fn cut_for_clamps<'a>(
+    this: This,
+    wanted: impl FnOnce(&crate::host::HostList, &crate::draw::State) -> bool,
+) -> Option<&'a crate::host::HostList> {
+    let current = host_list(this)?;
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    if !wanted(current, &state) || current.is_empty() {
+        return None;
+    }
+    // Nothing locks the hosts and then the state.
+    let next = next_segment(this)?;
+    state.flush_hdr_probe(current);
+    next.follow_clamp_cut(current);
+    current.close();
+    state.cut(next);
+    crate::indirect::note_cut();
+    Some(next)
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1845,6 +1878,9 @@ extern "system" fn execute_indirect(
         } else {
             *kind
         };
+        if crate::indirect::groups_enabled() {
+            cut_for_clamps(this, |list, s| s.wants_clamp_cut(list, (stride, max), address, counter));
+        }
         with_state(this, |list, s| {
             ran = s.execute_indirect(list, (kind, stride, max), address, counter);
         });
@@ -2452,6 +2488,140 @@ mod tests {
 
         assert_eq!(release(queue), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// A clamp cut in one title list: a dispatch writes four indirect
+    /// dispatch records over stale ones, so the first execution after it
+    /// cannot be clamped in its host list's prelude. The title list goes on
+    /// in a second host list sharing the first's budget, where the four
+    /// clamps go into the prelude (no second cut), and the queue runs both
+    /// in order: each execution runs the groups the producer wrote.
+    #[cfg(windows)]
+    #[test]
+    fn a_clamp_cut_runs_a_producers_records_in_the_next_host_list() {
+        use crate::compute::Param;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+        const MARK: &str = r#"
+RWByteAddressBuffer marks : register(u0);
+cbuffer Offset : register(b0) { uint base; };
+[numthreads(1, 1, 1)]
+void main(uint3 g : SV_GroupID) {
+    marks.Store((base + g.x) * 4, 1);
+}
+"#;
+        const PRODUCE: &str = r#"
+RWByteAddressBuffer records : register(u0);
+[numthreads(4, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    records.Store3(id.x * 12u, uint3(3u + id.x, 1u, 1u));
+}
+"#;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (mark_root, mark_pso) = crate::compute::pipeline(
+            MARK,
+            s!("cut_marks"),
+            0,
+            &[Param::Uav { register: 0 }, Param::Constants { register: 0, count: 1 }],
+        )
+        .unwrap();
+        let (produce_root, produce_pso) =
+            crate::compute::pipeline(PRODUCE, s!("cut_produce"), 0, &[Param::Uav { register: 0 }]).unwrap();
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        };
+        let desc = D3D12_COMMAND_SIGNATURE_DESC {
+            ByteStride: 12,
+            NumArgumentDescs: 1,
+            pArgumentDescs: &argument,
+            NodeMask: 0,
+        };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        // SAFETY: plain command signature creation.
+        unsafe {
+            host.device
+                .CreateCommandSignature(&desc, None::<&ID3D12RootSignature>, &mut signature)
+                .unwrap()
+        };
+        let signature = signature.unwrap();
+        let (marks, marks_ptr) = host.shared_buffer(64 * 4).unwrap();
+        // The title's buffer of records and its host copy, stale: one group.
+        let backing = vec![0u8; 4096];
+        let at = backing.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, 4096);
+        let records = crate::shadow::find(at, 48).expect("registered shadow");
+        // SAFETY: our mapped buffers, written before the lists run.
+        unsafe {
+            std::ptr::write_bytes(marks_ptr, 0, 64 * 4);
+            let mut p = std::ptr::null_mut();
+            records.buffer.Map(0, None, Some(&mut p)).unwrap();
+            let stale = p.cast::<u8>().add(records.offset(at) as usize).cast::<[u32; 3]>();
+            (0..4).for_each(|i| stale.add(i).write_volatile([1, 1, 1]));
+            records.buffer.Unmap(0, None);
+        }
+
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        assert_eq!(create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list), S_OK);
+        let queue = crate::queue::create_direct_for_test();
+
+        let first = host_list(list).expect("host list");
+        records.gpu_writes(first, at, 48, false);
+        // SAFETY: an open list; our pipeline and live buffers.
+        unsafe {
+            first.list.SetComputeRootSignature(&produce_root);
+            first.list.SetPipelineState(&produce_pso);
+            first.list.SetComputeRootUnorderedAccessView(0, records.gpu(at));
+            first.list.Dispatch(1, 1, 1);
+            first.list.ResourceBarrier(&[crate::host::uav_barrier()]);
+        }
+        assert_eq!(first.clamp_blocker(at, 12, None), Some(crate::host::Blocker::Written));
+        let next = cut_for_clamps(list, |l, _| l.wants_clamp_cut(at, 12, None)).expect("a clamp cut");
+        assert_eq!(segments(list).len(), 2);
+        assert!(std::ptr::eq(next, host_list(list).unwrap()), "recording goes on in the cut's list");
+        assert_eq!(next.budget(), first.budget(), "one budget across the cut");
+        for i in 0..4u64 {
+            let record = at + 12 * i;
+            assert!(
+                cut_for_clamps(list, |l, _| l.wants_clamp_cut(record, 12, None)).is_none(),
+                "the cut's list hoists record {i}"
+            );
+            let next = host_list(list).unwrap();
+            let (clamped, offset) =
+                crate::indirect::enqueue(next, records.gpu(record), (2, 12, 1), None).unwrap();
+            let base = 8 * i as u32;
+            // SAFETY: an open list; our pipeline, signature and live buffers.
+            unsafe {
+                let l = &next.list;
+                l.SetComputeRootSignature(&mark_root);
+                l.SetPipelineState(&mark_pso);
+                l.SetComputeRootUnorderedAccessView(0, marks.GetGPUVirtualAddress());
+                l.SetComputeRoot32BitConstants(1, 1, (&raw const base).cast(), 0);
+                l.ExecuteIndirect(&signature, 1, &clamped, offset, None, 0);
+            }
+        }
+        assert_eq!(segments(list).len(), 2, "one cut for the group");
+        assert_eq!(close(list), S_OK);
+        crate::queue::submit_one(queue, list);
+        for i in 0..4usize {
+            for k in 0..8usize {
+                // SAFETY: mapped; the submission ran synchronously.
+                let marked = unsafe { marks_ptr.cast::<u32>().add(8 * i + k).read_volatile() };
+                assert_eq!(marked, u32::from(k < 3 + i), "record {i} group {k}");
+            }
+        }
+        assert_eq!(release(list), 0);
+        assert_eq!(release(queue), 0);
+        assert_eq!(release(allocator), 0);
+        crate::shadow::unregister(at as usize, at);
+        drop(backing);
+        assert_eq!(host.log_messages(), None);
     }
 
     /// A stand-in host list for `restart_hosts` (tests).

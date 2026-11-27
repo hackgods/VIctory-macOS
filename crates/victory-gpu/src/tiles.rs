@@ -1077,20 +1077,7 @@ mod tests {
         /// A list copying page `page` of the buffer out, recorded now; and
         /// what it copies to.
         fn record(&self, page: usize) -> (crate::host::HostList, ID3D12Resource, *mut u8) {
-            use crate::backend::{HostGpu, HostMemory};
-            let host = crate::host::host().unwrap();
-            let shadow = self.shadow();
-            let (out, data) = host.shared_buffer(TILE as u64).expect("an output buffer");
-            let list = host.new_list().expect("a list");
-            let at = self.start + (page * TILE) as u64;
-            shadow.refresh(&list, at, TILE as u64);
-            // SAFETY: both buffers live through the waited submission.
-            unsafe {
-                list.list
-                    .CopyBufferRegion(&out, 0, &shadow.buffer, shadow.offset(at), TILE as u64)
-            };
-            list.close();
-            (list, out, data)
+            record_copy(&self.shadow(), self.start + (page * TILE) as u64)
         }
 
         fn run(list: &crate::host::HostList, data: *mut u8) -> Vec<u8> {
@@ -1099,6 +1086,32 @@ mod tests {
             // SAFETY: the output buffer's CPU mapping, after the wait.
             unsafe { std::slice::from_raw_parts(data, TILE).to_vec() }
         }
+    }
+
+    /// A list copying the page at `at` out of `shadow`, recorded now; and
+    /// what it copies to.
+    fn record_copy(
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        at: u64,
+    ) -> (crate::host::HostList, ID3D12Resource, *mut u8) {
+        use crate::backend::{HostGpu, HostMemory};
+        let host = crate::host::host().unwrap();
+        let (out, data) = host.shared_buffer(TILE as u64).expect("an output buffer");
+        let list = host.new_list().expect("a list");
+        shadow.refresh(&list, at, TILE as u64);
+        // SAFETY: both buffers live through the waited submission.
+        unsafe {
+            list.list
+                .CopyBufferRegion(&out, 0, &shadow.buffer, shadow.offset(at), TILE as u64)
+        };
+        list.close();
+        (list, out, data)
+    }
+
+    /// What a GPU copy reads of the page at `at` through `shadow` now.
+    fn read_page(shadow: &std::sync::Arc<crate::shadow::Shadow>, at: u64) -> Vec<u8> {
+        let (list, _out, data) = record_copy(shadow, at);
+        Title::run(&list, data)
     }
 
     impl Drop for Title {
@@ -1220,6 +1233,154 @@ mod tests {
             let (list, _out, data) = title.record(page);
             assert_eq!(Title::run(&list, data), vec![byte; TILE], "page {page}");
         }
+    }
+
+    /// Title memory outside any buffer (a loose window, `crate::shadow`)
+    /// in place through tiles with `VICTORY_INPLACE_LOOSE`: a whole 4 MiB
+    /// window over pages of two heaps out of order (on the heaps' own
+    /// buffers, 64 KiB pages one by one). It stays in place when the title
+    /// maps other heap pages there; when a page of it is no heap's it is
+    /// let go, but nothing is refused: once the page is a heap's again, the
+    /// whole window is in place again.
+    #[test]
+    fn loose_windows_are_in_place_through_tiles() {
+        use std::sync::Arc;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const WINDOW: usize = 4 << 20;
+        const PAGES: usize = WINDOW / TILE;
+        let Some(device) = on_d3dmetal() else {
+            return;
+        };
+        // Two heaps of 33 tiles: 32 each for the window, one more each to
+        // remap to.
+        let heaps = [0u8, 1].map(|h| {
+            let heap = PhysicalHeap::new(&device, 33 * TILE).expect("a heap");
+            for t in 0..33 {
+                // SAFETY: inside the heap's CPU mapping; no GPU use yet.
+                unsafe {
+                    (heap.cpu_address() as *mut u8)
+                        .add(t * TILE)
+                        .write_bytes(0x80 + 0x20 * h + t as u8, TILE)
+                };
+            }
+            Arc::new(heap)
+        });
+        let byte = |heap: usize, tile: u32| 0x80 + 0x20 * heap as u8 + tile as u8;
+        // Window page `k`: even pages from heap 0, odd ones from heap 1,
+        // each in an order of its own.
+        let shows = |k: usize| -> (usize, u32) {
+            if k.is_multiple_of(2) {
+                (0, (k / 2 * 5 % 32) as u32)
+            } else {
+                (1, (k / 2 * 3 % 32) as u32)
+            }
+        };
+        // SAFETY: a fresh allocation of ours; a 4 MiB window lies inside.
+        let memory = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * WINDOW,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        }
+        .cast::<u8>();
+        assert!(!memory.is_null());
+        let start = (memory as u64).next_multiple_of(WINDOW as u64);
+        let page = |k: usize| start + (k * TILE) as u64;
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        crate::alias::TEST_IN_PLACE_LOOSE.with(|c| c.set(Some(true)));
+        super::TEST_TILES.with(|c| c.set(Some(true)));
+        super::TEST_RESOLVER.with(|c| c.set(Some(test_tile_at)));
+        {
+            let mut table = SHOWS.lock().unwrap();
+            for k in 0..PAGES {
+                let (heap, tile) = shows(k);
+                table.insert(page(k), (heaps[heap].clone(), tile, false));
+            }
+        }
+        super::title_reservation(start, WINDOW as u64);
+
+        let at = page(5) + 100;
+        let window = crate::shadow::find(at, 64).expect("loose memory in place");
+        assert!(
+            window.is_aliased() && super::is_region_buffer(&window.buffer),
+            "in place through tiles"
+        );
+        assert_eq!(window.range(), (start, WINDOW as u64), "the whole window");
+        for k in [0, 5, 6, PAGES - 1] {
+            let (heap, tile) = shows(k);
+            assert_eq!(
+                read_page(&window, page(k)),
+                vec![byte(heap, tile); TILE],
+                "page {k}"
+            );
+        }
+
+        // Other heap pages there: still in place, the new page read.
+        let stale = crate::alias::stale_lists();
+        SHOWS
+            .lock()
+            .unwrap()
+            .insert(page(5), (heaps[1].clone(), 32, false));
+        crate::watch::title_memory_remapped(page(5) as usize, TILE);
+        let again = crate::shadow::find(at, 64).expect("loose memory in place");
+        assert!(Arc::ptr_eq(&again, &window), "still in place");
+        assert_eq!(read_page(&window, page(5)), vec![byte(1, 32); TILE]);
+        assert_eq!(
+            crate::alias::stale_lists(),
+            stale,
+            "no list reads old pages"
+        );
+
+        // A page no heap's: the window is let go; the pages a range touches
+        // elsewhere are in place through tiles.
+        SHOWS.lock().unwrap().remove(&page(9));
+        crate::watch::title_memory_remapped(page(9) as usize, TILE);
+        let touched = crate::shadow::find(at, 64).expect("loose memory in place");
+        assert!(!Arc::ptr_eq(&touched, &window), "let go");
+        assert!(
+            touched.is_aliased() && super::is_region_buffer(&touched.buffer),
+            "the page touched, through tiles"
+        );
+        assert_eq!(touched.range(), (page(5), TILE as u64));
+
+        // A heap's page again, shown at a second address too: the whole
+        // window is in place through tiles again (nothing through tiles is
+        // refused, and aliased tiles are coherent).
+        SHOWS
+            .lock()
+            .unwrap()
+            .insert(page(9), (heaps[0].clone(), 32, true));
+        crate::watch::title_memory_remapped(page(9) as usize, TILE);
+        let whole = crate::shadow::find(page(9) + 8, 64).expect("loose memory in place");
+        assert!(
+            whole.is_aliased() && super::is_region_buffer(&whole.buffer),
+            "through tiles"
+        );
+        assert_eq!(
+            whole.range(),
+            (start, WINDOW as u64),
+            "the whole window again"
+        );
+        assert_eq!(read_page(&whole, page(9)), vec![byte(0, 32); TILE]);
+
+        drop((window, again, touched, whole));
+        SHOWS
+            .lock()
+            .unwrap()
+            .retain(|&a, _| a < start || a >= start + WINDOW as u64);
+        crate::watch::title_memory_remapped(start as usize, WINDOW);
+        crate::shadow::forget_loose_windows(start, start + WINDOW as u64);
+        crate::alias::clear_remapped(start, start + WINDOW as u64);
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+        crate::alias::TEST_IN_PLACE_LOOSE.with(|c| c.set(None));
+        super::TEST_TILES.with(|c| c.set(None));
+        super::TEST_RESOLVER.with(|c| c.set(None));
+        // SAFETY: our allocation, no longer used.
+        unsafe { VirtualFree(memory.cast(), 0, MEM_RELEASE) };
     }
 
     /// Reserved buffers as large as the title's biggest XMem section, with a

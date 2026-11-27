@@ -2281,21 +2281,19 @@ pub(crate) fn forget_in_place(from: u64, to: u64, which: InPlace) -> Vec<Arc<Sha
     let mut map = buffers();
     let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
     let mut gone = Vec::new();
+    // Through tiles (`crate::tiles`) memory follows the title's pages.
+    let chosen = |s: &Shadow| {
+        s.aliased && {
+            let tiled = crate::tiles::is_region_buffer(&s.buffer);
+            match which {
+                InPlace::All => true,
+                InPlace::Direct => !tiled,
+                InPlace::Tiled => tiled,
+            }
+        }
+    };
     for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
-        if entry.end > from
-            && entry.shadow.as_ref().is_some_and(|s| {
-                s.aliased && {
-                    // Through tiles (`crate::tiles`) a buffer follows the
-                    // title's pages.
-                    let tiled = crate::tiles::is_region_buffer(&s.buffer);
-                    match which {
-                        InPlace::All => true,
-                        InPlace::Direct => !tiled,
-                        InPlace::Tiled => tiled,
-                    }
-                }
-            })
-        {
+        if entry.end > from && entry.shadow.as_deref().is_some_and(chosen) {
             gone.extend(entry.shadow.take());
         }
     }
@@ -2306,7 +2304,7 @@ pub(crate) fn forget_in_place(from: u64, to: u64, which: InPlace) -> Vec<Arc<Sha
         let lowest = from.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
         let keys: Vec<(u64, u64)> = loose
             .range((lowest, 0)..(to, 0))
-            .filter(|&(&(s, l), c)| c.aliased && s.saturating_add(l) > from)
+            .filter(|&(&(s, l), c)| s.saturating_add(l) > from && chosen(c))
             .map(|(&key, _)| key)
             .collect();
         for key in keys {

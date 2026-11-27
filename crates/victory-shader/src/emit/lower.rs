@@ -436,6 +436,12 @@ struct Lower<'a> {
     /// The results of first-lane reads each host half makes by itself
     /// ([`first_lane::read_alone`]).
     first_alone: HashSet<Value>,
+    /// In halves: the scalar load results the halves agree on where they
+    /// are loaded ([`halves::agreed_loads`]).
+    agreed: HashSet<Value>,
+    /// With loads agreed on: the VGPR values the same in every lane without
+    /// them ([`halves::lane_uniform`]).
+    alike_alone: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -874,6 +880,25 @@ impl<'a> Lower<'a> {
         let one_host_wave = s.threads.is_some_and(|t| t.iter().product::<u32>() <= 32);
         let meet = (halves && !one_host_wave && x.halves_rendezvous)
             .then(|| meet::meet_regions(p, x.st, &step));
+        let step = if !halves {
+            Vec::new()
+        } else if pred.step.is_empty() {
+            step
+        } else {
+            pred.step.clone()
+        };
+        let (alike, agreed, alike_alone) = if halves {
+            let base = alike_cache.unwrap_or_else(|| halves::lane_uniform(x));
+            match (!one_host_wave)
+                .then(|| halves::agreed_loads(x, &base, &first_alone, &step, &pred))
+                .flatten()
+            {
+                Some((agreed, alike)) => (alike, agreed, base),
+                None => (base, HashSet::new(), HashSet::new()),
+            }
+        } else {
+            (HashSet::new(), HashSet::new(), HashSet::new())
+        };
         let mut l = Lower {
             s,
             x,
@@ -926,13 +951,7 @@ impl<'a> Lower<'a> {
             console_lanes,
             halves,
             halves_refused,
-            step: if !halves {
-                Vec::new()
-            } else if pred.step.is_empty() {
-                step
-            } else {
-                pred.step.clone()
-            },
+            step,
             pred,
             block_active: vec![None; p.blocks.len()],
             pred_edge_active: Map::default(),
@@ -951,12 +970,10 @@ impl<'a> Lower<'a> {
             meet_words: None,
             meet_epoch: Map::default(),
             level: 0,
-            alike: if halves {
-                alike_cache.unwrap_or_else(|| halves::lane_uniform(x))
-            } else {
-                HashSet::new()
-            },
+            alike,
             first_alone,
+            agreed,
+            alike_alone,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             depth_before_shader: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -4183,7 +4200,9 @@ impl<'a> Lower<'a> {
                 }
             }
             Fields::Sopp { .. } => Ok(()),
-            Fields::Smem { .. } => self.smem(inst, (b, i)),
+            Fields::Smem { .. } => {
+                self.smem(inst, (b, i)).and_then(|()| self.agree_halves(inst))
+            }
             Fields::Valu(_) if name.starts_with("v_interp_") => self.interp(inst, (b, i)),
             Fields::Valu(_) => self.valu(inst, b, i),
             Fields::Vintrp { .. } => self.interp(inst, (b, i)),
@@ -7626,7 +7645,7 @@ impl<'a> Lower<'a> {
                 // one host wave.
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
                 let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike_here(x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
                 let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));

@@ -4351,3 +4351,175 @@ fn halves_proofs_reads_match_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// Two first-lane reads of values made from one scalar load: `s14`, the
+/// first dword of the SRV buffer at table dword 8, as `v4 = f32(s14) + 1.0`
+/// (read into `s12`) and `v5 = v4 + 1.0` (read into `s13`). A scalar branch
+/// compares the two (so they are not reads each half makes by itself), and
+/// every lane stores both where they differ. `guarded`: the reads are in an
+/// `s_and_saveexec_b64` region of lanes 40 and 41 instead, and stored after
+/// EXEC is restored. The program stores, so a load's result is not known to
+/// be the same in both halves of a console wave.
+fn two_reads_of_a_scalar_load(guarded: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0xF420_0396,
+        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+    ]);
+    let reads = [
+        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
+        0x0608_08F2, // v_add_f32 v4, 1.0, v4
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x060A_08F2, // v_add_f32 v5, 1.0, v4
+        0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+    ];
+    let stores = [
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0x7E0C_020D, // v_mov_b32 v6, s13
+    ];
+    if guarded {
+        w.extend(MASK_LANES_40_41);
+        w.extend([
+            0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+            0xBF88_0005, // s_cbranch_execz (past the region)
+        ]);
+        w.extend(reads);
+        w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    } else {
+        w.extend(reads);
+        w.extend([
+            0xBF06_0D0C, // s_cmp_eq_u32 s12, s13
+            0xBF85_0002, // s_cbranch_scc1 (past the two moves)
+        ]);
+    }
+    w.extend(stores);
+    w.extend(store(2, 0));
+    w.extend(store(6, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_scalar_load_programs_are_what_their_comments_say() {
+    for guarded in [false, true] {
+        let words = two_reads_of_a_scalar_load(guarded);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let own: &[&str] = if guarded {
+            &["s_and_saveexec_b64 s[0:1], vcc", "s_cbranch_execz", "s_mov_b64 exec, s[0:1]"]
+        } else {
+            &["s_cmp_eq_u32 s12, s13", "s_cbranch_scc1"]
+        };
+        for want in [
+            "s_load_dwordx4 s[44:47], s[4:5], 0x000020",
+            "s_buffer_load_dword s14, s[44:47]",
+            "v_mov_b32 v6, 0",
+            "v_cvt_f32_u32 v4, s14",
+            "v_add_f32 v4, 1.0, v4",
+            "v_readfirstlane_b32 s12, v4",
+            "v_add_f32 v5, 1.0, v4",
+            "v_readfirstlane_b32 s13, v5",
+            "v_mov_b32 v2, s12",
+            "v_mov_b32 v6, s13",
+        ]
+        .iter()
+        .chain(own)
+        {
+            assert!(all.contains(want), "guarded={guarded}: {want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// The halves agree on the scalar load's result once, where it is loaded
+/// (one exchange: two group barriers), and then read the first lane of what
+/// is made from it each by itself. Without, each of the two reads passes
+/// the console's first lane between the halves: an exchange more.
+///
+/// Not where the reads are in a block predication runs in every lane: the
+/// lanes outside the region hold no such value, so a half with no lane in
+/// it would read an old one. There the reads stay passed between the
+/// halves, and the load is not agreed on.
+#[test]
+fn the_halves_agree_on_a_scalar_load_two_first_lane_reads_take() {
+    for guarded in [false, true] {
+        let words = two_reads_of_a_scalar_load(guarded);
+        for threads in [64, 128, 256] {
+            let barriers = |agree: bool| {
+                crate::emit::with_halves_agree(agree, || {
+                    let l = lowered(&native(&words, true, threads, 0), true).unwrap_or_else(|e| {
+                        panic!("guarded={guarded} agree={agree} {threads} threads: {e}")
+                    });
+                    assert_eq!(l.wave_size, Some(32));
+                    l.barriers
+                })
+            };
+            let (with, without) = (barriers(true), barriers(false));
+            if guarded {
+                assert_eq!(with, without, "{threads} threads: as without");
+            } else {
+                assert_eq!(with + 2, without, "{threads} threads: an exchange fewer");
+            }
+        }
+    }
+}
+
+/// One first-lane read is not worth agreeing on the load for: an exchange
+/// either way. The program translates as without.
+#[test]
+fn one_first_lane_read_does_not_make_the_halves_agree_on_its_load() {
+    let words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_40_41, false, false);
+    let barriers = |agree: bool| {
+        crate::emit::with_halves_agree(agree, || {
+            lowered(&native(&words, true, 128, 0), true)
+                .unwrap_or_else(|e| panic!("agree={agree}: {e}"))
+                .barriers
+        })
+    };
+    assert_eq!(barriers(true), barriers(false));
+}
+
+/// Agreed on or not, the reads give the console's lanes on every GPU.
+#[cfg(windows)]
+#[test]
+fn first_lane_reads_of_a_scalar_load_match_the_console_on_every_gpu_agreed_on_or_not() {
+    let mut failed = Vec::new();
+    for agree in [true, false] {
+        // The guarded form: a group of 64, whose one console wave has lanes
+        // 40 and 41.
+        for (guarded, threads) in [(false, 64), (false, 128), (true, 64)] {
+            let words = two_reads_of_a_scalar_load(guarded);
+            let want: Vec<u32> = (0..threads)
+                .flat_map(|_| [42.0f32.to_bits(), 43.0f32.to_bits()])
+                .collect();
+            let found = crate::emit::with_halves_agree(agree, || {
+                differences_with_buffer(
+                    true,
+                    &words,
+                    threads,
+                    2,
+                    &want,
+                    0,
+                    false,
+                    false,
+                    &[41, 0, 0, 0],
+                )
+            });
+            failed.extend(found.into_iter().map(|m| {
+                format!("agree={agree} guarded={guarded} {threads} threads: {m}")
+            }));
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

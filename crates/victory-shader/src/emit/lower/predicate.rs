@@ -139,6 +139,47 @@ impl PredicatePlan {
         self.exits.is_empty()
     }
 
+    /// Whether IR block `b` may run under a predicate of this plan, lanes in
+    /// it that the console's control flow would not have brought there: as
+    /// [`Lower::enter_predicated_block`] finds each block's active lanes,
+    /// from its immediate dominator up (a join takes its branch block's).
+    /// Errs towards yes.
+    pub(super) fn predicated(&self, mut b: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        for _ in 0..=self.idom.len() {
+            if self.lockstep_headers.contains_key(&b)
+                || self.skip_bodies.contains_key(&b)
+                || self.in_diamond.contains(&b)
+                || self.early_conts.contains_key(&b)
+            {
+                return true;
+            }
+            let up = if let Some(&d) = self.skip_joins.get(&b).or(self.diamond_joins.get(&b)) {
+                d
+            } else if let Some(&h) = self.lockstep_exits.get(&b) {
+                // The loop's outer lanes: its header's immediate dominator's.
+                match self.idom.get(h) {
+                    Some(&up) if up != h && up != usize::MAX => up,
+                    _ => return false,
+                }
+            } else if self.skipped_ends.contains(&b) {
+                return false;
+            } else {
+                match self.idom.get(b) {
+                    Some(&up) if up != b && up != usize::MAX => up,
+                    _ => return false,
+                }
+            };
+            if up == b {
+                return false;
+            }
+            b = up;
+        }
+        true
+    }
+
     /// Computes a selective predication plan for a wave64 compute program on a
     /// 32-lane host. Returns an empty plan (zero codegen overhead) when no
     /// non-`in_step` block needs cross-half or split-wave LDS execution.

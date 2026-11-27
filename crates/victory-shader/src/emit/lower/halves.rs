@@ -450,6 +450,40 @@ impl Lower<'_> {
         Some((ra, rb))
     }
 
+    /// The halves agree on the dwords of the scalar load `inst` that
+    /// [`agreed_loads`] chose: each half passes the other what it loaded,
+    /// and both go on with the lower half's.
+    pub(super) fn agree_halves(&mut self, inst: &Inst) -> Result<(), Why> {
+        for &(_, v) in &inst.writes {
+            if !self.agreed.contains(&v) {
+                continue;
+            }
+            let Some(&Val::I32(own)) = self.vals.get(&v) else {
+                return Err(AGREE_ACROSS);
+            };
+            if !self.across_here() {
+                return Err(AGREE_ACROSS);
+            }
+            let zero = self.s.m.i32(0);
+            let (lower, _) = self.exchange_halves(own, zero, self.cur)?;
+            self.vals.insert(v, Val::I32(lower));
+        }
+        Ok(())
+    }
+
+    /// Whether the VGPR value `x` is the same in every lane where the
+    /// instruction being lowered reads its first lane. A value alike only
+    /// through a load the halves agreed on is alike in the lanes that made
+    /// it: in a predicated block the others hold an old one, and a half
+    /// whose lanes are all of those would read that. There the read is
+    /// passed between the halves as before.
+    pub(super) fn alike_here(&self, x: Value) -> bool {
+        self.alike.contains(&x)
+            && (self.agreed.is_empty()
+                || self.alike_alone.contains(&x)
+                || self.pred_active(self.cur_ir).is_none())
+    }
+
     /// `v_readlane_b32` of `x` at console lane `lane` (the low 6 bits), in
     /// halves ([`Lower::across_here`]): each half reads the lane with that
     /// index in it, and the lane's own half gives the value.
@@ -770,6 +804,161 @@ pub(super) fn needs_first_lane(
     srcs.any(|val| !uniform.contains(&val))
 }
 
+/// Why a scalar load the halves were to agree on stops: the lowering gave
+/// it no value to pass, or its block is not one the halves can meet in.
+pub(super) const AGREE_ACROSS: Why =
+    "a scalar load the 32-lane halves cannot agree on (wave64 on a 32-lane host)";
+
+/// The runs of [`lane_uniform`] choosing the loads to agree on may take;
+/// with more, none is agreed on.
+const MAX_AGREE_RUNS: usize = 40;
+
+/// A smallest part of `candidates` that, with `kept`, `keeps` what all of
+/// them keep (`keeps`: whether a set does): by halves, a half dropped where
+/// the other suffices, else each shrunk beside the other.
+fn fewest(
+    kept: &HashSet<Value>,
+    candidates: &[Value],
+    keeps: &mut impl FnMut(&HashSet<Value>) -> Option<HashSet<Value>>,
+) -> HashSet<Value> {
+    let with = |more: &[Value]| -> HashSet<Value> {
+        kept.iter().chain(more).copied().collect()
+    };
+    match candidates {
+        [] => HashSet::new(),
+        [one] => {
+            if keeps(kept).is_some() {
+                HashSet::new()
+            } else {
+                HashSet::from([*one])
+            }
+        }
+        _ => {
+            let (a, b) = candidates.split_at(candidates.len() / 2);
+            if keeps(&with(a)).is_some() {
+                fewest(kept, a, keeps)
+            } else if keeps(&with(b)).is_some() {
+                fewest(kept, b, keeps)
+            } else {
+                let of_a = fewest(&with(b), a, keeps);
+                let beside: Vec<Value> = of_a.iter().copied().collect();
+                let of_b = fewest(&with(&beside), b, keeps);
+                of_a.into_iter().chain(of_b).collect()
+            }
+        }
+    }
+}
+
+/// The scalar buffer load results the two halves of a console wave agree
+/// on, and the VGPR values the same in every lane with those agreed
+/// ([`lane_uniform_with`]). `None`: none, `base` ([`lane_uniform`]) stands.
+///
+/// The console wave loads a scalar once, for all its lanes. Its two halves
+/// each load it, at different times, and where another lane's store can
+/// change the memory between them they can load different values: so a load's
+/// result proves nothing about what the halves hold, and a first-lane read
+/// of what is made from it passes the console's first lane between the
+/// halves, each time. Passing the load's result between them once instead,
+/// where it is loaded, gives both halves the lower half's: one load for the
+/// whole console wave, whatever is stored meanwhile. Its result is then the
+/// same in both halves by construction, whatever its operands are.
+///
+/// Only a `s_buffer_load_dword*` (its dwords are values of their own in the
+/// host's code; a descriptor load's are not) in a block every lane of the
+/// group runs together (`step`), where the halves can meet; never a
+/// waterfall loop's. The fewest dwords that make the same first-lane reads
+/// alike are agreed on, and only where that is fewer exchanges than the
+/// reads take (`alone`: reads each half makes by itself, which take none),
+/// or one of the reads is where the halves cannot meet, and would be
+/// refused. A read in a block predication runs in every lane (`pred`) does
+/// not count: it is passed between the halves all the same.
+pub(super) fn agreed_loads(
+    x: &Parts,
+    base: &HashSet<Value>,
+    alone: &HashSet<Value>,
+    step: &[bool],
+    pred: &predicate::PredicatePlan,
+) -> Option<(HashSet<Value>, HashSet<Value>)> {
+    if !super::super::halves_agree() {
+        return None;
+    }
+    let p = x.p;
+    let wf = &x.res.waterfall;
+    let in_step = |b: usize| step.get(b).copied().unwrap_or(false);
+    let mut candidates: Vec<Value> = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        if !in_step(b) {
+            continue;
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            if matches!(inst.fields, Fields::Smem { .. })
+                && inst.name().starts_with("s_buffer_load_dword")
+                && !wf.loads.contains(&(b, i))
+            {
+                candidates.extend(
+                    inst.writes
+                        .iter()
+                        .filter(|w| matches!(w.0, Reg::S(_)) && !wf.reads.contains(&w.1))
+                        .map(|w| w.1),
+                );
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return None;
+    }
+    // The first-lane reads the halves pass between them (or are refused):
+    // their block and source.
+    let mut reads: Vec<(usize, Value)> = Vec::new();
+    for (b, block) in p.blocks.iter().enumerate() {
+        for inst in &block.insts {
+            if inst.name() != "v_readfirstlane_b32"
+                || inst
+                    .writes
+                    .first()
+                    .is_some_and(|w| wf.reads.contains(&w.1) || alone.contains(&w.1))
+            {
+                continue;
+            }
+            let Fields::Valu(v) = &inst.fields else {
+                continue;
+            };
+            if let Some(&Operand::Vector { reg, .. }) = v.src.first()
+                && let Some(src) = inst.read(Reg::V(reg))
+                && !base.contains(&src)
+            {
+                reads.push((b, src));
+            }
+        }
+    }
+    if reads.is_empty() {
+        return None;
+    }
+    let mut agreed: HashSet<Value> = candidates.iter().copied().collect();
+    let mut alike = lane_uniform_with(x, &agreed);
+    // Not a read in a predicated block: there the lanes that did not make
+    // the value hold an old one, and the read stays passed between the
+    // halves (`Lower::valu`).
+    reads.retain(|r| alike.contains(&r.1) && !pred.predicated(r.0));
+    if reads.is_empty() {
+        return None;
+    }
+    // The fewest dwords that keep those reads alike, found by halving:
+    // what one half of the candidates keeps alike needs none of the other.
+    let mut runs = 0;
+    let mut keeps = |agreed: &HashSet<Value>| {
+        runs += 1;
+        let with = lane_uniform_with(x, agreed);
+        (runs <= MAX_AGREE_RUNS && reads.iter().all(|r| with.contains(&r.1))).then_some(with)
+    };
+    agreed = fewest(&HashSet::new(), &candidates, &mut keeps);
+    alike = keeps(&agreed)?;
+    // An agreed dword is one exchange per run of its load; a read is one
+    // at least, per run of it.
+    let refused = reads.iter().any(|r| !in_step(r.0));
+    (refused || agreed.len() < reads.len()).then_some((agreed, alike))
+}
+
 /// Every branch (by its block) with its region: the blocks reachable from
 /// it that do not post-dominate it, which only the lanes taking one side may
 /// run (the branch's own block among them where a cycle leads back to it).
@@ -1004,6 +1193,13 @@ fn uniform_entry_tids(x: &Parts) -> Vec<Value> {
 /// point from nothing, so a loop-carried value that needs itself to be
 /// alike never is.
 pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
+    lane_uniform_with(x, &HashSet::new())
+}
+
+/// [`lane_uniform`], with the scalar values `agreed` the same in both
+/// halves too: scalar load results the halves pass between them where they
+/// are loaded ([`agreed_loads`]), so that both hold the lower half's.
+pub(super) fn lane_uniform_with(x: &Parts, agreed: &HashSet<Value>) -> HashSet<Value> {
     let (p, st) = (x.p, x.st);
     // The wider proofs (`crate::emit::halves_proofs`): an operand's check
     // reads only its own dwords, and [`FULL_DWORD_VALU`] ops replace their
@@ -1018,6 +1214,7 @@ pub(super) fn lane_uniform(x: &Parts) -> HashSet<Value> {
     // same way: a root parameter's dword on entry (a root constant, a user
     // SGPR), grown by [`SCALAR_ALOP`] over such values in the fixed point.
     let mut same_s: HashSet<Value> = x.res.params.iter().map(|&(v, _, _)| v).collect();
+    same_s.extend(agreed.iter().copied());
     // Whether any instruction writes memory a `global_load_dword*` can read
     // (a global, flat, buffer or image store or atomic, or a scalar store,
     // scalar atomic or scalar buffer store or atomic): then a global load

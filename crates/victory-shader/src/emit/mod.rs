@@ -546,6 +546,44 @@ fn halves_proofs_from(value: Option<&str>) -> bool {
 #[cfg(test)]
 std::thread_local! {
     static HALVES_PROOFS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    static HALVES_AGREE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether the 32-lane halves of a console wave64 agree on a scalar
+/// buffer load's result where that saves them exchanges at first-lane reads
+/// (`lower::halves::agreed_loads`). On by default; `VICTORY_HALVES_AGREE=0`
+/// turns it off, for A/B runs of one binary. Tests run with it on unless
+/// they turn it off ([`with_halves_agree`]).
+pub fn halves_agree() -> bool {
+    #[cfg(test)]
+    {
+        HALVES_AGREE.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| halves_agree_from(std::env::var("VICTORY_HALVES_AGREE").ok().as_deref()))
+    }
+}
+
+/// `VICTORY_HALVES_AGREE`'s value as a switch: only `0` turns it off.
+#[cfg_attr(test, allow(dead_code))]
+fn halves_agree_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
+/// Runs `f` with [`halves_agree`] set to `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_halves_agree<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HALVES_AGREE.with(|c| c.set(self.0));
+        }
+    }
+    let prev = HALVES_AGREE.with(|c| c.replace(on));
+    let _restore = Restore(prev);
+    f()
 }
 
 /// Runs `f` with [`halves_proofs`] set to `on` on this thread.
@@ -1320,6 +1358,15 @@ mod tests {
         assert!(super::halves_proofs_from(Some("1")));
         assert!(super::halves_proofs_from(Some("")));
         assert!(!super::halves_proofs_from(Some("0")));
+    }
+
+    /// So is the halves' agreeing on scalar loads.
+    #[test]
+    fn the_halves_agreeing_is_opt_out() {
+        assert!(super::halves_agree_from(None));
+        assert!(super::halves_agree_from(Some("1")));
+        assert!(super::halves_agree_from(Some("")));
+        assert!(!super::halves_agree_from(Some("0")));
     }
 
     use super::bitcode::Attr;

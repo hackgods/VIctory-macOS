@@ -2420,7 +2420,11 @@ impl Host {
         }
         // Views of title memory in place where the title has since mapped
         // other pages: made again from their records before they are read.
+        // Lists recorded with that memory before then are counted.
         crate::alias::remake_let_go();
+        for run in runs {
+            run.reads_let_go();
+        }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -3939,6 +3943,18 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the list reads or writes title memory in place that the title
+    /// mapped other pages over after it was recorded (`crate::alias`), by
+    /// the copies its submission steps name: those are every one its draws
+    /// and copies refresh or write.
+    fn reads_let_go(&self) -> bool {
+        let deferred = self.deferred();
+        crate::alias::stale_list(deferred.copies.iter().filter_map(|step| match step {
+            Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) => Some(shadow),
+            _ => None,
+        }))
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.

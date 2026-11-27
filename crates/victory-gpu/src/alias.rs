@@ -660,12 +660,15 @@ pub(crate) fn in_place_shadow(
         return None;
     }
     crate::host::name(&heap.backing, || "XMem section in place".to_owned());
-    let shadow = crate::shadow::Shadow::new_aliased(
+    // The heap's buffer holds the whole section: the range starts `offset`
+    // into it, which views and copies of it count from.
+    let shadow = crate::shadow::Shadow::new_aliased_at(
         heap.backing.clone(),
         (heap.cpu_address() + offset) as *mut u8,
         heap.gpu_address() + offset as u64,
         start,
         len,
+        offset as u64,
     );
     {
         let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
@@ -755,6 +758,19 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
     }
     drop(map);
     crate::shadow::forget_in_place(from, to);
+    // shortcut: host view slots made from the buffer keep the section's
+    // pages until the title writes their descriptors again (copies would
+    // be refreshed from the new pages). Rare: counted to see if it is not.
+    static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = LET_GO.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(
+            from = format_args!("{from:#x}"),
+            to = format_args!("{to:#x}"),
+            n,
+            "title memory in place let go: the title mapped other pages there"
+        );
+    }
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
@@ -1340,6 +1356,15 @@ mod tests {
             shadow.gpu(start + 16),
             heap.gpu_address() + PAGE as u64 + 16
         );
+        // Views and copies count from where the range is in the heap's
+        // buffer, which holds the whole section.
+        assert_eq!(shadow.offset(start + 16), PAGE as u64 + 16);
+        let (viewed, exact) = crate::shadow::for_view(start + 16, 64, 4).expect("a view's copy");
+        assert!(!exact && std::sync::Arc::ptr_eq(&viewed, &shadow));
+        // Elements of 12 bytes off the heap's (the range is 64 KiB into it):
+        // a copy of the view's own, not a view at the wrong place.
+        let (_, exact) = crate::shadow::for_view(start + 16, 48, 12).expect("a view's copy");
+        assert!(exact);
         assert!(is_in_place(start + 8, 20));
         assert!(!is_in_place(start - 64, 20));
         assert!(clamp_in_place_inline(start + 8, 20, None));

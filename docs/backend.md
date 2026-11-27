@@ -23,3 +23,28 @@ The step 0 probe for that work, which needs no game files, is in issue #221.
 6. **Choosing the host** with a switch. D3D12 stays the default.
 
 The Metal backend itself starts after step 2. It is first useful for title buffers, which is where the copies are.
+
+## From Windows code to Metal: `victory-metal`
+
+VIctory runs as a Windows program under Wine, so a Metal host needs a way from Windows code into macOS code. `crates/victory-metal` is that way, made as Wine's own builtin DLLs reach their macOS halves, and as D3DMetal's `d3d12.dll` reaches its own: a Wine unixlib.
+
+- `unix/anchor.rs` is an empty DLL that `tools/macos/build-metal-bridge.sh` marks as a Wine builtin, and `unix/victory_metal.m` is a Mach-O library of the same name (x86_64, since the Wine process runs under Rosetta). With their folder in `WINEDLLPATH`, Wine pairs the two when the DLL is loaded, and `NtQueryVirtualMemory` with `MemoryWineUnixFuncs` hands the Windows side the library's call table. `Bridge` makes the calls through `__wine_unix_call_dispatcher`.
+- A call runs on the calling thread, in the same process, so Windows memory has the same address on the macOS side. `newBufferWithBytesNoCopy` over `VirtualAlloc` memory lets the GPU write that memory in place, and the Windows side reads the result where it is.
+- Each call takes one block of arguments that starts with its size (`unix/abi.h`, mirrored in `src/abi.rs`), so a unixlib built from another layout refuses the call.
+- `tools/macos/test-wine.sh` builds the pair and sets `WINEDLLPATH` and `VICTORY_METAL_BRIDGE` for the tests. Nothing else uses the bridge yet.
+
+What the calls cost, on an M5 Pro (macOS 27.2, CrossOver Wine 26.3, release build), from `bridge_against_d3d12` in `crates/victory-metal/tests/bridge.rs` and the same unixlib called without Wine:
+
+| | Through the bridge to Metal | Through D3D12 to D3DMetal |
+| --- | --- | --- |
+| A call into macOS code and back (no-op) | 15–16 ns | |
+| An empty submission, waited for | 22.8 µs | 52.4 µs |
+| 5,000 dispatches writing 20 MB, one submission, wall | 5.5 ms (recording 0.58 ms, GPU 4.24 ms) | 6.0 ms with one root UAV, 7.5 ms with a view table bound per dispatch |
+| Recording one dispatch, the unixlib's code without Wine | 116–129 ns under Rosetta, 127–174 ns native | |
+| One dispatch with a heap of 20,000 buffers or 1,000,000 slots bound | | 0.26–0.77 ms, not growing with either |
+
+What this says for the Metal host:
+
+- Calls are cheap enough to make one per command: a frame's 50,000 or so would take under 1 ms. (D3DMetal's list calls cost about the same to record: 10,000 in 0.15 ms.) A command stream in memory both sides see, with one call per list or submission, still keeps the Windows side free of Metal's objects and lets recording run on the title's threads.
+- Metal's own recording runs as fast under Rosetta as natively, so the unixlib can stay in the Wine process: a helper process of its own would gain nothing there and would need title memory shared across processes.
+- For simple compute work D3DMetal adds little: 0.1–0.5 µs a dispatch and 30 µs a submission. Its cost in a title's frame, if it is in D3DMetal at all, is elsewhere: draws, render passes, barriers or indirect calls, which are next to measure the same way.

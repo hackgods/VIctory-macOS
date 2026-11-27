@@ -24,6 +24,12 @@
 //! `NSEventTypeKeyUp` goes through only for keys it saw go down, and only to
 //! our windows), so a key let go in another app, Cmd among them after
 //! Cmd-Tab, stays down in `GetAsyncKeyState` until it is pressed again.
+//!
+//! `VICTORY_INPUT_WATCH=1`: once a second, while a host pad is off rest or a
+//! key is down, one log line (`input watch`) with what the host reports: each
+//! such pad's sticks, triggers and buttons, how long its value has been
+//! exactly the same and how long XInput's packet number has (a pad whose
+//! reports stopped keeps both still), and the keys down. Changes nothing.
 
 use super::{FALLBACK, PADS, PadState};
 
@@ -140,6 +146,125 @@ impl Refocus {
         self.focused = focused;
         self.ignored.retain(|k| held.contains(k));
         held.retain(|k| !self.ignored.contains(k));
+    }
+}
+
+/// What `VICTORY_INPUT_WATCH` keeps of one host pad.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct Watched {
+    pad: PadState,
+    packet: u32,
+    /// When the value and the packet number last changed (µs).
+    changed: u64,
+    packet_changed: u64,
+}
+
+/// The input watch; see the module notes.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+pub(super) struct Watch {
+    /// `None` until the environment was read.
+    on: Option<bool>,
+    pads: [Option<Watched>; PADS],
+    /// The last line (µs).
+    logged: u64,
+}
+
+#[cfg(any(windows, test))]
+impl Watch {
+    fn on(&mut self) -> bool {
+        *self.on.get_or_insert_with(|| {
+            let on = std::env::var("VICTORY_INPUT_WATCH")
+                .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+            if on {
+                tracing::info!(
+                    "input watch: a line a second while input is off rest (VICTORY_INPUT_WATCH)"
+                );
+            }
+            on
+        })
+    }
+
+    /// Host slot `slot` reported `state` (with XInput's packet number).
+    pub(super) fn pad(&mut self, slot: usize, state: Option<(PadState, u32)>, now: u64) {
+        if !self.on() {
+            return;
+        }
+        let Some(watched) = self.pads.get_mut(slot) else {
+            return;
+        };
+        *watched = state.map(|(pad, packet)| match *watched {
+            Some(w) => Watched {
+                pad,
+                packet,
+                changed: if w.pad == pad { w.changed } else { now },
+                packet_changed: if w.packet == packet {
+                    w.packet_changed
+                } else {
+                    now
+                },
+            },
+            None => Watched {
+                pad,
+                packet,
+                changed: now,
+                packet_changed: now,
+            },
+        });
+    }
+
+    /// The keys down (virtual keys) after the pads of one poll; the line
+    /// logged, if one is due.
+    pub(super) fn keys(&mut self, keys: &[u8], now: u64) -> Option<String> {
+        use std::fmt::Write;
+        if !self.on() || now.saturating_sub(self.logged) < 1_000_000 {
+            return None;
+        }
+        let off_rest = |p: &PadState| {
+            p.buttons != 0
+                || [
+                    p.left_trigger,
+                    p.right_trigger,
+                    p.left_x,
+                    p.left_y,
+                    p.right_x,
+                    p.right_y,
+                ]
+                .iter()
+                .any(|v| v.abs() > 0.1)
+        };
+        let secs = |since: u64| now.saturating_sub(since) as f64 / 1e6;
+        let mut line = String::new();
+        for (slot, w) in self.pads.iter().enumerate() {
+            let Some(w) = w.filter(|w| off_rest(&w.pad)) else {
+                continue;
+            };
+            let p = w.pad;
+            let _ = write!(
+                line,
+                "pad {slot}: left {:+.2} {:+.2} right {:+.2} {:+.2} triggers {:.2} {:.2} buttons {:#x}, same for {:.1} s, packet {} same for {:.1} s; ",
+                p.left_x,
+                p.left_y,
+                p.right_x,
+                p.right_y,
+                p.left_trigger,
+                p.right_trigger,
+                p.buttons,
+                secs(w.changed),
+                w.packet,
+                secs(w.packet_changed),
+            );
+        }
+        if !keys.is_empty() {
+            let _ = write!(line, "keys {keys:02x?}");
+        }
+        if line.is_empty() {
+            return None;
+        }
+        self.logged = now;
+        tracing::info!("input watch: {line}");
+        Some(line)
     }
 }
 
@@ -323,6 +448,30 @@ mod tests {
         let mut held = vec![b'W'];
         off.filter(true, &mut held);
         assert_eq!(held, [b'W']);
+    }
+
+    #[test]
+    fn the_watch_says_how_long_a_pad_has_been_still() {
+        let mut watch = Watch {
+            on: Some(true),
+            ..Watch::default()
+        };
+        let held = pad(0, 0.0).unwrap();
+        watch.pad(0, Some((PadState::default(), 7)), 1_000_000);
+        assert_eq!(watch.keys(&[], 1_000_000), None, "at rest: nothing");
+        for t in [2_000_000, 3_000_000] {
+            watch.pad(0, Some((held, 8)), t);
+        }
+        watch.pad(0, Some((held, 8)), 4_500_000);
+        let line = watch.keys(&[0x57], 4_500_000).unwrap();
+        assert!(line.contains("pad 0: left +0.25 +0.00"), "{line}");
+        assert!(
+            line.contains("same for 2.5 s, packet 8 same for 2.5 s"),
+            "{line}"
+        );
+        assert!(line.ends_with("keys [57]"), "{line}");
+        // At most a line a second.
+        assert_eq!(watch.keys(&[0x57], 5_000_000), None);
     }
 
     #[test]

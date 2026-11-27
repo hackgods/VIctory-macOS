@@ -1231,6 +1231,8 @@ mod host {
         empty_until: [Option<Instant>; PADS],
         /// macOS port: `VICTORY_INPUT_REFOCUS`.
         refocus: super::mac::Refocus,
+        /// macOS port: `VICTORY_INPUT_WATCH`.
+        watch: super::mac::Watch,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1247,16 +1249,21 @@ mod host {
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                self.watch.pad(slot, None, now());
                 return None;
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                self.watch.pad(slot, None, now());
                 return None;
             }
             self.empty_until[slot] = None;
-            Some(convert(&state.Gamepad))
+            let pad = convert(&state.Gamepad);
+            let packet = state.dwPacketNumber;
+            self.watch.pad(slot, Some((pad, packet)), now());
+            Some(pad)
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1276,6 +1283,7 @@ mod host {
             }
             self.refocus.filter(focused, &mut held);
             down.extend(held);
+            self.watch.keys(&down, now());
             down.into_iter().map(key_state).collect()
         }
 

@@ -78,9 +78,10 @@ pub(crate) struct Heap {
 
 /// The view kinds translated shaders take from the title's own records
 /// instead of host slots made for them: `VICTORY_GPU_RECORDS`, a list of
-/// `cb` (constant buffer views named whole in their records, bit 0);
-/// nothing by default. `placed` and `all` are accepted and mean `cb` until
-/// those kinds are read from records too.
+/// `cb` (constant buffer views named whole in their records, bit 0) and
+/// `placed` (buffer views of placed memory that are read raw, bit 1);
+/// nothing by default. `all` means both until views that are table entries
+/// are read from records too.
 pub(crate) fn gpu_records() -> u8 {
     #[cfg(test)]
     if let Some(kinds) = tests::GPU_RECORDS.with(|k| k.get()) {
@@ -93,7 +94,9 @@ pub(crate) fn gpu_records() -> u8 {
             .split(',')
             .map(str::trim)
             .fold(0u8, |kinds, kind| match kind {
-                "cb" | "placed" | "all" | "1" => kinds | 1,
+                "cb" | "1" => kinds | 1,
+                "placed" => kinds | 2,
+                "all" => kinds | 3,
                 _ => kinds,
             });
         if kinds != 0 {
@@ -111,6 +114,30 @@ pub(crate) fn gpu_records() -> u8 {
 #[cfg(test)]
 pub(crate) fn gpu_records_for_test(kinds: Option<u8>) {
     tests::GPU_RECORDS.with(|k| k.set(kinds));
+}
+
+/// The address and shape number of the view of placed memory that record
+/// words name whole; `None` for any other record.
+pub(crate) fn placed_record(i: u32, generation: u32) -> Option<(u64, u32)> {
+    if generation >> KIND_SHIFT != PLACED {
+        return None;
+    }
+    let payload = payload(i, generation);
+    Some((
+        payload & ((1 << PLACED_ADDRESS_BITS) - 1),
+        (payload >> PLACED_ADDRESS_BITS) as u32,
+    ))
+}
+
+/// Calls `each` with every shape of placed views so far, by number
+/// (unordered or not, the resource description, the view's words but its
+/// address). No shape is added meanwhile.
+#[cfg(windows)]
+pub(crate) fn shapes_each(mut each: impl FnMut(u32, bool, &[u32; 14], &[u32; 14])) {
+    let shapes = SHAPES.read().unwrap_or_else(|e| e.into_inner());
+    for (at, (unordered, resource, rest)) in shapes.list.iter().enumerate() {
+        each(at as u32, *unordered, resource, rest);
+    }
 }
 
 /// The address and bytes of the constant buffer view that record words
@@ -150,13 +177,19 @@ impl Heap {
                     && self.desc.flags & SHADER_VISIBLE != 0
                     && self.start.is_multiple_of(4)
                     && self.host().is_some();
-                let words = [self.start as u32, (self.start >> 32) as u32, if on { self.desc.count } else { 0 }, 0];
+                // The shape table is made (and filled) before any record of
+                // a placed view is left without a host view.
+                let shapes = match on && gpu_records() & 2 != 0 && host::shapes_table().is_some() {
+                    true => host::SHAPE_SLOTS,
+                    false => 0,
+                };
+                let words = [self.start as u32, (self.start >> 32) as u32, if on { self.desc.count } else { 0 }, shapes];
                 // SAFETY: the table's mapping, 256 bytes.
                 unsafe { data.cast::<[u32; 4]>().write_volatile(words) };
                 if on {
                     crate::shadow::register(std::ptr::from_ref(self) as usize, self.start, bytes);
                     if let Some(host) = self.host() {
-                        host.records_on();
+                        host.records_on(1 | if shapes != 0 { 2 } else { 0 });
                     }
                     tracing::info!(
                         start = format_args!("{:#x}", self.start),
@@ -1006,6 +1039,10 @@ fn shape_number(shape: Shape) -> Option<u32> {
     let at = shapes.list.len() as u32;
     shapes.list.push(shape);
     shapes.index.insert(shape, at);
+    // The shape table shaders read, if there is one yet (still under the
+    // lock: the table is first filled under it too).
+    #[cfg(windows)]
+    host::shape_added(at, shape.0, &shape.1, &shape.2);
     SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
     Some(at)
 }

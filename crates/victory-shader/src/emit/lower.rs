@@ -302,7 +302,8 @@ type EntryAddress = (usize, u32);
 thread_local! {
     /// The view kinds translated shaders take from the title's own records
     /// ([`super::Options::gpu_records`]), for the lowering running on this
-    /// thread: bit 0, constant buffer views.
+    /// thread: bit 0, constant buffer views; bit 1, raw buffer views of
+    /// placed memory.
     pub(crate) static GPU_RECORDS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
@@ -334,9 +335,10 @@ struct RecordRead {
 /// (`emit`, "Views from the title's records").
 #[derive(Clone, Copy)]
 struct RecordView {
-    /// The record names a constant buffer view whole.
+    /// The record names a view whole that is read from title memory: a
+    /// constant buffer view, or a raw buffer view of placed memory.
     constant: V,
-    /// Its address: the low dword, and bits 32-46.
+    /// Where its bytes start: the low dword, and bits 32-46.
     lo: V,
     hi: V,
     /// Its bytes.
@@ -520,7 +522,7 @@ struct Lower<'a> {
     memory_null: Option<V>,
     /// The bound heap's start (low, high) and slots, from the heap-info
     /// table ([`Lower::heap_info`]).
-    heap_info: Option<(V, V, V)>,
+    heap_info: Option<(V, V, V, V)>,
     /// Records read in the entry block, in a block, and at a join
     /// ([`Lower::record_for`]), as the handles of such descriptors are kept.
     entry_records: Map<(EntryAddress, u8), RecordView>,
@@ -2795,22 +2797,23 @@ impl<'a> Lower<'a> {
     /// The bound view heap's first descriptor in title memory (low dword,
     /// high dword) and its slots: three dwords of the heap-info table, root
     /// SRV `t`[`HEAP_RECORDS`] in [`super::shader::ROOT_CBV_SPACE`], read
-    /// once in the entry block. Zero slots: no record is read.
-    fn heap_info(&mut self) -> (V, V, V) {
+    /// once in the entry block. Zero slots: no record is read. The fourth
+    /// dword counts the shapes in the shape table.
+    fn heap_info(&mut self) -> (V, V, V, V) {
         if let Some(info) = self.heap_info {
             return info;
         }
         let table = self.s.root_srv_handle(super::HEAP_RECORDS);
         let b = self.s.entry;
         let (zero, u) = (self.s.m.i32(0), self.s.m.undef(self.s.t.i32));
-        let (mask, al) = (self.s.m.i8(7), self.s.m.i32(4));
+        let (mask, al) = (self.s.m.i8(15), self.s.m.i32(4));
         let r = self.raw_buffer_load(b, &[table, zero, u, mask, al]);
-        let [lo, hi, count] = [0, 1, 2].map(|j| {
+        let [lo, hi, count, shapes] = [0, 1, 2, 3].map(|j| {
             let x = self.s.m.extract(b, r, j);
             self.s.m.cast(b, Cast::Bitcast, x, self.s.t.i32)
         });
-        self.heap_info = Some((lo, hi, count));
-        (lo, hi, count)
+        self.heap_info = Some((lo, hi, count, shapes));
+        (lo, hi, count, shapes)
     }
 
     /// The page table's entry for title address `(hi:lo)`, without a handle
@@ -2838,7 +2841,7 @@ impl<'a> Lower<'a> {
     /// three dwords through the page table at the heap's address, and what
     /// they name. `legacy` is the index of the host's own view of the slot.
     fn record_view(&mut self, index: V, legacy: V) -> RecordView {
-        let (start_lo, start_hi, count) = self.heap_info();
+        let (start_lo, start_hi, count, shapes) = self.heap_info();
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
         let inside = self.s.m.cmp(c, pred::IULT, index, count);
@@ -2870,6 +2873,12 @@ impl<'a> Lower<'a> {
         let is_constant = self.s.m.cmp(c, pred::EQ, kind, one);
         let constant = self.s.m.bin(c, Bin::And, inside, tagged);
         let constant = self.s.m.bin(c, Bin::And, constant, is_constant);
+        // A view at an address that is not 4-byte aligned keeps its host
+        // view (a copy of its own bytes, which raw loads can address).
+        let (three, none) = (k(self, 3), k(self, 0));
+        let odd = self.s.m.bin(c, Bin::And, low, three);
+        let aligned = self.s.m.cmp(c, pred::EQ, odd, none);
+        let constant = self.s.m.bin(c, Bin::And, constant, aligned);
         let (k15, m15, m14, k8, big) = (k(self, 15), k(self, 0x7FFF), k(self, 0x3FFF), k(self, 8), k(self, 1 << 14));
         let hi = self.s.m.bin(c, Bin::And, high, m15);
         let code = self.s.m.bin(c, Bin::LShr, high, k15);
@@ -2878,11 +2887,50 @@ impl<'a> Lower<'a> {
         let units = self.s.m.bin(c, Bin::Shl, units, k8);
         let in_units = self.s.m.cmp(c, pred::IUGE, code, big);
         let size = self.s.m.select(c, in_units, units, code);
+        if GPU_RECORDS.get() & 2 == 0 {
+            return RecordView {
+                constant,
+                lo: low,
+                hi,
+                size,
+                legacy,
+            };
+        }
+        // Kind 2, a view of placed memory: a 40-bit address below 22 bits
+        // of shape number. The shape table says whether the shape is a
+        // buffer view read raw, where its bytes start from the address,
+        // and how many they are.
+        let (two, zero, m30, m8) = (k(self, 2), k(self, 0), k(self, 0x3FFF_FFFF), k(self, 0xFF));
+        let is_placed = self.s.m.cmp(c, pred::EQ, kind, two);
+        let shape = self.s.m.bin(c, Bin::And, high, m30);
+        let shape = self.s.m.bin(c, Bin::LShr, shape, k8);
+        let known = self.s.m.cmp(c, pred::IULT, shape, shapes);
+        let shape = self.s.m.select(c, known, shape, zero);
+        let k4 = k(self, 4);
+        let at = self.s.m.bin(c, Bin::Shl, shape, k4);
+        let table = self.s.root_srv_handle(super::HEAP_SHAPES);
+        let (u, mask, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(7), k(self, 4));
+        let r = self.raw_buffer_load(c, &[table, at, u, mask, al]);
+        let [raw, first, bytes] = [0, 1, 2].map(|j| {
+            let x = self.s.m.extract(c, r, j);
+            self.as_int(x)
+        });
+        let raw = self.s.m.cmp(c, pred::NE, raw, zero);
+        let placed = self.s.m.bin(c, Bin::And, inside, tagged);
+        let placed = self.s.m.bin(c, Bin::And, placed, is_placed);
+        let placed = self.s.m.bin(c, Bin::And, placed, known);
+        let placed = self.s.m.bin(c, Bin::And, placed, raw);
+        let placed_hi = self.s.m.bin(c, Bin::And, high, m8);
+        let (placed_lo, placed_hi) = self.add64(low, placed_hi, first, false);
+        let c = self.cur;
+        let odd = self.s.m.bin(c, Bin::And, placed_lo, three);
+        let aligned = self.s.m.cmp(c, pred::EQ, odd, zero);
+        let placed = self.s.m.bin(c, Bin::And, placed, aligned);
         RecordView {
-            constant,
-            lo: low,
-            hi,
-            size,
+            constant: self.s.m.bin(c, Bin::Or, constant, placed),
+            lo: self.s.m.select(c, placed, placed_lo, low),
+            hi: self.s.m.select(c, placed, placed_hi, hi),
+            size: self.s.m.select(c, placed, bytes, size),
             legacy,
         }
     }

@@ -23,6 +23,12 @@ pub const VIEW_STRIDES: u8 = 255;
 /// title address (low, high) of the bound view heap's first descriptor and
 /// the heap's slots (0: no record is read).
 pub const HEAP_RECORDS: u8 = 254;
+/// The root SRV slot (in [`ROOT_CBV_SPACE`]) of the shape table of a shader
+/// that takes views of placed memory from the title's records: four dwords
+/// a shape number (1 if the shape is a buffer view read raw at its bytes,
+/// the view's first byte from the record's address, its bytes, its element
+/// size). The heap-info table's fourth dword says how many shapes it holds.
+pub const HEAP_SHAPES: u8 = 253;
 /// The bits of a view-stride table dword holding the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format

@@ -22,6 +22,87 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+/// Shapes the shape table has room for (16 bytes each).
+pub(crate) const SHAPE_SLOTS: u32 = 1 << 20;
+
+/// The shape table of shaders that take views of placed memory from the
+/// title's records (root SRV `HEAP_SHAPES`), and its mapping.
+static SHAPE_TABLE: std::sync::OnceLock<Option<(ID3D12Resource, usize)>> = std::sync::OnceLock::new();
+
+/// The shape table, made and filled with every shape so far the first
+/// time; later shapes are entered as they come ([`shape_added`]).
+pub(crate) fn shapes_table() -> Option<&'static ID3D12Resource> {
+    SHAPE_TABLE
+        .get_or_init(|| {
+            let (table, data) = host()?.upload_buffer(u64::from(SHAPE_SLOTS) * 16)?;
+            crate::host::name(&table, || "shapes of placed views".to_owned());
+            // SAFETY: the table's mapping.
+            unsafe { std::ptr::write_bytes(data, 0, SHAPE_SLOTS as usize * 16) };
+            crate::descriptor::shapes_each(|at, unordered, resource, rest| {
+                write_shape(data as usize, at, shape_words(unordered, resource, rest));
+            });
+            Some((table, data as usize))
+        })
+        .as_ref()
+        .map(|(table, _)| table)
+}
+
+fn write_shape(data: usize, at: u32, words: [u32; 4]) {
+    if at < SHAPE_SLOTS {
+        // SAFETY: inside the table's mapping.
+        unsafe { ((data + 16 * at as usize) as *mut [u32; 4]).write_volatile(words) };
+    }
+}
+
+/// Enters shape `at` in the shape table, if it is made (the descriptor
+/// module calls this under its shapes' lock, as the table's first fill
+/// reads them).
+pub(crate) fn shape_added(at: u32, unordered: bool, resource: &[u32; 14], rest: &[u32; 14]) {
+    if let Some(Some((_, data))) = SHAPE_TABLE.get() {
+        write_shape(*data, at, shape_words(unordered, resource, rest));
+    }
+}
+
+/// Shape `at`'s words in the shape table; `None` without a table or past it.
+fn shape_words_at(at: u32) -> Option<[u32; 4]> {
+    let (_, data) = SHAPE_TABLE.get()?.as_ref()?;
+    // SAFETY: inside the table's mapping.
+    (at < SHAPE_SLOTS).then(|| unsafe { ((data + 16 * at as usize) as *const [u32; 4]).read_volatile() })
+}
+
+/// A shape's words in the shape table: 1 if it is a buffer view that the
+/// host makes raw at its bytes ([`buffer_srv`]: a raw view, or a structured
+/// one made raw), then the view's first byte from its address, its bytes
+/// and its element size; zeros for any other shape (textures, unordered,
+/// typed and unaligned structured views), which keep host views.
+fn shape_words(unordered: bool, resource: &[u32; 14], rest: &[u32; 14]) -> [u32; 4] {
+    const NONE: [u32; 4] = [0; 4];
+    let Ok(words) = <&[u32; 10]>::try_from(&rest[..10]) else {
+        return NONE;
+    };
+    // A buffer resource, a buffer view.
+    if unordered || resource[0] != 1 || words[1] != 1 {
+        return NONE;
+    }
+    let desc = srv_desc(words);
+    let element = element_size(&desc);
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { desc.Anonymous.Buffer };
+    let raw = buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let stride = u64::from(buffer.StructureByteStride);
+    let first = buffer.FirstElement.saturating_mul(element);
+    let align = if crate::shader_cache::under_wine() { 4 } else { 16 };
+    let made_raw = raw
+        || (stride > 0 && raw_structured() && stride.is_multiple_of(4) && first.is_multiple_of(align));
+    let bytes = u64::from(buffer.NumElements) * element;
+    match (u32::try_from(first), u32::try_from(bytes)) {
+        (Ok(first), Ok(bytes)) if made_raw && element != 0 && first.is_multiple_of(4) => {
+            [1, first, bytes, element.max(1) as u32]
+        }
+        _ => NONE,
+    }
+}
+
 /// Slots whose record named a constant buffer view whole and got no host
 /// view (`[0]`), and those of them that held a view and went null (`[1]`).
 static RECORD_SLOTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
@@ -569,7 +650,7 @@ pub(crate) struct HostHeap {
     /// Shaders take constant buffer views from the title's records in this
     /// heap ([`HostHeap::records_on`]): none is made for a record that
     /// names one whole.
-    records: std::sync::atomic::AtomicBool,
+    records: std::sync::atomic::AtomicU8,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
     /// stride table has one: the mark bit and phase of the unordered buffer
@@ -757,7 +838,7 @@ impl HostHeap {
                 _ => total,
             },
             strides,
-            records: std::sync::atomic::AtomicBool::new(false),
+            records: std::sync::atomic::AtomicU8::new(0),
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -1149,8 +1230,10 @@ impl HostHeap {
     /// From now on no host view is made for a record that names a constant
     /// buffer view whole: shaders read such views from the record itself
     /// (`crate::descriptor::Heap::records_info`).
-    pub(crate) fn records_on(&self) {
-        self.records.store(true, Ordering::Release);
+    /// `kinds`: bit 0, constant buffer views; bit 1, buffer views of
+    /// placed memory read raw (as `crate::descriptor::gpu_records`).
+    pub(crate) fn records_on(&self, kinds: u8) {
+        self.records.store(kinds, Ordering::Release);
     }
 
     /// Slot `index` holds `record`, which names a constant buffer view
@@ -1160,14 +1243,39 @@ impl HostHeap {
     /// is none yet, as making the view did; the page table's refresh keeps
     /// it current), the slot's stride (4, as a raw view's), and a slot that
     /// held another view goes null, once.
-    fn constant_record(&self, index: u32, [_, view, generation]: [u32; 3]) {
+    /// The same for a record naming a view of placed memory whose shape is
+    /// a buffer view read raw (`kinds` bit 1): its stride and its address
+    /// in the view addresses are kept as a made view's. False for a record
+    /// that still needs a host view (another kind or shape).
+    fn whole_record(&self, index: u32, [_, view, generation]: [u32; 3], kinds: u8) -> bool {
         let key = u64::from(generation) << 32 | u64::from(view);
+        // What the record names: its bytes, its stride, its address words.
+        let (start, bytes, stride, address) = match generation >> 30 {
+            1 if kinds & 1 != 0 => match crate::descriptor::constant_record(view, generation) {
+                Some((address, size)) => (address, u64::from(size), 4, [0; 4]),
+                None => return false,
+            },
+            2 if kinds & 2 != 0 => {
+                let Some((address, shape)) = crate::descriptor::placed_record(view, generation) else {
+                    return false;
+                };
+                let Some([1, first, bytes, stride]) = shape_words_at(shape) else {
+                    return false;
+                };
+                let start = address + u64::from(first);
+                (start, u64::from(bytes), stride, [start as u32, (start >> 32) as u32 & 0xFFFF, 0, 0])
+            }
+            _ => return false,
+        };
+        // A view at an address that is not 4-byte aligned keeps its host
+        // view, as the shaders read it.
+        if !start.is_multiple_of(4) {
+            return false;
+        }
         if self.synced[index as usize].load(Ordering::Acquire) == key {
-            return;
+            return true;
         }
-        if let Some((address, size)) = crate::descriptor::constant_record(view, generation) {
-            let _ = crate::shadow::find(address, u64::from(size));
-        }
+        let _ = crate::shadow::find(start, bytes);
         if self.made_is_nonzero(index) {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != 0 {
@@ -1178,9 +1286,17 @@ impl HostHeap {
                 RECORD_SLOTS[1].fetch_add(1, Ordering::Relaxed);
             }
         }
-        self.write_stride(index, 4);
+        self.write_stride(index, stride);
+        if index < self.address_slots()
+            && let Some(Some((_, data, _))) = self.addresses.get()
+        {
+            // SAFETY: the mapped view addresses hold 16 bytes per slot
+            // below `address_slots`.
+            unsafe { ((*data + 16 * index as usize) as *mut [u32; 4]).write_unaligned(address) };
+        }
         self.synced[index as usize].store(key, Ordering::Release);
         RECORD_SLOTS[0].fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
@@ -1574,8 +1690,7 @@ impl HostHeap {
                                 i += 1;
                                 continue;
                             }
-                            if records && generation >> 30 == 1 {
-                                self.constant_record(i, record);
+                            if records != 0 && generation >> 30 != 0 && self.whole_record(i, record, records) {
                                 i += 1;
                                 continue;
                             }
@@ -1629,8 +1744,7 @@ impl HostHeap {
                                 i += 1;
                                 continue;
                             }
-                            if records && generation >> 30 == 1 {
-                                self.constant_record(i, record);
+                            if records != 0 && generation >> 30 != 0 && self.whole_record(i, record, records) {
                                 i += 1;
                                 continue;
                             }
@@ -2133,9 +2247,11 @@ impl HostHeap {
         // A constant buffer view named whole, in a heap whose shaders read
         // such views from the records: no host view (a draw's own tables
         // still get theirs).
-        if tag == VIEW_TAG && !for_draw && generation >> 30 == 1 && self.records.load(Ordering::Acquire) {
-            self.constant_record(index, [tag, i, generation]);
-            return None;
+        if tag == VIEW_TAG && !for_draw && generation >> 30 != 0 {
+            let kinds = self.records.load(Ordering::Acquire);
+            if kinds != 0 && self.whole_record(index, [tag, i, generation], kinds) {
+                return None;
+            }
         }
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
@@ -6016,7 +6132,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (Some(made), Some(records)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS)) else {
             return;
         };
-        records.records_on();
+        records.records_on(1);
         let buffer = crate::resource::test_buffer(4 << 20);
         let (ptr, len) = crate::resource::buffer_bytes(buffer).expect("buffer bytes");
         crate::shadow::register(buffer as usize, ptr as u64, len);

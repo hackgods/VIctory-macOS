@@ -134,6 +134,13 @@
 //!   slots) or a heap of no slots reads the host's view at the index, as
 //!   without the option. The host keeps the title heap's memory in a copy
 //!   the page table names, and makes no view for a record named whole.
+//!   With bit 1, a record that names a view of placed memory (kind 2: a
+//!   40-bit address and a 22-bit shape number) is looked up in the shape
+//!   table (root SRV `t`[`HEAP_SHAPES`]; the heap-info table's fourth
+//!   dword counts its shapes): a shape that is a buffer view read raw is
+//!   read the same way, from the record's address plus the view's first
+//!   byte, bounded by the view's bytes. Any other shape (textures,
+//!   unordered and typed buffer views) reads the host's view.
 //!   An access that crosses onto the next 64 KiB page looks that page up
 //!   too (only where it crosses) and takes its dwords there from that
 //!   page's memory: two copies of title memory, or pages of a heap that
@@ -323,7 +330,7 @@ pub use shader::{
     ATOMIC_LOCK_ROUNDS, ATOMIC_LOCK_SPINS, ATOMIC_LOCK_SPINS_DRAWN, ATOMIC_LOCKS, ATOMIC_LOCKS_AT,
     ATOMIC_LOCKS_GAVE_UP_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    HEAP_RECORDS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_RECORDS, HEAP_SHAPES, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
     VIEW_WRITES_BYTES,
 };
 
@@ -611,8 +618,9 @@ pub struct Options {
     pub thread_limits: bool,
     /// The view kinds a shader takes from the title's own records instead
     /// of the host's slots ("Views from the title's records"): bit 0,
-    /// constant buffer views. The host then binds the heap-info table and
-    /// keeps the title's heap in a copy the page table names.
+    /// constant buffer views; bit 1, buffer views of placed memory that are
+    /// read raw. The host then binds the heap-info table (and the shape
+    /// table) and keeps the title's heap in a copy the page table names.
     pub gpu_records: u8,
 }
 

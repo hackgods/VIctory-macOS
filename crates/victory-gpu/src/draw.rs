@@ -1203,6 +1203,24 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
+                    if kind == 1 && slot == victory_shader::emit::HEAP_SHAPES {
+                        // The shapes of placed views, for records naming one.
+                        let Some(table) = crate::descriptor::host::shapes_table() else {
+                            once!("a shader reads the shapes of placed views without a table: dropped");
+                            not_run("no shape table");
+                            return false;
+                        };
+                        // SAFETY: an open list; the table lives for good.
+                        unsafe {
+                            let gpu = table.GetGPUVirtualAddress();
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     if kind == 1 && slot == victory_shader::emit::HEAP_RECORDS {
                         // The bound view heap's info table: where its
                         // records lie in title memory, and how many.
@@ -6782,7 +6800,12 @@ void main() {
     /// its own, constants it rewrote in place, a view that is a table entry
     /// (not named whole), and a slot it cleared. Returns what each step read
     /// and whether the slot had a host view after each.
-    fn heap_constant_steps(records: bool) -> Option<Vec<(u32, bool)>> {
+    ///
+    /// With `placed`, the views are raw buffer views of placed memory
+    /// instead (and the fourth step a structured one the host makes raw,
+    /// from its second 8-byte element): read from records with `kinds` bit 1.
+    fn heap_view_steps(kinds: u8, placed: bool) -> Option<Vec<(u32, bool)>> {
+        let records = kinds != 0;
         use crate::pipeline::{Shader, Translated, host::HostPipeline};
         use victory_shader::native::{ComputeIo, StageIo};
         use victory_shader::{
@@ -6804,7 +6827,7 @@ void main() {
         if ok.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
             return None;
         }
-        crate::descriptor::gpu_records_for_test(Some(u8::from(records)));
+        crate::descriptor::gpu_records_for_test(Some(kinds));
         // User data: s0 the heap index of a constant buffer (a root
         // constant), s1 the resource heap, s2 a table with a raw UAV. Each
         // lane stores dword 2 of the constant buffer to dword `lane` of the
@@ -6872,11 +6895,12 @@ void main() {
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
         let io = io::raise(&p, &native).unwrap();
         let options = emit::Options {
-            gpu_records: u8::from(records),
+            gpu_records: kinds,
             ..Default::default()
         };
         let hs = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
         assert_eq!(hs.root_srvs.contains(&emit::HEAP_RECORDS), records);
+        assert_eq!(hs.root_srvs.contains(&emit::HEAP_SHAPES), kinds & 2 != 0);
         assert_eq!(hs.memory, records);
         assert!(!hs.memory_writes);
         let shader = Shader::for_test(
@@ -6930,6 +6954,7 @@ void main() {
         // SAFETY: inside the title buffers.
         unsafe {
             (a_bytes as *mut u32).add(2).write(0xA000_0002);
+            (a_bytes as *mut u32).add(4).write(0xA000_0004);
             (b_bytes as *mut u32).add(2).write(0xB000_0002);
             (big_bytes as *mut u32).add(2).write(0xC000_0002);
         }
@@ -6937,6 +6962,25 @@ void main() {
         crate::descriptor::create_uav(std::ptr::null(), out, std::ptr::null(), &raw, title_heap.start);
         let slot = title_heap.start + 32;
         let constants = |address: u64, size: u32| [address as u32, (address >> 32) as u32, size, 0];
+        // Writes at `to` the record of the view of `size` bytes at
+        // `address`: a constant buffer view, or with `placed` a raw buffer
+        // view of placed memory (`stride` 0) or a structured one of that
+        // stride from its second element.
+        let view = |address: u64, size: u32, stride: u32, to: u64| {
+            if !placed {
+                crate::descriptor::create_cbv(std::ptr::null(), &constants(address, size), to);
+                return;
+            }
+            let mut resource = [0u32; 14];
+            (resource[0], resource[4]) = (1, 256);
+            let mut words = [0u32; 16];
+            words[..10].copy_from_slice(&match stride {
+                0 => [39, 1, 0x1688, 0, 0, 0, size / 4, 0, 1, 0],
+                _ => [0, 1, 0x1688, 0, 1, 0, size / stride, stride, 0, 0],
+            });
+            (words[10], words[11]) = (address as u32, (address >> 32) as u32);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &words, to);
+        };
         let run = || {
             // SAFETY: inside the output buffer.
             unsafe { (out_bytes as *mut u32).write(0xDEAD_BEEF) };
@@ -6954,11 +6998,11 @@ void main() {
         };
         let mut steps = Vec::new();
         // The title creates a view in the slot.
-        crate::descriptor::create_cbv(std::ptr::null(), &constants(a_bytes, 256), slot);
+        view(a_bytes, 256, 0, slot);
         steps.push(run());
         // It copies a record there as bytes, from memory of its own.
         let mut record = [0u32; 8];
-        crate::descriptor::create_cbv(std::ptr::null(), &constants(b_bytes, 256), record.as_mut_ptr() as u64);
+        view(b_bytes, 256, 0, record.as_mut_ptr() as u64);
         // SAFETY: one 32-byte record in each of our allocations.
         unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
         steps.push(run());
@@ -6968,12 +7012,22 @@ void main() {
         steps.push(run());
         // A view too large and uneven to be named whole: a table entry,
         // read through the host's own view either way.
-        crate::descriptor::create_cbv(std::ptr::null(), &constants(big_bytes, 0x4004), record.as_mut_ptr() as u64);
+        if placed {
+            // A structured view of 8-byte elements from its second: the
+            // host makes it raw from there, and so is it read from records.
+            view(a_bytes, 24, 8, record.as_mut_ptr() as u64);
+        } else {
+            crate::descriptor::create_cbv(
+                std::ptr::null(),
+                &constants(big_bytes, 0x4004),
+                record.as_mut_ptr() as u64,
+            );
+        }
         // SAFETY: as above.
         unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
         steps.push(run());
         // A view named whole again, past the end of which dword 2 lies.
-        crate::descriptor::create_cbv(std::ptr::null(), &constants(a_bytes, 8), record.as_mut_ptr() as u64);
+        view(a_bytes, 8, 0, record.as_mut_ptr() as u64);
         // SAFETY: as above.
         unsafe { std::ptr::copy_nonoverlapping(record.as_ptr().cast::<u8>(), slot as *mut u8, 32) };
         steps.push(run());
@@ -6997,10 +7051,10 @@ void main() {
     /// where the record names the view whole.
     #[test]
     fn constant_buffers_from_the_titles_records_read_as_host_views_do() {
-        let Some(legacy) = heap_constant_steps(false) else {
+        let Some(legacy) = heap_view_steps(0, false) else {
             return; // no host GPU with SM 6.6 here
         };
-        let records = heap_constant_steps(true).expect("the same host");
+        let records = heap_view_steps(1, false).expect("the same host");
         let read = |steps: &[(u32, bool)]| steps.iter().map(|s| s.0).collect::<Vec<_>>();
         assert_eq!(
             read(&legacy),
@@ -7013,5 +7067,32 @@ void main() {
         // The first view was made before the heap's records were read on the
         // GPU; after that only the table entry's record has a host view.
         assert_eq!(made(&records), [true, false, false, true, false, false]);
+    }
+
+    /// Raw buffer views of placed memory read from the title's records on
+    /// the GPU (`VICTORY_GPU_RECORDS=cb,placed`) give what the host's own
+    /// views give, step for step, and take no host view; with constant
+    /// buffers only read from records (`cb`), placed views keep theirs.
+    #[test]
+    fn placed_buffers_from_the_titles_records_read_as_host_views_do() {
+        let Some(legacy) = heap_view_steps(0, true) else {
+            return; // no host GPU with SM 6.6 here
+        };
+        let constants_only = heap_view_steps(1, true).expect("the same host");
+        let records = heap_view_steps(3, true).expect("the same host");
+        let read = |steps: &[(u32, bool)]| steps.iter().map(|s| s.0).collect::<Vec<_>>();
+        assert_eq!(
+            read(&legacy),
+            [0xA000_0002, 0xB000_0002, 0xB111_0002, 0xA000_0004, 0, 0],
+            "the host's own views"
+        );
+        assert_eq!(read(&constants_only), read(&legacy), "constant buffers only from records");
+        assert_eq!(read(&records), read(&legacy), "records read on the GPU");
+        let made = |steps: &[(u32, bool)]| steps.iter().map(|s| s.1).collect::<Vec<_>>();
+        assert_eq!(made(&legacy), [true, true, true, true, true, false]);
+        assert_eq!(made(&constants_only), made(&legacy));
+        // The first view was made before the heap's records were read on
+        // the GPU; none after.
+        assert_eq!(made(&records), [true, false, false, false, false, false]);
     }
 }

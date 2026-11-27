@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod alias;
+#[cfg(all(test, windows))]
+mod decode_bench;
 pub mod bench;
 #[cfg(windows)]
 mod backend;

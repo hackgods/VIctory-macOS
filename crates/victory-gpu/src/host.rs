@@ -2275,6 +2275,7 @@ impl Host {
                 #[cfg(test)]
                 tests::native_call(group.len() - first);
                 queue.ExecuteCommandLists(&group[first..]);
+                crate::awake::sent(&self.device);
                 let waited = queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));

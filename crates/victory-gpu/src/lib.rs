@@ -18,6 +18,8 @@
 
 #[cfg(windows)]
 mod alias;
+#[cfg(windows)]
+mod awake;
 pub mod bench;
 #[cfg(windows)]
 mod backend;

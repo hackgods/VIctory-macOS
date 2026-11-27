@@ -98,7 +98,7 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| v.trim() == "1");
+        let on = std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| matches!(v.trim(), "1" | "keep"));
         if on {
             tracing::info!(
                 "VICTORY_BVH_BUILDER=1: the BVH builder runs from forms of its own with no half answering alone, once all are made; DispatchX thread counts are honoured"
@@ -106,6 +106,14 @@ pub(crate) fn on() -> bool {
         }
         on
     })
+}
+
+/// `VICTORY_BVH_BUILDER=keep`: as `1`, but a submission the host GPU ended
+/// while the builder ran does not stop it ([`submission_lost`]): for runs
+/// that find what faults, where each frame may lose a submission.
+fn keep() -> bool {
+    static KEEP: OnceLock<bool> = OnceLock::new();
+    *KEEP.get_or_init(|| std::env::var("VICTORY_BVH_BUILDER").is_ok_and(|v| v.trim() == "keep"))
 }
 
 /// What a pipeline of the builder is to [`runs`].
@@ -215,6 +223,13 @@ static RAN_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// frame's.
 pub(crate) fn submission_lost() {
     let ran = RAN_IN.load(Ordering::Relaxed);
+    if keep() && ran_lately(ran, crate::frame::current()) {
+        static SAID: AtomicBool = AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            tracing::warn!("the host GPU ended a submission while the BVH builder ran; it runs on (VICTORY_BVH_BUILDER=keep)");
+        }
+        return;
+    }
     if on() && ran_lately(ran, crate::frame::current()) {
         trip(format!(
             "the host GPU ended a submission in frame {} while the builder ran (it ran in frame {ran})",

@@ -55,6 +55,18 @@
 //! Reports that stop below XInput (Wine's HID bus, SDL, the pad's radio)
 //! reach neither module, look like a pad held still, and are kept. One
 //! `pad frozen:` line each time a step fires.
+//!
+//! `VICTORY_PAD_RUMBLE=0`: the title's rumble is not sent to XInput. On the
+//! SDL path (read in SDL 2.32.10) a rumble report goes out on SDL's rumble
+//! thread holding the pad's device lock (`SDL_hidapi_rumble.c`), and SDL's
+//! update skips a pad whose lock is taken (`SDL_hidapijoystick.c:1347`): a
+//! write that blocks (`IOHIDDeviceSetReport` has no timeout, `hidapi/mac`)
+//! stops the pad's input with no disconnect. Wine turns PS4 rumble over
+//! Bluetooth on (`bus_sdl.c`, "CW HACK 19629"). Without our rumble SDL still
+//! writes at open and, in its enhanced mode, a keep-alive after 0.5 s without
+//! a report; `SDL_JOYSTICK_HIDAPI_PS4_RUMBLE=0` in the environment beats
+//! Wine's hint (`SDL_hints.c:58`) and keeps a pad switched on afresh out of
+//! that mode (a pad already in it stays there until switched off).
 
 use super::{FALLBACK, PADS, PadState};
 
@@ -589,6 +601,28 @@ impl Rearm {
             _ => Some(pad),
         }
     }
+}
+
+/// `VICTORY_PAD_RUMBLE` (its value): `0` or `off` drops the title's rumble.
+#[cfg(any(windows, test))]
+fn rumble_off(value: Option<&str>) -> bool {
+    value.is_some_and(|v| matches!(v.trim(), "0" | "off"))
+}
+
+/// Whether the title's rumble is dropped (`VICTORY_PAD_RUMBLE=0`); see the
+/// module notes.
+#[cfg(windows)]
+pub(super) fn rumble_dropped() -> bool {
+    static DROPPED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DROPPED.get_or_init(|| {
+        let dropped = rumble_off(std::env::var("VICTORY_PAD_RUMBLE").ok().as_deref());
+        if dropped {
+            tracing::info!(
+                "pad rumble: the title's rumble is not sent to XInput (VICTORY_PAD_RUMBLE=0)"
+            );
+        }
+        dropped
+    })
 }
 
 /// `VICTORY_PAD_REARM` on the host: the switch, the decisions, and the helper
@@ -1267,6 +1301,12 @@ mod tests {
             Probe::Off,
         );
         assert_eq!(asked, 0, "a new connection starts a new spell");
+    }
+
+    #[test]
+    fn rumble_is_dropped_only_when_asked() {
+        assert!(rumble_off(Some("0")) && rumble_off(Some(" off ")));
+        assert!(!rumble_off(None) && !rumble_off(Some("1")) && !rumble_off(Some("")));
     }
 
     #[test]

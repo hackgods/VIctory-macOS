@@ -1307,8 +1307,9 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
-            // macOS port: not while `VICTORY_PAD_REARM` re-arms XInput.
-            if !self.rearm.rumble(slot, low, high, now()) {
+            // macOS port: `VICTORY_PAD_RUMBLE=0` drops it; not while
+            // `VICTORY_PAD_REARM` re-arms XInput.
+            if super::mac::rumble_dropped() || !self.rearm.rumble(slot, low, high, now()) {
                 return;
             }
             let speeds = XINPUT_VIBRATION {

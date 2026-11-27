@@ -1157,6 +1157,9 @@ struct Scripted {
     /// How long each repeated press is held (`+<hold>`; [`PRESS`] by default).
     hold: Duration,
     vk: u8,
+    /// Times count from the world's first frame (`w` in front), not from
+    /// when input started.
+    world: bool,
 }
 
 /// The virtual key a script names: a letter, a digit, or `Enter`, `Esc`,
@@ -1239,13 +1242,19 @@ fn take_time<'a>(s: &'a str, delims: &str) -> Option<(Duration, &'a str)> {
 /// `<span>` is `<from>-<to>` (bounds; empty parts default to the start, 0,
 /// or no end), and `/<every>[+<hold>]` presses the key again each `<every>`
 /// seconds, each press `<hold>` long (0.2 s by default). A plain
-/// `<seconds>:<key>` is one 0.2 s press at that time.
+/// `<seconds>:<key>` is one 0.2 s press at that time. A `w` in front
+/// (`w5-60/6+5:Enter`) counts the times from the world's first frame
+/// (`victory_gpu::bench::world_frame`), however long loading took.
 #[cfg(any(test, windows))]
 fn parse_script(list: &str) -> Vec<Scripted> {
     list.split(',')
         .filter_map(|entry| {
             let (at, key) = entry.split_once(':')?;
             let vk = key_named(key)?;
+            let (world, at) = match at.trim_start().strip_prefix('w') {
+                Some(at) => (true, at),
+                None => (false, at),
+            };
             // `<from>-<to>/<every>[+<hold>]`: the `/<every>` part is optional,
             // and `+<hold>` (shorter than `<every>`) lengthens each press,
             // e.g. for prompts that skip only while the key is held.
@@ -1284,17 +1293,45 @@ fn parse_script(list: &str) -> Vec<Scripted> {
                 every,
                 hold,
                 vk,
+                world,
             })
         })
         .collect()
 }
 
-/// The keys of `script` held `now` after input started.
+/// How long ago the world's first frame came, once one has: `at` keeps when
+/// `world_frame` was first seen at 1 or more (polls come every few ms).
 #[cfg(any(test, windows))]
+fn since_world(
+    world_frame: u64,
+    at: &std::sync::OnceLock<Instant>,
+    now: Instant,
+) -> Option<Duration> {
+    if world_frame >= 1 {
+        at.get_or_init(|| now);
+    }
+    at.get().map(|&first| now.saturating_duration_since(first))
+}
+
+/// The keys of `script` held `now` after input started, before the world's
+/// first frame.
+#[cfg(test)]
 fn held_at(script: &[Scripted], now: Duration) -> Vec<u8> {
+    held(script, now, None)
+}
+
+/// The keys of `script` held `now` after input started, `world` after the
+/// world's first frame (`None` before it: `w` entries hold nothing yet).
+#[cfg(any(test, windows))]
+fn held(script: &[Scripted], now: Duration, world: Option<Duration>) -> Vec<u8> {
     script
         .iter()
         .filter(|k| {
+            let now = match (k.world, world) {
+                (false, _) => now,
+                (true, Some(world)) => world,
+                (true, None) => return false,
+            };
             if !(k.from..k.to).contains(&now) {
                 return false;
             }
@@ -1448,7 +1485,8 @@ mod script_tests {
                 to: s(0.201),
                 every: None,
                 hold: PRESS,
-                vk: 0x0D
+                vk: 0x0D,
+                world: false,
             }
         );
         assert_eq!(script[1].from, s(0.001));
@@ -1520,6 +1558,51 @@ mod script_tests {
         assert_eq!(held_at(&script, s(4.5)), Vec::<u8>::new());
         assert_eq!(held_at(&script, s(4.6)), Vec::<u8>::new());
         assert_eq!(held_at(&script, s(5.1)), [0x0D]);
+    }
+
+    #[test]
+    fn world_entries_count_from_the_worlds_first_frame() {
+        // Menu taps on the input clock, then a hold-to-skip from a second
+        // into the world, and one press 2 s into it; `w` alone has no time.
+        let script = parse_script("3-60/1:Enter, w1-90/6+5:Enter,w 2:X,w:Y");
+        assert_eq!(script.len(), 3);
+        assert!(!script[0].world);
+        assert_eq!(
+            script[1],
+            Scripted {
+                from: s(1.0),
+                to: s(90.0),
+                every: Some(s(6.0)),
+                hold: s(5.0),
+                vk: 0x0D,
+                world: true,
+            }
+        );
+        assert!(script[2].world);
+        // Before the world: only the input clock's entries.
+        assert_eq!(held_at(&script, s(10.05)), [0x0D]);
+        assert_eq!(held_at(&script, s(70.0)), Vec::<u8>::new());
+        // In the world, however late it came.
+        assert_eq!(held(&script, s(70.0), Some(s(0.5))), Vec::<u8>::new());
+        assert_eq!(held(&script, s(70.0), Some(s(1.0))), [0x0D]);
+        assert_eq!(held(&script, s(170.0), Some(s(2.1))), [0x0D, b'X']);
+        assert_eq!(held(&script, s(70.0), Some(s(6.5))), Vec::<u8>::new());
+        assert_eq!(held(&script, s(70.0), Some(s(7.0))), [0x0D]);
+        assert_eq!(held(&script, s(70.0), Some(s(90.0))), Vec::<u8>::new());
+        // The input clock's entries go on as before in the world.
+        assert_eq!(held(&script, s(10.05), Some(s(0.5))), [0x0D]);
+    }
+
+    #[test]
+    fn the_world_clock_starts_at_the_first_world_frame() {
+        let at = std::sync::OnceLock::new();
+        let t0 = Instant::now();
+        assert_eq!(since_world(0, &at, t0), None);
+        assert_eq!(since_world(0, &at, t0 + s(30.0)), None);
+        assert_eq!(since_world(1, &at, t0 + s(40.0)), Some(Duration::ZERO));
+        assert_eq!(since_world(9, &at, t0 + s(43.5)), Some(s(3.5)));
+        // It keeps counting from that first frame.
+        assert_eq!(since_world(0, &at, t0 + s(50.0)), Some(s(10.0)));
     }
 
     #[test]
@@ -1824,7 +1907,12 @@ mod host {
     /// ready, not up to a period late, or `2-200/3+2.5:Enter` to hold long
     /// enough to skip a hold-to-skip cutscene. A key is a letter, a digit, or
     /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
-    /// stand-in pad's table maps them to buttons).
+    /// stand-in pad's table maps them to buttons). A `w` in front of an
+    /// entry times it from the world's first frame (the first presented
+    /// frame with 500 draws or more) instead, so that it lands at the same
+    /// point of the world however long loading took: `3-60/1:Enter,
+    /// w1-90/6+5:Enter` taps through the menus, then holds A from a second
+    /// into the world.
     ///
     /// `VICTORY_KEYS_FILE=<path>`: one key name per line (as above), each
     /// pressed for 0.2 s once its line is complete (newline-terminated), in
@@ -1843,9 +1931,11 @@ mod host {
             LazyLock::new(|| std::env::var_os("VICTORY_KEYS_FILE"));
         static KEYS_FILE: LazyLock<Mutex<FileKeys>> =
             LazyLock::new(|| Mutex::new(FileKeys::default()));
+        static WORLD: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        let mut down = held_at(keys, now);
+        let world = since_world(victory_gpu::bench::world_frame(), &WORLD, Instant::now());
+        let mut down = held(keys, now, world);
         if let Some(file) = FILE.as_ref() {
             let mut asked = lock(&KEYS_FILE);
             asked.poll(std::path::Path::new(file), now);

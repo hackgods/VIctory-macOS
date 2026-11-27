@@ -320,6 +320,24 @@ pub(crate) fn dispatch_clamps() -> bool {
     })
 }
 
+/// Whether every BVH node test misses without reading the node
+/// (`victory_shader::emit::Options::bvh_miss`): `VICTORY_BVH_MISS=1`, as in
+/// trustno1-coder 24a479d3. Off by default. This line holds the structure
+/// builder back, so the title's reflection rays walk memory that was never
+/// built: at the boat, whole 8x8 tiles of the reflections came back dark
+/// once the denoiser's history reached the lighting (`VICTORY_PLACED_TWIN`;
+/// run 08-32-25 of 27 November without the ray binning pass had none).
+pub(crate) fn bvh_miss() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_BVH_MISS").is_ok_and(|v| v.trim() == "1");
+        if on {
+            tracing::info!("VICTORY_BVH_MISS=1: every BVH node test misses without reading the node (the title's rays find nothing)");
+        }
+        on
+    })
+}
+
 /// Whether the dwords of one console load are read four a call
 /// (`victory_shader::emit::Options::wide_loads`): bit 64 of
 /// `VICTORY_SHADER_OPT`, as in 64bitMango 759c4d6b and

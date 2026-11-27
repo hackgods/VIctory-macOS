@@ -54,6 +54,9 @@ use crate::resource::Source;
 
 const INVALID: u32 = u32::MAX;
 
+/// A triangle node's result for a miss: t `+inf` over 1, barycentrics 0.
+const TRIANGLE_MISS: [u32; 4] = [0x7F80_0000, 0x3F80_0000, 0, 0];
+
 /// Where a site reads its nodes.
 enum Nodes {
     /// A raw buffer and the node's byte offset in it.
@@ -126,6 +129,25 @@ impl Lower<'_> {
             return Err("a BVH intersection result");
         };
         let guard = self.guard(b, i)?;
+        // Mac (`Mac::bvh_miss`, after trustno1-coder 24a479d3): no node is
+        // read; by the pointer's type, a triangle node gives the triangle
+        // miss `(+inf, 1, 0, 0)` and any other node four `0xffffffff` (a box
+        // without children, as instance and procedural nodes), so a walk
+        // ends at its first node.
+        if self.x.mac.bvh_miss {
+            let c = self.cur;
+            let seven = self.s.m.i32(7);
+            let ty = self.s.m.bin(c, Bin::And, node, seven);
+            let four = self.s.m.i32(4);
+            let is_tri = self.s.m.cmp(c, pred::IULT, ty, four);
+            let none = self.s.m.i32(INVALID);
+            for (k, miss) in TRIANGLE_MISS.into_iter().enumerate() {
+                let m = self.s.m.i32(miss);
+                let x = self.s.m.select(c, is_tri, m, none);
+                self.write(inst, Reg::V(out + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         let c = self.cur;
         let i64t = self.s.m.int(64);
         // The node's byte offset from the BVH's base: (pointer & !7) * 8.

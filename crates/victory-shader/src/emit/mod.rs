@@ -551,6 +551,12 @@ pub struct Options {
     /// (`lower::Mac::wide_loads`; after 64bitMango 759c4d6b and
     /// fxceless/victory-fork c36971b2). The shader cache keys on it. Mac.
     pub wide_loads: bool,
+    /// Every BVH node test (`image_bvh_intersect_ray`, `_bvh64_`) misses
+    /// without reading the node: a box node gives no child, a triangle
+    /// node the triangle miss (`lower::bvh`; after trustno1-coder
+    /// 24a479d3, `VICTORY_BVH_MISS`). For hosts where the title's
+    /// structures are never built. The shader cache keys on it. Mac.
+    pub bvh_miss: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1027,6 +1033,7 @@ fn emit_form(
             walk: options.halves_walk,
             across: options.halves_across,
             wide_loads: options.wide_loads,
+            bvh_miss: options.bvh_miss,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

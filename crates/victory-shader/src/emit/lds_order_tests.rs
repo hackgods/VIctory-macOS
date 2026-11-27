@@ -27,6 +27,7 @@ const ORDER: Mac = Mac {
     walk: false,
     across: false,
     wide_loads: false,
+    bvh_miss: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

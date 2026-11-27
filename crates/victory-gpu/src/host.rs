@@ -450,6 +450,25 @@ pub(crate) fn device_removed() -> bool {
     host().is_some_and(|h| unsafe { h.device.GetDeviceRemovedReason() }.is_err())
 }
 
+/// The PCI vendor id of the host device's adapter (NVIDIA 0x10DE), 0 if it
+/// cannot be told.
+pub(crate) fn host_vendor() -> u32 {
+    static VENDOR: OnceLock<u32> = OnceLock::new();
+    *VENDOR.get_or_init(|| {
+        let Some(host) = host() else { return 0 };
+        // SAFETY: plain DXGI queries for the device's own adapter.
+        let vendor = unsafe {
+            let luid = host.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+                .map_or(0, |d| d.VendorId)
+        };
+        tracing::info!(vendor = format_args!("{vendor:#x}"), "host adapter vendor");
+        vendor
+    })
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -1680,6 +1699,14 @@ struct Deferred {
     slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Title textures written by GPU shaders that match `VICTORY_TEXTURE_BACK`,
+    /// copied into readback buffers when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Recorded GPU-to-CPU texture readbacks to retile into title memory once
+    /// the submission completes.
+    texture_backs: Vec<crate::texback::Back>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -2387,6 +2414,11 @@ impl Host {
             }
         }
         for list in runs {
+            for back in &list.deferred().texture_backs {
+                crate::texback::land(back);
+            }
+        }
+        for list in runs {
             for work in &list.deferred().after {
                 work();
             }
@@ -2907,6 +2939,7 @@ impl HostList {
                     .ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
             }
         }
+        self.textures_back();
         self.widen_close();
         self.hoisted_clamps_close();
         // SAFETY: our list.
@@ -3049,6 +3082,65 @@ impl HostList {
         }
         self.memory_writer.store(uses, Ordering::Relaxed);
         Reset(&self.memory_writer)
+    }
+
+    /// Marks title texture `resource` as GPU-written on this command list so
+    /// eligible 2D textures (`VICTORY_TEXTURE_BACK`) are copied into a readback
+    /// buffer when the list closes.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    /// Whether this command list has recorded GPU-to-CPU texture readbacks.
+    #[allow(dead_code)]
+    pub(crate) fn has_texture_backs(&self) -> bool {
+        !self.deferred().texture_backs.is_empty()
+    }
+
+    /// Destination title-memory ranges `[start, end)` updated when this command
+    /// list's GPU-to-CPU texture readbacks land.
+    #[allow(dead_code)]
+    pub(crate) fn texture_back_ranges(&self) -> Vec<(usize, usize)> {
+        self.deferred()
+            .texture_backs
+            .iter()
+            .map(crate::texback::Back::range)
+            .collect()
+    }
+
+    /// Before the list closes: copies eligible GPU-written textures into host
+    /// readback buffers (`crate::texback::record`).
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            if !target.is_valid() {
+                continue;
+            }
+            if let Some(barrier) = self.move_texture(&target.copy, COPY_SOURCE) {
+                // SAFETY: open command list and valid resource transition.
+                unsafe { self.list.ResourceBarrier(&[barrier]) };
+            }
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn keep_upload_for_test(&self, upload: ID3D12Resource) {
+        self.deferred().uploads.push(upload);
     }
 
     /// A copy of ours replaced the compute root signature and pipeline.
@@ -3905,6 +3997,16 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    pub(crate) fn alias_source_changed(
+        &self,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
+    }
+
     /// Runs `work` on host memory at submission, in order with the copies.
     pub(crate) fn defer_host(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Host(Box::new(work)));
@@ -3960,6 +4062,15 @@ impl HostList {
                         move_mapped(dst as *mut u8, src as *const u8, len);
                     } else {
                         copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    }
+                    if crate::shadow::shadow_keep_enabled() {
+                        crate::shadow::forget_range(dst, len);
+                        for page in crate::watch::alias_pages(dst, len) {
+                            crate::shadow::forget_range(
+                                page * crate::watch::PAGE,
+                                crate::watch::PAGE,
+                            );
+                        }
                     }
                     len
                 }
@@ -4771,6 +4882,47 @@ impl HostMemory for Host {
 }
 
 impl Host {
+    /// An unmapped `D3D12_HEAP_TYPE_READBACK` buffer of `size` bytes in
+    /// `D3D12_RESOURCE_STATE_COPY_DEST`.
+    pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_READBACK,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        // SAFETY: plain readback buffer creation.
+        let made = unsafe {
+            self.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut buffer,
+            )
+        };
+        match made {
+            Ok(()) => buffer,
+            Err(e) => {
+                tracing::warn!(error = %e, size, "no readback buffer");
+                None
+            }
+        }
+    }
+
     /// A mapped buffer of `size` bytes: upload memory, or (`readback`)
     /// readback memory in the copy-destination state.
     fn mapped_buffer(&self, size: u64, readback: bool) -> Option<(ID3D12Resource, *mut u8)> {
@@ -5496,6 +5648,17 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+}
+
+/// Batched [`retire`] under one hold of the retired-resources lock.
+pub(crate) fn retire_all(mut resources: Vec<ID3D12Resource>) {
+    if resources.is_empty() {
+        return;
+    }
+    RETIRED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(&mut resources);
 }
 
 /// After a submission has run, with none running: the retired resources go.

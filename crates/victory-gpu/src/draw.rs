@@ -66,6 +66,10 @@ pub(crate) struct State {
     depth: usize,
     /// Last render target and depth keys set on the host list.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -261,6 +265,17 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -438,6 +453,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         let mut rtv_views = Vec::with_capacity(handles.len());
         let mut rtv_keys = Vec::with_capacity(handles.len());
         for &h in handles {
@@ -454,8 +471,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            let desc = record.desc();
+            if rtv_views.len() < 8 {
+                formats[rtv_views.len()] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
+            }
             rtv_keys.push((texture.as_raw() as usize, record.key()));
-            rtv_views.push((texture, record.desc()));
+            rtv_views.push((texture, desc));
         }
         if self
             .hdr_rtvs
@@ -471,11 +492,14 @@ impl State {
             && let Some(texture) = crate::resource::host_resource(record.resource)
         {
             self.depth = record.resource as usize;
+            let desc = record.depth_desc();
+            formats[8] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             dsv_key = Some((texture.as_raw() as usize, record.key()));
-            dsv_view = Some((texture, record.depth_desc()));
+            dsv_view = Some((texture, desc));
         }
+        self.target_formats = formats;
         if bind_cache_enabled()
             && self
                 .host_targets
@@ -585,7 +609,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -649,6 +674,7 @@ impl State {
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;
         for &t in &self.targets {
+            list.texture_written(t as This);
             crate::list::ensure_state(list, t as This, RENDER_TARGET);
         }
         if self.depth != 0 {
@@ -1947,7 +1973,8 @@ impl State {
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -2332,10 +2359,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
-            if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a.get(), *resource as This);
-            }
-            if let Some(t) = crate::resource::host_copy(*resource as This)
+            let copied = crate::resource::alias_source(*resource as This)
+                .is_some_and(|a| crate::texture::alias_copy(list, a.get(), *resource as This));
+            if !copied
+                && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
             {
                 crate::texture::upload(list, *resource as This, &t.texture);
@@ -2357,6 +2384,7 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, *resource as This);
+            list.texture_written(*resource as This);
             crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
         }
         _ => {}
@@ -5394,5 +5422,119 @@ void main(uint3 id : SV_DispatchThreadID) {
         state.host_state_lost();
         assert!(state.host_targets.is_none());
         list.close();
+    }
+
+    fn run_shadow_preserve_gpu_write_repro(p: usize, len: usize) {
+        let _keep = crate::shadow::KeepGuard::enable();
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        // SAFETY: committed buffer of `len` bytes.
+        unsafe {
+            (p as *mut u32).write_volatile(0x1111_1111);
+            ((p + 0x200) as *mut u32).write_volatile(0x2222_2222);
+        }
+        let buf = buffer_at_address(p as u64, len as u64);
+        let copy = crate::shadow::find(p as u64, len as u64).expect("shadow copy");
+        assert!(!copy.is_aliased(), "test requires a non-aliased shadow buffer");
+        let (out_buf, out_data) = host.shared_buffer(256).expect("output buffer");
+        // SAFETY: live output buffer.
+        let out_gpu = unsafe { out_buf.GetGPUVirtualAddress() };
+        // SAFETY: inside mapped output buffer.
+        unsafe { std::ptr::write_bytes(out_data, 0, 256) };
+
+        let writer = compile_cs(
+            r#"
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() { dst.Store(0, 0xDEADBEEFu); }
+"#,
+            &[Param::Uav { register: 0 }],
+        );
+        let reader = compile_cs(
+            r#"
+ByteAddressBuffer src : register(t0);
+RWByteAddressBuffer dst : register(u0);
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(0, src.Load(0));
+    dst.Store(4, src.Load(0x200));
+}
+"#,
+            &[
+                Param::Srv {
+                    register: 0,
+                    space: 0,
+                },
+                Param::Uav { register: 0 },
+            ],
+        );
+
+        // Submission 1: initial refresh uploads CPU values, then GPU writes
+        // 0xDEADBEEF to word 0 (kept in shadow, not copied back to CPU).
+        let list1 = host.new_list().unwrap();
+        copy.refresh(&list1, p as u64, len as u64);
+        // SAFETY: open command list and live root/PSO/buffers.
+        unsafe {
+            list1.list.SetComputeRootSignature(&writer.0);
+            list1.list.SetComputeRootUnorderedAccessView(0, copy.gpu(p as u64));
+            list1.list.SetPipelineState(&writer.1);
+            list1.list.Dispatch(1, 1, 1);
+        }
+        list1.close();
+        host.execute(&[&list1]);
+        assert_eq!(copy.read_host(p as u64, 1), [0xDEAD_BEEF]);
+        // SAFETY: committed title memory.
+        assert_eq!(unsafe { (p as *const u32).read_volatile() }, 0x1111_1111);
+
+        // Between submissions: sibling CPU write in a different 256-byte piece
+        // on the same 64 KiB page marks the page dirty while word 0 stays unchanged.
+        // SAFETY: committed title memory.
+        unsafe { ((p + 0x200) as *mut u32).write_volatile(0x3333_3333) };
+
+        // Submission 2: refresh runs, then GPU reads both words into `out_buf`.
+        let list2 = host.new_list().unwrap();
+        copy.refresh(&list2, p as u64, len as u64);
+        // SAFETY: open command list and live root/PSO/buffers.
+        unsafe {
+            list2.list.SetComputeRootSignature(&reader.0);
+            list2.list.SetComputeRootShaderResourceView(0, copy.gpu(p as u64));
+            list2.list.SetComputeRootUnorderedAccessView(1, out_gpu);
+            list2.list.SetPipelineState(&reader.1);
+            list2.list.Dispatch(1, 1, 1);
+        }
+        list2.close();
+        host.execute(&[&list2]);
+
+        // SAFETY: inside mapped output buffer after GPU completion.
+        let got = unsafe { std::slice::from_raw_parts(out_data.cast::<u32>(), 2).to_vec() };
+        crate::shadow::unregister(buf as usize, p as u64);
+        assert_eq!(
+            got,
+            [0xDEAD_BEEF, 0x3333_3333],
+            "GPU write at word 0 must survive refresh when sibling CPU write dirties the same 64 KiB page"
+        );
+    }
+
+    #[test]
+    fn shadow_refresh_preserves_gpu_writes_on_same_tracked_page() {
+        let len = crate::watch::PAGE;
+        let p = crate::watch::tests::pool(1);
+        run_shadow_preserve_gpu_write_repro(p, len);
+    }
+
+    #[test]
+    fn shadow_refresh_preserves_gpu_writes_on_untracked_buffer() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        let len = crate::watch::PAGE;
+        // SAFETY: fresh plain committed page (untracked by fault tracking).
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        run_shadow_preserve_gpu_write_repro(p, len);
+        crate::watch::tests::free(p);
     }
 }

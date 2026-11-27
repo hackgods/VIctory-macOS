@@ -1588,6 +1588,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_work(true);
         self.ambient(list);
     }
 
@@ -1836,6 +1837,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.note_work(false);
                     true
                 }
                 Err(_) => false,
@@ -2457,6 +2459,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2553,6 +2556,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2661,9 +2665,35 @@ impl State {
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
         // Decide hoisting before `prepare`/`bind`, which record *this* call's
         // own GPU writes (those only constrain subsequent indirect calls).
-        let hoist = crate::indirect::batch_clamps_enabled()
-            && list.can_hoist_clamp(arguments, len, count);
-        let inline_clamped = if hoist {
+        let blocker = crate::indirect::batch_clamps_enabled()
+            .then(|| crate::indirect::blocker(list, (arguments, len), count));
+        let hoist = blocker == Some(None);
+        if !hoist {
+            crate::indirect::note_held_out(blocker.flatten());
+        }
+        // Held out of the prelude: clamped in a group pass if it can be
+        // (`crate::indirect::groups_enabled`), a pass recorded here if the
+        // group open in the list cannot take it.
+        let in_place = blocker == Some(Some(crate::host::Blocker::InPlace));
+        let seat = (blocker.is_some_and(|b| b.is_some())
+            && !in_place
+            && crate::indirect::groups_enabled()
+            && crate::indirect::groupable(kind, stride, max, count.is_some()))
+        .then(|| {
+            crate::indirect::note_source(&args);
+            list.clamp_group_seat(
+                (&args.buffer, args_gpu),
+                (arguments, len),
+                crate::indirect::recent_sources,
+            )
+        })
+        .flatten();
+        if seat.as_ref().is_some_and(|&(_, opened)| opened) {
+            // The pass binds a compute pipeline of its own.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
+        }
+        let inline_clamped = if hoist || seat.is_some() {
             None
         } else {
             // Bounded first: the inline clamp binds a compute pipeline of its
@@ -2712,11 +2742,21 @@ impl State {
             }
             return false;
         }
-        let (clamped, dst_offset, needs_done) = match inline_clamped {
-            Some(clamped) => (clamped, 0, true),
-            None => {
+        let (clamped, dst_offset, needs_done) = match (inline_clamped, seat) {
+            (Some(clamped), _) => (clamped, 0, true),
+            (None, Some((seat, _))) => {
                 let Some((clamped, dst_offset)) =
-                    crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
+                    list.clamp_group_join(&seat, args_gpu, (kind, stride))
+                else {
+                    why("not bounded (no place in its clamp group)");
+                    return false;
+                };
+                (clamped, dst_offset, false)
+            }
+            (None, None) => {
+                let record = (Some(&args.buffer), args_gpu);
+                let Some((clamped, dst_offset)) =
+                    crate::indirect::enqueue_from(list, record, (kind, stride, max), counted)
                 else {
                     why("not bounded (no hoisted argument buffer)");
                     return false;
@@ -2768,10 +2808,12 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            list.note_work(true);
             self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         true
     }

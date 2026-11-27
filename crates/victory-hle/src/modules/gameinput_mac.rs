@@ -58,6 +58,12 @@
 //! reach neither module, look like a pad held still, and are kept. One
 //! `pad frozen:` line each time a step fires.
 //!
+//! `VICTORY_PAD_STALE_REST=<seconds>` (with `VICTORY_PAD_REARM`, at least 5):
+//! on the SDL path nothing on our side tells a pad held still from one whose
+//! reports stopped, so this is a bound, off unless set: a kept pad still off
+//! rest that long after its last packet reads at rest until a reading moves.
+//! A trigger really held that long reads released until the pad changes.
+//!
 //! `VICTORY_PAD_RUMBLE=0`: the title's rumble is not sent to XInput. On the
 //! SDL path (read in SDL 2.32.10) a rumble report goes out on SDL's rumble
 //! thread holding the pad's device lock (`SDL_hidapi_rumble.c`), and SDL's
@@ -431,6 +437,8 @@ pub(super) struct Rearm {
     wanted: bool,
     /// A re-arm never returned: our module is not asked again.
     hung: bool,
+    /// `VICTORY_PAD_STALE_REST` (µs).
+    stale: Option<u64>,
 }
 
 /// A pad is off rest: a button, a trigger, or a stick past drift.
@@ -496,7 +504,7 @@ impl Rearm {
         second: Probe,
         now: u64,
     ) -> Option<PadState> {
-        let hung = self.hung;
+        let (hung, stale) = (self.hung, self.stale);
         let s = self.slots.get_mut(slot)?;
         match main {
             Some(None) => {
@@ -628,6 +636,16 @@ impl Rearm {
                         Some(Stage::Kept)
                     }
                 }
+                Stage::Kept
+                    if off_rest(&pad)
+                        && stale.is_some_and(|b| now.saturating_sub(s.moved) >= b) =>
+                {
+                    tracing::warn!(
+                        "pad frozen: pad {slot} packet {packet} unchanged for {still:.1} s while off rest ({}), with nothing newer in either XInput module; reported at rest (VICTORY_PAD_STALE_REST) until a reading moves",
+                        describe(&pad)
+                    );
+                    Some(Stage::Rest)
+                }
                 _ => None,
             };
             if let Some(next) = next {
@@ -687,6 +705,21 @@ impl PadRearm {
         }
         let mut on =
             std::env::var("VICTORY_PAD_REARM").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+        if on && let Ok(v) = std::env::var("VICTORY_PAD_STALE_REST") {
+            match v.trim().parse::<f64>() {
+                Ok(s) if s >= secs(REARM_STILL + REARM_WAIT) && s.is_finite() => {
+                    tracing::info!(
+                        seconds = s,
+                        "pad rearm: a kept pad still off rest this long reads at rest (VICTORY_PAD_STALE_REST)"
+                    );
+                    self.rearm.stale = Some((s * 1e6) as u64);
+                }
+                _ => tracing::warn!(
+                    value = v,
+                    "VICTORY_PAD_STALE_REST wants seconds, at least 5"
+                ),
+            }
+        }
         if on {
             match helper::Helper::start() {
                 Ok(helper) => {
@@ -1357,6 +1390,26 @@ mod tests {
             t += 8_000;
         }
         assert_eq!(last, Some(a));
+    }
+
+    #[test]
+    fn the_stale_bound_rests_a_kept_pad_only_when_set() {
+        let main = Some((held(), 78));
+        let second = Probe::Reading(held(), 9);
+        let mut rearm = Rearm::default();
+        let (_, shown) = run(&mut rearm, 0, 120 * S, main, second);
+        assert_eq!(shown, Some(held()), "off by default");
+        let mut rearm = Rearm {
+            stale: Some(15 * S),
+            ..Rearm::default()
+        };
+        let (_, shown) = run(&mut rearm, 0, 15 * S - 10_000, main, second);
+        assert_eq!((shown, rearm.slots[0].stage), (Some(held()), Stage::Kept));
+        let (_, shown) = run(&mut rearm, 15 * S - 10_000, 20 * S, main, second);
+        assert_eq!(shown, Some(PadState::default()));
+        // Any change brings it back.
+        let (_, shown) = run(&mut rearm, 20 * S, 21 * S, Some((held(), 79)), second);
+        assert_eq!(shown, Some(held()));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
-use crate::census_fast::{Fast, Tickets, Unordered};
+use crate::census_fast::{Fast, Hold, Tickets, Unordered};
 use crate::census_maps::{Counts, Hashing};
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -44,6 +44,9 @@ pub(crate) struct Viewed {
     /// mac: with `VICTORY_CENSUS_FAST=1` (`crate::census_fast`): the kept
     /// answer of [`unordered_writes`] and its generation.
     fast: Option<Fast<Shadow>>,
+    /// mac: with `VICTORY_CENSUS_BATCH=1` (and the fast parts): a heap sync
+    /// pass holds the updates of its slots ([`Pass`]).
+    batch: bool,
 }
 
 impl Default for Viewed {
@@ -55,7 +58,13 @@ impl Default for Viewed {
 impl Viewed {
     /// A census, with the fast parts (`fast`) or as before.
     pub(crate) fn new(fast: bool) -> Self {
-        Viewed { inner: Mutex::new(Inner::new(fast)), fast: fast.then(Fast::default) }
+        Viewed::with_batch(fast, fast && crate::mac_switches::census_batch())
+    }
+
+    /// A census, with the fast parts (`fast`) and passes holding updates
+    /// (`batch`, only with them).
+    pub(crate) fn with_batch(fast: bool, batch: bool) -> Self {
+        Viewed { inner: Mutex::new(Inner::new(fast)), fast: fast.then(Fast::default), batch: fast && batch }
     }
 }
 
@@ -256,7 +265,105 @@ impl Drop for Batch<'_> {
     }
 }
 
+/// A census update as a pass holds it: the slot, its making's ticket, what
+/// it views.
+type Update = (u32, u64, Option<Seen>);
+
+thread_local! {
+    /// mac (`VICTORY_CENSUS_BATCH=1`): the updates this thread holds for
+    /// the heap sync pass it is in, if it is in one ([`Pass`]).
+    static HELD: std::cell::RefCell<Option<Hold<Update>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// mac: while this lives, the census updates of the slots this thread makes
+/// in `viewed` through [`Viewed::set_seen`] (`HostHeap::mirror`,
+/// `HostHeap::make_null`) are held ([`crate::census_fast::Hold`]) and entered
+/// under one hold of the census lock [`crate::census_fast::BATCH`] at a time
+/// ([`Pass::enter_if_full`]), the rest when the outermost pass goes, before
+/// the pass's function returns: readers ordered after it see every slot it
+/// made. Texture views still go in at once ([`forget`] must find them), and
+/// so do other heaps' and other threads' updates. Without the switch (or
+/// inside another pass of the thread) it holds nothing.
+pub(crate) struct Pass<'a> {
+    viewed: &'a Viewed,
+    /// This pass installed the thread's hold (it is the outermost one).
+    own: bool,
+}
+
+impl Pass<'_> {
+    /// With no slot lock held: a batch's held updates, if there are a
+    /// batch's (for this census).
+    pub(crate) fn enter_if_full(&self) {
+        self.enter(false);
+    }
+
+    fn enter(&self, all: bool) {
+        let Some(fast) = &self.viewed.fast else {
+            return;
+        };
+        let owner = std::ptr::from_ref(self.viewed) as usize;
+        let updates = HELD.with(|h| match h.borrow_mut().as_mut() {
+            Some(hold) if hold.is_for(owner) => hold.take(all),
+            _ => Vec::new(),
+        });
+        if updates.is_empty() {
+            return;
+        }
+        let n = updates.len();
+        let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
+        for (index, ticket, seen) in updates {
+            inner.enter(fast, index, ticket, seen);
+        }
+        drop(inner);
+        crate::census_fast::entered(n);
+    }
+}
+
+impl Drop for Pass<'_> {
+    fn drop(&mut self) {
+        if self.own {
+            self.enter(true);
+            HELD.with(|h| *h.borrow_mut() = None);
+        }
+    }
+}
+
 impl Viewed {
+    /// mac: a heap sync pass over this census's heap ([`Pass`]).
+    pub(crate) fn pass(&self) -> Pass<'_> {
+        let owner = std::ptr::from_ref(self) as usize;
+        let own = self.batch
+            && HELD.with(|h| {
+                let mut h = h.borrow_mut();
+                let free = h.is_none();
+                if free {
+                    *h = Some(Hold::new(owner));
+                }
+                free
+            });
+        Pass { viewed: self, own }
+    }
+
+    /// mac: `seen` for slot `index`, made with `ticket`, held for the pass
+    /// this thread is in over this census; given back if it is not in one,
+    /// or if it is a texture view.
+    fn hold(&self, index: u32, ticket: u64, seen: Option<Seen>) -> Result<(), Option<Seen>> {
+        if !self.batch {
+            return Err(seen);
+        }
+        let owner = std::ptr::from_ref(self) as usize;
+        HELD.with(|h| match h.borrow_mut().as_mut() {
+            Some(hold) if !matches!(seen, Some(Seen::Texture(_))) => {
+                hold.hold(owner, (index, ticket, seen)).map_err(|(_, _, seen)| seen)
+            }
+            Some(_) => {
+                crate::census_fast::at_once();
+                Err(seen)
+            }
+            None => Err(seen),
+        })
+    }
+
     /// Title slot `index` now holds `view` (none: no view), made on the
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
@@ -272,6 +379,11 @@ impl Viewed {
         // a heap sync's batch enters them ([`Batch`]).
         if let Some(fast) = &self.fast {
             let ticket = fast.ticket();
+            // mac: held for the heap sync pass this thread is in
+            // (`VICTORY_CENSUS_BATCH=1`, [`Pass`]).
+            let Err(seen) = self.hold(index, ticket, seen) else {
+                return;
+            };
             let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
             inner.enter(fast, index, ticket, seen);
             return;
@@ -571,6 +683,22 @@ pub(crate) fn unordered_writes(viewed: &Viewed) -> Option<Arc<[(Arc<Shadow>, usi
     }
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     inner.unordered.as_ref().map(|unordered| fast.answer(unordered))
+}
+
+/// mac: with the frame line (`frames` since the last one): the census
+/// updates heap sync passes held (`VICTORY_CENSUS_BATCH=1`, [`Pass`]), the
+/// census lock takes that entered them and the takes that saved (one a held
+/// update before). Nothing without the switch.
+pub(crate) fn log_held(frames: f64) {
+    if !crate::mac_switches::census_batch() {
+        return;
+    }
+    let [held, takes, saved, once] = crate::census_fast::take_held(frames);
+    tracing::info!(
+        "census batch (VICTORY_CENSUS_BATCH=1): {held:.0} census updates/frame of mirror and make_null held by heap \
+         sync passes, entered in {takes:.0} census lock takes ({saved:.0} takes/frame saved); {once:.0} texture \
+         views/frame entered at once beside a pass"
+    );
 }
 
 /// Draws and dispatches run with heap-indexing shaders, those of them
@@ -952,6 +1080,100 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(old.range_at(0), None, "entered at once");
         drop(batch);
         drop((old, fast));
+        release();
+    }
+
+    /// mac (`VICTORY_CENSUS_BATCH`): what a slot's census entry is: a buffer
+    /// range, a texture, a view left without a host view, or none.
+    fn entry(viewed: &Viewed, index: u32) -> Option<(u8, Option<Range>)> {
+        let kind = match viewed.inner.lock().unwrap().slots.get(&index)? {
+            Seen::Buffer(..) => 0,
+            Seen::Texture(_) => 1,
+            Seen::Left(_) => 2,
+        };
+        Some((kind, viewed.range_at(index)))
+    }
+
+    /// mac: a pass (`VICTORY_CENSUS_BATCH=1`) holds the updates its thread
+    /// makes for its census until a batch is full or it goes, and a reader
+    /// after it finds them all: texture views, other heaps' updates and
+    /// other threads' go in at once; a nested pass enters nothing when it
+    /// goes; an update held past another thread's later making of the slot
+    /// leaves that making in. Without the switch a pass holds nothing.
+    #[test]
+    fn a_pass_holds_its_slots_until_it_goes() {
+        let memory = vec![0u8; 0x3000];
+        let at = memory.as_ptr() as u64;
+        let (Some(copies), release) = three_copies(&memory) else {
+            return; // no host GPU here
+        };
+        let view = |k: usize, uav: bool| Some(Seen::Buffer(copies[k].clone(), at + 0x1000 * k as u64, 0x100, uav));
+        let range = |k: usize, uav: bool| Some((0u8, Some((Arc::as_ptr(&copies[k]) as usize, at + 0x1000 * k as u64, 0x100, uav))));
+        let (viewed, other) = (Viewed::with_batch(true, true), Viewed::with_batch(true, true));
+        viewed.set_seen(3, view(0, false));
+        let _ = crate::census_fast::take_held(1.0);
+        {
+            let pass = viewed.pass();
+            viewed.set_seen(0, view(1, true));
+            viewed.set_seen(3, None);
+            viewed.set_seen(4, Some(Seen::Left((1, 0, 0))));
+            assert_eq!((entry(&viewed, 0), entry(&viewed, 3), entry(&viewed, 4)), (None, range(0, false), None), "held");
+            viewed.set_seen(5, Some(Seen::Texture(0x1234)));
+            assert_eq!(entry(&viewed, 5), Some((1, None)), "a texture view goes in at once");
+            other.set_seen(0, view(2, false));
+            assert_eq!(entry(&other, 0), range(2, false), "another heap's update goes in at once");
+            // Another thread (in no pass) makes slot 6 after this one did.
+            viewed.set_seen(6, view(0, true));
+            std::thread::scope(|s| {
+                s.spawn(|| viewed.set_seen(6, view(2, true)));
+            });
+            assert_eq!(entry(&viewed, 6), range(2, true), "the other thread's at once");
+            {
+                let inner = viewed.pass();
+                viewed.set_seen(1, view(2, false));
+                drop(inner);
+            }
+            assert_eq!(entry(&viewed, 1), None, "a nested pass enters nothing when it goes");
+            pass.enter_if_full();
+            assert_eq!(entry(&viewed, 0), None, "less than a batch stays held");
+            for slot in 100..100 + crate::census_fast::BATCH as u32 {
+                viewed.set_seen(slot, view(0, false));
+            }
+            pass.enter_if_full();
+            assert_eq!(entry(&viewed, 0), range(1, true), "a full batch went in");
+            assert_eq!(entry(&viewed, 100), range(0, false));
+            viewed.set_seen(2, view(1, false));
+            assert_eq!(entry(&viewed, 2), None);
+        }
+        // The pass went: everything is in, and slot 6 keeps the later making.
+        let want = [(0, range(1, true)), (1, range(2, false)), (2, range(1, false)), (3, None), (4, Some((2, None))), (6, range(2, true))];
+        for (slot, entry_want) in want {
+            assert_eq!(entry(&viewed, slot), entry_want, "slot {slot}");
+        }
+        let [held, takes, saved, once] = crate::census_fast::take_held(1.0);
+        let n = 6.0 + crate::census_fast::BATCH as f64;
+        assert!(held >= n && takes >= 2.0 && saved >= n - 2.0 && once >= 1.0, "{held} {takes} {saved} {once}");
+        // The counts follow the entries, as in a census without passes.
+        let old = Viewed::new(false);
+        for (slot, seen) in [(3, view(0, false)), (0, view(1, true)), (3, None), (6, view(2, true)), (1, view(2, false)), (2, view(1, false))] {
+            old.set_seen(slot, seen);
+        }
+        for slot in 100..100 + crate::census_fast::BATCH as u32 {
+            old.set_seen(slot, view(0, false));
+        }
+        let slots = 100 + crate::census_fast::BATCH as u32;
+        let answer = |v: &Viewed| match unordered_writes(v) {
+            Some(writes) => plain(&writes, v, slots),
+            None => plain(&widened_writes(v), v, slots),
+        };
+        assert_eq!(answer(&viewed), answer(&old));
+        // Without the switch: at once.
+        let plain_census = Viewed::with_batch(true, false);
+        let pass = plain_census.pass();
+        plain_census.set_seen(0, view(0, true));
+        assert_eq!(entry(&plain_census, 0), range(0, true), "no pass without the switch");
+        drop(pass);
+        drop((viewed, other, old, plain_census));
         release();
     }
 

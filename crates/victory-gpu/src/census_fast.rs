@@ -26,7 +26,9 @@
 //!    was made ([`Fast::ticket`], under the slot's lock), and an update older
 //!    than the one a slot's entry is from is dropped ([`Tickets::newer`]).
 //!    The census so ends with what the slot was made from last, as it did
-//!    when the update went in under the slot's lock.
+//!    when the update went in under the slot's lock. With
+//!    `VICTORY_CENSUS_BATCH=1` a pass also holds the updates of the slots
+//!    `mirror` and `make_null` make in it ([`Hold`]).
 //!
 //! Plain std, outside the Windows-only census, so that the tests run on any
 //! host.
@@ -179,6 +181,82 @@ impl Tickets {
         self.0[i] = ticket;
         true
     }
+}
+
+/// mac: `VICTORY_CENSUS_BATCH=1` (`crate::mac_switches::census_batch`, only
+/// with `VICTORY_CENSUS_FAST=1`): the census updates a thread holds for the
+/// heap sync pass it is in (`bindless::Pass`), for one census (`owner`, its
+/// address). `HostHeap::mirror` and `HostHeap::make_null` enter one update
+/// a slot under the census lock (13.7 ms a frame of lock work at the cell,
+/// `notes/profile-second-run.md` 2b row 2); in a pass they are held here and
+/// entered [`BATCH`] at a time, and in full when the pass ends.
+///
+/// The rule that keeps readers right: **every update a pass holds is
+/// entered before the pass returns.** The census's readers that must see
+/// the pass (a submission's refreshes, uploads, `written` and slot
+/// refreshes) run on the submitting thread after the heap sync has
+/// returned, or under the submission lock that the sync's rounds ahead
+/// hold; so they find every slot the pass made. Each update carries its
+/// making's ticket ([`Fast::ticket`], drawn under the slot's lock), so one
+/// held past a later making by another thread is dropped ([`Tickets`]).
+pub(crate) struct Hold<U> {
+    owner: usize,
+    updates: Vec<U>,
+}
+
+impl<U> Hold<U> {
+    pub(crate) fn new(owner: usize) -> Self {
+        Hold { owner, updates: Vec::new() }
+    }
+
+    /// Holds `update` if it is for this hold's census; gives it back if not.
+    pub(crate) fn hold(&mut self, owner: usize, update: U) -> Result<(), U> {
+        if owner != self.owner {
+            return Err(update);
+        }
+        self.updates.push(update);
+        HELD[0].fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    /// Whether this hold is for census `owner`.
+    pub(crate) fn is_for(&self, owner: usize) -> bool {
+        owner == self.owner
+    }
+
+    /// The updates to enter now: all of them (`all`, the pass ends), or a
+    /// batch's once there are [`BATCH`]; none otherwise.
+    pub(crate) fn take(&mut self, all: bool) -> Vec<U> {
+        if self.updates.is_empty() || (!all && self.updates.len() < BATCH) {
+            return Vec::new();
+        }
+        std::mem::take(&mut self.updates)
+    }
+}
+
+/// Since the last frame line: census updates held by passes, census lock
+/// takes that entered them, and updates that went in at once while a pass
+/// held (texture views, `bindless::Viewed::set_seen`).
+static HELD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `n` held updates were entered under one take of the census lock.
+pub(crate) fn entered(n: usize) {
+    if n > 0 {
+        HELD[1].fetch_add(1, Relaxed);
+    }
+}
+
+/// An update went in at once while the thread's pass held others.
+pub(crate) fn at_once() {
+    HELD[2].fetch_add(1, Relaxed);
+}
+
+/// The counts since the last call, each divided by `frames`: updates held,
+/// lock takes for them, census lock takes saved (one a held update before),
+/// updates entered at once beside a pass.
+pub(crate) fn take_held(frames: f64) -> [f64; 4] {
+    let [held, takes, once] = std::array::from_fn(|i| HELD[i].swap(0, Relaxed));
+    [held, takes, held.saturating_sub(takes), once].map(|n| n as f64 / frames)
 }
 
 /// For each of a barrier's events (`Some(heap)` for a heap-writing draw,
@@ -604,6 +682,134 @@ mod tests {
             }
             assert_eq!(c.slots.get(&(slot as u32)).map(|(k, _)| *k), Some(range(v).0), "slot {slot}");
         }
+    }
+
+    /// A hold takes only its own census's updates, gives a batch once it
+    /// has [`BATCH`], everything when asked for all, and nothing when empty.
+    #[test]
+    fn a_hold_keeps_its_own_censuses_updates_and_gives_them_by_batch() {
+        let mut hold = Hold::new(1);
+        assert!(hold.is_for(1) && !hold.is_for(2));
+        assert_eq!(hold.hold(2, 7u32), Err(7), "another census's update goes back");
+        assert!(hold.take(true).is_empty(), "nothing held");
+        for k in 0..BATCH as u32 - 1 {
+            assert_eq!(hold.hold(1, k), Ok(()));
+        }
+        assert!(hold.take(false).is_empty(), "one short of a batch");
+        assert_eq!(hold.hold(1, 999), Ok(()));
+        let batch = hold.take(false);
+        assert_eq!(batch.len(), BATCH);
+        assert_eq!(batch.last(), Some(&999), "in the order held");
+        assert_eq!(hold.hold(1, 5), Ok(()));
+        assert_eq!(hold.take(true), [5], "the rest when the pass ends");
+        assert!(hold.take(true).is_empty());
+    }
+
+    /// An update as a pass holds it: slot, ticket, range and copy.
+    type Held = (u32, u64, Option<(Range, Arc<Copy>)>);
+
+    /// The pass rule (`Hold`): a "pass" thread makes slots and holds their
+    /// census updates, entering a batch now and then, while a "title thread"
+    /// makes the same slots and enters each at once, every making under the
+    /// slot's lock. When the pass has returned, a reader ordered after it
+    /// (here: after the join) finds each slot as its last making left it.
+    /// The negative control: a pass that returns with updates still held
+    /// leaves slots the reader misses (its last 200 makings come after all
+    /// of the title thread's, so some held ones are the slots' last).
+    fn pass_then_read(enter_at_end: bool) -> Result<usize, String> {
+        const SLOTS: usize = 600;
+        let fast = Fast::default();
+        let census = Mutex::new(Census::new());
+        let made: Vec<Mutex<Option<u64>>> = (0..SLOTS).map(|_| Mutex::new(None)).collect();
+        let next = AtomicU64::new(1);
+        let title_done = std::sync::atomic::AtomicBool::new(false);
+        let copy = Arc::new(Copy(0));
+        let pc = Arc::as_ptr(&copy) as usize;
+        // A making's value: none (a cleared record, `make_null`) or a range.
+        let range =
+            |v: u64| (!v.is_multiple_of(5)).then(|| ((pc, 16 * (v % 499), 16 * (v % 499) + 16, v.is_multiple_of(3)), copy.clone()));
+        let enter = |updates: Vec<Held>| {
+            let mut c = census.lock().unwrap();
+            for (slot, ticket, seen) in updates {
+                c.set(&fast, slot, ticket, seen);
+            }
+        };
+        let mut late = 0;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut hold = Hold::new(1);
+                for round in 0..3_000usize {
+                    if round == 2_800 {
+                        while !title_done.load(Acquire) {
+                            std::thread::yield_now();
+                        }
+                    }
+                    let slot = (round * 7) % SLOTS;
+                    {
+                        let mut m = made[slot].lock().unwrap();
+                        let v = next.fetch_add(1, Relaxed);
+                        *m = Some(v);
+                        let held = hold.hold(1, (slot as u32, fast.ticket(), range(v)));
+                        assert!(held.is_ok());
+                    }
+                    // With no slot lock held.
+                    enter(hold.take(false));
+                }
+                if enter_at_end {
+                    enter(hold.take(true));
+                }
+            });
+            s.spawn(|| {
+                for round in 0..3_000usize {
+                    let slot = (round * 11) % SLOTS;
+                    let mut m = made[slot].lock().unwrap();
+                    let v = next.fetch_add(1, Relaxed);
+                    *m = Some(v);
+                    let ticket = fast.ticket();
+                    census.lock().unwrap().set(&fast, slot as u32, ticket, range(v));
+                }
+                title_done.store(true, Release);
+            });
+        });
+        let c = census.lock().unwrap();
+        for (slot, m) in made.iter().enumerate() {
+            let Some(v) = *m.lock().unwrap() else { continue };
+            let want = range(v).map(|r| r.0);
+            let got = c.slots.get(&(slot as u32)).map(|(k, _)| *k);
+            if got != want {
+                late += 1;
+                if enter_at_end {
+                    return Err(format!("slot {slot}: {got:?}, its last making {want:?}"));
+                }
+            }
+        }
+        Ok(late)
+    }
+
+    #[test]
+    fn a_pass_that_returned_has_entered_every_slot_it_made() {
+        assert_eq!(pass_then_read(true), Ok(0));
+        let missed = pass_then_read(false).unwrap();
+        assert!(missed > 0, "the negative control: updates still held are missed ({missed})");
+    }
+
+    #[test]
+    fn the_held_counts_say_how_many_lock_takes_were_saved() {
+        // Other tests hold and enter too: only what this one adds is looked at.
+        let _ = take_held(1.0);
+        let mut hold = Hold::new(9);
+        for k in 0..600u32 {
+            hold.hold(9, k).unwrap();
+            if !hold.take(false).is_empty() {
+                entered(BATCH);
+            }
+        }
+        entered(hold.take(true).len());
+        entered(0);
+        at_once();
+        let [held, takes, saved, once] = take_held(1.0);
+        assert!(held >= 600.0 && takes >= 3.0 && once >= 1.0, "{held} {takes} {once}");
+        assert!(saved >= 597.0 && saved == held - takes);
     }
 
     #[test]

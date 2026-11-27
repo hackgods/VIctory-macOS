@@ -5069,6 +5069,7 @@ impl Meter {
             crate::physical_runs::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
+            crate::bindless::log_held(report_frames);
             crate::descriptor::pool::log(report_frames);
             crate::descriptor::reports::log(report_frames);
             crate::ambient_estimate::log(report_frames);

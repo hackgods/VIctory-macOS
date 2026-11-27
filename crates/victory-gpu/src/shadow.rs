@@ -1795,7 +1795,37 @@ thread_local! {
     static MARKED_SPLIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// mac: of [`copy_back_marks`] since the last frame line: marked pages of
+/// host copies compared with title memory, marked pages of aliased copies
+/// (told to the other trackers, nothing to compare), bytes written back
+/// from the compared pages, and the calls' microseconds.
+static MARKED_BACK: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Adds the time it lived to [`MARKED_BACK`]'s microseconds.
+struct MarkedClock(std::time::Instant);
+
+impl Drop for MarkedClock {
+    fn drop(&mut self) {
+        MARKED_BACK[3].fetch_add(self.0.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// The frame line's part for [`MARKED_BACK`] (`frames` since the last
+/// one), always, at the end of the line: the line's "copying back ... MB"
+/// counts the declared ranges only (`crate::host`), not these.
+pub(crate) fn marked_back_line(frames: f64) -> String {
+    let [compared, aliased, bytes, us] =
+        MARKED_BACK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!(
+        "; marked pages copied back: {compared:.0} compared, {:.1} MB written back from them, {aliased:.0} more in \
+         aliased memory told only, in {:.1} ms",
+        bytes / 1e6,
+        us / 1e3
+    )
+}
+
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
+    let _clocked = MarkedClock(std::time::Instant::now());
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
         let Some(b) = bitmap(memory) else {
@@ -1863,6 +1893,9 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         list.dedup();
     }
     let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
+    for (copy, list) in &by_copy {
+        MARKED_BACK[usize::from(copy.is_aliased())].fetch_add(list.len() as u64, Ordering::Relaxed);
+    }
     let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
     let parallel = parallel_copies_enabled()
         && by_copy.len() >= 2
@@ -1878,6 +1911,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
             let written = copy.copy_back_marked(list);
             total_written.fetch_add(written, Ordering::Relaxed);
         });
+        MARKED_BACK[2].fetch_add(total_written.load(Ordering::Relaxed) as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, total_pages as u64);
@@ -1892,6 +1926,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     }
     for (copy, list) in by_copy {
         let written = copy.copy_back_marked(&list);
+        MARKED_BACK[2].fetch_add(written as u64, Ordering::Relaxed);
         #[cfg(feature = "diagnostics")]
         {
             crate::copystat::add(crate::copystat::C::MarkedPages, list.len() as u64);

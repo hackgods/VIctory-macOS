@@ -774,6 +774,11 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
     // are made again before the next submission ([`remake_let_go`]), as
     // slots made from copies show the new pages once those are refreshed.
     if !gone.is_empty() {
+        let mut gone_ever = LET_GONE.lock().unwrap_or_else(|e| e.into_inner());
+        gone_ever.retain(|w| w.strong_count() > 0);
+        gone_ever.extend(gone.iter().map(std::sync::Arc::downgrade));
+        LET_GONE_ANY.store(true, Ordering::Release);
+        drop(gone_ever);
         LET_GO
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -832,6 +837,59 @@ fn remapped_before(start: u64, len: u64) -> bool {
         }
     }
     refused
+}
+
+/// Every title buffer in place let go that something still holds: a list
+/// recorded with it reads the section's old pages ([`stale_list`]).
+static LET_GONE: Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+static LET_GONE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Lists submitted that read title memory in place let go after they were
+/// recorded ([`stale_list`]).
+static STALE_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `shadows` (what a list about to be submitted refreshes or writes)
+/// hold title memory in place the title has since mapped other pages over:
+/// the list was recorded with the section's old pages, which it reads; the
+/// console would read the new ones. Counted and logged (it cannot be undone
+/// in a recorded list; [`in_place_shadow`] keeps it to once a range).
+pub(crate) fn stale_list<'a>(
+    shadows: impl IntoIterator<Item = &'a std::sync::Arc<crate::shadow::Shadow>>,
+) -> bool {
+    if !LET_GONE_ANY.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut gone = LET_GONE.lock().unwrap_or_else(|e| e.into_inner());
+    gone.retain(|w| w.strong_count() > 0);
+    if gone.is_empty() {
+        LET_GONE_ANY.store(false, Ordering::Release);
+        return false;
+    }
+    let held: Vec<*const crate::shadow::Shadow> =
+        gone.iter().map(std::sync::Weak::as_ptr).collect();
+    drop(gone);
+    let Some(shadow) = shadows
+        .into_iter()
+        .find(|s| held.contains(&std::sync::Arc::as_ptr(s)))
+    else {
+        return false;
+    };
+    let n = STALE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        let (start, len) = shadow.range();
+        tracing::warn!(
+            start = format_args!("{start:#x}"),
+            len,
+            n,
+            "a list recorded before the title mapped other pages over title memory in place reads the old pages"
+        );
+    }
+    true
+}
+
+/// [`stale_list`]'s count so far (tests).
+#[cfg(test)]
+pub(crate) fn stale_lists() -> u64 {
+    STALE_LISTS.load(Ordering::Relaxed)
 }
 
 /// Title buffers in place let go since the last [`remake_let_go`].
@@ -1390,6 +1448,7 @@ mod tests {
     /// the buffer is looked up again.
     #[test]
     fn title_buffers_on_section_heaps_are_used_in_place() {
+        use crate::backend::HostGpu;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1477,6 +1536,13 @@ mod tests {
         assert_eq!(shadow.update(start as usize, len), 0);
         assert_eq!(shadow.copy_back(start as usize, len), 0);
 
+        // A list recorded now reads these pages; submitted after the title
+        // maps other pages there, it is counted as reading the old ones.
+        let before = h.new_list().expect("a list");
+        shadow.refresh(&before, start, len as u64);
+        before.close();
+        let stale = stale_lists();
+
         // The title maps other pages over part of it: looked up again, and
         // (with no section there any more) copied.
         TEST_RESOLVER.with(|c| c.set(None));
@@ -1491,6 +1557,17 @@ mod tests {
             "remapped before"
         );
         TEST_RESOLVER.with(|c| c.set(None));
+        h.execute(&[&before]);
+        assert!(
+            stale_lists() > stale,
+            "the list recorded before the remap is counted"
+        );
+        let after = h.new_list().expect("a list");
+        again.refresh(&after, start, len as u64);
+        after.close();
+        let stale = stale_lists();
+        h.execute(&[&after]);
+        assert_eq!(stale_lists(), stale, "a list recorded after it is not");
 
         drop((again, shadow));
         crate::shadow::unregister(resource, start);

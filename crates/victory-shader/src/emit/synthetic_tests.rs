@@ -723,6 +723,104 @@ fn a_compare_mask_joined_with_data_on_the_skip_edge_is_0_there() {
     assert!(what.contains("lane-mask join"), "{what}");
 }
 
+/// An immediate sampler made in an arm that lanes failing a compare skip
+/// (`s_cbranch_execz` when none is left) and used after the join, where
+/// those lanes' EXEC bits are clear (`resource::tests::
+/// a_guarded_access_excludes_dead_lane_edges_at_a_join`): the program
+/// translates, and lanes 0-15 sample the texel and store it while the
+/// others store nothing. Refused before ("a descriptor neither loaded nor
+/// built"), which dropped the program.
+#[test]
+fn a_sampler_made_in_an_arm_samples_after_the_join() {
+    let words: [u32; 22] = [
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
+        0xBF88_0004, // s_cbranch_execz -> join (skips 4 dwords)
+        0xBE88_0380, // s_mov_b32 s8, 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        0xBE8A_0380, // s_mov_b32 s10, 0
+        0xBE8B_0380, // s_mov_b32 s11, 0
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let text: Vec<String> = crate::gfx10::decode(&code)
+        .unwrap()
+        .iter()
+        .map(|i| i.text(true))
+        .collect();
+    for want in [
+        "s_load_dwordx4 s[40:43], s[4:5]",
+        "v_lshlrev_b32 v16, 2, v0",
+        "image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]",
+        "buffer_store_dword v12, v16, s[40:43], 0 offen",
+    ] {
+        assert!(
+            text.iter().any(|t| t.contains(want)),
+            "{want:?} not in {text:?}"
+        );
+    }
+    let shader = build(&words).expect("lower");
+    assert_eq!(shader.static_samplers.len(), 1, "the immediate sampler");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let views = [
+        View::Texture(1, 1, &[[0.75, 0.5, 0.25, 1.0]]),
+        View::Buffer {
+            data: &[0; 4],
+            stride: Stride::Structured(16),
+        },
+        View::RawUav(32),
+    ];
+    let want: Vec<u32> = (0..32)
+        .map(|lane| if lane < 16 { 0.75f32.to_bits() } else { 0 })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+            assert!(warp, "{label}: no pipeline for a wave of 32");
+            eprintln!("{label}: no pipeline for a wave of 32; skipped");
+            continue;
+        };
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &views,
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out[0], want, "{label}");
+        eprintln!("{label}: lanes 0-15 sampled after the join");
+    }
+}
+
 /// A register array (v3-v14) indexed through M0 in waterfall loops, as
 /// `tiled_lighting:CS_PrescalarizeLightLoop` builds its per-tile light
 /// masks: each lane's index (clamped to 0-11 by `v_med3_u32`) becomes M0 in

@@ -242,6 +242,8 @@ struct Shared {
     pairs: HashMap<(usize, u32), u32>,
     /// The copies' generation it names ([`crate::shadow::generation`]).
     generation: u64,
+    /// The missed regions' count it gives blocks to ([`missed_regions`]).
+    regions: usize,
     layout: Arc<Layout>,
     /// The table's working buffers, kept between rewrites (grown as
     /// needed, never shrunk): the copies' order, the level-1 index, each
@@ -305,6 +307,11 @@ struct Stats {
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
+    /// Pages read with no copy that are reserved with nothing mapped: they
+    /// read as zeros, as the console's unmapped tiles do, and are no miss.
+    unmapped_pages: u64,
+    /// Copies made of mapped pages shaders missed, for the lists after.
+    copies_made: u64,
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -408,19 +415,38 @@ fn retake_dropped() {
 /// presented frame while shaders use it.
 pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    MISSED_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
     retake_dropped();
     let s = stats(std::mem::take);
-    if s.uses.is_empty() && s.written + s.withheld + s.withheld_bytes + s.missed_pages + s.missed_regions == 0 {
+    if s.uses.is_empty()
+        && s.written
+            + s.withheld
+            + s.withheld_bytes
+            + s.missed_pages
+            + s.missed_regions
+            + s.unmapped_pages
+            == 0
+    {
         return;
     }
     let mut uses: Vec<(&String, &u64)> = s.uses.iter().collect();
     uses.sort_by(|a, b| b.1.cmp(a.1));
     let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
-    let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
+    let missed: Vec<String> = s
+        .first_missed
+        .iter()
+        .map(|&a| {
+            #[cfg(feature = "diagnostics")]
+            return format!("{a:#x} {}", memory_kind(a));
+            #[cfg(not(feature = "diagnostics"))]
+            format!("{a:#x}")
+        })
+        .collect();
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}); {} pages read as unmapped tiles (zeros, no \
+         miss), {} copies made of missed pages",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -429,8 +455,103 @@ pub(crate) fn log_frame() {
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
-        missed.join(" ")
+        missed.join(" "),
+        s.unmapped_pages,
+        s.copies_made,
     );
+}
+
+/// What a shader read where it found no copy, told after its list ran.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissKind {
+    /// Memory is mapped there, or may have been while the list ran: the
+    /// console read the title's bytes there. A miss; a copy is made of it
+    /// for the lists after.
+    Mapped,
+    /// Reserved with nothing mapped, and no mapping change reported there
+    /// since the list was recorded: an unmapped tile of a reservation, which
+    /// reads as zeros on the console's GPU as D3D12 has unmapped tiles of
+    /// reserved resources read (tier 2 and up; D3DMetal too, docs/macos.md),
+    /// and the null views read zeros. No miss.
+    Unmapped,
+    /// Nothing reserved: memory the title never had. A miss.
+    Free,
+}
+
+/// [`MissKind`] of page `at`, with mapping changes counted from `since`
+/// (`crate::watch::remap_epoch` when the list was recorded).
+fn miss_kind(at: u64, since: u64) -> MissKind {
+    use windows_sys::Win32::System::Memory::{
+        MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return MissKind::Free;
+    }
+    // Nothing mapped now; a page whose mapping changed meanwhile may have
+    // had memory while the shaders read it.
+    let changed = || crate::watch::remapped_since(since, at as usize / crate::watch::PAGE);
+    match info.State {
+        MEM_RESERVE if !changed() => MissKind::Unmapped,
+        MEM_FREE if !changed() => MissKind::Free,
+        _ => MissKind::Mapped,
+    }
+}
+
+/// Whether misses are told apart (`VICTORY_TITLE_MISSES=0`: every page read
+/// with no copy is a miss, and no copy is made for it, as before).
+fn misses_told_apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TITLE_MISSES").as_deref() != Ok("0"))
+}
+
+/// Copies made of missed pages since the last frame line, at most
+/// [`MISSED_COPIES_MAX`] a frame (shaders following garbage pointers into
+/// mapped memory would make one per page).
+static MISSED_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const MISSED_COPIES_MAX: u64 = 64;
+
+/// A copy of the mapped page `at` a shader missed, for the lists after
+/// (the next page table names it): whether one was asked for.
+fn copy_missed(at: u64) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if MISSED_COPIES.fetch_add(1, Relaxed) >= MISSED_COPIES_MAX {
+        return false;
+    }
+    crate::shadow::find(at, crate::watch::PAGE as u64).is_some()
+}
+
+/// What the memory at `at` is now, for the missed addresses of the frame
+/// line (diagnostics): whether a copy could be made of it (committed, and a
+/// view of a section or private memory) or the shaders read past what the
+/// title maps (reserved, free).
+#[cfg(feature = "diagnostics")]
+fn memory_kind(at: u64) -> String {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE,
+        MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return "(not asked)".into();
+    }
+    let state = match info.State {
+        MEM_COMMIT => "committed",
+        MEM_RESERVE => "reserved",
+        MEM_FREE => "free",
+        _ => "?",
+    };
+    let kind = match info.Type {
+        MEM_MAPPED => " view",
+        MEM_PRIVATE => " private",
+        MEM_IMAGE => " image",
+        _ => "",
+    };
+    format!("({state}{kind}, protect {:#x})", info.Protect)
 }
 
 /// Our view heap for lists that bind none of the title's (dynamic slots
@@ -461,6 +582,7 @@ impl Shared {
             null,
             pairs: HashMap::new(),
             generation: u64::MAX,
+            regions: 0,
             layout: Arc::default(),
             scratch: pagetable::Scratch::default(),
         })
@@ -516,7 +638,10 @@ impl Shared {
             Ok(Layout { blocks, owner, .. }) => pagetable::Outputs { blocks, owners: owner },
             Err(_) => pagetable::Outputs::default(),
         };
-        let built = self.scratch.build(&ranges, &slots, self.null, &mut out);
+        let regions = missed_regions();
+        let built = self
+            .scratch
+            .build_with_regions(&ranges, &slots, self.null, &regions, &mut out);
         // SAFETY: the mapping has room for `CAPACITY` blocks, which the
         // builder keeps to; no submission runs.
         unsafe { std::ptr::copy_nonoverlapping(built.dwords.as_ptr(), self.data as *mut u32, built.dwords.len()) };
@@ -526,6 +651,7 @@ impl Shared {
             ONCE.call_once(|| tracing::warn!(CAPACITY, "title memory copies in more 256 MiB regions than a page table has room for: the rest read as missing"));
         }
         self.generation = now;
+        self.regions = regions.len();
         self.layout = Arc::new(Layout {
             bits: named.iter().map(|c| c.dirty_bit()).collect(),
             copies: named,
@@ -556,7 +682,7 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
         let host = std::ptr::from_ref(heap) as usize;
         let (_, s) = shared.iter_mut().find(|(k, s)| *k == key && s.host == host)?;
         let now = crate::shadow::generation();
-        if s.generation != now {
+        if s.generation != now || s.regions != missed_regions_count() {
             s.rewrite(heap, now);
         }
         Some(s.layout.clone())
@@ -580,16 +706,48 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 }
 
 /// Whether any marked page in `marks` fell outside a valid copy in `l`.
-fn has_missed(marks: &[u32], l: &Layout) -> bool {
+/// The 256 MiB regions with no copy shaders read (level-1 indices), at
+/// most [`MISSED_REGIONS_MAX`]: the page tables give each a block of
+/// entries that name no copy, which read as missing as the null block
+/// does, so that the next miss there names its page, not the region.
+static MISSED_REGIONS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+const MISSED_REGIONS_MAX: usize = 64;
+static MISSED_REGIONS_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn missed_regions() -> Vec<usize> {
+    MISSED_REGIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn missed_regions_count() -> usize {
+    MISSED_REGIONS_COUNT.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Shaders read 256 MiB region `l1` (a level-1 index), which no copy and
+/// so no block has.
+fn note_missed_region(l1: usize) {
+    let mut regions = MISSED_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if l1 < LEVEL1 && regions.len() < MISSED_REGIONS_MAX && !regions.contains(&l1) {
+        regions.push(l1);
+        MISSED_REGIONS_COUNT.store(regions.len(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn has_missed(marks: &[u32], l: &Layout, kind: impl Fn(u64) -> MissKind) -> bool {
     for (w, &mark) in marks.iter().enumerate() {
         let mut bits = mark;
         while bits != 0 {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let block = entry / BLOCK;
-            if block == 0
-                || l.blocks.get(block).is_none()
-                || l.owner.get(entry).is_none_or(|o| o.is_none())
+            let (block, page) = (entry / BLOCK, entry % BLOCK);
+            let Some(&l1) = l.blocks.get(block).filter(|_| block != 0) else {
+                return true;
+            };
+            if l.owner.get(entry).is_none_or(|o| o.is_none())
+                && kind((l1 << 28 | page << 16) as u64) != MissKind::Unmapped
             {
                 return true;
             }
@@ -625,12 +783,22 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
     let precise: Arc<Mutex<Vec<(u64, u64)>>> = Arc::default();
     let byte_for_byte = precise.clone();
     let missed_bitmap = Arc::clone(&pooled);
+    // Mapping changes from now on: a page found with nothing mapped after
+    // the list ran may have had memory while it ran if one touched it.
+    let since = crate::watch::remap_epoch();
+    let kind = move |at: u64| {
+        if misses_told_apart() {
+            miss_kind(at, since)
+        } else {
+            MissKind::Mapped
+        }
+    };
     list.defer_missed(move || {
         let l = layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
-        has_missed(marks, &l)
+        has_missed(marks, &l, kind)
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
@@ -639,6 +807,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks =
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let (mut unmapped, mut copied) = (0, 0);
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -654,16 +823,23 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    note_missed_region(entry);
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
-                    _ => {
-                        pages += 1;
-                        missed.push(at);
-                    }
+                    _ => match kind(at) {
+                        MissKind::Unmapped => unmapped += 1,
+                        k => {
+                            pages += 1;
+                            missed.push(at);
+                            if k == MissKind::Mapped && misses_told_apart() && copy_missed(at) {
+                                copied += 1;
+                            }
+                        }
+                    },
                 }
             }
         }
@@ -693,6 +869,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.withheld += withheld;
             s.missed_pages += pages;
             s.missed_regions += regions;
+            s.unmapped_pages += unmapped;
+            s.copies_made += copied;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
@@ -721,6 +899,59 @@ mod tests {
                 assert_eq!(stats(|_| true), expected);
             });
         }
+    }
+
+    /// An address with nothing reserved near it: the middle of the largest
+    /// free region of the process. A fixed high address can be reserved on
+    /// Windows (the control-flow-guard bitmap takes terabytes up there),
+    /// and an allocation just released can be taken again by another test.
+    fn free_address() -> u64 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        };
+        let (mut at, mut best) = (0usize, (0usize, 0usize));
+        loop {
+            // SAFETY: a plain structure of integers and pointers; zero is valid.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: the query writes its own structure of the given size.
+            if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+                break;
+            }
+            let (base, size) = (info.BaseAddress as usize, info.RegionSize);
+            if info.State == MEM_FREE && size > best.1 {
+                best = (base, size);
+            }
+            match base.checked_add(size) {
+                Some(next) if next > at => at = next,
+                _ => break,
+            }
+        }
+        assert!(best.1 >= 1 << 20, "no free region of a MiB");
+        (best.0 + best.1 / 2) as u64 & !0xFFFF
+    }
+
+    /// The frame line names what a missed address is: committed private
+    /// memory here, nothing at all in the largest free region.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missed_addresses_are_named_by_their_memory() {
+        let ours = vec![0u8; 1 << 16];
+        assert!(memory_kind(ours.as_ptr() as u64).starts_with("(committed private"));
+        assert!(memory_kind(free_address()).starts_with("(free"));
+    }
+
+    /// A region missed is noted once, and the count the page tables compare
+    /// moves with it; past the index or the cap nothing is noted.
+    #[test]
+    fn missed_regions_are_noted_once() {
+        let before = missed_regions_count();
+        note_missed_region(LEVEL1 - 7);
+        note_missed_region(LEVEL1 - 7);
+        note_missed_region(LEVEL1);
+        assert!(missed_regions().contains(&(LEVEL1 - 7)));
+        assert!(!missed_regions().contains(&LEVEL1));
+        assert!(missed_regions_count() <= before + 1);
+        assert!(missed_regions_count() <= MISSED_REGIONS_MAX);
     }
 
     /// Writes of lists using title memory are held back from a frame with a
@@ -811,29 +1042,120 @@ mod tests {
             blocks: vec![usize::MAX, 0],
             owner,
         };
+        let mapped = |_| MissKind::Mapped;
         let mut marks = vec![0u32; BITMAP_WORDS];
-        assert!(!has_missed(&marks, &l));
+        assert!(!has_missed(&marks, &l, mapped));
 
         // Owned entry in block 1.
         let owned = BLOCK + 5;
         marks[owned / 32] = 1 << (owned % 32);
-        assert!(!has_missed(&marks, &l));
+        assert!(!has_missed(&marks, &l, mapped));
 
-        // Unowned entry in the same word as an owned entry.
+        // Unowned entry in the same word as an owned entry: a miss where
+        // something is (or was) mapped, or nothing reserved; none where an
+        // unmapped tile reads zeros.
         let unowned = BLOCK + 6;
         marks[unowned / 32] |= 1 << (unowned % 32);
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, mapped));
+        assert!(has_missed(&marks, &l, |_| MissKind::Free));
+        assert!(!has_missed(&marks, &l, |at| {
+            assert_eq!(at, 6 << 16, "the page's address");
+            MissKind::Unmapped
+        }));
 
-        // Block 0 bit (missing 256 MiB region).
+        // Block 0 bit (missing 256 MiB region): its page is not known.
         marks.fill(0);
         marks[0] = 1 << 3;
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, |_| MissKind::Unmapped));
 
         // Out-of-range block.
         marks.fill(0);
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
-        assert!(has_missed(&marks, &l));
+        assert!(has_missed(&marks, &l, |_| MissKind::Unmapped));
+    }
+
+    /// A page read with no copy is told by its memory: committed memory is
+    /// mapped (copies are made of it), a reservation with nothing mapped is
+    /// an unmapped tile (zeros, no miss) unless the runtime reported a
+    /// mapping change there since the list was recorded, and nothing
+    /// reserved is free.
+    #[test]
+    fn missed_pages_are_told_by_their_memory() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree,
+        };
+        let page = crate::watch::PAGE;
+        // SAFETY: fresh allocations of ours, freed below.
+        let (committed, reserved) = unsafe {
+            (
+                VirtualAlloc(
+                    std::ptr::null(),
+                    page,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                ),
+                VirtualAlloc(std::ptr::null(), 2 * page, MEM_RESERVE, PAGE_NOACCESS),
+            )
+        };
+        assert!(!committed.is_null() && !reserved.is_null());
+        let (committed, reserved) = (committed as u64, reserved as u64);
+        let since = crate::watch::remap_epoch();
+        assert_eq!(miss_kind(committed, since), MissKind::Mapped);
+        assert_eq!(miss_kind(reserved, since), MissKind::Unmapped);
+        assert_eq!(miss_kind(free_address(), since), MissKind::Free);
+        // The title's memory there was reported unmapped meanwhile: it may
+        // have had memory while the shaders read it.
+        drop(crate::watch::title_memory_unmapping(
+            reserved as usize,
+            page,
+        ));
+        assert_eq!(miss_kind(reserved, since), MissKind::Mapped);
+        assert_eq!(
+            miss_kind(reserved + page as u64, since),
+            MissKind::Unmapped,
+            "the next page was not"
+        );
+        // SAFETY: ours, as allocated.
+        unsafe {
+            VirtualFree(committed as *mut _, 0, MEM_RELEASE);
+            VirtualFree(reserved as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A mapped page a shader missed gets a copy (the next page table names
+    /// it), up to the frame's limit.
+    #[test]
+    fn a_mapped_page_missed_gets_a_copy() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let page = crate::watch::PAGE;
+        // SAFETY: a fresh allocation of ours, kept (its copy may outlive the test).
+        let at = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                page,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!at.is_null());
+        let at = at as u64;
+        let before = crate::shadow::generation();
+        MISSED_COPIES.store(0, Relaxed);
+        assert!(copy_missed(at), "a copy for the lists after");
+        let copy = crate::shadow::find(at, page as u64).expect("found again");
+        assert!(copy.range().0 <= at && at + page as u64 <= copy.range().0 + copy.range().1);
+        assert!(crate::shadow::generation() >= before);
+        MISSED_COPIES.store(MISSED_COPIES_MAX, Relaxed);
+        assert!(!copy_missed(at), "past the frame's limit");
+        MISSED_COPIES.store(0, Relaxed);
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

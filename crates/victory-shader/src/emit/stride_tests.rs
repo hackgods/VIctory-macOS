@@ -1006,7 +1006,7 @@ fn a_constant_buffer_is_taken_from_the_titles_record() {
     let shader = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
     lower::GPU_RECORDS.set(0);
     assert!(shader.heap && !shader.heap_writes);
-    assert_eq!(shader.root_srvs, [super::HEAP_RECORDS, VIEW_STRIDES], "heap info, then the stride table");
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES, super::HEAP_RECORDS], "the stride table and heap info");
     assert!(shader.memory && !shader.memory_writes, "reads the page table, marks nothing");
     // The host's own view of slot 1, and title memory holding the heap's
     // records and other constants.

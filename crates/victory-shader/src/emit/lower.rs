@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod barriers;
 mod atomics;
 mod bvh;
+mod descriptor_records;
 mod exchange;
 mod f64_cvt;
 mod f64_sum;
@@ -4908,7 +4909,10 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
+            return match self.unused_buffer(site) {
+                Some(props) => self.buffer_records(inst, site, code, count, props),
+                None => self.view_addresses(inst, site, code, count),
+            };
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);

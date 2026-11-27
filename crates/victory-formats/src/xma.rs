@@ -1209,51 +1209,6 @@ fn to_i16(v: f32) -> i16 {
 mod tests {
     use super::*;
 
-    #[test]
-    #[ignore = "benchmark"]
-    fn perf_peek32() {
-        use std::{hint::black_box, time::Instant};
-        let data: Vec<u8> = (0..8192).map(|i| (i * 73 + 19) as u8).collect();
-        let mut samples = Vec::new();
-        for round in 0..35 {
-            let start = Instant::now();
-            let mut sum = 0u32;
-            for pos in 0..32768 {
-                let bits = Bits {
-                    data: black_box(&data),
-                    pos: black_box(pos),
-                    end: data.len() * 8,
-                };
-                sum = sum.wrapping_add(black_box(bits.peek32()));
-            }
-            black_box(sum);
-            if round >= 4 {
-                samples.push(start.elapsed().as_nanos());
-            }
-        }
-        println!("peek_32768_ns {samples:?}");
-    }
-
-    #[test]
-    fn peek_matches_individual_bits_with_zero_padding() {
-        let data: Vec<u8> = (0..257).map(|i| (i * 73 + 19) as u8).collect();
-        for len in 0..=data.len() {
-            for pos in (len.saturating_sub(9) * 8)..len * 8 + 40 {
-                let bits = Bits {
-                    data: &data[..len],
-                    pos,
-                    end: len * 8,
-                };
-                let expected = (0..32).fold(0, |v, i| {
-                    let p = pos + i;
-                    (v << 1)
-                        | u32::from((bits.data.get(p / 8).copied().unwrap_or(0) >> (7 - p % 8)) & 1)
-                });
-                assert_eq!(bits.peek32(), expected, "len={len} pos={pos}");
-            }
-        }
-    }
-
     /// Writes `value` as `n` bits, MSB first, at bit `pos`.
     fn put_bits(data: &mut [u8], pos: usize, n: u32, value: u32) {
         for i in 0..n as usize {
@@ -1518,6 +1473,51 @@ mod tests {
                 out[i],
                 signal[i]
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "benchmark"]
+    fn perf_peek32() {
+        use std::{hint::black_box, time::Instant};
+        let data: Vec<u8> = (0..8192).map(|i| (i * 73 + 19) as u8).collect();
+        let mut samples = Vec::new();
+        for round in 0..35 {
+            let start = Instant::now();
+            let mut sum = 0u32;
+            for pos in 0..32768 {
+                let bits = Bits {
+                    data: black_box(&data),
+                    pos: black_box(pos),
+                    end: data.len() * 8,
+                };
+                sum = sum.wrapping_add(black_box(bits.peek32()));
+            }
+            black_box(sum);
+            if round >= 4 {
+                samples.push(start.elapsed().as_nanos());
+            }
+        }
+        println!("peek_32768_ns {samples:?}");
+    }
+
+    #[test]
+    fn peek_matches_individual_bits_with_zero_padding() {
+        let data: Vec<u8> = (0..257).map(|i| (i * 73 + 19) as u8).collect();
+        for len in 0..=data.len() {
+            for pos in (len.saturating_sub(9) * 8)..len * 8 + 40 {
+                let bits = Bits {
+                    data: &data[..len],
+                    pos,
+                    end: len * 8,
+                };
+                let expected = (0..32).fold(0, |v, i| {
+                    let p = pos + i;
+                    (v << 1)
+                        | u32::from((bits.data.get(p / 8).copied().unwrap_or(0) >> (7 - p % 8)) & 1)
+                });
+                assert_eq!(bits.peek32(), expected, "len={len} pos={pos}");
+            }
         }
     }
 

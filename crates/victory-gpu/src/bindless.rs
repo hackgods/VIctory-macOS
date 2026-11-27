@@ -593,6 +593,18 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
     }
 }
 
+/// The copies the heap views for unordered access: what shaders that take
+/// views from the heap itself may write with no list declaring it
+/// (`crate::host::flight`, for a flight still running).
+pub(crate) fn written(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>)) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, _, _, uav, _) in inner.hulls.values() {
+        if *uav {
+            each(shadow);
+        }
+    }
+}
+
 /// Per submission: the buffer range of the view currently in `index`. A
 /// table draw may have been recorded with another view in that slot.
 pub(crate) fn refresh_slot(

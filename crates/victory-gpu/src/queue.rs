@@ -1478,6 +1478,10 @@ mod tests {
 
     #[test]
     fn queue_signals_complete_at_once() {
+        // At once only without Flight-1, whatever a flight test running
+        // beside it asks for.
+        #[cfg(windows)]
+        let _mode = crate::host::flight::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let desc = QueueDesc {
             kind: 0,

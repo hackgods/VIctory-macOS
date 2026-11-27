@@ -4,7 +4,7 @@
 //! shortcut: every submission is waited for, so CPU and GPU never overlap;
 //! overlap them with per-submission fences once more than clears run.
 
-mod flight;
+pub(crate) mod flight;
 pub(crate) use flight::{async_submit_enabled, flight1_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -707,12 +707,21 @@ pub(crate) mod tests {
     }
 
     thread_local! {
+        /// `VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE` on for this thread's
+        /// submissions.
+        pub(crate) static SPLIT_PRELUDES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
         static NATIVE_CALLS: std::cell::RefCell<Option<NativeCallTrace>> =
             const { std::cell::RefCell::new(None) };
 
         /// Every transition barrier built on this thread (resource, before,
         /// after), in order.
         pub(crate) static ISSUED: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Submissions that did not run to their marks so far.
+    pub(crate) fn lost_so_far() -> u64 {
+        LOST[0].load(Ordering::Relaxed)
     }
 
     /// The barriers built on this thread since the last call.
@@ -1587,6 +1596,10 @@ fn timing() -> bool {
 /// On D3DMetal, a separate native queue call before a deferred UAV-to-SRV
 /// prelude can make the preceding producer's writes visible.
 fn split_uav_srv_prelude() -> bool {
+    #[cfg(test)]
+    if tests::SPLIT_PRELUDES.with(std::cell::Cell::get) {
+        return true;
+    }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| crate::switch::on("VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE"))
 }
@@ -2154,7 +2167,7 @@ impl HostGpu for Host {
         let holding = Holding::enter();
         // Ensure the GPU is completely idle before descriptor heap creation /
         // null-fill begins (VIctory-macOS issue #31).
-        let landed = self.finish_flight_locked(&mut held, None, None);
+        let landed = self.land_all_locked(&mut held);
         Some(Quiet {
             holding: Some(holding),
             held: Some(held),
@@ -2187,7 +2200,7 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
-        self.finish_flight_locked(&mut submitted, None, None);
+        self.land_all_locked(&mut submitted);
 
         #[cfg(feature = "diagnostics")]
         let gpu_timing = timing();
@@ -2280,7 +2293,10 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        let launched = std::time::Instant::now();
                         self.wait_for(*submitted);
+                        let ran = launched.elapsed();
+                        flight::ran_for(ran, ran, false);
                         true
                     }
                     Err(e) => {
@@ -2412,10 +2428,14 @@ impl Host {
         crate::copystat::add(crate::copystat::C::ExecuteLists, runs.len() as u64);
         // Host textures the title has not used for a while (or past the
         // card's budget) are given up first: the last submission has run.
-        crate::resource::evict_unused();
+        // (Not beside a flight still in the air, `VICTORY_FLIGHTS`: the next
+        // submission prepared with none does it.)
+        if !flight::beside() {
+            crate::resource::evict_unused();
+        }
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
-        if crate::bindless::take_remake() {
+        if !flight::beside() && crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
         }
         // Descriptors the title copied into its heaps itself, before the
@@ -4896,6 +4916,10 @@ impl Batch {
         if shadow.clean() {
             return;
         }
+        // A copy a flight still in the air may write: after it lands.
+        if flight::defer_beside(shadow, address, len) {
+            return;
+        }
         let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
@@ -5898,6 +5922,7 @@ impl Meter {
                  {barriers:.0} barriers); {switches:.0} draws after compute/frame",
                 making = crate::pipeline::making()
             );
+            flight::log(report_frames);
             crate::ray_skip::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
@@ -6510,7 +6535,8 @@ pub(crate) fn retire_any<T: Send + 'static>(object: T) {
 /// Releases retired objects whose [`bury_lag`] window has elapsed at
 /// `done_submission`.
 fn advance_retired(done_submission: u64) {
-    let lag = bury_lag();
+    // With flights beside each other, what a later one in the air uses too.
+    let lag = bury_lag().max(flight::bury_floor());
     let ready: Vec<(u64, Retired)> = {
         let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
         let n = retired
@@ -7378,6 +7404,9 @@ mod marks {
         let Some(host) = super::host() else {
             return; // no host GPU here
         };
+        // Under the submission lock nothing else may be in the air (no
+        // flight test beside it).
+        let _mode = super::flight::ModeGuard::new(false, false);
         let mark = host.mark().expect("the mark list");
         let old = host.queue();
         {

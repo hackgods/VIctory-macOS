@@ -241,6 +241,28 @@ type WidenedViews = Vec<(u64, u64, u32, std::sync::Weak<Widened>)>;
 /// Widened views by title range, including views whose exact shadow differs
 /// from the parent shadow a raw UAV writes.
 static WIDENED_RANGES: Mutex<Vec<(u64, u64, std::sync::Weak<Widened>)>> = Mutex::new(Vec::new());
+
+/// The pages (copy, page number) copies took early, while a flight ran on
+/// the host GPU ([`Shadow::update_early`]), until it is landed
+/// ([`forget_early`]); whoever notes them holds the copies that long, so
+/// that a copy's address names no other.
+static EARLY: Mutex<std::collections::BTreeSet<(usize, usize)>> =
+    Mutex::new(std::collections::BTreeSet::new());
+
+/// Whether [`EARLY`] holds anything (asked at every page that goes back).
+static EARLY_ANY: AtomicBool = AtomicBool::new(false);
+
+/// Pages taken early that the running flight's shaders marked as written
+/// all the same ([`Shadow::kept_early`]), since last asked.
+pub(crate) static EARLY_MARKED: AtomicU64 = AtomicU64::new(0);
+
+/// The flight that ran while copies took pages early is landed: its
+/// shaders' writes have gone back, and the pages are as any other.
+pub(crate) fn forget_early() {
+    if EARLY_ANY.swap(false, Ordering::AcqRel) {
+        EARLY.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+}
 /// Whether any widened view has been made. Writes are retained from the start
 /// of a list, so the first view made after a write can still consume them.
 pub(crate) static WIDENED_ANY: AtomicBool = AtomicBool::new(false);
@@ -534,6 +556,10 @@ impl Shadow {
         // already matches or cannot be written; widened views still need them.
         if self.has_widened.load(Ordering::Acquire) {
             self.refresh_widened(from, to);
+        }
+        // Taken early, while the flight ran: as a page the title wrote.
+        if self.kept_early(page) {
+            return 0;
         }
         if let Some(t) = &self.tracked
             && (t.changed(page / PAGE) || t.is_untracked(page / PAGE))
@@ -943,6 +969,10 @@ impl Shadow {
             if from >= to {
                 continue;
             }
+            // Taken early, while the flight ran: as a page the title wrote.
+            if self.kept_early(page) {
+                continue;
+            }
             // Our own write below must not save the page for this copy again.
             t.unarm(page / PAGE);
             let saved = t.saved(page / PAGE);
@@ -1053,7 +1083,7 @@ impl Shadow {
             .filter(|&(a, e)| a < to && e > from)
             .collect();
         if self.tracked.is_some() {
-            return self.update_tracked(from, to, !busy.is_empty());
+            return self.update_tracked(from, to, !busy.is_empty(), false);
         }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
@@ -1102,7 +1132,12 @@ impl Shadow {
     /// and looped until the device was removed). The same bytes go into the
     /// snapshot `writing` took, so copy-back neither takes them for the
     /// GPU's nor puts them back over a later title write.
-    fn update_tracked(&self, from: usize, to: usize, busy: bool) -> usize {
+    ///
+    /// `early` ([`Shadow::update_early`]): the pages taken are noted, and
+    /// the parts on memory that is not the runtime's are left for the
+    /// submission's own refresh (copied whole each time, they would only
+    /// be copied twice).
+    fn update_tracked(&self, from: usize, to: usize, busy: bool, early: bool) -> usize {
         let Some(t) = &self.tracked else {
             return 0;
         };
@@ -1112,6 +1147,11 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let (runs, unmapped) = t.take_split(from, to);
+        // Taken while a flight runs (the prewarm's, or a preparation beside
+        // it, `VICTORY_FLIGHTS`): noted for its copy-back.
+        if early || crate::host::flight::beside() {
+            self.note_early(runs.iter().chain(&unmapped));
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
         let start = self.start as usize;
@@ -1138,7 +1178,7 @@ impl Shadow {
             crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
         }
         // Parts on memory that is not the runtime's: whole, as below.
-        for (a, b) in t.untracked(from, to) {
+        for (a, b) in t.untracked(from, to).into_iter().filter(|_| !early) {
             #[cfg(feature = "diagnostics")]
             let started = std::time::Instant::now();
             copied += self.copy(a, b);
@@ -1158,6 +1198,110 @@ impl Shadow {
             add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
         }
         copied
+    }
+
+    /// Whether the copy may be brought up to date while a flight still runs
+    /// on the host GPU ([`Shadow::update_early`]): its memory is tracked
+    /// (not aliased), and no submitted list declared that its shaders write
+    /// it (no range pending, no snapshot kept).
+    pub(crate) fn idle(&self) -> bool {
+        !self.aliased
+            && self.tracked.is_some()
+            && self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+            && self
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    /// Whether a submitted list declared that its shaders write the copy and
+    /// it is not copied back yet (a range pending or a snapshot kept).
+    pub(crate) fn busy(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !self
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    /// [`Shadow::update`] made early, for a submission not yet prepared,
+    /// while the flight before it still runs on the host GPU
+    /// (`crate::host::flight`, under the submission lock): the pages of
+    /// `[address, address + len)` the title wrote since the copy took them
+    /// are taken and copied now, so the submission's own refresh finds them
+    /// done unless the title writes them again. Only for a copy that is
+    /// [`Shadow::idle`] (`None` otherwise, and nothing is touched): where
+    /// the flight's shaders write, title memory is older than the copy
+    /// until they are copied back, and `update` would put it over what
+    /// they wrote.
+    ///
+    /// The pages taken are noted until the flight is landed
+    /// ([`forget_early`]): should its shaders have marked one as written
+    /// all the same (through a view no list declared), the title's bytes
+    /// are kept there, as for a page the title wrote meanwhile
+    /// ([`Shadow::kept_early`]).
+    pub(crate) fn update_early(&self, address: usize, len: usize) -> Option<usize> {
+        let _source = self
+            .widened_source
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !self.idle() {
+            return None;
+        }
+        if self.clean() {
+            return Some(0);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return Some(0);
+        }
+        Some(self.update_tracked(from, to, false, true))
+    }
+
+    /// Notes the pages of `runs` (title addresses) as taken early.
+    fn note_early<'a>(&self, runs: impl Iterator<Item = &'a (usize, usize)>) {
+        let key = std::ptr::from_ref(self) as usize;
+        let mut early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+        for &(a, b) in runs {
+            early.extend((a / PAGE..b.div_ceil(PAGE)).map(|page| (key, page)));
+        }
+        EARLY_ANY.store(!early.is_empty(), Ordering::Release);
+    }
+
+    /// After a flight whose shaders marked the 64 KiB title page at `page`
+    /// as written in this copy: whether the copy took the page early, while
+    /// that flight ran ([`Shadow::update_early`]). Then the copy's bytes
+    /// there are title memory's with, at most, a part of what the shaders
+    /// wrote: nothing goes back, and the copy takes the page from title
+    /// memory again at its next refresh, which is what becomes of a page
+    /// the title wrote while shaders wrote it. Counted: the copies
+    /// refreshed early are chosen so that this does not happen.
+    fn kept_early(&self, page: usize) -> bool {
+        if !EARLY_ANY.load(Ordering::Acquire) {
+            return false;
+        }
+        let key = (std::ptr::from_ref(self) as usize, page / PAGE);
+        if !EARLY
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&key)
+        {
+            return false;
+        }
+        crate::watch::retake(page, PAGE);
+        EARLY_MARKED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
@@ -3654,6 +3798,62 @@ pub(crate) mod tests {
             widened.read_host(8),
             [0, 0, 0, 1, 0x1817_1615, 0x1c1b_1a19, 0x201f_1e1d, 1]
         );
+    }
+
+    /// While a flight runs on the host GPU (`crate::host::flight`'s
+    /// prewarm), a copy a submitted list's shaders write is left alone and
+    /// an idle one takes the title's writes early, so that the next refresh
+    /// finds nothing to do. A page taken early that the running shaders
+    /// marked all the same keeps the title's bytes, and the copy takes them
+    /// again.
+    #[test]
+    fn idle_copies_take_the_titles_writes_early() {
+        let p = crate::watch::tests::pool(2);
+        let len = 2 * PAGE;
+        register(p, p as u64, len as u64);
+        let (Some(copy), Some(b)) = (find(p as u64, len as u64), bitmap(false)) else {
+            unregister(p, p as u64);
+            return; // no host GPU here
+        };
+        let base = copy.marks.expect("tracked memory gets mark bits") as usize;
+        let title = |at: usize| (p + at) as *mut u8;
+        let in_copy = |at: usize| copy.read_host((p + at) as u64 & !3, 1)[0].to_le_bytes()[at % 4];
+        // As under the submission lock: a flight landed meanwhile (another
+        // test's) forgets what was taken early, and the bitmap is shared.
+        let quiet = host().and_then(|h| h.quiet());
+        copy.update(p, len);
+        // A submitted list declares it as written by shaders: left alone.
+        copy.writing(p, len, false);
+        // SAFETY: (all title reads and writes below) bytes of our pool.
+        unsafe { title(20).write_volatile(0x55) };
+        assert!(!copy.idle());
+        assert_eq!(copy.update_early(p, len), None, "busy: not touched");
+        assert_ne!(in_copy(20), 0x55);
+        assert_eq!(copy.copy_back(p, len), 0, "the shaders wrote nothing");
+        // Idle now: the title's write is taken early, once.
+        assert!(copy.idle());
+        assert!(
+            copy.update_early(p, len).is_some_and(|n| n > 0),
+            "the title's page is copied"
+        );
+        assert_eq!(in_copy(20), 0x55);
+        assert_eq!(copy.update_early(p, len), Some(0));
+        assert_eq!(copy.update(p, len), 0, "the refresh proper finds it done");
+        // The running shaders write the page all the same, and mark it.
+        copy.write_host((p + 10) as u64, &[0xaa]);
+        let bits = b.data as *mut u32;
+        // SAFETY: a dword of the mapped bitmap.
+        unsafe { *bits.add(base / 32) |= 1 << (base % 32) };
+        copy_back_marks(&[], false);
+        // SAFETY: a byte of our pool.
+        let kept = unsafe { title(10).read_volatile() };
+        assert_eq!(kept, 0, "the title's bytes are kept");
+        assert!(!copy.clean(), "the copy takes the page again");
+        forget_early();
+        drop(quiet);
+        assert!(copy.update(p, len) > 0);
+        assert_eq!(in_copy(10), 0, "the copy holds the title's bytes again");
+        unregister(p, p as u64);
     }
 
     /// Pages shaders marked (`copy_back_marks`, `victory_shader::emit`

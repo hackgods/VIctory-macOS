@@ -340,6 +340,14 @@ fn withheld_in(frame: u64, missed: u64) -> bool {
 /// the frame withheld ([`withholding`]; ranges).
 static DROPPED: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
+/// The title memory whose host copies hold shader writes kept from it
+/// until the frame's end ([`DROPPED`]): a refresh there drops them
+/// (`crate::host::flight`'s prewarm leaves such copies alone).
+#[cfg(windows)]
+pub(crate) fn kept() -> Vec<(usize, usize)> {
+    DROPPED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Shaders wrote `[address, address + len)` of title memory in host copies
 /// and the submission withheld it: the copies take title memory's bytes
 /// again at their next refresh, from right after the submission if a list

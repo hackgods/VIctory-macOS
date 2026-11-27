@@ -2346,6 +2346,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Submissions run to completion inside the pump (no Flight-1,
+        // whatever a flight test running beside it asks for).
+        let _mode = crate::host::flight::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
 
@@ -2459,6 +2462,120 @@ mod tests {
             "both uploads must be unregistered and freed once held lists finish"
         );
 
+        assert_eq!(release(queue), 0);
+        assert_eq!(release(allocator), 0);
+    }
+
+    /// A title list reset and recorded again, then released, while the host
+    /// GPU still runs the flight it was in (`VICTORY_FLIGHT1`, the queue
+    /// held by a gate): the host list that runs is left to the flight and
+    /// replaced, its upload memory is kept until it has run, and each
+    /// flight copies what it was recorded with.
+    #[cfg(windows)]
+    #[test]
+    fn a_list_reset_while_its_flight_runs_keeps_what_it_ran() {
+        crate::host::with_bury_lag(0, list_reset_while_in_flight_body);
+    }
+
+    #[cfg(windows)]
+    fn list_reset_while_in_flight_body() {
+        use crate::host::flight::{Gate, ModeGuard};
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 2, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 2, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let qdesc = crate::queue::QueueDesc::compute();
+        let mut queue = null;
+        assert_eq!(
+            crate::queue::create(null, &qdesc, &crate::queue::QUEUE_IID, &mut queue),
+            S_OK
+        );
+        let dst = [0, 1].map(|_| host.shared_buffer(256).unwrap());
+        for (_, cpu) in &dst {
+            // SAFETY: newly allocated mapped shared buffers of 256 bytes.
+            unsafe { std::ptr::write_bytes(*cpu, 0, 256) };
+        }
+        let mode = ModeGuard::new(true, false);
+        let mut gate = Gate::hold(host);
+        // Each batch: upload memory of the title list's with a pattern,
+        // copied into its buffer by the host GPU.
+        let record = |pattern: u32,
+                      (buffer, _): &(
+            windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+            *mut u8,
+        )| {
+            let at = allocate_upload(list, 256, 64);
+            assert!(!at.is_null());
+            for i in 0..64u32 {
+                // SAFETY: 256 bytes were allocated at `at`.
+                unsafe { at.cast::<u32>().add(i as usize).write_volatile(pattern + i) };
+            }
+            let copy = crate::shadow::find(at as u64, 256).expect("upload registered in shadow");
+            let h = host_list(list).expect("a host list");
+            copy.refresh(h, at as u64, 256);
+            let offset = (at as u64) - copy.range().0;
+            // SAFETY: an open host list and buffers of at least 256 bytes.
+            unsafe {
+                h.list
+                    .CopyBufferRegion(buffer, 0, &copy.buffer, offset, 256)
+            };
+            h.keep(buffer);
+            assert_eq!(close(list), S_OK);
+            crate::queue::submit_one(queue, list);
+            (at, std::ptr::from_ref(h))
+        };
+        let (p1, ran) = record(0xA1B2_0000, &dst[0]);
+        let in_air = host.has_in_flight();
+        assert_eq!(reset(list, allocator, null), S_OK);
+        let replaced = !std::ptr::eq(host_list(list).unwrap(), ran);
+        let kept = crate::shadow::find(p1 as u64, 256).is_some();
+        // (Only while the gate held it: its watchdog opens it after a while.)
+        if gate.held() {
+            assert!(in_air, "in the air");
+            assert!(
+                replaced,
+                "the reset list records into a host list of its own"
+            );
+            assert!(kept, "upload 1 kept while it runs");
+        }
+        gate.open();
+        // The second flight lands the first before it is prepared.
+        let mut gate = Gate::hold(host);
+        let (p2, _) = record(0xC3D4_0000, &dst[1]);
+        assert_eq!(release(list), 0);
+        let in_air = host.has_in_flight();
+        let kept = crate::shadow::find(p2 as u64, 256).is_some();
+        if gate.held() {
+            assert!(in_air, "in the air");
+            assert!(kept, "upload 2 kept while it runs");
+        }
+        gate.open();
+        host.finish_flight_now();
+        drop(mode);
+        for (k, (pattern, (_, cpu))) in [0xA1B2_0000u32, 0xC3D4_0000]
+            .into_iter()
+            .zip(&dst)
+            .enumerate()
+        {
+            // SAFETY: both submissions have run; 64 mapped u32s.
+            let got = unsafe { std::slice::from_raw_parts(cpu.cast::<u32>(), 64) };
+            for i in 0..64u32 {
+                assert_eq!(got[i as usize], pattern + i, "batch {} word {i}", k + 1);
+            }
+        }
+        // (Freed as the lists come back, by whichever thread finished them:
+        // another test's may age them for its bury lag.)
         assert_eq!(release(queue), 0);
         assert_eq!(release(allocator), 0);
     }

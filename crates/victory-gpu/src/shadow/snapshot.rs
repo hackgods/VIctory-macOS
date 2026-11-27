@@ -170,6 +170,11 @@ impl Snapshot {
         }
     }
 
+    /// Whether it holds nothing: no submission's shaders write the copy.
+    pub(super) fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+    }
+
     pub(super) fn clear(&mut self) {
         self.compared.clear();
         self.spans.clear();

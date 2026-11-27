@@ -22,6 +22,10 @@ use super::xasync::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+// macOS port: input switches of our own (`VICTORY_INPUT_*`), off by default.
+#[path = "gameinput_mac.rs"]
+mod mac;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -359,6 +363,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// macOS port: our input switches.
+    mac: mac::Mac,
 }
 
 pub struct Hub {
@@ -400,6 +406,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                mac: mac::Mac::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -416,6 +423,7 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(source);
+        hub.state().mac = mac::Mac::from_env();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -508,17 +516,25 @@ impl State {
         let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = self.mac.latch(slot, pad, now);
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
             let base = fallback(&keys);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
-                return Value::Pad(merge_pad(base, fallback(scripted)));
+                return merge_pad(base, fallback(scripted));
             }
-            Value::Pad(base)
+            base
         });
-        self.update(devices, FALLBACK, fallback, now, &mut events);
+        let fallback = self.mac.latch(FALLBACK, fallback, now);
+        self.update(
+            devices,
+            FALLBACK,
+            fallback.map(Value::Pad),
+            now,
+            &mut events,
+        );
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -652,7 +668,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -677,7 +693,14 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let handed = found.and_then(|r| hub.index(r.device));
+    let hr = hand(out, found);
+    if hr == S_OK
+        && let Some(index) = handed
+    {
+        state.mac.handed(index, now());
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -765,9 +788,13 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
+    let mut state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let hr = hand(out, history.iter().rev().find(|r| r.timestamp <= time));
+    if hr == S_OK {
+        state.mac.handed(index, now());
+    }
+    hr
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -1813,6 +1840,55 @@ mod tests {
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(pad(r), physical);
         release(r);
+    }
+
+    #[test]
+    fn latch_shows_a_tap_between_readings_once_and_held_buttons_while_held() {
+        let (hub, host) = fake();
+        let set = |buttons| {
+            host.lock().unwrap().pads[1] = Some(PadState {
+                buttons,
+                left_x: 0.1,
+                ..Default::default()
+            })
+        };
+        let read = || {
+            let r = current(hub, GAMEPAD_KIND, 1).unwrap();
+            let buttons = pad(r).buttons;
+            release(r);
+            buttons
+        };
+        let tap = || {
+            set(A);
+            hub.poll();
+            set(0);
+            hub.poll();
+        };
+        set(0);
+        hub.poll();
+        // Off (the default): the title never sees a tap between two readings.
+        tap();
+        assert_eq!(read(), 0);
+
+        hub.state().mac = mac::latch_for_tests(0);
+        hub.poll();
+        assert_eq!(read(), 0);
+        tap();
+        assert_eq!(read(), A, "the tap");
+        hub.poll();
+        assert_eq!(read(), 0, "once");
+        hub.poll();
+        assert_eq!(read(), 0);
+
+        // Held across readings: down in each, up in the first after release.
+        set(B);
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(read(), B);
+        }
+        set(0);
+        hub.poll();
+        assert_eq!(read(), 0);
     }
 
     #[test]

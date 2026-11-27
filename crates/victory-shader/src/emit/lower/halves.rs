@@ -81,37 +81,110 @@ impl Lower<'_> {
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
-    /// [`Shader::wave_size`]-aligned ids from its first lane (see
-    /// [`Lower::thread_id`]); made once, in the entry block.
+    /// [`Shader::wave_size`]-aligned ids (see [`Lower::thread_id`]); made once,
+    /// in the entry block.
+    ///
+    /// When the group is larger than one host wave and `VICTORY_THREAD_TICKET`
+    /// is enabled, waves claim aligned runs from a 1-dword group-shared counter
+    /// rather than rounding `WaveReadLaneFirst(flattenedThreadIdInGroup)` down:
+    /// 32-lane hosts can tile 2-D groups (e.g. 16x2 tiles in a 32x2 group),
+    /// where two waves would otherwise round down to the same base and collide.
+    /// Full waves take `w` from the low 16 bits; any partial tail wave takes
+    /// its lane count from the high 16 bits past the full blocks, so it cannot
+    /// misalign full waves regardless of arrival order.
     pub(super) fn relabelled_flat(&mut self) -> V {
         if let Some(f) = self.relabelled {
             return f;
         }
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        let flat = self.s.op(
-            e,
-            "flattenedThreadIdInGroup.i32",
-            Attr::ReadNone,
-            i32t,
-            96,
-            &[],
-        );
-        let first = self.s.op(
-            e,
-            "waveReadLaneFirst.i32",
-            Attr::NoUnwind,
-            i32t,
-            118,
-            &[flat],
-        );
         let wave = self.s.wave_size.expect("set with console lanes");
-        let mask = self.s.m.i32(!(wave - 1));
-        let base = self.s.m.bin(e, Bin::And, first, mask);
-        let lane = self
-            .s
-            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
-        let f = self.s.m.bin(e, Bin::Add, base, lane);
+        let group: u32 = self.s.threads.map_or(wave, |t| t.iter().product());
+        let half_dwords = if self.halves {
+            group.div_ceil(2 * HALF) * 2
+        } else {
+            0
+        };
+        let use_ticket = group > wave
+            && super::super::thread_ticket()
+            && self.s.lds_dwords + half_dwords < GROUP_SHARED_DWORDS;
+        let f = if use_ticket {
+            let arr = self.s.m.array(1, i32t);
+            let counter = self.s.m.global("wave_ticket", arr, 3);
+            let zero = self.s.m.i32(0);
+            let cell = self.s.m.element(e, counter, zero);
+            self.s.m.store(e, cell, zero);
+            let sync = self.s.m.i32(1 | 8);
+            self.s
+                .op(e, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[sync]);
+            let one = self.s.m.i32(1);
+            let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+            let count = self.s.op(
+                e,
+                "waveActiveOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                119,
+                &[one, sum, unsigned],
+            );
+            let rank = self.s.op(
+                e,
+                "wavePrefixOp.i32",
+                Attr::NoUnwind,
+                i32t,
+                121,
+                &[one, sum, unsigned],
+            );
+            let kw = self.s.m.i32(wave);
+            let full = self.s.m.cmp(e, pred::EQ, count, kw);
+            let first = self.s.m.cmp(e, pred::EQ, rank, zero);
+            let sixteen = self.s.m.i32(16);
+            let high = self.s.m.bin(e, Bin::Shl, count, sixteen);
+            let take = self.s.m.select(e, full, kw, high);
+            let add = self.s.m.select(e, first, take, zero);
+            let old = self
+                .s
+                .m
+                .atomic(e, super::super::bitcode::Rmw::Add, cell, add);
+            let found = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[old],
+            );
+            let low_mask = self.s.m.i32(0xffff);
+            let low = self.s.m.bin(e, Bin::And, found, low_mask);
+            let past = self.s.m.bin(e, Bin::LShr, found, sixteen);
+            let blocks = self.s.m.i32(group / wave * wave);
+            let tail = self.s.m.bin(e, Bin::Add, blocks, past);
+            let base = self.s.m.select(e, full, low, tail);
+            self.s.m.bin(e, Bin::Add, base, rank)
+        } else {
+            let flat = self.s.op(
+                e,
+                "flattenedThreadIdInGroup.i32",
+                Attr::ReadNone,
+                i32t,
+                96,
+                &[],
+            );
+            let first = self.s.op(
+                e,
+                "waveReadLaneFirst.i32",
+                Attr::NoUnwind,
+                i32t,
+                118,
+                &[flat],
+            );
+            let mask = self.s.m.i32(!(wave - 1));
+            let base = self.s.m.bin(e, Bin::And, first, mask);
+            let lane = self
+                .s
+                .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            self.s.m.bin(e, Bin::Add, base, lane)
+        };
         self.s.flags |= flags::WAVE_OPS;
         self.relabelled = Some(f);
         f

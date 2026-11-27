@@ -1255,6 +1255,70 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host()
 }
 
+/// `(width, height, format)` of a single-sample 2D title texture, for
+/// GPU-to-CPU texture readback matching (`crate::texback`).
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    const TEXTURE_2D: u32 = 3;
+    if this.is_null() {
+        return None;
+    }
+    let d = &resource(this).desc;
+    (d.dimension == TEXTURE_2D && d.sample_count <= 1).then_some((d.width, d.height, d.format))
+}
+
+/// Console tiling layout, title CPU address, and byte size of a single-plane
+/// title texture (`crate::texback`).
+#[cfg(windows)]
+pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    let t = texture_layout(&r.desc)?;
+    if t.planes.len() != 1 {
+        return None;
+    }
+    let size = usize::try_from(t.size).ok()?;
+    let plane = t.planes.into_iter().next()?;
+    Some((plane.layout, r.data() as usize, size))
+}
+
+/// Creates a 2D title texture placed at `backing` for GPU unit tests.
+#[cfg(all(windows, test))]
+pub(crate) fn create_placed_2d_for_test(
+    backing: *mut u8,
+    width: u64,
+    height: u32,
+    format: u32,
+    flags: u32,
+    out: *mut This,
+) -> HRESULT {
+    const TEXTURE_2D: u32 = 3;
+    let desc = ResourceDesc {
+        dimension: TEXTURE_2D,
+        alignment: 0,
+        width,
+        height,
+        depth_or_array_size: 1,
+        mip_levels: 1,
+        format,
+        sample_count: 1,
+        sample_quality: 0,
+        layout: 0,
+        flags,
+    };
+    create_at_address(
+        std::ptr::null(),
+        backing as u64,
+        &desc,
+        0,
+        std::ptr::null(),
+        &RESOURCE_IIDS[0],
+        out,
+    )
+}
+
 /// The host description of a title texture: the same, without the
 /// console's layout and flags, in a format the host takes for its use.
 #[cfg(windows)]
@@ -2158,8 +2222,11 @@ fn hand_out_resource(
         crate::shadow::register(at, resource.data() as u64, desc.width);
     } else if host_desc(&desc).is_some() {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        let data_at = resource.data() as usize;
+        let size = texture_layout(&desc).map_or(0, |t| t.size as usize);
+        crate::texback::replaced(data_at, size);
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(resource.data() as u64).or_default().push(at);
+        map.entry(data_at as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -2263,10 +2330,12 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
-                list.retain(|&r| r != std::ptr::from_ref::<Resource>(self) as usize);
+                list.retain(|&r| r != address);
                 if list.is_empty() {
                     map.remove(&at);
                 }

@@ -215,7 +215,9 @@ fn pump(held: &mut Holding, why: Why) {
         // One host submission, or with `VICTORY_COPY_ORDER=split` one more
         // for each title copy in the piece that changes what its earlier
         // lists read: the part before it has run when the copy is made.
-        for part in crate::host::copy_order_parts(segments) {
+        let parts = crate::host::copy_order_parts(segments);
+        crate::host::joined::count_run(parts.len(), 0);
+        for part in parts {
             let at = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
@@ -251,6 +253,48 @@ fn pump(held: &mut Holding, why: Why) {
         }
         finished
     };
+    // mac: `VICTORY_COALESCE_PIECES=1` (VIctory-macOS #419): ready heads of
+    // every queue join one piece (`crate::hold::joined`).
+    type Joined = (std::sync::Arc<crate::host::HostList>, bool);
+    let leaves = |s: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| s.leaves(wait);
+    // What each list does on the CPU, asked once a pump.
+    let flags = std::cell::RefCell::new(Vec::<(usize, crate::hold::joined::JoinFlags)>::new());
+    let flags_of = |s: &std::sync::Arc<crate::host::HostList>| {
+        let key = std::sync::Arc::as_ptr(s) as usize;
+        if let Some(&(_, f)) = flags.borrow().iter().find(|(k, _)| *k == key) {
+            return f;
+        }
+        let f = s.join_flags();
+        flags.borrow_mut().push((key, f));
+        f
+    };
+    let cap = crate::hold::joined::cap();
+    let can_join = |piece: &[Joined], next: &std::sync::Arc<crate::host::HostList>| {
+        piece.len() < cap
+            && crate::hold::joined::may_join(
+                piece.iter().fold(Default::default(), |all, (s, _)| flags_of(s).merge(all)),
+                flags_of(next),
+            )
+    };
+    let mut run_joined = |queue: Option<usize>, segments: Vec<Joined>| {
+        let queue = queue.unwrap_or(unwaited::MIXED);
+        let parts = crate::host::joined::copy_order_parts(segments);
+        let barriers = parts.iter().map(|(_, b)| b.iter().filter(|&&b| b).count()).sum();
+        crate::host::joined::count_run(parts.len(), barriers);
+        for (part, barriers) in parts {
+            let at = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+            let done = host.execute_title_with(queue, part, &barriers);
+            ran.set(ran.get() + at.elapsed());
+            done.into_iter().for_each(crate::list::recycle);
+        }
+    };
+    let joining = crate::hold::joined::on().then_some(crate::hold::Joining {
+        leaves: &leaves,
+        can_join: &can_join,
+        run: &mut run_joined,
+    });
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
@@ -258,7 +302,9 @@ fn pump(held: &mut Holding, why: Why) {
         signal: &mut signal,
         owed: &mut owed,
         ahead: unwaited::prewarms(),
+        joining,
     });
+    crate::host::joined::count(&pumped);
     let ran = ran.get();
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();

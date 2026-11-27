@@ -2401,15 +2401,76 @@ pub(crate) fn placed_size(desc: &[u32; 14]) -> Option<u64> {
     (d.dimension != BUFFER).then(|| footprint(&d).map(|f| f.size)).flatten()
 }
 
+/// `VICTORY_PLACED_TWIN=1`: a placed view of automatic layout (layout 0)
+/// of memory a title texture of the same shape is written through (render
+/// target, depth or unordered access), whose memory key differs from the
+/// view's (its automatic layout is resolved from its own flags, or its mip
+/// count differs), views that title texture itself: the GPU's writes reach
+/// it. Unset: a texture of its own is made for the view, as before.
+///
+/// Why (`notes/black-objects.md`, "the read trace"): the screen reflections'
+/// history is written through a title texture (R32_UINT, render target and
+/// unordered access, layout 0, so `SW_64KB_R_X`) and read by the denoiser
+/// and the tiled lighting through placed views of the same memory
+/// (R9G9B9E5, layout 0). The two get different memory keys and so
+/// different host textures, and no copy bridges them (0 copies between
+/// textures of one memory a frame): what the lighting reads is never
+/// written, and no change to the reflections reached the picture.
+/// shortcut: same start and shape only (as `alias_source`).
+#[cfg(windows)]
+fn written_twin(address: u64, desc: &ResourceDesc) -> Option<This> {
+    const WRITTEN: u32 = 0x7; // render target, depth, unordered access
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_PLACED_TWIN")) || desc.layout != 0 {
+        return None;
+    }
+    let key = memory_key(address, desc)?;
+    let map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let twin = map.get(&address)?.iter().map(|&r| r as This).find(|&r| {
+        let a = &resource(r).desc;
+        a.flags & WRITTEN != 0
+            && a.dimension == desc.dimension
+            && (a.width, a.height, a.depth_or_array_size) == (desc.width, desc.height, desc.depth_or_array_size)
+            && a.sample_count.max(1) == desc.sample_count.max(1)
+            && element(a.format).is_some()
+            && element(a.format) == element(desc.format)
+            && mip_count(desc) <= mip_count(a)
+            && memory_key(address, a) != Some(key)
+    })?;
+    let a = resource(twin).desc;
+    drop(map);
+    static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.len() < 64 && !seen.contains(&address) {
+        seen.push(address);
+        tracing::info!(
+            address = format_args!("{address:#x}"),
+            view = ?(desc.format, desc.layout, desc.flags, desc.mip_levels),
+            written = ?(a.format, a.layout, a.flags, a.mip_levels),
+            "VICTORY_PLACED_TWIN: a placed view (format, layout, flags, mips) views the title texture written at its memory"
+        );
+    }
+    Some(twin)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]
 pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
-    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // Words 1 and 13 are padding (stack bytes in the title's records).
     let mut desc = *desc;
     (desc[1], desc[13]) = (0, 0);
     let desc = &desc;
+    {
+        // SAFETY: 56 bytes in the description's layout.
+        let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+        if d.dimension != BUFFER
+            && let Some(twin) = written_twin(address, &d)
+        {
+            return Some(twin);
+        }
+    }
+    let mut map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
     // A resource whose memory's host texture was replaced since (one with
     // more uses) is made again, sharing the new one.
     // shortcut: the old one is kept (view heap slots made from it view its
@@ -2938,6 +2999,22 @@ mod tests {
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { layout: 0x102, ..a }));
         assert_ne!(key, memory_key(0x1_0000, &ResourceDesc { flags: 2, format: 40, ..a }));
         assert_eq!(memory_key(0x1_0000, &buffer(256)), None);
+    }
+
+    /// The fault `written_twin` (`VICTORY_PLACED_TWIN`) works around: an
+    /// automatic layout is resolved from the description's own flags, so a
+    /// render target with unordered access (the reflections' history,
+    /// R32_UINT, flags 5) and a placed view of its memory without those
+    /// flags (R9G9B9E5) get different keys, so different host textures.
+    #[test]
+    fn an_automatic_layout_follows_the_flags() {
+        let written = ResourceDesc { flags: 5, ..texture(2560, 1440, 42, 1) };
+        let view = ResourceDesc { format: 67, flags: 0, ..written };
+        assert_ne!(memory_key(0x7059_0e0000, &written), memory_key(0x7059_0e0000, &view));
+        // With the twin's flags, or an explicit layout on both, one key.
+        assert_eq!(memory_key(0x7059_0e0000, &written), memory_key(0x7059_0e0000, &ResourceDesc { flags: 1, ..view }));
+        let explicit = |d: ResourceDesc| ResourceDesc { layout: 0x105, ..d };
+        assert_eq!(memory_key(0x7059_0e0000, &explicit(written)), memory_key(0x7059_0e0000, &explicit(view)));
     }
 
     /// Castable formats: every format of the same element but typeless,

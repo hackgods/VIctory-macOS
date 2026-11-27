@@ -1726,6 +1726,97 @@ pub(crate) mod tests {
         crate::watch::tests::free(memory);
     }
 
+    /// `VICTORY_FLIGHT_HEAP_SYNC`: a record the title copies into its heap
+    /// while a flight is in the air (the host queue held by a gate) is made
+    /// by the next submission's heap sync while that flight still runs,
+    /// before it is landed.
+    #[cfg(windows)]
+    #[test]
+    fn a_record_copied_during_a_flight_is_made_in_the_wait_for_it() {
+        use crate::host::flight::{Gate, ModeGuard, TEST_HEAP_SYNC, beside_counts};
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: SAMPLERS,
+            count: 64,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 64 * 16,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(heap_host) = heap(h).host() {
+            let _mode = ModeGuard::new(true, false);
+            TEST_HEAP_SYNC.with(|s| s.set(true));
+            let list = |host: &crate::host::Host| std::sync::Arc::new(host.new_list().unwrap());
+            let mut gate = Gate::hold(host);
+            // Whether the slot is made when the held flight lands (its work
+            // for after): the next submission's own sync comes after that.
+            let made_at_landing = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let first = list(host);
+            first.close();
+            let (seen, heap_at) = (
+                made_at_landing.clone(),
+                std::ptr::from_ref(heap_host) as usize,
+            );
+            first.defer_after(move || {
+                // SAFETY: the heap lives until the end of the test.
+                let made = unsafe { (*(heap_at as *const host::HostHeap)).made(7) };
+                seen.store(made, std::sync::atomic::Ordering::Release);
+            });
+            host.execute_flight1(vec![first], vec![]);
+            let mut elsewhere = [0u64; 2];
+            let at = elsewhere.as_mut_ptr() as u64;
+            create_sampler(
+                std::ptr::null(),
+                &[21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0],
+                at,
+            );
+            let slot = memory as u64 + 7 * 16;
+            // SAFETY: 16 bytes of each, ours; the heap's page is guarded
+            // (our handler opens it).
+            unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
+            let syncs = beside_counts()[2];
+            let opener = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                gate.open();
+            });
+            // Syncs the heaps in the wait for the held flight, then lands it.
+            let second = list(host);
+            second.close();
+            host.execute_flight1(vec![second], vec![]);
+            opener.join().unwrap();
+            host.finish_flight_now();
+            TEST_HEAP_SYNC.with(|s| s.set(false));
+            // (Another test's submission may have held this thread off the
+            // submission lock until the flight had run: then no sync in the
+            // wait, and the submission's own sync made it.)
+            if beside_counts()[2] > syncs {
+                assert!(
+                    made_at_landing.load(std::sync::atomic::Ordering::Acquire),
+                    "made in the wait, before the flight landed"
+                );
+            }
+            // (Another test's sync may have taken the written page and be
+            // making it still.)
+            let since = std::time::Instant::now();
+            while !heap_host.made(7) && since.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                heap_host.made(7),
+                "made by the sync in the wait or the one after it"
+            );
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+    }
+
     #[cfg(windows)]
     #[test]
     fn sync_heaps_reads_partial_64k_pages_and_small_heaps() {

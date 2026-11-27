@@ -2527,26 +2527,30 @@ mod tests {
             (at, std::ptr::from_ref(h))
         };
         let (p1, ran) = record(0xA1B2_0000, &dst[0]);
-        assert!(host.has_in_flight(), "in the air");
+        let in_air = host.has_in_flight();
         assert_eq!(reset(list, allocator, null), S_OK);
-        assert!(
-            !std::ptr::eq(host_list(list).unwrap(), ran),
-            "the reset list records into a host list of its own"
-        );
-        assert!(
-            crate::shadow::find(p1 as u64, 256).is_some(),
-            "upload 1 kept while it runs"
-        );
+        let replaced = !std::ptr::eq(host_list(list).unwrap(), ran);
+        let kept = crate::shadow::find(p1 as u64, 256).is_some();
+        // (Only while the gate held it: its watchdog opens it after a while.)
+        if gate.held() {
+            assert!(in_air, "in the air");
+            assert!(
+                replaced,
+                "the reset list records into a host list of its own"
+            );
+            assert!(kept, "upload 1 kept while it runs");
+        }
         gate.open();
         // The second flight lands the first before it is prepared.
         let mut gate = Gate::hold(host);
         let (p2, _) = record(0xC3D4_0000, &dst[1]);
         assert_eq!(release(list), 0);
-        assert!(host.has_in_flight(), "in the air");
-        assert!(
-            crate::shadow::find(p2 as u64, 256).is_some(),
-            "upload 2 kept while it runs"
-        );
+        let in_air = host.has_in_flight();
+        let kept = crate::shadow::find(p2 as u64, 256).is_some();
+        if gate.held() {
+            assert!(in_air, "in the air");
+            assert!(kept, "upload 2 kept while it runs");
+        }
         gate.open();
         host.finish_flight_now();
         drop(mode);

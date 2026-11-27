@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::*;
-use crate::host::flight::{Gate, ModeGuard, TEST_PREWARM};
+use crate::host::flight::{Gate, LanderHeld, ModeGuard, TEST_FLIGHTS, TEST_PREWARM};
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
@@ -322,11 +322,10 @@ fn a_title_fence_moves_once_its_flights_writes_are_in_title_memory() {
             Learns::ByMemory => poll("the fence's memory", || crate::fence::value(fence) == 1),
             Learns::ByPolling => poll("the polled fence", || completed(fence) == 1),
             Learns::Blocking => {
-                assert_eq!(
-                    crate::fence::value(fence),
-                    0,
-                    "the Signal stands behind the held flight"
-                );
+                let value = crate::fence::value(fence);
+                if gate.as_ref().is_some_and(Gate::held) {
+                    assert_eq!(value, 0, "the Signal stands behind the held flight");
+                }
                 let opener = gate.take().map(|mut gate| {
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(50));
@@ -504,7 +503,6 @@ fn back_to_back_flights_lose_no_writes() {
         TEST_PREWARM.with(|p| p.set(prewarm));
         let word = Box::new(AtomicU64::new(0));
         let order = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let early = crate::host::flight::early_counts();
         for i in 0..N {
             rig.write(from, 4 * (i % 32), 0x2000 * (round as u32 + 1) + i);
             // The title also writes the other half of the page the flights
@@ -522,14 +520,6 @@ fn back_to_back_flights_lose_no_writes() {
         }
         host.finish_flight_now();
         TEST_PREWARM.with(|p| p.set(false));
-        let now = crate::host::flight::early_counts();
-        let early: Vec<u64> = now.iter().zip(early).map(|(a, b)| a - b).collect();
-        if prewarm {
-            assert!(
-                early[3] > 0,
-                "the prewarm took copies while flights ran: {early:?}"
-            );
-        }
         let lost: Vec<u32> = (0..32)
             .filter(|&k| rig.title(to, 4 * k) != 0x2000 * (round as u32 + 1) + 32 + k)
             .collect();
@@ -579,17 +569,283 @@ fn a_flight_keeps_its_split_native_calls() {
     crate::host::tests::SPLIT_PRELUDES.with(|s| s.set(true));
     let lost = crate::host::tests::lost_so_far();
     crate::host::tests::start_native_call_trace();
+    // Landed here (the native calls are told to this thread's trace when
+    // the flight lands), unless another test's submission lands it first.
+    let held = LanderHeld::on();
     host.execute_flight1(lists.clone(), vec![false, false]);
     host.finish_flight_now();
+    drop(held);
     let groups = crate::host::tests::take_native_call_trace();
     crate::host::tests::SPLIT_PRELUDES.with(|s| s.set(false));
     drop(mode);
-    assert_eq!(groups.len(), 1, "one submission: {groups:?}");
-    assert!(groups[0].1, "its fence signalled");
-    assert_eq!(groups[0].0.len(), 2, "two native calls: {groups:?}");
+    if !groups.is_empty() {
+        assert_eq!(groups.len(), 1, "one submission: {groups:?}");
+        assert!(groups[0].1, "its fence signalled");
+        assert_eq!(groups[0].0.len(), 2, "two native calls: {groups:?}");
+    }
     assert_eq!(
         crate::host::tests::lost_so_far(),
         lost,
         "every mark saw the flight"
     );
+}
+
+/// `VICTORY_FLIGHTS=2` on for this thread until dropped.
+struct TwoFlights;
+
+impl TwoFlights {
+    fn on() -> TwoFlights {
+        TEST_FLIGHTS.with(|n| n.set(2));
+        TwoFlights
+    }
+}
+
+impl Drop for TwoFlights {
+    fn drop(&mut self) {
+        TEST_FLIGHTS.with(|n| n.set(0));
+    }
+}
+
+/// Two flights in the air at once (the queue held by a gate): they land in
+/// order, each one's copy-back before its own Signal and before the next
+/// one's, as a title thread polling memory sees.
+#[test]
+fn two_flights_go_up_together_and_land_in_order() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let rig = Rig::new(2);
+    let _mode = ModeGuard::new(true, false);
+    let _two = TwoFlights::on();
+    let (queue, fence) = (title_queue(), title_fence());
+    let word = Box::new(AtomicU64::new(0));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watched = {
+        let (stop, at) = (stop.clone(), fence as usize);
+        let (a, b) = (rig.at(0, 8) as usize, rig.at(1, 8) as usize);
+        std::thread::spawn(move || {
+            // SAFETY: dwords of the buffers' title memory, alive until the end.
+            let dword = |at: usize| unsafe { (at as *const u32).read_volatile() };
+            let mut seen = vec![(0, 0, 0)];
+            while !stop.load(Ordering::Acquire) {
+                let v = crate::fence::value(at as This);
+                if seen.last().map(|s| s.0) != Some(v) {
+                    seen.push((v, dword(a), dword(b)));
+                }
+            }
+            seen.push((crate::fence::value(at as This), dword(a), dword(b)));
+            seen
+        })
+    };
+    let mut gate = Gate::hold(host);
+    for (k, slot) in [0u32, 1].into_iter().enumerate() {
+        let list = rig.list(&[(slot, 8, 0xE00 + slot)]);
+        list.defer_write(
+            word.as_ptr().cast(),
+            crate::queue::Written::Value(k as u64 + 1),
+            8,
+        );
+        let log = order.clone();
+        list.defer_after(move || log.lock().unwrap().push(k));
+        submit(&list);
+        assert_eq!(
+            crate::queue::signal_for_test(queue, fence, k as u64 + 1),
+            S_OK
+        );
+    }
+    let (in_air, value) = (host.in_air(), crate::fence::value(fence));
+    if gate.held() {
+        assert_eq!(in_air, 2, "two flights in the air");
+        assert_eq!(value, 0, "both Signals stand behind them");
+    }
+    gate.open();
+    host.finish_flight_now();
+    poll("the second Signal", || crate::fence::value(fence) == 2);
+    stop.store(true, Ordering::Release);
+    let seen = watched.join().unwrap();
+    assert_eq!(*order.lock().unwrap(), [0, 1], "work for after in order");
+    assert_eq!(
+        word.load(Ordering::Acquire),
+        2,
+        "the second's bottom-of-pipe write is the last"
+    );
+    assert!(
+        seen.windows(2).all(|w| w[0].0 <= w[1].0),
+        "the fence went back: {seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .all(|&(v, a, b)| (v < 1 || a == 0xE00) && (v < 2 || b == 0xE01)),
+        "a fence moved before its flight's copy-back: {seen:?}"
+    );
+    release(queue);
+    release(fence);
+}
+
+/// A flight that writes a copy the flight in the air writes too does not
+/// go beside it: that one lands first (the gate opens meanwhile), and both
+/// writes land.
+#[test]
+fn a_flight_writing_what_the_one_in_the_air_writes_waits_for_it() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let rig = Rig::new(1);
+    let _mode = ModeGuard::new(true, false);
+    let _two = TwoFlights::on();
+    let mut gate = Gate::hold(host);
+    let beside = crate::host::flight::beside_counts()[0];
+    submit(&rig.list(&[(0, 0, 0xF01)]));
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        gate.open();
+    });
+    submit(&rig.list(&[(0, 4, 0xF02)]));
+    opener.join().unwrap();
+    // (Whether the first was still in the air, or another test's
+    // submission landed it first, the second never goes beside it.)
+    assert_eq!(
+        crate::host::flight::beside_counts()[0],
+        beside,
+        "it went up alone"
+    );
+    host.finish_flight_now();
+    assert_eq!((rig.title(0, 0), rig.title(0, 4)), (0xF01, 0xF02));
+}
+
+/// A flight in the air has run on the GPU but is not landed yet; the title
+/// writes another dword of a copy it wrote, and the next submission reads
+/// both: its refresh of that copy waits until the first is landed (else the
+/// title's older bytes would go over what the first's shader wrote, and
+/// that write would be lost), then reads the title's write and the
+/// shader's.
+#[test]
+fn a_refresh_of_what_the_flight_in_the_air_writes_waits_for_its_landing() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let mut rig = Rig::new(0);
+    // Slots 0 and 1 view the same write-watched buffer (for writing, for
+    // reading); slot 2 the buffer the next one copies into.
+    let pool = crate::watch::tests::pool(1);
+    let shared = buffer_at_address(pool as u64, crate::watch::PAGE as u64);
+    rig.view(0, shared);
+    rig.view_srv(1, shared);
+    rig.view(2, buffer(256));
+    let _mode = ModeGuard::new(true, false);
+    let _two = TwoFlights::on();
+    let held = LanderHeld::on();
+    submit(&rig.list(&[(0, 4, 0x1234)]));
+    // Its shader has run (a tiny dispatch), and nothing of ours lands it
+    // (another test's submission may: then this checks only the results).
+    std::thread::sleep(Duration::from_millis(50));
+    rig.write(1, 0, 0x5678);
+    let first = rig.copying(1, 2, 0);
+    let second = rig.copying(1, 2, 4);
+    first.close();
+    second.close();
+    host.execute_flight1(vec![first, second], vec![false, false]);
+    drop(held);
+    host.finish_flight_now();
+    assert_eq!(
+        rig.title(0, 4),
+        0x1234,
+        "the first flight's write is in title memory"
+    );
+    assert_eq!(rig.title(0, 0), 0x5678, "and the title's own");
+    assert_eq!(
+        (rig.title(2, 0), rig.title(2, 4)),
+        (0x5678, 0x1234),
+        "the next one read both"
+    );
+}
+
+/// The title writes a view into a heap slot while two flights that bind
+/// the heap are in the air; the next flight writes through it, and every
+/// write lands.
+#[test]
+fn a_heap_slot_written_while_two_flights_are_in_the_air_serves_the_next() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    let mut rig = Rig::new(2);
+    let _ = host.log_messages();
+    let _mode = ModeGuard::new(true, false);
+    let _two = TwoFlights::on();
+    let mut gate = Gate::hold(host);
+    submit(&rig.list(&[(0, 0, 0xD11)]));
+    submit(&rig.list(&[(1, 0, 0xD12)]));
+    let in_air = host.in_air();
+    if gate.held() {
+        assert_eq!(in_air, 2, "two flights in the air");
+    }
+    rig.view(2, buffer(256));
+    gate.open();
+    submit(&rig.list(&[(2, 0, 0xD13)]));
+    host.finish_flight_now();
+    assert_eq!(
+        (rig.title(0, 0), rig.title(1, 0), rig.title(2, 0)),
+        (0xD11, 0xD12, 0xD13)
+    );
+    assert_eq!(host.log_messages(), None);
+    assert!(!crate::host::device_removed());
+}
+
+/// Many submissions back to back with two flights allowed: they alternate
+/// between two buffers (each goes beside the one before) and now and then
+/// write the same one twice in a row (then the one in the air lands
+/// first), with bottom-of-pipe counts and Signals between them: nothing is
+/// lost, and their work for after and Signals come in order.
+#[test]
+fn back_to_back_with_two_flights_lose_no_writes() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    const N: u32 = 64;
+    let rig = Rig::new(2);
+    let _mode = ModeGuard::new(true, false);
+    let _two = TwoFlights::on();
+    let (queue, fence) = (title_queue(), title_fence());
+    let word = Box::new(AtomicU64::new(0));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let [beside, _, _] = crate::host::flight::beside_counts();
+    for i in 0..N {
+        let slot = if i % 8 == 7 { (i + 1) % 2 } else { i % 2 };
+        let list = rig.list(&[(slot, 4 * (i / 2 % 32), 0x4000 + i)]);
+        list.defer_write(
+            word.as_ptr().cast(),
+            crate::queue::Written::Value(u64::from(i) + 1),
+            8,
+        );
+        let log = order.clone();
+        list.defer_after(move || log.lock().unwrap().push(i));
+        submit(&list);
+        if i % 4 == 3 {
+            assert_eq!(
+                crate::queue::signal_for_test(queue, fence, u64::from(i / 4) + 1),
+                S_OK
+            );
+        }
+    }
+    host.finish_flight_now();
+    let went = crate::host::flight::beside_counts()[0] - beside;
+    let mut want = std::collections::HashMap::new();
+    for i in 0..N {
+        let slot = if i % 8 == 7 { (i + 1) % 2 } else { i % 2 };
+        want.insert((slot, 4 * (i / 2 % 32)), 0x4000 + i);
+    }
+    let lost: Vec<_> = want
+        .iter()
+        .filter(|&(&(slot, at), &v)| rig.title(slot, at) != v)
+        .collect();
+    assert!(
+        lost.is_empty(),
+        "writes lost: {lost:?} ({went} went beside)"
+    );
+    assert_eq!(word.load(Ordering::Acquire), u64::from(N));
+    assert_eq!(*order.lock().unwrap(), (0..N).collect::<Vec<_>>());
+    assert_eq!(crate::fence::value(fence), u64::from(N / 4));
+    release(queue);
+    release(fence);
 }

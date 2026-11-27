@@ -1147,7 +1147,9 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let (runs, unmapped) = t.take_split(from, to);
-        if early {
+        // Taken while a flight runs (the prewarm's, or a preparation beside
+        // it, `VICTORY_FLIGHTS`): noted for its copy-back.
+        if early || crate::host::flight::beside() {
             self.note_early(runs.iter().chain(&unmapped));
         }
         #[cfg(feature = "diagnostics")]
@@ -1211,6 +1213,21 @@ impl Shadow {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
             && self
+                .before
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
+    }
+
+    /// Whether a submitted list declared that its shaders write the copy and
+    /// it is not copied back yet (a range pending or a snapshot kept).
+    pub(crate) fn busy(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty()
+            || !self
                 .before
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

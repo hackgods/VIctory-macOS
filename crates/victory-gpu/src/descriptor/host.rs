@@ -1185,7 +1185,9 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        let later = !for_draw && is_placed_texture(&view);
+        // mac: with `VICTORY_PLACED_AT_ONCE=1`, not when the texture's host
+        // texture is made already: then the view makes nothing new.
+        let later = !for_draw && is_placed_texture(&view) && !made_at_once(&view);
         // mac: a heap sync ahead of the submission leaves the slot as it is,
         // for the sync before it: made now, its read mark would be forgotten
         // under the running submission's shaders (`super::ahead`).
@@ -2205,6 +2207,19 @@ fn is_unordered_texture(view: &View) -> bool {
 /// Whether `view` is a view of a texture the title placed in memory itself.
 fn is_placed_texture(view: &View) -> bool {
     matches!(view, View::Placed(_, resource, _) if resource[0] != 1)
+}
+
+/// mac: whether a heap sync makes the slot of placed texture view `view` at
+/// once (`VICTORY_PLACED_AT_ONCE=1`): its host texture is made already
+/// (`crate::resource::placed_made`), so making the view makes no texture.
+fn made_at_once(view: &View) -> bool {
+    if !crate::mac_switches::placed_at_once() {
+        return false;
+    }
+    let View::Placed(_, resource, desc) = view else {
+        return false;
+    };
+    crate::resource::placed_made(u64::from(desc[10]) | u64::from(desc[11]) << 32, resource)
 }
 
 /// Makes what a host view of `view` needs, if it is not made yet: the

@@ -163,6 +163,9 @@ pub extern "system" fn XMemVirtualAlloc(
     if at.is_null() && constrained && highest < FOUR_GIB {
         at = low_guards::retry(size, || allocate(&mut parameter));
     }
+    if !at.is_null() && placeholder {
+        victory_gpu::title_reservation(at as u64, size as u64);
+    }
     if at.is_null() {
         let error = std::io::Error::last_os_error();
         if kind & MEM_COMMIT != 0 {
@@ -554,8 +557,32 @@ fn shared_heap(size: usize) -> Option<Arc<victory_gpu::PhysicalHeap>> {
     let heap = trial.or_else(|| victory_gpu::in_place_heap(size))?;
     if victory_gpu::in_place_sections() {
         victory_gpu::set_in_place_resolver(in_place_run);
+        victory_gpu::set_tile_resolver(tile_at);
     }
     Some(heap)
+}
+
+/// What the title shows at the 64 KiB page at `at`, if a page of a section
+/// on a heap ([`victory_gpu::TileResolver`]): the heap, the page's tile in
+/// it, and whether the title shows that page at another address too.
+fn tile_at(at: u64) -> Option<victory_gpu::TileAt> {
+    let at = usize::try_from(at).ok()?;
+    let (section, index) = {
+        let views = IN_PLACE_VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        let (&base, (_, slice)) = views
+            .range(..=at)
+            .next_back()
+            .filter(|(base, (size, _))| at < *base + size)?;
+        (slice.section.clone(), slice.index + (at - base) / PAGE)
+    };
+    let heap = section.shared.clone()?;
+    let mut shown_at = Vec::new();
+    shown().push_at(Arc::as_ptr(&section) as usize, index, &mut shown_at);
+    Some(victory_gpu::TileAt {
+        heap,
+        tile: u32::try_from(index).ok()?,
+        shared: shown_at.len() > 1,
+    })
 }
 
 /// Views of sections on a heap ([`Section::shared`]), by address: their
@@ -660,6 +687,11 @@ struct Shown {
     pages: HashMap<(usize, usize), Vec<usize>>,
     /// Views longer than [`SHORT`] pages: `(base, len, section_ptr, first_index)`.
     long: Vec<(usize, usize, usize, usize)>,
+    /// Pages shown at more than one address now, and the most so far
+    /// ([`Shown::log_multi`]): what one GPU address per physical page has to
+    /// cover where tile mappings would give such a page two (#221).
+    multi: usize,
+    multi_most: usize,
 }
 
 /// Views up to this many pages record each page in [`Shown::pages`]; larger
@@ -688,9 +720,16 @@ impl Shown {
         for k in 0..count {
             let mut existing = Vec::new();
             self.push_at(section, slice.index + k, &mut existing);
+            if existing.len() == 1 {
+                self.multi += 1;
+            }
             if !existing.is_empty() {
                 aliased.push((base + k * PAGE, existing));
             }
+        }
+        if self.multi > self.multi_most {
+            self.multi_most = self.multi;
+            self.log_multi();
         }
         if count > SHORT {
             self.long.push((base, len, section, slice.index));
@@ -706,11 +745,20 @@ impl Shown {
     }
 
     fn forget(&mut self, base: usize, len: usize, slice: &Slice) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        // Pages shown here and at one other address only: shown once after.
+        let mut shown = Vec::new();
+        for k in 0..len / PAGE {
+            shown.clear();
+            self.push_at(section, slice.index + k, &mut shown);
+            if shown.len() == 2 {
+                self.multi = self.multi.saturating_sub(1);
+            }
+        }
         if len / PAGE > SHORT {
             self.long.retain(|view| view.0 != base);
             return;
         }
-        let section = Arc::as_ptr(&slice.section) as usize;
         for k in 0..len / PAGE {
             let key = (section, slice.index + k);
             if let Some(addresses) = self.pages.get_mut(&key) {
@@ -719,6 +767,19 @@ impl Shown {
                     self.pages.remove(&key);
                 }
             }
+        }
+    }
+
+    /// Logs how many pages are shown at more than one address, at a new
+    /// most of a power of two (and the first 16 new mosts).
+    fn log_multi(&self) {
+        let n = self.multi_most;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(
+                pages = n,
+                mib = (n * PAGE) >> 20,
+                "XMem physical pages shown at more than one address: a new most"
+            );
         }
     }
 }
@@ -1478,17 +1539,19 @@ fn finish_map(
     // before acquiring `GUARDS`) so concurrent DirectStorage completions never
     // miss a newly mapped view.
     let aliased = shown_mut().note(base, len, &slice);
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    for (at, others) in aliased {
-        // Pages shown elsewhere already: guarded here too if they are there.
-        victory_gpu::title_memory_aliased(at, &others);
-    }
+    // Known to the resolvers before the GPU side hears of it below: tiles
+    // in place there are mapped to it then (`victory_gpu::TileResolver`).
     if slice.section.shared.is_some() {
         IN_PLACE_VIEWS
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .insert(base, (len, slice.clone()));
+    }
+    // New contents, read-write: the GPU side's copies no longer guard it.
+    victory_gpu::title_memory_remapped(base, len);
+    for (at, others) in aliased {
+        // Pages shown elsewhere already: guarded here too if they are there.
+        victory_gpu::title_memory_aliased(at, &others);
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1963,6 +2026,32 @@ mod tests {
             TEST_LEAN.with(|c| c.set(self.prev_lean));
             TEST_MAP_RUNS.with(|c| c.set(self.prev_runs));
         }
+    }
+
+    /// Pages shown at two addresses are counted while both views stand (on
+    /// an index of its own: other tests map pages meanwhile).
+    #[test]
+    fn pages_shown_twice_are_counted() {
+        let pages = allocate(2);
+        let slice = |page: usize| page_table().pages[&page].clone();
+        let mut shown = Shown::default();
+        let (a, b) = (0x7100_0000usize, 0x7200_0000usize);
+        shown.note(a, 2 * PAGE, &slice(pages[0]));
+        assert_eq!(shown.multi, 0);
+        shown.note(b, 2 * PAGE, &slice(pages[0]));
+        assert_eq!(
+            (shown.multi, shown.multi_most),
+            (2, 2),
+            "both pages shown twice"
+        );
+        shown.forget(b, 2 * PAGE, &slice(pages[0]));
+        assert_eq!((shown.multi, shown.multi_most), (0, 2));
+        // One page of them again, as a view of its own.
+        shown.note(b + PAGE, PAGE, &slice(pages[1]));
+        assert_eq!(shown.multi, 1, "the second page shown twice");
+        shown.forget(a, 2 * PAGE, &slice(pages[0]));
+        assert_eq!(shown.multi, 0);
+        XMemFreePhysicalPages(pages.len(), pages.as_ptr());
     }
 
     /// Title memory lies in place on a section's heap only where views next

@@ -125,6 +125,10 @@ pub use alias::{
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::physical_heap;
 #[cfg(windows)]
+pub use tiles::{
+    TileAt, TileResolver, in_place_tiles, set_tile_resolver, title_memory_tiled, title_reservation,
+};
+#[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use watch::{

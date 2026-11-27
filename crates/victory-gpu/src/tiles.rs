@@ -7,7 +7,407 @@
 //! pages, the tiles are mapped again on the queue before the next
 //! submission, and a list recorded before that reads the new pages.
 //!
-//! This first part holds the probes of what D3DMetal's tile mappings do.
+//! A title reservation of 64 KiB pages (the placeholders XMem physical
+//! pages are mapped into) becomes a region the first time a title buffer in
+//! it is looked up: one reserved buffer the length of the reservation, so
+//! that every title buffer there shares it (one GPU address for each title
+//! address), its tiles mapped to what the title shows at each page. A
+//! buffer whose pages are all shown from section heaps is that buffer at
+//! its offset ([`tiled`]), whatever sections and in whatever order: the
+//! run of one section in order that `crate::alias` needs is not needed.
+//! When the title maps or unmaps pages ([`remapped`]), the tiles there are
+//! mapped again on the host queue at once: submissions after it read the
+//! new pages, lists recorded before it included.
+
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+use windows::Win32::Graphics::Direct3D12::*;
+
+use crate::alias::PhysicalHeap;
+use crate::host::host;
+
+/// The title's pages and the tiles of reserved buffers: 64 KiB both.
+const TILE: u64 = 64 << 10;
+
+/// What the title shows at a page: the heap that holds it, the tile of
+/// the heap it is, and whether the title shows that page at another address
+/// too ([`TileResolver`]).
+pub struct TileAt {
+    pub heap: Arc<PhysicalHeap>,
+    pub tile: u32,
+    pub shared: bool,
+}
+
+/// What the title shows at the page at a title address: `None` where no
+/// page on a heap is shown there. The runtime's, installed with
+/// [`set_tile_resolver`].
+pub type TileResolver = fn(u64) -> Option<TileAt>;
+
+static RESOLVER: OnceLock<TileResolver> = OnceLock::new();
+
+/// Installs the runtime's [`TileResolver`] (the first call's).
+pub fn set_tile_resolver(resolve: TileResolver) {
+    let _ = RESOLVER.set(resolve);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The resolver this thread's lookups use in place of the runtime's.
+    pub(crate) static TEST_RESOLVER: std::cell::Cell<Option<TileResolver>> = const { std::cell::Cell::new(None) };
+    /// Overrides `VICTORY_INPLACE_TILES` on this thread.
+    pub(crate) static TEST_TILES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+fn resolver() -> Option<TileResolver> {
+    #[cfg(test)]
+    if let Some(resolve) = TEST_RESOLVER.with(std::cell::Cell::get) {
+        return Some(resolve);
+    }
+    RESOLVER.get().copied()
+}
+
+/// Whether title memory in place goes through tile mappings
+/// (`VICTORY_INPLACE_TILES=1`, with `VICTORY_INPLACE_SECTIONS=1`).
+pub fn in_place_tiles() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_TILES.with(std::cell::Cell::get) {
+        return on && crate::alias::in_place_sections();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_INPLACE_TILES") && crate::alias::in_place_sections();
+        if on {
+            tracing::info!("title memory in place through tile mappings (VICTORY_INPLACE_TILES)");
+        }
+        on
+    })
+}
+
+/// Whether two tiles mapped onto one heap tile read what a shader wrote
+/// through the other within one list (the probe
+/// `tests::aliased_tiles_within_one_list`). Where not, pages the title shows
+/// at more than one address are left to `crate::alias`'s one address per
+/// page.
+const ALIASED_TILES_COHERENT: bool = false;
+
+/// The title's reservations of 64 KiB pages for physical pages, by start:
+/// their end.
+static RESERVATIONS: RwLock<BTreeMap<u64, u64>> = RwLock::new(BTreeMap::new());
+
+/// The title reserved `[base, base + len)` for physical pages.
+pub fn title_reservation(base: u64, len: u64) {
+    if !in_place_tiles() || len == 0 || !base.is_multiple_of(TILE) {
+        return;
+    }
+    RESERVATIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(base, base + len.next_multiple_of(TILE));
+    // A region left from a reservation there before is not this one's.
+    REGIONS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&base);
+}
+
+/// A reservation made a region: its reserved buffer and what each of its
+/// tiles shows.
+struct Region {
+    base: u64,
+    reserved: ID3D12Resource,
+    gpu: u64,
+    /// Per tile: the heap (its address, as a key) and the tile of it shown
+    /// there, whether the title shows it elsewhere too; `None` for none.
+    tiles: Mutex<Vec<Option<(usize, u32, bool)>>>,
+    /// The heaps its tiles map onto, kept while it lives.
+    heaps: Mutex<Vec<Arc<PhysicalHeap>>>,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the rest is behind locks.
+unsafe impl Send for Region {}
+// SAFETY: as above.
+unsafe impl Sync for Region {}
+
+static REGIONS: RwLock<BTreeMap<u64, Arc<Region>>> = RwLock::new(BTreeMap::new());
+
+/// The reservation holding `[start, start + len)`: its start and end.
+fn reservation(start: u64, len: u64) -> Option<(u64, u64)> {
+    RESERVATIONS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..=start)
+        .next_back()
+        .filter(|&(_, &end)| start.saturating_add(len) <= end)
+        .map(|(&base, &end)| (base, end))
+}
+
+/// The region of the reservation `[base, end)`, made the first time.
+fn region(base: u64, end: u64) -> Option<Arc<Region>> {
+    if let Some(r) = REGIONS.read().unwrap_or_else(|e| e.into_inner()).get(&base) {
+        return Some(r.clone());
+    }
+    let h = host()?;
+    let mut reserved: Option<ID3D12Resource> = None;
+    // SAFETY: a reserved buffer of whole tiles; the output is ours.
+    unsafe {
+        h.device
+            .CreateReservedResource(
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: end - base,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut reserved,
+            )
+            .inspect_err(|error| tracing::warn!(len = end - base, %error, "no reserved buffer for title memory"))
+            .ok()?;
+    }
+    let reserved = reserved?;
+    crate::host::name(&reserved, || {
+        format!("title reservation {base:#x}+{:#x} in place", end - base)
+    });
+    // SAFETY: a live buffer.
+    let gpu = unsafe { reserved.GetGPUVirtualAddress() };
+    let tiles = ((end - base) / TILE) as usize;
+    let region = Arc::new(Region {
+        base,
+        reserved,
+        gpu,
+        tiles: Mutex::new(vec![None; tiles]),
+        heaps: Mutex::new(Vec::new()),
+    });
+    let mut regions = REGIONS.write().unwrap_or_else(|e| e.into_inner());
+    // Another thread may have made it meanwhile: that one is the region.
+    if let Some(r) = regions.get(&base) {
+        return Some(r.clone());
+    }
+    regions.insert(base, region.clone());
+    drop(regions);
+    region.map(0, tiles as u32);
+    MADE.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        base = format_args!("{base:#x}"),
+        len = end - base,
+        "title reservation in place through tile mappings"
+    );
+    Some(region)
+}
+
+static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Tile mappings made again for the title's remaps, and the calls.
+static REMAPPED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+impl Region {
+    /// Maps `count` tiles from `first` to what the title shows there now,
+    /// on the host queue; returns whether any of them is now no heap's (or
+    /// shared, where aliased tiles are not coherent).
+    fn map(&self, first: u32, count: u32) -> bool {
+        let Some(resolve) = resolver() else {
+            return true;
+        };
+        let Some(h) = host() else {
+            return true;
+        };
+        let queue = h.queue_for_tiles();
+        let mut tiles = self.tiles.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lost = false;
+        // Runs of tiles onto one heap, in one call each.
+        let mut run: Option<(u32, Arc<PhysicalHeap>, Vec<u32>)> = None;
+        let mut nulls: Vec<u32> = Vec::new();
+        let flush = |run: &mut Option<(u32, Arc<PhysicalHeap>, Vec<u32>)>| {
+            if let Some((start, heap, offsets)) = run.take() {
+                update(&queue, &self.reserved, start, Some(&heap._heap), &offsets);
+            }
+        };
+        for t in first..first + count {
+            let at = self.base + u64::from(t) * TILE;
+            let now = resolve(at);
+            let key = now
+                .as_ref()
+                .map(|a| (Arc::as_ptr(&a.heap) as usize, a.tile, a.shared));
+            // As it is (reserved tiles start with none): nothing to map.
+            if tiles[t as usize] == key {
+                lost |= key.is_none_or(|(_, _, shared)| shared && !ALIASED_TILES_COHERENT);
+                flush(&mut run);
+                continue;
+            }
+            tiles[t as usize] = key;
+            match now {
+                Some(TileAt { heap, tile, shared }) => {
+                    lost |= shared && !ALIASED_TILES_COHERENT;
+                    let next = run
+                        .as_ref()
+                        .is_some_and(|(s, h, o)| Arc::ptr_eq(h, &heap) && *s + o.len() as u32 == t);
+                    if !next {
+                        flush(&mut run);
+                        let mut heaps = self.heaps.lock().unwrap_or_else(|e| e.into_inner());
+                        if !heaps.iter().any(|k| Arc::ptr_eq(k, &heap)) {
+                            heaps.push(heap.clone());
+                        }
+                        run = Some((t, heap, Vec::new()));
+                    }
+                    if let Some((_, _, offsets)) = &mut run {
+                        offsets.push(tile);
+                    }
+                }
+                None => {
+                    flush(&mut run);
+                    lost = true;
+                    nulls.push(t);
+                }
+            }
+        }
+        flush(&mut run);
+        for t in nulls {
+            update(&queue, &self.reserved, t, None, &[0]);
+        }
+        lost
+    }
+
+    fn end(&self) -> u64 {
+        self.base + self.tiles.lock().unwrap_or_else(|e| e.into_inner()).len() as u64 * TILE
+    }
+
+    /// Whether every page of `[start, start + len)` is shown from a heap
+    /// (and once, where aliased tiles are not coherent).
+    fn backs(&self, start: u64, len: u64) -> bool {
+        let tiles = self.tiles.lock().unwrap_or_else(|e| e.into_inner());
+        let first = ((start - self.base) / TILE) as usize;
+        let last = ((start + len.max(1) - 1 - self.base) / TILE) as usize;
+        tiles.get(first..=last).is_some_and(|t| {
+            t.iter()
+                .all(|t| t.is_some_and(|(_, _, shared)| !shared || ALIASED_TILES_COHERENT))
+        })
+    }
+}
+
+/// Maps tiles from `start` of `reserved`, one each, to tiles `offsets` of
+/// `heap`, or to none.
+fn update(
+    queue: &ID3D12CommandQueue,
+    reserved: &ID3D12Resource,
+    start: u32,
+    heap: Option<&ID3D12Heap>,
+    offsets: &[u32],
+) {
+    let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
+        X: start,
+        ..Default::default()
+    };
+    let size = D3D12_TILE_REGION_SIZE {
+        NumTiles: offsets.len() as u32,
+        ..Default::default()
+    };
+    let flag = if heap.is_some() {
+        D3D12_TILE_RANGE_FLAG_NONE
+    } else {
+        D3D12_TILE_RANGE_FLAG_NULL
+    };
+    let flags = vec![flag; offsets.len()];
+    let counts = vec![1u32; offsets.len()];
+    // SAFETY: each range maps one tile of a live heap, or none, of a live
+    // reserved buffer; arrays of `offsets.len()` entries.
+    unsafe {
+        queue.UpdateTileMappings(
+            reserved,
+            1,
+            Some(&coordinate),
+            Some(&size),
+            heap,
+            offsets.len() as u32,
+            Some(flags.as_ptr()),
+            Some(offsets.as_ptr()),
+            Some(counts.as_ptr()),
+            D3D12_TILE_MAPPING_FLAG_NONE,
+        );
+    }
+    REMAPPED[0].fetch_add(offsets.len() as u64, Ordering::Relaxed);
+    REMAPPED[1].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The title buffer `[start, start + len)` through its reservation's
+/// reserved buffer, if [`in_place_tiles`] and every page of it is shown
+/// from a section heap: the buffer, the GPU address of `start` and its
+/// offset in the buffer.
+pub(crate) fn tiled(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> {
+    if !in_place_tiles() {
+        return None;
+    }
+    let (base, end) = reservation(start, len)?;
+    let region = region(base, end)?;
+    region.backs(start, len).then(|| {
+        let offset = start - region.base;
+        (region.reserved.clone(), region.gpu + offset, offset)
+    })
+}
+
+/// Whether title memory `[start, start + len)` would be in place through
+/// tile mappings now ([`tiled`]).
+pub fn title_memory_tiled(start: u64, len: u64) -> bool {
+    tiled(start, len).is_some()
+}
+
+/// Whether `buffer` is a region's reserved buffer (a shadow over it follows
+/// the title's remaps by itself).
+pub(crate) fn is_region_buffer(buffer: &ID3D12Resource) -> bool {
+    use windows::core::Interface;
+    MADE.load(Ordering::Relaxed) != 0
+        && REGIONS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|r| r.reserved.as_raw() == buffer.as_raw())
+}
+
+/// Tiles mapped again for the title's remaps since the start, and the
+/// calls that did it (tests and benches).
+#[cfg(test)]
+pub(crate) fn remap_counts() -> [u64; 2] {
+    REMAPPED.each_ref().map(|c| c.load(Ordering::Relaxed))
+}
+
+/// The title mapped or unmapped pages over `[at, at + len)`: the tiles of
+/// regions there are mapped again now, on the host queue. Returns whether
+/// any tile there is now no heap's (memory in place through it has to be
+/// let go).
+pub(crate) fn remapped(at: u64, len: u64) -> bool {
+    if !in_place_tiles() || len == 0 {
+        return false;
+    }
+    let end = at.saturating_add(len);
+    let regions: Vec<Arc<Region>> = REGIONS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..end)
+        .filter(|(_, r)| r.end() > at)
+        .map(|(_, r)| r.clone())
+        .collect();
+    let mut lost = false;
+    for region in regions {
+        let first = at.max(region.base);
+        let last = end.min(region.end());
+        let (t0, t1) = (
+            ((first - region.base) / TILE) as u32,
+            ((last - region.base).div_ceil(TILE)) as u32,
+        );
+        lost |= region.map(t0, t1 - t0);
+    }
+    lost
+}
 
 #[cfg(test)]
 mod tests {
@@ -18,6 +418,9 @@ mod tests {
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::Interface;
+
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
 
     use crate::alias::PhysicalHeap;
 
@@ -50,7 +453,10 @@ mod tests {
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
             Flags: flags,
             ..Default::default()
@@ -67,10 +473,12 @@ mod tests {
                         ..Default::default()
                     })
                     .unwrap();
-                let allocator: ID3D12CommandAllocator =
-                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
-                let list: ID3D12GraphicsCommandList =
-                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                let allocator: ID3D12CommandAllocator = device
+                    .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                    .unwrap();
+                let list: ID3D12GraphicsCommandList = device
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+                    .unwrap();
                 list.Close().unwrap();
                 Rig {
                     device: device.clone(),
@@ -132,7 +540,13 @@ mod tests {
 
         /// Maps `tiles` of `reserved` from tile `first` on to the tiles
         /// `offsets` of `heap` (one tile each), or to none.
-        fn map(&self, reserved: &ID3D12Resource, first: u32, heap: Option<&ID3D12Heap>, offsets: &[u32]) {
+        fn map(
+            &self,
+            reserved: &ID3D12Resource,
+            first: u32,
+            heap: Option<&ID3D12Heap>,
+            offsets: &[u32],
+        ) {
             let start = D3D12_TILED_RESOURCE_COORDINATE {
                 X: first,
                 ..Default::default()
@@ -142,7 +556,11 @@ mod tests {
                 ..Default::default()
             };
             let flags = vec![
-                if heap.is_some() { D3D12_TILE_RANGE_FLAG_NONE } else { D3D12_TILE_RANGE_FLAG_NULL };
+                if heap.is_some() {
+                    D3D12_TILE_RANGE_FLAG_NONE
+                } else {
+                    D3D12_TILE_RANGE_FLAG_NULL
+                };
                 offsets.len()
             ];
             let counts = vec![1u32; offsets.len()];
@@ -182,7 +600,9 @@ mod tests {
         fn fetch_tile(&mut self, reserved: &ID3D12Resource, tile: u64) -> Vec<u8> {
             let back = self.readback(TILE);
             // SAFETY: two live buffers, the tile inside the reserved one.
-            self.record(|l| unsafe { l.CopyBufferRegion(&back, 0, reserved, tile * TILE as u64, TILE as u64) });
+            self.record(|l| unsafe {
+                l.CopyBufferRegion(&back, 0, reserved, tile * TILE as u64, TILE as u64)
+            });
             self.run().unwrap();
             read(&back)
         }
@@ -202,18 +622,25 @@ mod tests {
     /// Two heaps of four tiles each, tile `t` of the first holding bytes
     /// `0xa0 + t`, of the second `0xb0 + t`.
     fn two_heaps(device: &ID3D12Device) -> [PhysicalHeap; 2] {
-        let heaps = [0xa0u8, 0xb0].map(|_| PhysicalHeap::new(device, 4 * TILE).expect("a tile heap"));
+        let heaps =
+            [0xa0u8, 0xb0].map(|_| PhysicalHeap::new(device, 4 * TILE).expect("a tile heap"));
         for (heap, base) in heaps.iter().zip([0xa0u8, 0xb0]) {
             for t in 0..4 {
                 // SAFETY: inside the heap's CPU mapping; no GPU use yet.
-                unsafe { (heap.cpu_address() as *mut u8).add(t * TILE).write_bytes(base + t as u8, TILE) };
+                unsafe {
+                    (heap.cpu_address() as *mut u8)
+                        .add(t * TILE)
+                        .write_bytes(base + t as u8, TILE)
+                };
             }
         }
         heaps
     }
 
     fn on_d3dmetal() -> Option<ID3D12Device> {
-        crate::watch::rosetta().then(|| crate::host::host().map(|h| h.device.clone())).flatten()
+        crate::watch::rosetta()
+            .then(|| crate::host::host().map(|h| h.device.clone()))
+            .flatten()
     }
 
     /// D3DMetal follows tile mappings onto two heaps at once, in any order,
@@ -231,7 +658,12 @@ mod tests {
         rig.map(&reserved, 4, Some(&heaps[1]._heap), &[1, 3, 0, 2]);
         let expected = [0xa2u8, 0xa0, 0xa3, 0xa1, 0xb1, 0xb3, 0xb0, 0xb2];
         for (tile, &byte) in expected.iter().enumerate() {
-            assert!(rig.fetch_tile(&reserved, tile as u64).iter().all(|&b| b == byte), "tile {tile}");
+            assert!(
+                rig.fetch_tile(&reserved, tile as u64)
+                    .iter()
+                    .all(|&b| b == byte),
+                "tile {tile}"
+            );
         }
         // Recorded, then remapped on the queue, then run.
         let back = rig.readback(TILE);
@@ -239,10 +671,16 @@ mod tests {
         rig.record(|l| unsafe { l.CopyBufferRegion(&back, 0, &reserved, 0, TILE as u64) });
         rig.map(&reserved, 0, Some(&heaps[1]._heap), &[3]);
         rig.run().unwrap();
-        assert!(read(&back).iter().all(|&b| b == 0xb3), "the list reads the tile mapped before it ran");
+        assert!(
+            read(&back).iter().all(|&b| b == 0xb3),
+            "the list reads the tile mapped before it ran"
+        );
         // Unmapped: reads zeros.
         rig.map(&reserved, 1, None, &[0]);
-        assert!(rig.fetch_tile(&reserved, 1).iter().all(|&b| b == 0), "a null tile");
+        assert!(
+            rig.fetch_tile(&reserved, 1).iter().all(|&b| b == 0),
+            "a null tile"
+        );
     }
 
     /// Whether a shader's writes through one tile are what a shader reads
@@ -260,66 +698,280 @@ mod tests {
         let heaps = two_heaps(&device);
         let reserved = rig.reserved(2 * TILE as u64).expect("a reserved buffer");
         rig.map(&reserved, 0, Some(&heaps[0]._heap), &[0, 0]);
-        const COPY: &str = "cbuffer c : register(b0) { uint src; uint dst; uint fill; };\n\
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        // Two programs as the title's would be: one writes 7s, the other
+        // reads words and writes them plus one, at offsets given as
+        // constants, through one root UAV over the reserved buffer.
+        const WRITE: &str = "cbuffer c : register(b0) { uint dst; uint src; };\n\
             RWByteAddressBuffer b : register(u0);\n\
             [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
-                uint at = id.x * 4;\n\
-                uint v = fill;\n\
-                if (fill == 0) v = b.Load(src + at) + 1;\n\
-                b.Store((fill == 0 ? dst : src) + at, v);\n\
+                b.Store(dst + id.x * 4, 7);\n\
             }\n";
-        let (root, pso) = pipeline(
-            COPY,
-            windows::core::s!("alias tiles"),
-            0,
-            &[Param::Constants { register: 0, count: 3 }, Param::Uav { register: 0 }],
-        )
-        .unwrap_or_else(|e| panic!("the probe's pipeline: {e}"));
+        const READ: &str = "cbuffer c : register(b0) { uint dst; uint src; };\n\
+            RWByteAddressBuffer b : register(u0);\n\
+            [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
+                b.Store(dst + id.x * 4, b.Load(src + id.x * 4) + 1);\n\
+            }\n";
+        let params = [
+            Param::Constants {
+                register: 0,
+                count: 2,
+            },
+            Param::Uav { register: 0 },
+        ];
+        let (root, write) = pipeline(WRITE, windows::core::s!("alias write"), 0, &params)
+            .unwrap_or_else(|e| panic!("the probe's write pipeline: {e}"));
+        let (_, read_pso) = pipeline(READ, windows::core::s!("alias read"), 0, &params)
+            .unwrap_or_else(|e| panic!("the probe's read pipeline: {e}"));
         let back = rig.readback(TILE);
         let words = (TILE / 4) as u32;
-        // Write 7s through tile 0, then (a barrier between) read them back
-        // through tile 1 plus one into the second half of tile 0's page...
-        // which is tile 1's page too: so write the result to an offset of
-        // its own, past the first half.
+        // Both tiles show one page: the result goes to its second half.
         let half = (TILE / 2) as u32;
-        // SAFETY: our pipeline and buffers live through the run.
+        let barrier = || D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: a copy of the pointer without a reference of
+                    // its own, never released; the buffer outlives the run.
+                    pResource: unsafe { std::mem::transmute_copy(&reserved) },
+                }),
+            },
+        };
+        // SAFETY: our pipelines and buffers live through the run.
         rig.record(|l| unsafe {
             l.SetComputeRootSignature(&root);
-            l.SetPipelineState(&pso);
             l.SetComputeRootUnorderedAccessView(1, reserved.GetGPUVirtualAddress());
-            l.SetComputeRoot32BitConstants(0, 3, [0u32, 0, 7].as_ptr().cast(), 0);
+            // 7s into the first half of the page, through tile 0.
+            l.SetPipelineState(&write);
+            l.SetComputeRoot32BitConstants(0, 2, [0u32, 0].as_ptr().cast(), 0);
             l.Dispatch(words / 2 / 64, 1, 1);
-            l.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::transmute_copy(&reserved),
-                    }),
-                },
-            }]);
-            // Read through tile 1 (the same page), write to tile 0's second half.
-            l.SetComputeRoot32BitConstants(0, 3, [TILE as u32, half, 0].as_ptr().cast(), 0);
+            l.ResourceBarrier(&[barrier()]);
+            // Read back through tile 1 (the same page), plus one, into the
+            // second half of the page through tile 0.
+            l.SetPipelineState(&read_pso);
+            l.SetComputeRoot32BitConstants(0, 2, [half, TILE as u32].as_ptr().cast(), 0);
             l.Dispatch(words / 2 / 64, 1, 1);
-            l.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
-                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
-                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                        pResource: std::mem::transmute_copy(&reserved),
-                    }),
-                },
-            }]);
+            l.ResourceBarrier(&[barrier()]);
             l.CopyBufferRegion(&back, 0, &reserved, 0, TILE as u64);
         });
         rig.run().unwrap();
         let bytes = read(&back);
         let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let stale = (half as usize..TILE).step_by(4).filter(|&at| word(at) != 8).count();
+        let stale = (half as usize..TILE)
+            .step_by(4)
+            .filter(|&at| word(at) != 8)
+            .count();
         println!(
             "aliased tiles in one list: {stale} of {} words read stale through the second tile",
             TILE / 2 / 4
         );
+    }
+
+    /// What the test resolver says each title page shows: the heap, its tile
+    /// and whether the page is shown elsewhere too.
+    type Shown = (std::sync::Arc<PhysicalHeap>, u32, bool);
+    static SHOWS: Mutex<BTreeMap<u64, Shown>> = Mutex::new(BTreeMap::new());
+
+    fn test_tile_at(at: u64) -> Option<super::TileAt> {
+        let shows = SHOWS.lock().unwrap();
+        let (heap, tile, shared) = shows.get(&at)?;
+        Some(super::TileAt {
+            heap: heap.clone(),
+            tile: *tile,
+            shared: *shared,
+        })
+    }
+
+    /// A title reservation of four pages (committed memory of our own
+    /// stands for the title's views: the CPU side of a tiled shadow is the
+    /// title's address), the first three a title buffer, shown from two
+    /// heaps as `shows` says; its in-place shadow.
+    struct Title {
+        memory: *mut u8,
+        resource: usize,
+        start: u64,
+        heaps: [std::sync::Arc<PhysicalHeap>; 2],
+    }
+
+    impl Title {
+        fn new(resource: usize, shows: [(usize, u32); 3]) -> Option<Title> {
+            use windows_sys::Win32::System::Memory::{
+                MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+            };
+            let device = on_d3dmetal()?;
+            crate::alias::TEST_IN_PLACE.with(|c| c.set(Some(true)));
+            super::TEST_TILES.with(|c| c.set(Some(true)));
+            super::TEST_RESOLVER.with(|c| c.set(Some(test_tile_at)));
+            let [a, b] = two_heaps(&device);
+            let heaps = [std::sync::Arc::new(a), std::sync::Arc::new(b)];
+            // SAFETY: a fresh reservation, ours.
+            let memory = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    4 * TILE,
+                    MEM_RESERVE | MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            }
+            .cast::<u8>();
+            assert!(!memory.is_null());
+            let start = memory as u64;
+            {
+                let mut table = SHOWS.lock().unwrap();
+                for (k, (heap, tile)) in shows.into_iter().enumerate() {
+                    table.insert(
+                        start + (k * TILE) as u64,
+                        (heaps[heap].clone(), tile, false),
+                    );
+                }
+            }
+            super::title_reservation(start, 4 * TILE as u64);
+            crate::shadow::register(resource, start, 3 * TILE as u64);
+            Some(Title {
+                memory,
+                resource,
+                start,
+                heaps,
+            })
+        }
+
+        /// The title shows `(heap, tile)` at page `page` from now on.
+        fn remap(&self, page: usize, heap: usize, tile: u32) {
+            let at = self.start + (page * TILE) as u64;
+            SHOWS
+                .lock()
+                .unwrap()
+                .insert(at, (self.heaps[heap].clone(), tile, false));
+            crate::watch::title_memory_remapped(at as usize, TILE);
+        }
+
+        fn shadow(&self) -> std::sync::Arc<crate::shadow::Shadow> {
+            crate::shadow::find(self.start, 3 * TILE as u64).expect("a shadow")
+        }
+
+        /// A list copying page `page` of the buffer out, recorded now; and
+        /// what it copies to.
+        fn record(&self, page: usize) -> (crate::host::HostList, ID3D12Resource, *mut u8) {
+            use crate::backend::{HostGpu, HostMemory};
+            let host = crate::host::host().unwrap();
+            let shadow = self.shadow();
+            let (out, data) = host.shared_buffer(TILE as u64).expect("an output buffer");
+            let list = host.new_list().expect("a list");
+            let at = self.start + (page * TILE) as u64;
+            shadow.refresh(&list, at, TILE as u64);
+            // SAFETY: both buffers live through the waited submission.
+            unsafe {
+                list.list
+                    .CopyBufferRegion(&out, 0, &shadow.buffer, shadow.offset(at), TILE as u64)
+            };
+            list.close();
+            (list, out, data)
+        }
+
+        fn run(list: &crate::host::HostList, data: *mut u8) -> Vec<u8> {
+            use crate::backend::HostGpu;
+            crate::host::host().unwrap().execute(&[list]);
+            // SAFETY: the output buffer's CPU mapping, after the wait.
+            unsafe { std::slice::from_raw_parts(data, TILE).to_vec() }
+        }
+    }
+
+    impl Drop for Title {
+        fn drop(&mut self) {
+            use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+            // The title unmaps it all: the tiles go to none, the buffer is
+            // let go; then it goes.
+            SHOWS
+                .lock()
+                .unwrap()
+                .retain(|&at, _| at < self.start || at >= self.start + 4 * TILE as u64);
+            crate::watch::title_memory_remapped(self.memory as usize, 4 * TILE);
+            crate::shadow::unregister(self.resource, self.start);
+            crate::alias::clear_remapped(self.start, self.start + 4 * TILE as u64);
+            crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+            super::TEST_TILES.with(|c| c.set(None));
+            super::TEST_RESOLVER.with(|c| c.set(None));
+            // SAFETY: our reservation, no longer used.
+            unsafe { VirtualFree(self.memory.cast(), 0, MEM_RELEASE) };
+        }
+    }
+
+    /// A list recorded before the title maps other pages at a buffer in
+    /// place through tiles, and submitted after, reads the new pages, as the
+    /// console would; the buffer stays in place, and no list is counted as
+    /// reading old pages.
+    #[test]
+    fn a_list_recorded_before_a_remap_reads_the_new_pages() {
+        let Some(title) = Title::new(0x7e57_3000, [(0, 0), (0, 1), (0, 2)]) else {
+            return;
+        };
+        let shadow = title.shadow();
+        assert!(
+            shadow.is_aliased() && super::is_region_buffer(&shadow.buffer),
+            "in place through tiles"
+        );
+        let stale = crate::alias::stale_lists();
+        let (list, _out, data) = title.record(0);
+        title.remap(0, 1, 3);
+        assert_eq!(
+            Title::run(&list, data),
+            vec![0xb3; TILE],
+            "the page mapped there when it ran"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&title.shadow(), &shadow),
+            "still in place"
+        );
+        assert_eq!(
+            crate::alias::stale_lists(),
+            stale,
+            "no list reads old pages"
+        );
+    }
+
+    /// Remapped again and again, a buffer stays in place, and each run reads
+    /// what the title shows then.
+    #[test]
+    fn a_range_remapped_repeatedly_stays_in_place() {
+        let Some(title) = Title::new(0x7e57_4000, [(0, 0), (0, 1), (0, 2)]) else {
+            return;
+        };
+        let shadow = title.shadow();
+        let before = super::remap_counts();
+        for round in 0..6u32 {
+            let (heap, tile) = ((round % 2) as usize, round % 4);
+            title.remap(1, heap, tile);
+            let (list, _out, data) = title.record(1);
+            let byte = [0xa0u8, 0xb0][heap] + tile as u8;
+            assert_eq!(Title::run(&list, data), vec![byte; TILE], "round {round}");
+            assert!(
+                std::sync::Arc::ptr_eq(&title.shadow(), &shadow),
+                "round {round}: still in place"
+            );
+        }
+        assert!(
+            super::remap_counts()[0] >= before[0] + 6,
+            "a tile mapped again each time"
+        );
+    }
+
+    /// Pages of two heaps out of order (no run of one section, which
+    /// `crate::alias` alone needs) make one buffer in place.
+    #[test]
+    fn views_out_of_order_are_in_place() {
+        let Some(title) = Title::new(0x7e57_5000, [(1, 2), (0, 3), (1, 0)]) else {
+            return;
+        };
+        let shadow = title.shadow();
+        assert!(
+            super::is_region_buffer(&shadow.buffer),
+            "in place through tiles"
+        );
+        for (page, byte) in [(0, 0xb2u8), (1, 0xa3), (2, 0xb0)] {
+            let (list, _out, data) = title.record(page);
+            assert_eq!(Title::run(&list, data), vec![byte; TILE], "page {page}");
+        }
     }
 
     /// Reserved buffers as large as the title's biggest XMem section, with a
@@ -355,7 +1007,12 @@ mod tests {
         const CALLS: u32 = 2000;
         let t = Instant::now();
         for i in 0..CALLS {
-            rig.map(&reserved, i % 4096, Some(&heaps[(i & 1) as usize]._heap), &[i % 4]);
+            rig.map(
+                &reserved,
+                i % 4096,
+                Some(&heaps[(i & 1) as usize]._heap),
+                &[i % 4],
+            );
         }
         let one = t.elapsed() / CALLS;
         rig.fetch_tile(&reserved, 0);
@@ -383,7 +1040,10 @@ mod tests {
             remapped += t.elapsed();
         }
         let (copy, remapped) = (copy / RUNS, remapped / RUNS);
-        assert!(read(&back).iter().all(|&b| b == 0xb2), "the last remap's tile");
+        assert!(
+            read(&back).iter().all(|&b| b == 0xb2),
+            "the last remap's tile"
+        );
         println!(
             "UpdateTileMappings under D3DMetal: one tile {:.1} us a call, 4096 tiles in one call {:.2} ms; \
              a 64 KiB copy run and waited {:.1} us, after a remap on the queue {:.1} us",

@@ -2781,6 +2781,13 @@ impl Host {
         self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The queue tile mappings of title memory in place go on
+    /// (`crate::tiles`): the one submissions go on, so that each submission
+    /// after a remap sees it.
+    pub(crate) fn queue_for_tiles(&self) -> ID3D12CommandQueue {
+        self.queue()
+    }
+
     /// The list submissions end with ([`Mark`]); `None` if it could not be
     /// made, and then submissions are not checked.
     fn mark(&self) -> Option<&Mark> {

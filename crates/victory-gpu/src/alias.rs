@@ -649,33 +649,43 @@ pub(crate) fn in_place_shadow(
     start: u64,
     len: u64,
 ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-    if len == 0 || !in_place_sections() || remapped_before(start, len) {
+    if len == 0 || !in_place_sections() {
         return None;
     }
-    let (heap, offset) = resolver()?(start, len)?;
-    if (offset as u64)
-        .checked_add(len)
-        .is_none_or(|end| end > heap.len() as u64)
-    {
-        return None;
-    }
-    crate::host::name(&heap.backing, || "XMem section in place".to_owned());
-    // The heap's buffer holds the whole section: the range starts `offset`
-    // into it, which views and copies of it count from.
-    let shadow = crate::shadow::Shadow::new_aliased_at(
-        heap.backing.clone(),
-        (heap.cpu_address() + offset) as *mut u8,
-        heap.gpu_address() + offset as u64,
-        start,
-        len,
-        offset as u64,
-    );
-    {
+    // Through its reservation's tiles where it can (`crate::tiles`): the
+    // title's own addresses, whatever pages they show, the CPU's view of
+    // them the title's own.
+    let tiled = crate::tiles::tiled(start, len);
+    let shadow = if let Some((buffer, gpu, base)) = tiled {
+        crate::shadow::Shadow::new_aliased_at(buffer, start as *mut u8, gpu, start, len, base)
+    } else {
+        if remapped_before(start, len) {
+            return None;
+        }
+        let (heap, offset) = resolver()?(start, len)?;
+        if (offset as u64)
+            .checked_add(len)
+            .is_none_or(|end| end > heap.len() as u64)
+        {
+            return None;
+        }
+        crate::host::name(&heap.backing, || "XMem section in place".to_owned());
+        // The heap's buffer holds the whole section: the range starts
+        // `offset` into it, which views and copies of it count from.
+        let shadow = crate::shadow::Shadow::new_aliased_at(
+            heap.backing.clone(),
+            (heap.cpu_address() + offset) as *mut u8,
+            heap.gpu_address() + offset as u64,
+            start,
+            len,
+            offset as u64,
+        );
         let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
         if !kept.iter().any(|k| std::sync::Arc::ptr_eq(k, &heap)) {
             kept.push(heap);
         }
-    }
+        shadow
+    };
     let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
     // Two buffers may start at one address: keep the longer end.
     match map.entry(start) {
@@ -732,44 +742,52 @@ pub(crate) fn clamp_in_place_inline(address: u64, len: u64, count: Option<u64>) 
 /// The runtime mapped other pages over `[at, at + len)`, or unmapped it:
 /// title buffers in place there are looked up again.
 pub(crate) fn forget_in_place(at: u64, len: u64) {
+    // Tiles of regions in place there follow the new pages first, on the
+    // queue: buffers through them stay in place unless a page of theirs is
+    // now no heap's (`crate::tiles::remapped`).
+    let lost = crate::tiles::remapped(at, len);
     if len == 0 || IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
         return;
     }
     let end = at.saturating_add(len);
-    let gone: Vec<u64> = {
+    let (from, to) = {
         let map = IN_PLACE.read().unwrap_or_else(|e| e.into_inner());
         let lowest = at.saturating_sub(IN_PLACE_SPAN.load(Ordering::Relaxed));
         map.range(lowest..end)
             .filter(|&(_, &stop)| stop > at)
-            .map(|(&start, _)| start)
-            .collect()
+            .fold(None, |span: Option<(u64, u64)>, (&start, &stop)| {
+                Some(span.map_or((start, stop), |(f, t)| (f.min(start), t.max(stop))))
+            })
+            .map_or((0, 0), |(f, t)| (f.min(at), t.max(end)))
     };
+    if from == to {
+        return;
+    }
+    let gone = crate::shadow::forget_in_place(from, to, !lost);
     if gone.is_empty() {
         return;
     }
-    let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
-    let (mut from, mut to) = (at, end);
-    for start in gone {
-        if let Some(stop) = map.remove(&start) {
-            IN_PLACE_COUNT.fetch_sub(1, Ordering::Release);
-            from = from.min(start);
-            to = to.max(stop);
+    {
+        let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
+        let mut remapped = REMAPPED.write().unwrap_or_else(|e| e.into_inner());
+        for shadow in &gone {
+            let (start, bytes) = shadow.range();
+            if map.remove(&start).is_some() {
+                IN_PLACE_COUNT.fetch_sub(1, Ordering::Release);
+            }
+            // Never in place there again but through tiles: a list recorded
+            // before the title mapped other pages there and submitted
+            // after it read the old pages through the addresses it was
+            // recorded with (slots are made again, below; a list's own
+            // views cannot be). So that can happen once a range at most,
+            // and [`stale_list`] counts it.
+            remapped
+                .entry(start)
+                .and_modify(|end| *end = (*end).max(start + bytes))
+                .or_insert(start + bytes);
+            REMAPPED_COUNT.fetch_add(1, Ordering::Release);
         }
     }
-    drop(map);
-    // Never in place there again: a list recorded before the title mapped
-    // other pages there and submitted after it read the old pages through
-    // the addresses it was recorded with (slots are made again, below; a
-    // list's own views cannot be). So that can happen once a range at most,
-    // and the log below counts it.
-    REMAPPED
-        .write()
-        .unwrap_or_else(|e| e.into_inner())
-        .entry(from)
-        .and_modify(|end| *end = (*end).max(to))
-        .or_insert(to);
-    REMAPPED_COUNT.fetch_add(1, Ordering::Release);
-    let gone = crate::shadow::forget_in_place(from, to);
     // Host view slots made from them still show the section's pages: they
     // are made again before the next submission ([`remake_let_go`]), as
     // slots made from copies show the new pages once those are refreshed.

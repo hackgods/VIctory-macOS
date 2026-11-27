@@ -1585,3 +1585,142 @@ fn the_permlanex16_model_follows_the_instruction() {
     assert_eq!(permlanex16_console(32)[0], 63);
     assert_eq!(permlanex16_console(48)[0], 47);
 }
+
+/// `VICTORY_THREAD_TICKET` defaults on and turns off with `"0"`.
+#[test]
+fn thread_ticket_env_toggle_defaults_on() {
+    use std::ffi::OsStr;
+    assert!(super::thread_ticket_value(None));
+    assert!(super::thread_ticket_value(Some(OsStr::new("1"))));
+    assert!(!super::thread_ticket_value(Some(OsStr::new("0"))));
+    super::with_thread_ticket(false, || {
+        assert!(!super::thread_ticket());
+        super::with_thread_ticket(true, || {
+            assert!(super::thread_ticket());
+        });
+        assert!(!super::thread_ticket());
+    });
+}
+
+/// Multi-wave 2-D compute groups (32x2 = 64 threads) and partial-tail groups
+/// (40x1 = 32 + 8 threads) with console lanes (`v_mbcnt`) claim aligned thread
+/// blocks from the group-shared ticket counter so every console thread id in
+/// the group is executed once on 32-lane hardware (issue #1243).
+#[test]
+fn thread_ticket_relabels_2d_and_partial_tail_groups_bijectively() {
+    // Console wave32 program: triggers `console_lanes` via `v_mbcnt_lo_u32_b32`,
+    // computes `slot = (y * 32 + x) * 4`, and stores `1` to raw UAV `s[40:43]`.
+    let mut words_2d = PROLOGUE.to_vec();
+    words_2d.extend([
+        0xD765_0003,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x3420_0285, // v_lshlrev_b32 v16, 5, v1 (y * 32)
+        0x4A20_0110, // v_add_nc_u32 v16, v16, v0 (y * 32 + x)
+        0x3420_2082, // v_lshlrev_b32 v16, 2, v16 (* 4)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        S_WAITCNT_LGKM,
+    ]);
+    words_2d.extend(store(5, 0));
+    words_2d.push(S_ENDPGM);
+
+    let mut prog_2d = native(&words_2d, false, 64, 0);
+    prog_2d.io = StageIo::Cs(ComputeIo {
+        // 1 user SGPR, thread id X and Y in v0, v1 (bit 11 = tid_comp_cnt >= 1).
+        rsrc2: 1 << 1 | 1 << 11,
+        threads: [32, 2, 1],
+    });
+
+    let lower_prog = |prog: &NativeProgram, ticket: bool| -> lower::Lowered {
+        let p = ir::build(&prog.code, prog.wave64, prog.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &prog.layout, prog.stage, Some(&st)).expect("resource");
+        let io = io::raise(&p, prog).expect("io");
+        super::with_thread_ticket(ticket, || {
+            lower::lower(&lower::Parts {
+                native: prog,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+                prims: Vec::new(),
+                mesh_stride: 0,
+                view_marks: false,
+                atomic_locks: false,
+                atomic_lock_rounds: false,
+                atomic_umax: false,
+                bias_as_gradients: false,
+                host_wave32: true,
+                narrow_waves: false,
+                uav_size_level0: false,
+            })
+            .expect("lower")
+        })
+    };
+
+    let with_ticket = lower_prog(&prog_2d, true);
+    let without_ticket = lower_prog(&prog_2d, false);
+    assert_ne!(
+        with_ticket.dxil, without_ticket.dxil,
+        "multi-wave console-lane group should emit the TGSM ticket counter"
+    );
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut with_ticket.dxil.clone()).expect("DXIL validation (2-D ticket)");
+    }
+
+    // Partial tail group: 40x1 (1 full wave of 32 + 1 partial wave of 8).
+    let mut words_40 = PROLOGUE.to_vec();
+    words_40.extend([
+        0xD765_0003,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0 (x * 4)
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        S_WAITCNT_LGKM,
+    ]);
+    words_40.extend(store(5, 0));
+    words_40.push(S_ENDPGM);
+    let prog_40 = native(&words_40, false, 40, 0);
+    let lowered_40 = lower_prog(&prog_40, true);
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut lowered_40.dxil.clone()).expect("DXIL validation (40-thread partial tail)");
+    }
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        return; // no hardware D3D12 device
+    };
+    let run = |l: lower::Lowered, count: usize| -> Vec<u32> {
+        let s = shader(l);
+        let (root, pso) = host.compute_pipeline(&s).unwrap();
+        let ud = vec![0u32; s.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[
+                        View::Texture(1, 1, &[[0.0; 4]]),
+                        View::Buffer {
+                            data: &[0; 4],
+                            stride: Stride::Structured(16),
+                        },
+                        View::RawUav(count as u32),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch");
+        out[0][..count].to_vec()
+    };
+
+    let got_2d = run(with_ticket, 64);
+    assert_eq!(got_2d, vec![1u32; 64], "all 64 threads of 32x2 group must run once");
+
+    let got_40 = run(lowered_40, 40);
+    assert_eq!(got_40, vec![1u32; 40], "all 40 threads (32 full + 8 partial) must run once");
+}

@@ -2915,24 +2915,28 @@ fn lower_halves_io(
     let st = structure::structure(&p).unwrap();
     let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
     let io = io::raise(&p, &native).unwrap();
-    lower(&Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: vec![],
-        outputs: vec![],
-        prims: vec![],
-        mesh_stride: 0,
-        atomic_locks: false,
-        atomic_lock_rounds: false,
-        atomic_umax: false,
-        bias_as_gradients: false,
-        host_wave32: true,
-        narrow_waves: false,
-        uav_size_level0: false,
-        view_marks: false,
+    // The wave ticket's own barrier would count among the exchanges these
+    // tests look for, so they lower without it.
+    crate::emit::with_thread_ticket(false, || {
+        lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            host_wave32: true,
+            narrow_waves: false,
+            uav_size_level0: false,
+            view_marks: false,
+        })
     })
 }
 

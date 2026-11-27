@@ -1793,6 +1793,18 @@ impl HostHeap {
     /// as long as the caller uses it. Buffer views are made only for draws
     /// (`for_draw`), which also copy their data: a host copy of a buffer is
     /// made on first use.
+    /// Whether host slot `index` already holds the mirrored view currently
+    /// named by `handle`, without taking any lock.
+    pub(crate) fn slot_ready(&self, index: u32, handle: u64) -> bool {
+        let Some(slot) = self.ready.get(index as usize) else {
+            return false;
+        };
+        // SAFETY: `handle` is a descriptor slot in a live title heap.
+        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(i);
+        tag == VIEW_TAG && key != 0 && slot.load(Ordering::Acquire) == key
+    }
+
     pub(crate) fn mirror(&self, index: u32, handle: u64, for_draw: bool) -> Option<ViewPin> {
         if index >= self.count {
             // Diagnostic (NVIDIA heap cap): the highest title slot past the

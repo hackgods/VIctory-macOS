@@ -697,10 +697,16 @@ mod tests {
     }
 
     /// Whether a shader's writes through one tile are what a shader reads
-    /// through another tile mapped onto the same heap tile, in one list with
-    /// a UAV barrier between (the title maps physical pages at several
-    /// addresses; #221 found two Metal buffers over one page incoherent
-    /// within a submission). Reported, not asserted: it decides the design.
+    /// through another tile mapped onto the same heap tile (the title maps
+    /// physical pages at several addresses; #221 found two Metal buffers
+    /// over one page incoherent within a submission), and whether one list
+    /// orders work on a reserved buffer at all. Each case starts from a page
+    /// of zeros, writes 7s into its first half, and reads them (plus one)
+    /// into its second half: through the tile written (a control), the
+    /// other tile, or the heap's own buffer; in one list after a barrier
+    /// (all UAVs, as the runtime's, or the one resource), or in the next
+    /// submission. Reported, not asserted: it decides the design
+    /// ([`super::ALIASED_TILES_COHERENT`]).
     #[test]
     fn aliased_tiles_within_one_list() {
         use crate::compute::{Param, pipeline};
@@ -711,18 +717,19 @@ mod tests {
         let heaps = two_heaps(&device);
         let reserved = rig.reserved(2 * TILE as u64).expect("a reserved buffer");
         rig.map(&reserved, 0, Some(&heaps[0]._heap), &[0, 0]);
+        let placed = heaps[0].backing().clone();
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-        // Two programs as the title's would be: one writes 7s, the other
-        // reads words and writes them plus one, at offsets given as
-        // constants, through one root UAV over the reserved buffer.
-        const WRITE: &str = "cbuffer c : register(b0) { uint dst; uint src; };\n\
+        // Two programs as the title's would be: one writes a value, the
+        // other reads words and writes them plus one, at offsets given as
+        // constants, through one root UAV.
+        const WRITE: &str = "cbuffer c : register(b0) { uint dst; uint src; uint value; };\n\
             RWByteAddressBuffer b : register(u0);\n\
             [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
-                b.Store(dst + id.x * 4, 7);\n\
+                b.Store(dst + id.x * 4, value);\n\
             }\n";
-        // Reads through a view of its own (a root SRV of the same reserved
-        // buffer), as the title's programs mostly read.
-        const READ: &str = "cbuffer c : register(b0) { uint dst; uint src; };\n\
+        // Reads through a view of its own (a root SRV), as the title's
+        // programs mostly read.
+        const READ: &str = "cbuffer c : register(b0) { uint dst; uint src; uint value; };\n\
             RWByteAddressBuffer b : register(u0);\n\
             ByteAddressBuffer r : register(t0);\n\
             [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
@@ -731,7 +738,7 @@ mod tests {
         let params = [
             Param::Constants {
                 register: 0,
-                count: 2,
+                count: 3,
             },
             Param::Uav { register: 0 },
             Param::Srv {
@@ -745,48 +752,140 @@ mod tests {
             .unwrap_or_else(|e| panic!("the probe's read pipeline: {e}"));
         let back = rig.readback(TILE);
         let words = (TILE / 4) as u32;
-        // Both tiles show one page: the result goes to its second half.
         let half = (TILE / 2) as u32;
-        let barrier = || D3D12_RESOURCE_BARRIER {
+        let barrier = |on: Option<&ID3D12Resource>| D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
                 UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    // SAFETY: a copy of the pointer without a reference of
-                    // its own, never released; the buffer outlives the run.
-                    pResource: unsafe { std::mem::transmute_copy(&reserved) },
+                    // SAFETY: a copy of the pointer (or none) without a
+                    // reference of its own, never released; the buffer
+                    // outlives the run.
+                    pResource: unsafe { std::mem::transmute_copy(&on) },
                 }),
             },
         };
-        // SAFETY: our pipelines and buffers live through the run.
-        rig.record(|l| unsafe {
-            l.SetComputeRootSignature(&root);
-            l.SetComputeRootUnorderedAccessView(1, reserved.GetGPUVirtualAddress());
-            l.SetComputeRootShaderResourceView(2, reserved.GetGPUVirtualAddress());
-            // 7s into the first half of the page, through tile 0.
-            l.SetPipelineState(&write);
-            l.SetComputeRoot32BitConstants(0, 2, [0u32, 0].as_ptr().cast(), 0);
-            l.Dispatch(words / 2 / 64, 1, 1);
-            l.ResourceBarrier(&[barrier()]);
-            // Read back through tile 1 (the same page), plus one, into the
-            // second half of the page through tile 0.
-            l.SetPipelineState(&read_pso);
-            l.SetComputeRoot32BitConstants(0, 2, [half, TILE as u32].as_ptr().cast(), 0);
-            l.Dispatch(words / 2 / 64, 1, 1);
-            l.ResourceBarrier(&[barrier()]);
-            l.CopyBufferRegion(&back, 0, &reserved, 0, TILE as u64);
-        });
-        rig.run().unwrap();
-        let bytes = read(&back);
-        let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
-        let stale = (half as usize..TILE)
-            .step_by(4)
-            .filter(|&at| word(at) != 8)
-            .count();
-        println!(
-            "aliased tiles in one list: {stale} of {} words read stale through the second tile",
-            TILE / 2 / 4
-        );
+        /// What a case writes through, reads through and how it is ordered.
+        struct Case<'a> {
+            name: &'static str,
+            written: &'a ID3D12Resource,
+            read: &'a ID3D12Resource,
+            /// Where the first half is read, in `read`.
+            src: u32,
+            /// Read in the next submission rather than in the same list.
+            split: bool,
+            /// Barriers on the written buffer only, rather than all UAVs.
+            narrow: bool,
+        }
+        let both_tiles = |name, src, split, narrow| Case {
+            name,
+            written: &reserved,
+            read: &reserved,
+            src,
+            split,
+            narrow,
+        };
+        let cases = [
+            both_tiles(
+                "reserved, all-UAV barrier, control (the tile written)",
+                0,
+                false,
+                false,
+            ),
+            both_tiles("reserved, one-resource barrier, control", 0, false, true),
+            both_tiles(
+                "reserved, all-UAV barrier, the other tile",
+                TILE as u32,
+                false,
+                false,
+            ),
+            both_tiles(
+                "reserved, the other tile, next submission",
+                TILE as u32,
+                true,
+                false,
+            ),
+            Case {
+                name: "heap's own buffer, all-UAV barrier, control",
+                written: &placed,
+                read: &placed,
+                src: 0,
+                split: false,
+                narrow: false,
+            },
+            Case {
+                name: "heap's own buffer, one-resource barrier, control",
+                written: &placed,
+                read: &placed,
+                src: 0,
+                split: false,
+                narrow: true,
+            },
+            Case {
+                name: "written through tile 0, read through the heap's own buffer, all-UAV barrier",
+                written: &reserved,
+                read: &placed,
+                src: 0,
+                split: false,
+                narrow: false,
+            },
+        ];
+        for case in &cases {
+            let fence = || barrier(case.narrow.then_some(case.written));
+            // SAFETY: our pipelines and buffers live through the runs.
+            let bind = |l: &ID3D12GraphicsCommandList| unsafe {
+                l.SetComputeRootSignature(&root);
+                l.SetComputeRootUnorderedAccessView(1, case.written.GetGPUVirtualAddress());
+                l.SetComputeRootShaderResourceView(2, case.read.GetGPUVirtualAddress());
+            };
+            // SAFETY: as `bind`.
+            let store = |l: &ID3D12GraphicsCommandList, count: u32, value: u32| unsafe {
+                l.SetPipelineState(&write);
+                l.SetComputeRoot32BitConstants(0, 3, [0, 0, value].as_ptr().cast(), 0);
+                l.Dispatch(count / 64, 1, 1);
+                l.ResourceBarrier(&[fence()]);
+            };
+            // SAFETY: as `bind`.
+            let load = |l: &ID3D12GraphicsCommandList| unsafe {
+                l.SetPipelineState(&read_pso);
+                l.SetComputeRoot32BitConstants(0, 3, [half, case.src, 0].as_ptr().cast(), 0);
+                l.Dispatch(words / 2 / 64, 1, 1);
+                l.ResourceBarrier(&[fence()]);
+                l.CopyBufferRegion(&back, 0, case.written, 0, TILE as u64);
+            };
+            rig.record(|l| {
+                bind(l);
+                store(l, words, 0);
+                store(l, words / 2, 7);
+                if !case.split {
+                    load(l);
+                }
+            });
+            rig.run().unwrap();
+            if case.split {
+                rig.record(|l| {
+                    bind(l);
+                    load(l);
+                });
+                rig.run().unwrap();
+            }
+            let bytes = read(&back);
+            let word = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let mut seen = BTreeMap::<u32, usize>::new();
+            for at in (half as usize..TILE).step_by(4) {
+                *seen.entry(word(at)).or_default() += 1;
+            }
+            let first = (0..half as usize)
+                .step_by(4)
+                .filter(|&at| word(at) == 7)
+                .count();
+            let wrong = (TILE / 2 / 4) - seen.get(&8).copied().unwrap_or(0);
+            println!(
+                "aliased tiles, {}: {wrong} of {} words not 8 (seen {seen:?}; 7s in the first half {first})",
+                case.name,
+                TILE / 2 / 4
+            );
+        }
     }
 
     /// What the test resolver says each title page shows: the heap, its tile

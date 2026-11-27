@@ -355,6 +355,12 @@ pub struct PhysicalHeap {
 }
 
 impl PhysicalHeap {
+    /// The placed buffer over the whole heap (tests).
+    #[cfg(test)]
+    pub(crate) fn backing(&self) -> &ID3D12Resource {
+        &self.backing
+    }
+
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: len as u64,

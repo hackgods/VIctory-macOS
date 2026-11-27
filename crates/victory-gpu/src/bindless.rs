@@ -1401,6 +1401,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     ///   the very first submission without waiting for the worker.
     #[test]
     fn worker_upload_publishes_atomically_and_skips_host_written() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         let Some(host) = crate::host::host() else {
             return;
         };

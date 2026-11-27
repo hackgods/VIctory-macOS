@@ -3048,6 +3048,9 @@ mod tests {
     /// reading it through a table makes it.
     #[test]
     fn a_placed_texture_slot_left_null_is_made_once_a_draw_reads_it() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         if host().is_none() {
             return; // no host GPU here
         }
@@ -3179,6 +3182,9 @@ mod tests {
     /// the slot's old record is the one the slot ends up viewing.
     #[test]
     fn a_slot_rewritten_while_its_view_is_prepared_views_the_new_record() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         if host().is_none() {
             return; // no host GPU here
         }
@@ -3222,6 +3228,9 @@ mod tests {
     /// binding a view of the same heap meanwhile is not held up.
     #[test]
     fn views_bound_while_another_slot_gets_its_texture_do_not_wait() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         if host().is_none() {
             return; // no host GPU here
         }
@@ -3266,6 +3275,9 @@ mod tests {
     /// a title thread writing a view meanwhile is not held up by the make.
     #[test]
     fn views_written_while_read_slots_get_their_textures_do_not_wait() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         if host().is_none() {
             return; // no host GPU here
         }
@@ -3344,6 +3356,9 @@ mod tests {
     /// notes that record, as it always did.
     #[test]
     fn a_sync_ahead_leaves_placed_texture_views_for_the_sync_before_the_submission() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         if host().is_none() {
             return; // no host GPU here
         }
@@ -3753,6 +3768,9 @@ mod tests {
 
     #[test]
     fn placed_uav_textures_create_real_host_uavs() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         let Some(host) = host() else {
             return;
         };
@@ -4150,6 +4168,9 @@ mod tests {
     /// rejected after the title overwrites the slot.
     #[test]
     fn published_slot_stays_out_of_queue_and_rejects_stale_key() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
         let Some(heap) = HostHeap::new(false, 8) else {
             return; // no host GPU
         };

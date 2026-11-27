@@ -227,6 +227,14 @@ pub fn halves_across() -> bool {
     crate::mac_switches::across()
 }
 
+/// Whether one-wave groups that share LDS across loop rounds get barriers
+/// where every thread that has not ended meets
+/// (`victory_shader::emit::Options::lds_rounds`,
+/// `VICTORY_HALVES_LDS_ROUNDS=1`; the rule is in `mac_switches`).
+pub fn halves_lds_rounds() -> bool {
+    crate::mac_switches::lds_rounds()
+}
+
 /// Whether programs run in either of those ways here: asked for, on a host
 /// of 32-lane waves (elsewhere the settings change no translation).
 #[cfg(windows)]
@@ -365,6 +373,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And the LDS order across loop rounds (`VICTORY_HALVES_LDS_ROUNDS=1`);
+    // off, it adds nothing.
+    let key = if options.lds_rounds {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"halves lds rounds");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -412,6 +430,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         halves_across: crate::mac_switches::across(),
         wide_loads: crate::mac_switches::wide_loads(),
         bvh_miss: crate::mac_switches::bvh_miss(),
+        lds_rounds: crate::mac_switches::lds_rounds(),
     }
 }
 

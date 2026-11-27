@@ -115,6 +115,11 @@ pub(crate) struct Mac {
     /// [`super::lds_order`] where [`split_wave_barriers`] finds none
     /// (`emit::Options::lds_order`).
     pub lds_order: bool,
+    /// LDS that a group of one console wave shares across the rounds of a
+    /// loop, with lanes that leave the program on the way, gets group
+    /// barriers where every thread that has not ended meets
+    /// ([`super::lds_rounds`], `emit::Options::lds_rounds`).
+    pub lds_rounds: bool,
     /// In halves, a read across them in a block every lane runs once is
     /// handed over through group-shared memory, exact across the halves
     /// ([`super::exchange`], `emit::Options::halves_exchange`). Also: a

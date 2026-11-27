@@ -261,6 +261,8 @@ pub mod host;
 mod image_store_tests;
 #[cfg(test)]
 mod lds_order_tests;
+#[cfg(test)]
+mod lds_rounds_tests;
 mod lower;
 #[cfg(test)]
 mod mac_tests;
@@ -557,6 +559,15 @@ pub struct Options {
     /// 24a479d3, `VICTORY_BVH_MISS`). For hosts where the title's
     /// structures are never built. The shader cache keys on it. Mac.
     pub bvh_miss: bool,
+    /// A compute group of one console wave that shares LDS across the
+    /// rounds of a loop, with lanes that leave the program before it (the
+    /// title's hair shadow masks), gets group barriers in the blocks every
+    /// thread that has not ended runs as often as every other, where that
+    /// orders the LDS as the console's lockstep does (`lower::lds_rounds`).
+    /// It rests on a thread that has ended not holding up a group barrier
+    /// (measured on D3DMetal). Exact for the LDS, or the program stays as
+    /// it was. The shader cache keys on it.
+    pub lds_rounds: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1034,6 +1045,7 @@ fn emit_form(
             across: options.halves_across,
             wide_loads: options.wide_loads,
             bvh_miss: options.bvh_miss,
+            lds_rounds: options.lds_rounds,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

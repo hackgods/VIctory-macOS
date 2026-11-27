@@ -28,6 +28,7 @@ mod f64_cvt;
 mod f64_sum;
 mod halves;
 pub(crate) mod lds_order;
+pub(crate) mod lds_rounds;
 mod mac;
 mod mesh;
 mod together;
@@ -41,7 +42,7 @@ pub(crate) use f64_sum::count_f64_high;
 #[cfg(test)]
 pub(crate) use mac::early_depth as early_depth_rule;
 pub(crate) use mac::take_uav_size_queries;
-use barriers::{in_step, split_wave_barriers};
+use barriers::{in_step, split_wave_barriers, split_wave_barriers_in};
 use mesh::prune_signature;
 
 type Why = &'static str;
@@ -827,6 +828,10 @@ impl<'a> Lower<'a> {
                     Some(Err(why)) => unordered = Some(why),
                     None => {}
                 }
+            }
+            // Mac: across loop rounds, past lanes that leave (`lds_rounds`).
+            if !synced && let Some(b) = lds_rounds::wanted(x, group, s.lds_dwords) {
+                (split_barriers, synced, unordered) = (b, true, None);
             }
             // A host whose waves are narrower than WaveSize(64) does not run
             // the dispatch (D3DMetal: nothing written): ask for the console's

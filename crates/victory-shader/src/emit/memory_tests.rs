@@ -138,6 +138,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
             atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: true,
     })?;
@@ -163,6 +164,7 @@ fn typed_store_program(soffset: u8) -> Result<HostShader, crate::ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -306,6 +308,7 @@ fn program() -> HostShader {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .expect("lower");
@@ -327,6 +330,7 @@ fn program() -> HostShader {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -440,6 +444,168 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
+/// Four dwords from 4 bytes before a copy that starts 8 bytes into its page
+/// (which the page table gives it), read with a scalar and a global load:
+/// the offset in the copy wraps to 0 after the first dword, which reads 0,
+/// and the other three read the copy's first three, as one load a dword
+/// did.
+#[test]
+fn runs_from_just_before_a_copy_read_its_first_dwords() {
+    let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
+    w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
+    w.extend(s_load(2, 12, 0, 0)); // s[12:15]: four dwords at the pointer
+    w.push(v_mov_b32(1, ZERO));
+    w.extend(global(14, 2, 1, 0, 0, 0)); // global_load_dwordx4 v[2:5], v1, s[0:1]
+    w.push(S_WAITCNT_ALL);
+    for k in 0..4u8 {
+        w.push(v_mov_b32(6, 12 + u16::from(k)));
+        w.extend(buffer_store_dword(6, 8, 4 * u16::from(k)));
+        w.extend(buffer_store_dword(2 + k, 8, 16 + 4 * u16::from(k)));
+    }
+    w.push(S_ENDPGM);
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 7,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 8 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: w.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let l = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+        atomic_locks: false,
+        atomic_lock_rounds: false,
+        atomic_umax: false,
+        bias_as_gradients: false,
+        uav_size_level0: false,
+        host_wave32: false,
+        narrow_waves: false,
+        view_marks: false,
+    })
+    .expect("lower");
+    assert!(l.memory);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_srv_bytes: l.root_srv_bytes,
+        memory: l.memory,
+        memory_writes: l.memory_writes,
+        view_addresses: l.view_addresses,
+        heap: l.heap,
+        heap_writes: l.heap_writes,
+        view_marks: l.view_marks,
+        half_views: l.half_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let copy: Vec<u32> = (0..64).map(|k| 0x1000 + k).collect();
+    let mut table = page_table(1, 3);
+    let entry = 4096 + 2 * (4096 + (TITLE as u32 >> 16 & 0xFFF) as usize);
+    table[entry + 1] += 8;
+    let pointer = TITLE + 4;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] =
+                    [pointer as u32, (pointer >> 32) as u32, 0, 0][u.dword as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(8),
+                        View::Memory(&copy),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let want = [0, copy[0], copy[1], copy[2]];
+        assert_eq!(out[0][..4], want, "{label}: the scalar load");
+        assert_eq!(out[0][4..], want, "{label}: the global load");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
 /// A root SRV in a program that does not use title memory is read through
 /// the host's view of its host copy (`emit`, "Root SRVs and root UAVs"): the
 /// view's index and the root address's offset in it come as user data, and
@@ -544,6 +710,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
             bias_as_gradients: false,
             host_wave32: false,
             narrow_waves: false,
+            uav_size_level0: false,
             view_marks: false,
         })
         .expect("lower")
@@ -579,6 +746,7 @@ fn root_views_read_their_copy_and_zeros_past_it() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -702,6 +870,7 @@ fn writes_through_views_mark_their_pages() {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: true,
     })
     .expect("lower");
@@ -722,6 +891,7 @@ fn writes_through_views_mark_their_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -945,6 +1115,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         atomic_umax: false,
             bias_as_gradients: false,
             narrow_waves: false,
+            uav_size_level0: false,
         })
         .expect("lower")
     };
@@ -981,6 +1152,7 @@ fn heap_direct_texture_reads_mark_their_heap_index() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone()).expect("DXIL validation failed");
@@ -1074,6 +1246,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -1095,6 +1268,7 @@ fn straddling_writes_across_256mib_and_4gib_boundaries_mark_exact_pages() {
         heap: l.heap,
         heap_writes: l.heap_writes,
         view_marks: l.view_marks,
+        half_views: l.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -1276,6 +1450,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -1296,6 +1471,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         heap: vs_lowered.heap,
         heap_writes: vs_lowered.heap_writes,
         view_marks: vs_lowered.view_marks,
+        half_views: vs_lowered.half_views,
     };
 
     let ps_words: [u32; 12] = [
@@ -1352,6 +1528,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: true,
     })
@@ -1373,6 +1550,7 @@ fn early_depth_stencil_skips_occluded_read_mark_pixel_shaders() {
         heap: ps_lowered.heap,
         heap_writes: ps_lowered.heap_writes,
         view_marks: ps_lowered.view_marks,
+        half_views: ps_lowered.half_views,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {

@@ -298,6 +298,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })
     .map_err(e)?;
@@ -317,6 +318,7 @@ fn lower_program(words: &[u32]) -> Result<HostShader, String> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 

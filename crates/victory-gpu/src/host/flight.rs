@@ -166,7 +166,7 @@ impl Host {
     /// the host queue, and returns immediately while the GPU executes.
     /// Falls back to synchronous execution when Flight-1 is disabled or when
     /// per-submission diagnostics tracing is active on this frame.
-    pub(crate) fn execute_flight1(&self, segments: Vec<Arc<HostList>>) {
+    pub(crate) fn execute_flight1(&self, segments: Vec<Arc<HostList>>, barrier_before: Vec<bool>) {
         if segments.is_empty() {
             return;
         }
@@ -175,7 +175,7 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let traced = false;
         if !flight1_enabled() || traced {
-            self.execute_sync_segments(segments);
+            self.execute_sync_segments(segments, barrier_before);
             return;
         }
 
@@ -188,7 +188,7 @@ impl Host {
 
         let prep = {
             let run_refs: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
-            self.prepare_submission(&submitted, &run_refs, false)
+            self.prepare_submission(&submitted, &run_refs, &barrier_before, false)
         };
 
         let mut native_boundaries = prep.native_boundaries;
@@ -290,9 +290,9 @@ impl Host {
     /// Runs `segments` synchronously and recycles them afterward. Used by the
     /// submit worker when `VICTORY_ASYNC_SUBMIT=1` with `VICTORY_FLIGHT1=0`
     /// and as the fallback for traced frames.
-    pub(crate) fn execute_sync_segments(&self, segments: Vec<Arc<HostList>>) {
+    pub(crate) fn execute_sync_segments(&self, segments: Vec<Arc<HostList>>, barrier_before: Vec<bool>) {
         let lists: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
-        self.execute_sync(&lists);
+        self.execute_sync(&lists, &barrier_before);
         drop(lists);
         segments.into_iter().for_each(crate::list::recycle);
     }
@@ -490,6 +490,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::backend::{HostGpu, HostMemory};
     use crate::host::host;
     use crate::object::{S_OK, This, slot};
     use crate::queue::Written;
@@ -625,7 +626,7 @@ mod tests {
         seg.defer_write(bop_ptr_num as *mut u8, Written::Value(0x1234_5678), 8);
         seg.close();
 
-        host.execute_flight1(vec![seg]);
+        host.execute_flight1(vec![seg], vec![]);
         queue_signal(q, f, 7);
 
         // Background `victory-flight` must finish the flight and deliver the
@@ -664,7 +665,7 @@ mod tests {
         seg.defer_write((&raw mut bop_word).cast(), Written::Value(99), 4);
         seg.close();
 
-        host.execute_flight1(vec![seg]);
+        host.execute_flight1(vec![seg], vec![]);
         // `quiet()` locks `submitted` and finishes any in-flight work.
         // Force a direct `finish_flight_now` check via `quiet()` (note: off
         // Wine `quiet()` returns None, so also test `finish_flight_now`
@@ -736,7 +737,7 @@ mod tests {
             seg1.close();
 
             // Launch Flight 1 asynchronously!
-            host.execute_flight1(vec![seg1]);
+            host.execute_flight1(vec![seg1], vec![]);
 
             // Immediately overwrite title memory with NEW while Flight 1 is
             // still in flight (exactly the #273 overlap window).
@@ -761,7 +762,7 @@ mod tests {
             seg2.close();
 
             // Flight 2 MUST wait for Flight 1 before refreshing `shadow`.
-            host.execute_flight1(vec![seg2]);
+            host.execute_flight1(vec![seg2], vec![]);
             host.finish_flight_now();
 
             // SAFETY: both flights have landed.

@@ -157,8 +157,9 @@ pub fn run(
         }
     }
     // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
-    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
-    // off without it), ported from avatarmanz/VIctory-7900XTX.
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; the output size 1280x720
+    // on a Mac without the first, the other two off without theirs),
+    // ported from avatarmanz/VIctory-7900XTX.
     #[cfg(windows)]
     if execute {
         let size = image.info().size_of_image as usize;
@@ -214,6 +215,7 @@ pub fn run(
     for (name, dll) in &dlls {
         println!("title dll      {name} at {:#x}", dll.base());
         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+        victory_gpu::pipeline::note_title_dll(name, dll.base(), dll.info().size_of_image as usize);
     }
     let imported: Vec<&str> = image
         .info()
@@ -504,6 +506,11 @@ impl LateDlls {
                     );
                     show(name, dll.bind_imports(&resolver, self.policy)?);
                     set_image_path(dll.base(), &self.title_dir.join(name));
+                    victory_gpu::pipeline::note_title_dll(
+                        name,
+                        dll.base(),
+                        dll.info().size_of_image as usize,
+                    );
                 }
                 // Visible before their `DllMain`s run, which may load more.
                 mapped.extend(new.iter().cloned());

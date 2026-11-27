@@ -115,6 +115,7 @@ fn lowered() -> lower::Lowered {
         atomic_umax: false,
         bias_as_gradients: false,
         narrow_waves: false,
+        uav_size_level0: false,
         host_wave32: false,
         view_marks: false,
     })
@@ -144,6 +145,7 @@ fn shader() -> HostShader {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     }
 }
 

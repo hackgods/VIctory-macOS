@@ -128,6 +128,8 @@ The other, `ntdll-skip-host-mappings.patch`, is for thread creation. To find roo
 
 `./setup.sh` compares a stamp of the patches with `target/wine-cx/.victory-patches`. A Wine built before a patch was added or changed gets only its server and `ntdll.so` (ntdll's Unix library) rebuilt and installed, which takes a few minutes. That is because `make install` would put Wine's own DLLs back over D3DMetal's, and D3DMetal replaces neither of those two. A patch that changes anything outside `server/` and `dlls/ntdll/unix/` needs a new Wine: remove `target/wine-cx` and run `./setup.sh` again.
 
+To avoid triggering `try_map_free_area` scans across host Metal mappings when running under an unpatched CrossOver build as well, `xmem::low_guards` leaves 2.75 GiB of bottom-up slack below 4 GiB under Wine (keeping the top ~1 GiB below 4 GiB reserved for 32-bit `XMemVirtualAlloc` requests; `VICTORY_LOW_GUARDS=0` disables the low-address guards), and DirectStorage's whole-section and fallback `xmem` views request addresses at or above 2 TiB via `MapViewOfFile3`.
+
 ## Use D3DMetal 4.0 beta 3
 
 On 25 November 2026 two testers ran the same Series X executable (one SHA-256) with the same profile. With CrossOver 26.3's bundled D3DMetal 3.0 on an M5 Pro, the game stopped about seven seconds in at its own assert at `+0x1dac734`, a subsystem checked during start-up (#24). With D3DMetal 4.0 beta 3 on an M3 Max it never hit that assert and reached the game world (#50). D3DMetal 3.0 also names the adapter `VirtualApple @ 2.50GHz` and refuses an empty pipeline library blob (#30). Since #74 asks for an empty library with a null pointer, host pipelines are kept across runs on 3.0 too: mikebuckets171 saw a library written on a first run and loaded back on the second. Use 4.0 beta 3 or newer for the game. It is not the only cause of that assert, though: later the same day us3r40456 hit `+0x1dac734` with D3DMetal 4.0 beta 3 too, on both the Series X and Series S profiles, so something else in their setup also decides it (#24).
@@ -250,25 +252,93 @@ The title has eight loops that write cache lines back with `clwb`, which faults 
 
 ## Title buffers on D3DMetal's pages
 
-Under Rosetta with D3DMetal, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work, and `VICTORY_ALIAS_BUFFERS=0` keeps the copies.
+Under Rosetta with D3DMetal on Macs with at least 20 GiB of RAM, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work; `VICTORY_ALIAS_BUFFERS=0` keeps the copies, and `VICTORY_ALIAS_BUFFERS=1` enables aliasing on 8–18 GiB Macs.
+
+## The title's output size on a Mac
+
+The title takes its output size from its own settings (`settings.xml`, `video/resolutionFullscreen`), which a Series X wrote as 3840x2160, so a run without `VICTORY_OUTPUT` drew the world at 3840x2160. On a Mac the output size is 1280x720 now, the smallest of the title's own modes: `victory-loader/src/resolution.rs` writes it into the title's code at load, where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s.
+
+`VICTORY_OUTPUT=<W>x<H>` asks for another of the title's modes, as before. `VICTORY_OUTPUT=0`, or `none`, leaves the title's own size alone, for a run that wants the picture at the size its settings carry. On Windows, without the switch, the title's own size is used as before.
 
 ## Optional switches for slow storage, low memory and speed
 
-None of these changes the default. Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
+None of these changes the default, except `VICTORY_OUTPUT`, which sets the title's output size on a Mac (see above). Each is read from the environment when the game starts, and all of them are tools for testers, so please post what you see on #131 or #135 when you try one.
 
 | Switch | What it does |
 | --- | --- |
 | `VICTORY_NO_HANG_WATCHDOG=1` | Turns off the title's hang watchdog. Once a second it crashes the title on purpose when a thread's heartbeat is too old or the main thread has not finished a frame for 30 checks, and a world load from slow storage outlasts that (#135). It applies only to the known Series build 1.0.2.1 and only where the original bytes match. |
 | `VICTORY_DSTORAGE_WORKERS=<n>` | Reads with `n` workers (1 to 256) instead of one per core, for storage with a long wait per read such as a network share. |
+| `VICTORY_DSTORAGE_HANDLES=0` | Disables per-worker DirectStorage file handles and falls back to one mutex-guarded handle per open file. By default each worker opens its own OS file description so concurrent `seek_read` calls under Wine do not race on a shared file cursor. |
+| `VICTORY_MAP_LEAN=0` | Splits placeholders and commits section pages on every `XMemMapPhysicalPages` view map, instead of reusing exact-size unmapped 64 KiB placeholder holes and tracking already-committed section pages (on by default). |
+| `VICTORY_MAP_RUNS=1` | Experimental: coalesces contiguous 64 KiB physical-page mappings into multi-page `MapViewOfFile3` views. Off by default because remapping or unmapping a single 64 KiB page inside a coalesced view has to unmap and re-map the whole host view, briefly unmapping sibling pages that streaming threads may be reading. |
 | `VICTORY_EVICT_HEAP_UAV=1` | Lets textures viewed for unordered access in shader-visible heaps be given up until a shader writes through a heap, then made again. About 1.5 GB on an 8 GB Mac (#135). |
 | `VICTORY_SPILL_SHADERS=1` | Keeps shader containers on disk until they are translated. The title passes tens of thousands of containers and draws with a few hundred, and holding them all took about 700 MB of an 8 GB Mac (#135). |
+| `VICTORY_RAM_LOW=<share>`, `VICTORY_RAM_FREE=<share>` | Set when host textures are given up for the computer's free memory, each as a share of its memory from 0 to 0.5: below `VICTORY_RAM_LOW` free (0.10 by default), until `VICTORY_RAM_FREE` is (0.15, or 0.05 above a `VICTORY_RAM_LOW` set alone). On a 24 GB Mac macOS was already compressing about 800 MB a second with 14 % free, and 0.20 and 0.26 brought the wired peak from 13.9 to 12.9 GB and a frame in the playable yard from 516 to about 490 ms. More textures are given up and made again (#454). |
 | `VICTORY_READ_STATS=1` | Logs the requests and bytes read from each file, every 30 seconds, for the 30 most read. It shows which files a slow share serves most, so you can copy those to fast local storage. |
 | `VICTORY_GPU_BUDGET_MB=<MB>` | Sets the budget that host textures are kept under, in place of the device's. |
 | `VICTORY_PATCH_WIDE=<list>` | Splits the 256-bit stores listed by `cargo xtask wide-stores` into 128-bit halves, so fault tracking does not stop Rosetta on them (see above). |
 | `VICTORY_MESH_OVER_LIMIT=1` | Makes mesh pipelines whose outputs are over Metal's 32 KiB anyway (refused under Wine by default, as they hang the queue; see above). |
-| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
+| `VICTORY_OUTPUT=<W>x<H>` | Sets the title's output size, one of its own modes: 1280x720, 1664x936, 1920x1080, 2560x1440 or 3840x2160. It patches the title's code at load, only where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. Without it the size is 1280x720 on a Mac (see above) and the title's own size elsewhere; `0`, or `none`, leaves the title's own size alone. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s. Ported from avatarmanz/VIctory-7900XTX. |
 | `VICTORY_RENDER_SCALE=<s>` | 0.5 to 1.0: the title's own upscaler's render scale (2/3 by default, Series X). Not yet tested on a Mac. |
 | `VICTORY_UPSCALER=<6\|7>` | Makes the title pick its own upscaler (6) or FidelityFX (7). Not yet tested on a Mac. |
 | `VICTORY_STEP_OVER=pool` | Steps over the title's "no free element" traps: an `int3` followed by `xor r, r`, the shape of a full fixed-size pool's allocator, whose caller then gets the NULL it already checks for. Series 1.0.2.1 hits one at `+0x5149aec` (the instance lists' pool, Marvisak/VIctory#698) about 20 minutes into the opening when frames take seconds. A list of hex offsets also works. |
 | `VICTORY_WINDOW_SECONDARY=1` | Opens the game window on the only non-primary display. |
 | `VICTORY_WINDOW_SECONDARY=x,y` | Opens the game window on the display that holds the desktop point `x,y`, for layouts with more than one extra display (a Sidecar iPad beside two monitors, say). |
+| `VICTORY_UAV_SIZE_LEVEL0=<hash>[,<hash>]` | Makes a size query on a writable image ask for level 0 in the listed programs (16-digit shader hashes, as the log prints them). D3DMetal answers the undefined level DXC writes with a size of 0, so the shadow min/max program `07f451a14b13fecb` writes one flat value and sun shadows get 16x16-tile edges; `VICTORY_UAV_SIZE_LEVEL0=07f451a14b13fecb` smooths them. `=1` does it in every program, which also gave speckles on skin, so the list is the one to try. |
+
+## An ambient light in place of ray-traced indirect light
+
+`VICTORY_AMBIENT=1` turns on a stand-in from Belobug's fork (`victory-gpu/src/ambient.rs`). It is off by default, and off it changes nothing. The game lights what the sun does not reach with probes it fills by tracing rays. Right after the game's program that resolves those probes (`CS_ScreenProbes_TemporalResolve_*`), a compute pass of VIctory's own replaces that program's output with an ambient light: the same everywhere in a frame, darker in creases and under objects (worked out from the depth image). By default its level and colour follow the sky dome the game draws for its reflections. After the game's last reflection pass (`CS_UpdateHistory`), a second pass of the same shader holds reflections to half of that light.
+
+VIctory logs one line at start when the switch is on, one line for each program it found by name, and one line the first time each part runs (`ambient light: the first image it writes`, `ambient light follows the sky dome`, `reflections held to the ambient light`). `no ambient light: ...` says why a pass did not run.
+
+| Variable | Effect |
+| --- | --- |
+| `VICTORY_AMBIENT=1` | Turns the stand-in on. Unset, empty, `0` and `off` leave the game's own output. |
+| `VICTORY_AMBIENT_SKY=off` or `gain,least,power` | `off` keeps a constant level. Otherwise the level is `gain * mean^power + least` of the sky dome's mean (0.36, 0.05, 0.4). |
+| `VICTORY_AMBIENT_LEVEL=<level>` | The constant level (0.6), used while the light does not follow the sky. |
+| `VICTORY_AMBIENT_TINT=r,g,b` | The constant light's colour (1, 0.98, 0.94). |
+| `VICTORY_AMBIENT_SHADE=s,r,n,t` | The shading: strength (1; 0 for none), radius in metres (0.6), near plane (0.1), tangent of half the vertical field of view (0.45). |
+| `VICTORY_AMBIENT_REFLECT=<part>` | The most a reflection may hold, as a part of the light (0.5). 0 leaves reflections alone. |
+| `VICTORY_AMBIENT_FILE=<file>` | Diagnostics builds: the file is read twice a second, to tune a running game. `gain least [power] [s r n t]` follows the sky; `level r g b [s r n t [part [least]]]` sets a constant light. |
+
+In the fork `VICTORY_AMBIENT` is the level and the stand-in is on unless it says `off`. Here it is a switch, and the level has its own variable.
+
+The pass is compiled at run time, so under Wine its shader keeps to what Wine's compiler takes ("Run-time HLSL and textures under Wine and D3DMetal" above): its root signature is built in code, and the image sizes are constants, because Wine's compiler has no `GetDimensions` on unordered views (`RWTexture2D`): the fork's shader stops there with `E5005: Method 'GetDimensions' is not defined on type 'RWTexture2D<uint>'`. It finds the game's programs by the names in their shader containers and the images by fixed places in their tables, so it only fits this game's shader build. It changes no shader translation and no cached pipeline: turning it on or off leaves both caches warm.
+
+### The estimate: `VICTORY_AMBIENT=estimate`
+
+`VICTORY_AMBIENT=estimate` (or `estimate:<share>`) turns on another stand-in in the same place, from avatarmanz's fork (`victory-gpu/src/ambient_estimate.rs`). Every other value of the variable means what it meant before, and the constant stand-in above is unchanged. The constant one gives the whole picture one light. The estimate works the light out from the frame, so it follows the hour, the room and its lamps by itself:
+
+- The game keeps the light its visible surfaces send out, for its own screen traces (`CS_CacheScreenSpaceRadiance`, an R11G11B10 image of half the picture's size). Right after that program, in the same host list, VIctory averages the image in 64x36 cells of a buffer of its own, and moves a slow mean of all cells toward this frame's.
+- Right after the program that resolves the screen probes, in the next frame, VIctory places the cells in space by the depth image the resolve reads. At 160x90 points of the picture it sums the cells' light, each cell weighted by the share of the point's surroundings it covers, as a mean and a direction per colour. Every texel of the resolve's light image then gets what lies between the four points around it (those at its own depth first), turned by its normal, a fifth of it the slow mean, darker in creases.
+- After the game's last reflection pass, reflections are held to a part of that light, as with the constant stand-in.
+
+It assumes that what is not on screen sends out what is. It has no occlusion but the creases'. Where little light is on screen it has nothing to spread: a room lit only by its own bounce (the windows off screen, no lamp, no patch of sun) settles at black, because each frame's light is the walls' colour times the last frame's, and a night street stays black. So no texel gets less than a floor: a share of the constant stand-in's light above, worked out once a frame from the same sky dome.
+
+| Variable | Effect |
+| --- | --- |
+| `VICTORY_AMBIENT=estimate` or `estimate:<share>` | Turns the estimate on, with that share of it (1). A share that is not a number above 0 counts as 1. |
+| `VICTORY_AMBIENT_SETTLE=<ms>[,<jump>[,<fresh s>]]` | How the slow mean settles: by a time constant in milliseconds, a change by more than `jump` times at once (unset: `250,3`). `0`: 0.04 of the way a frame, which is about 8 s at 3 frames a second. |
+| `VICTORY_AMBIENT_FLOOR=<share>` | The least any texel gets, as a share of the constant stand-in's light (0.3). With the sky followed that is `share * gain * mean^power + least`: the sky's part cut to the share, the least level (the night's) whole; `VICTORY_AMBIENT_SKY`, `_LEVEL` and `_TINT` say what that light is. 0: no floor, as in the fork. 1: never darker than the constant stand-in. |
+| `VICTORY_AMBIENT_LEFT=<multiple>` | How much of what the game's resolve left counts: up to that many times the estimate's luminance, and the larger of the two is written. Unset or 0: the estimate replaces it. The fork has 4. With it, `fresh` seconds after a jump the leftover counts for no more than the estimate. |
+| `VICTORY_AMBIENT_AIR=<multiple>` | Bounds what the air scatters by that multiple of the light around, right after `CS_AccumulateLocalLightInscatteringVolume`. Unset or 0: the game's own. Without rays the air of a room is lit by the sky's light. |
+| `VICTORY_AMBIENT_SHADE=s,r,n,t` | The shading in creases, as above. |
+| `VICTORY_AMBIENT_MIX=<mean part>,<turn>,<least>,<most>` | How a texel's light is put together: the part of it that is the slow mean of the whole picture (0.2), how strongly its normal turns it toward where the light comes from (1.2), and the least and most it may be as multiples of the mean around it (0.2 and 2.5). These are the fork's fixed numbers. The sky's cells lie far away along the view, so a surface that faces the camera has the sky behind it: a larger mean part or a smaller turn gives it more of the sky. |
+| `VICTORY_AMBIENT_REFLECT=<part>` | The most a reflection may hold, as a part of the light around the point seen there (0.5). 0 leaves reflections alone, as the fork does. |
+
+`VICTORY_AMBIENT_SKY`, `_LEVEL`, `_TINT` and `_FILE` belong to the constant stand-in; with the estimate they only say what the floor is a share of. `VICTORY_AMBIENT_LEFT` is no floor: it bounds what the game's resolve left by a multiple of the estimate, so where the estimate is next to nothing it keeps next to nothing.
+
+VIctory logs one line at start (`VICTORY_AMBIENT=estimate: ...`), one line for each program it found by name (the resolve, `keeps the light visible surfaces send out`, and the two others), and one line the first time each part runs (`ambient estimate: the first light it keeps`, `the first image it writes`, `reflections held to the light around`, `the first volume of air it bounds`). With every frame line it logs what the estimate is:
+
+```
+ambient estimate (VICTORY_AMBIENT=estimate): the light around (slow mean) is 0.2000 0.1000 0.0500, luminance 0.1177; the picture's 160x90 points hold a luminance of 0.3000 on average (least 0.0100, most 2.0000); the floor (VICTORY_AMBIENT_FLOOR=0.3) is 0.2500, and 60% of the points are under it; texels are written about 0.3100 (the share 1 of the estimate, or the floor; the constant stand-in writes its level); 1.0 keepings, 2.0 raisings, 1.0 holds of reflections and 0.0 bounds of the air/frame
+```
+
+The number after `texels are written about` is what to compare with the constant stand-in's level. The part of the points under the floor says how much of the picture is the floor's flat light: nearly all of it in a room with nothing lit on screen, little where the estimate has light to work with. `nothing kept yet` means the game has not run `CS_CacheScreenSpaceRadiance`: until it does, the game's own light stays.
+
+Under Wine the passes' shader keeps to what Wine's compiler takes. Besides what the constant stand-in's shader avoids, it does not store through `RWStructuredBuffer` (each buffer is read through a structured view and written through a raw one, as the depth converter does), and it has one `main` per pass, chosen by a `#define`. It reads the R11G11B10 image through a shader resource view of its own, because Metal has no R11G11B10 texture that one view reads and writes. The air's pass does read and write the R11G11B10 volume through one unordered view, as the game's own program just before it does.
+
+Per frame it adds two small dispatches after `CS_CacheScreenSpaceRadiance` (2,304 and 1 threads), three after each resolve (2,304 threads, 14,400 threads that each walk the 2,304 cells, and one thread per texel of the light image), and one per texel of the reflection image. The constant stand-in adds one per resolve and one for the reflections.
+
+To find what the estimate costs on the GPU in a scene, `VICTORY_AMBIENT_PROBE=<n>` leaves its passes out in turn, each step for `n` frame lines: nothing, the gather, the creases' shade, the reflections' hold, the keeping, the raising, every pass. The estimate's line ends with the step the frame line above it was measured with (`probe (VICTORY_AMBIENT_PROBE) step 1 of 7: these frames were recorded without the gather ...`), so one run gives the frame line's GPU time with and without each part. The picture changes with the steps. Each pass is also named among its list's pipelines (`[ambient estimate: gather]` and so on), so a `slow host submission` or `slow host list` line says when a slow list holds one. In a diagnostics build with `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1`, a slow list also logs `slow list commands by kind`, since GPU timestamps read 0 under D3DMetal.

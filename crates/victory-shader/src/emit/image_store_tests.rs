@@ -153,6 +153,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         bias_as_gradients: false,
         host_wave32: false,
         narrow_waves: false,
+        uav_size_level0: false,
         view_marks: false,
     })?;
     Ok(HostShader {
@@ -171,6 +172,7 @@ fn lower(native: &NativeProgram) -> Result<HostShader, ShaderError> {
         heap: lowered.heap,
         heap_writes: lowered.heap_writes,
         view_marks: lowered.view_marks,
+        half_views: lowered.half_views,
     })
 }
 

@@ -1,6 +1,6 @@
 //! Mesh shader output signatures, counts and lane indices.
 
-use super::{Attr, HashMap, Lower, SigElement, V, Why, pred};
+use super::{Attr, Bin, Export, HashMap, Lower, SigElement, V, Why, pred};
 use crate::emit::shader::Mesh;
 
 /// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
@@ -51,14 +51,21 @@ impl Lower<'_> {
         }
         let e = self.s.entry;
         let void = self.s.t.void;
-        let (v, p) = (
-            self.s.m.i32(mesh.max_vertices),
-            self.s.m.i32(mesh.max_primitives),
-        );
+        // A mesh with zero vertices cannot validly index any primitive, so
+        // force the primitive count to 0 as well.
+        let prim_count = if mesh.max_vertices == 0 {
+            0
+        } else {
+            mesh.max_primitives
+        };
+        let (v, p) = (self.s.m.i32(mesh.max_vertices), self.s.m.i32(prim_count));
         self.s
             .op(e, "setMeshOutputCounts", Attr::NoUnwind, void, 168, &[v, p]);
+        if prim_count == 0 {
+            return Ok(());
+        }
         let flat = self.mesh_thread();
-        let guard = (threads > mesh.max_primitives).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
+        let guard = (threads > prim_count).then(|| self.s.m.cmp(e, pred::IULT, flat, p));
         let at = self.begin_guarded(guard);
         let z = self.s.m.i32(0);
         self.s.op(
@@ -69,6 +76,53 @@ impl Lower<'_> {
             169,
             &[flat, z, z, z],
         );
+        self.end_guarded(at, &[]);
+        Ok(())
+    }
+
+    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
+    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
+    /// and 29), which only the console's edge-flag rasterisation reads and
+    /// which is no part of the index. Bit 31 culls it (all indices 0: no
+    /// area). Non-culled corner indices are clamped below the mesh's vertex
+    /// count so out-of-bounds 9-bit indices cannot read past the vertex
+    /// array or wrap modulo 256 on hosts with 8-bit mesh index storage.
+    pub(super) fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
+        let v = e.values[0].ok_or("a primitive export without its indices")?;
+        let x = self.i32_of(v)?;
+        let mesh = self.s.mesh.expect("mesh");
+        if mesh.max_vertices == 0 || mesh.max_primitives == 0 {
+            return Ok(());
+        }
+        let threads = self.s.threads.expect("mesh")[0];
+        let flat = self.mesh_thread();
+        let guard = if threads > mesh.max_primitives {
+            let p = self.s.m.i32(mesh.max_primitives);
+            let in_range = self.s.m.cmp(self.cur, pred::IULT, flat, p);
+            Some(match guard {
+                Some(g) => self.s.m.bin(self.cur, Bin::And, g, in_range),
+                None => in_range,
+            })
+        } else {
+            guard
+        };
+        let at = self.begin_guarded(guard);
+        let c = self.cur;
+        let z = self.s.m.i32(0);
+        let last = self.s.m.i32(mesh.max_vertices - 1);
+        let culled = self.s.m.cmp(c, pred::SLT, x, z);
+        let mut args = vec![flat];
+        for k in 0..3 {
+            let (shift, mask) = (self.s.m.i32(10 * k), self.s.m.i32(0x1FF));
+            let i = self.s.m.bin(c, Bin::LShr, x, shift);
+            let i = self.s.m.bin(c, Bin::And, i, mask);
+            let in_bounds = self.s.m.cmp(c, pred::IULT, i, last);
+            let clamped = self.s.m.select(c, in_bounds, i, last);
+            args.push(self.s.m.select(c, culled, z, clamped));
+        }
+        let void = self.s.t.void;
+        self.s
+            .op(c, "emitIndices", Attr::NoUnwind, void, 169, &args);
         self.end_guarded(at, &[]);
         Ok(())
     }

@@ -1,4 +1,5 @@
 use super::{PIPELINE_IIDS, Shader, Translated, hand_out, host_pipeline};
+use crate::backend::HostGpu;
 use crate::object::{S_OK, This, guid, slot};
 use std::sync::{Arc, OnceLock};
 use victory_shader::native::{ComputeIo, StageIo};
@@ -124,7 +125,7 @@ fn placed_uav_dispatch_writes_its_texture() {
 
     let mut pipeline = std::ptr::null();
     assert_eq!(
-        hand_out(vec![store_shader()], None, &PIPELINE_IIDS[0], &mut pipeline),
+        hand_out(vec![store_shader()], None, &[], &PIPELINE_IIDS[0], &mut pipeline),
         S_OK
     );
     let pipeline = Guest(pipeline);

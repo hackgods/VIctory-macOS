@@ -120,7 +120,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let mut held = held();
+        let mut held = held_for(Why::Submission);
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
@@ -278,6 +278,7 @@ fn pump_ready_under_drain(why: Why) -> bool {
         return false;
     };
     let fence = |f: usize| crate::fence::value(f as This);
+    let max_lists = join_lists();
     let mut moved_any = false;
     let mut pieces = 0u32;
     let mut segments_count = 0u32;
@@ -299,12 +300,29 @@ fn pump_ready_under_drain(why: Why) -> bool {
                         "held work runs without its waits after {VALVE:?} (safety valve)"
                     );
                 }
-                let no_write =
-                    |_: &std::sync::Arc<crate::host::HostList>, _: &crate::hold::ValueWait| false;
-                let no_join = |_: &[(std::sync::Arc<crate::host::HostList>, bool)],
-                               _: &std::sync::Arc<crate::host::HostList>| false;
-                let item =
-                    held.take_ready_with(&read_value, &fence, &no_write, &no_join, false);
+                let will_write = |seg: &std::sync::Arc<crate::host::HostList>,
+                                  wait: &crate::hold::ValueWait| {
+                    seg.will_write(wait)
+                };
+                let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                                next: &std::sync::Arc<crate::host::HostList>| {
+                    if piece.len() >= max_lists {
+                        return false;
+                    }
+                    let existing = piece
+                        .iter()
+                        .fold(crate::hold::BatchFlags::default(), |acc, (s, _)| {
+                            acc.merge(s.batch_flags())
+                        });
+                    crate::hold::can_join_batch(existing, next.batch_flags(), piece.len(), max_lists)
+                };
+                let item = held.take_ready_with(
+                    &read_value,
+                    &fence,
+                    &will_write,
+                    &can_join,
+                    coalesce_pieces(),
+                );
                 if item.is_none() && !held.is_empty() {
                     start_held_timer();
                 }
@@ -338,15 +356,16 @@ fn pump_ready_under_drain(why: Why) -> bool {
                 segments_count += segments.len() as u32;
                 unknown_count += unknown;
                 waited_all.extend(waited);
+                let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
                 let run_segments: Vec<std::sync::Arc<crate::host::HostList>> =
                     segments.into_iter().map(|(s, _)| s).collect();
                 let at = std::time::Instant::now();
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
                 if crate::host::flight1_enabled() {
-                    host.execute_flight1(run_segments);
+                    host.execute_flight1(run_segments, barriers);
                 } else {
-                    host.execute_sync_segments(run_segments);
+                    host.execute_sync_segments(run_segments, barriers);
                 }
                 for (fence, value) in signals {
                     if !crate::host::flight1_enabled()
@@ -437,6 +456,57 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
     HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Microseconds the threads that ran held work spent on it, by what ran it
+/// ([`Why`], in its order): `[0]` waiting for the queues' lock, `[1]` in
+/// the pump, the host submissions included. The thread that called is held
+/// for both: a title thread for all but [`Why::Timer`], which is ours. The
+/// frame report divides them by its frames ([`take_blocked`]).
+#[cfg(windows)]
+static BLOCKED_US: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
+
+/// [`held`] for a caller that runs held work for `why`, its wait for the
+/// lock counted in [`BLOCKED_US`].
+#[cfg(windows)]
+fn held_for(why: Why) -> std::sync::MutexGuard<'static, Holding> {
+    lock_timed(&HELD, &BLOCKED_US[why as usize][0])
+}
+
+/// Locks `lock`, adding the microseconds it waited to `waited`.
+#[cfg(any(windows, test))]
+fn lock_timed<'a, T>(
+    lock: &'a std::sync::Mutex<T>,
+    waited: &AtomicU64,
+) -> std::sync::MutexGuard<'a, T> {
+    let asked = std::time::Instant::now();
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    waited.fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
+    guard
+}
+
+/// [`Why`]'s variants in their order, as the frame report names them: the
+/// title's submissions, its queues' Signals and Waits, its CPU fence calls,
+/// its presents, and our timer thread.
+#[cfg(windows)]
+pub(crate) const WHY_NAMES: [&str; 6] = [
+    "title submissions",
+    "queue signals",
+    "queue waits",
+    "fence calls",
+    "presents",
+    "our timer",
+];
+#[cfg(windows)]
+const _: () = assert!(Why::Timer as usize + 1 == WHY_NAMES.len());
+
+/// [`BLOCKED_US`] since the last call, cleared: for each [`Why`], the
+/// microseconds waiting for the queues' lock and in the pump.
+#[cfg(windows)]
+pub(crate) fn take_blocked() -> [[u64; 2]; 6] {
+    BLOCKED_US
+        .each_ref()
+        .map(|w| w.each_ref().map(|a| a.swap(0, Ordering::Relaxed)))
+}
+
 /// Runs held work that may run now (`why` for the frame line).
 pub(crate) fn pump_held(why: Why) {
     #[cfg(windows)]
@@ -447,7 +517,7 @@ pub(crate) fn pump_held(why: Why) {
         } else if crate::host::flight1_enabled() {
             pump_unlocked(why);
         } else {
-            pump(&mut held(), why);
+            pump(&mut held_for(why), why);
         }
     }
     #[cfg(not(windows))]
@@ -484,8 +554,46 @@ pub(crate) fn pump_held_if_free(why: Why) {
 #[cfg(windows)]
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Whether ready segments across queues and chained bottom-of-pipe waits are
+/// coalesced into one host submission (`VICTORY_COALESCE_PIECES`, on by default
+/// unless `"0"`).
+#[cfg(windows)]
+fn coalesce_pieces() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COALESCE_PIECES").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("queue piece coalescing disabled (VICTORY_COALESCE_PIECES=0)");
+        }
+        on
+    })
+}
+
+/// Maximum number of host command lists joined into one coalesced submission
+/// (`VICTORY_JOIN_LISTS`, default 64).
+#[cfg(windows)]
+fn join_lists() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_JOIN_LISTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n >= 1)
+            .unwrap_or(64)
+    })
+}
+
+/// Runs what held work may run now (`why`), its time counted in
+/// [`BLOCKED_US`].
 #[cfg(windows)]
 fn pump(held: &mut Holding, why: Why) {
+    let entered = std::time::Instant::now();
+    pump_work(held, why);
+    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn pump_work(held: &mut Holding, why: Why) {
     if held.is_empty() {
         return;
     }
@@ -496,17 +604,36 @@ fn pump(held: &mut Holding, why: Why) {
         tracing::warn!(queue = kind(queue), ?waits, "held work runs without its waits after {VALVE:?} (safety valve)");
     }
     let fence = |f: usize| crate::fence::value(f as This);
+    let max_lists = join_lists();
+    let will_write = |seg: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| {
+        seg.will_write(wait)
+    };
+    let can_join = |piece: &[(std::sync::Arc<crate::host::HostList>, bool)],
+                    next: &std::sync::Arc<crate::host::HostList>| {
+        if piece.len() >= max_lists {
+            return false;
+        }
+        let existing = piece
+            .iter()
+            .fold(crate::hold::BatchFlags::default(), |acc, (s, _)| {
+                acc.merge(s.batch_flags())
+            });
+        crate::hold::can_join_batch(existing, next.batch_flags(), piece.len(), max_lists)
+    };
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
-    let mut run = |_: usize, segments: Vec<std::sync::Arc<crate::host::HostList>>| {
-        let lists: Vec<&crate::host::HostList> = segments.iter().map(|s| &**s).collect();
+    let mut run = |segments: Vec<(std::sync::Arc<crate::host::HostList>, bool)>| {
+        let lists: Vec<&crate::host::HostList> = segments.iter().map(|(s, _)| &**s).collect();
+        let barriers: Vec<bool> = segments.iter().map(|&(_, b)| b).collect();
         let at = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
-        host.execute(&lists);
+        host.execute_with_barriers(&lists, &barriers);
         ran += at.elapsed();
         drop(lists);
-        segments.into_iter().for_each(crate::list::recycle);
+        segments
+            .into_iter()
+            .for_each(|(s, _)| crate::list::recycle(s));
     };
     let mut signal = |f: usize, value: u64| {
         crate::fence::set(f as This, value);
@@ -515,6 +642,9 @@ fn pump(held: &mut Holding, why: Why) {
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
+        will_write: &will_write,
+        can_join: &can_join,
+        coalesce: coalesce_pieces(),
         run: &mut run,
         signal: &mut signal,
     });
@@ -524,6 +654,8 @@ fn pump(held: &mut Holding, why: Why) {
         a.pieces += pumped.pieces;
         a.segments += pumped.segments;
         a.unknown += pumped.unknown;
+        a.coalesced_bop_waits += pumped.coalesced_bop_waits;
+        a.hazard_splits += pumped.hazard_splits;
         for (queue, waited) in pumped.waited {
             a.released.push((kind(queue), waited, why));
         }
@@ -562,6 +694,8 @@ struct Account {
     unknown: u32,
     forced: u32,
     mappings: u32,
+    coalesced_bop_waits: u32,
+    hazard_splits: u32,
     /// Time in the pump outside host submissions.
     pump: std::time::Duration,
 }
@@ -596,13 +730,17 @@ fn account_frame(frame: u64) {
         cuts,
         early_resets = early,
         waited = a.released.len(),
+        coalesced_bop_waits = a.coalesced_bop_waits,
+        hazard_splits = a.hazard_splits,
         longest_ms = longest.as_secs_f64() * 1e3,
         pump_ms = a.pump.as_secs_f64() * 1e3,
         fence_waits,
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; time in the pump outside host submissions; events the          title waited on for fence values and their summed waits); held at the present: {}",
+         submission/signal/wait/fence/present/timer {by:?}; coalesced BoP waits and hazard splits; time in the pump \
+         outside host submissions; events the title waited on for fence values and their summed waits); held at the \
+         present: {}",
         blocked.len()
     );
     tracing::debug!(
@@ -670,7 +808,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     {
-        let mut held = held();
+        let mut held = held_for(Why::Signal);
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
             held.push(this as usize, Item::Signal(fence as usize, value));
@@ -720,7 +858,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
-        let mut held = held();
+        let mut held = held_for(Why::Wait);
         held.push(this as usize, Item::FenceWait(fence as usize, value));
         if crate::host::async_submit_enabled() {
             drop(held);
@@ -985,6 +1123,8 @@ extern "system" fn present(
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
         }
     }
+    #[cfg(windows)]
+    crate::hdr_probe::on_present(frame);
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::presented(frame);
@@ -992,6 +1132,10 @@ extern "system" fn present(
             crate::capture::dump_targets(frame);
         }
     }
+    #[cfg(windows)]
+    let mut black_frame = false;
+    #[cfg(not(windows))]
+    let black_frame = false;
     #[cfg(windows)]
     let found = plane_resources(planes, plane_parameters);
     #[cfg(windows)]
@@ -1019,6 +1163,7 @@ extern "system" fn present(
         });
         let overlay = other.as_ref().zip(overlay_state).map(|((_, t), s)| (t, s));
         let shown = host.present(&texture, state, overlay, frame);
+        black_frame = shown.unwrap_or(false);
         if let Some(((o, _), s)) = other.as_ref().zip(overlay_state) {
             crate::resource::host_transition(*o, s);
         }
@@ -1030,6 +1175,11 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(windows)]
+    let drawn = crate::draw::drawn();
+    #[cfg(not(windows))]
+    let drawn = 0;
+    crate::bench::on_present(drawn, black_frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was
@@ -1212,6 +1362,32 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// A lock another thread holds is waited for, and the wait is counted
+    /// in microseconds; a free lock adds next to nothing.
+    #[test]
+    fn a_timed_lock_counts_its_wait() {
+        let lock = std::sync::Mutex::new(());
+        let waited = AtomicU64::new(0);
+        drop(lock_timed(&lock, &waited));
+        assert!(waited.load(Ordering::Relaxed) < 5_000, "a free lock");
+        let (taken, take) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let _held = lock.lock().unwrap();
+                taken.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            });
+            take.recv().unwrap();
+            let before = waited.load(Ordering::Relaxed);
+            drop(lock_timed(&lock, &waited));
+            let counted = waited.load(Ordering::Relaxed) - before;
+            assert!(
+                counted >= 20_000,
+                "waited {counted} us for a lock held 30 ms"
+            );
+        });
+    }
 
     /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
     /// it names one, else the plane whose first resource has the most

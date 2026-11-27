@@ -64,7 +64,7 @@ tools/macos/build-deps.sh "$ALIAS/target/deps-x86"
 
 # 5. CrossOver Wine, with the patches in tools/macos/patches. A Wine built
 # before a patch was added or changed gets only its server and ntdll rebuilt.
-if [[ -x $WINE_DIR/bin/wine && "$(cat "$WINE_DIR/.victory-patches" 2> /dev/null)" == "$(tools/macos/build-crossover-wine.sh --stamp)" ]]; then
+if [[ -x $WINE_DIR/bin/wine && -f $WINE_DIR/.victory-patches && -f $WINE_DIR/.victory-patch-paths && "$(cat "$WINE_DIR/.victory-patches" 2> /dev/null)" == "$(tools/macos/build-crossover-wine.sh --stamp)" ]]; then
   say "Wine already built"
 elif [[ -x $WINE_DIR/bin/wine ]]; then
   say "rebuilding Wine's server and ntdll with the patches in tools/macos/patches (a few minutes)"
@@ -99,8 +99,15 @@ else
     rmdir "$inner" "$outer" 2> /dev/null || true
   }
   trap unmount EXIT
-  hdiutil attach -quiet -nobrowse -readonly -mountpoint "$outer" "$dmg" \
-    || die "could not open ${dmg:t}. It may be an incomplete download: delete it, download it again and run ./setup.sh again"
+  if ! hdiutil attach -quiet -nobrowse -readonly -mountpoint "$outer" "$dmg"; then
+    # An intact download that macOS would not mount is not fixed by
+    # downloading it again: a sandboxed shell, such as an AI agent's, failed
+    # with "Device not configured" while the disk-image service was not running.
+    if hdiutil verify -quiet "$dmg" 2> /dev/null; then
+      die "macOS could not mount ${dmg:t}, though the file is intact. Run ./setup.sh again; if an AI agent or another sandboxed shell runs it and it fails again, run it from your own Terminal"
+    fi
+    die "could not open ${dmg:t}. It may be an incomplete download: delete it, download it again and run ./setup.sh again"
+  fi
   eval_dmg=("$outer"/Evaluation*.dmg(N))
   (( ${#eval_dmg} )) || die "${dmg:t} has no Evaluation .dmg inside. Check that it is Apple's Game Porting Toolkit"
   hdiutil attach -quiet -nobrowse -readonly -mountpoint "$inner" "$eval_dmg[1]" \
@@ -119,11 +126,18 @@ fi
 
 # 7. VIctory itself.
 say "building VIctory"
-cargo build --quiet --release -p victory --target x86_64-pc-windows-gnullvm
 [[ -f victory.toml ]] || cp victory.example.toml victory.toml
-# --version starts VIctory under Wine without reading victory.toml, whose
-# example game_dir does not exist yet, so a fresh setup does not fail here.
-tools/macos/victory.sh --version > /dev/null 2>&1 || die "VIctory did not start under Wine. Run tools/macos/victory.sh --version to see why"
+# victory.sh owns the single release build: it sets VICTORY_HELPER_DXC when
+# D3DMetal's DXC is there, and a separate build here without it would make
+# victory-gpu's build.rs see the variable appear and rebuild and relink
+# victory a second time. --version starts VIctory under Wine without reading
+# victory.toml, whose example game_dir does not exist yet, so a fresh setup
+# does not fail here. Stderr stays visible, and captured stdout is printed on
+# failure so diagnostics from either Cargo or a custom Wine wrapper are kept.
+version_out=$(tools/macos/victory.sh --version) || {
+  [[ -n "$version_out" ]] && print -r -- "$version_out" >&2
+  die "VIctory failed to build or start under Wine. Run tools/macos/victory.sh --version to see why"
+}
 
 print
 print -P "%F{green}Setup finished.%f"

@@ -6000,4 +6000,73 @@ void main(uint3 id : SV_DispatchThreadID) {
         ];
         assert_eq!(got, expected);
     }
+
+    /// Bench (`--ignored --nocapture`): the heap sync of records the title
+    /// copied as bytes, 30,000 constant buffer views named whole changing
+    /// every sweep (the world copies ~400,000 slots a frame and ~30,000
+    /// were made again), with a host view made for each as before and with
+    /// the views read from the records on the GPU (`VICTORY_GPU_RECORDS=cb`:
+    /// no host view, the copy holding the view's bytes looked up).
+    #[test]
+    #[ignore = "bench"]
+    fn bench_sync_of_copied_constant_records() {
+        const SLOTS: u32 = 65_536;
+        const CHANGED: usize = 30_000;
+        const SWEEPS: usize = 14;
+        let (Some(made), Some(records)) = (HostHeap::new(false, SLOTS), HostHeap::new(false, SLOTS)) else {
+            return;
+        };
+        records.records_on();
+        let buffer = crate::resource::test_buffer(4 << 20);
+        let (ptr, len) = crate::resource::buffer_bytes(buffer).expect("buffer bytes");
+        crate::shadow::register(buffer as usize, ptr as u64, len);
+        // Two records a slot, of different views, taken in turn.
+        let views: Vec<[u32; 3]> = (0..2 * CHANGED as u64)
+            .map(|k| {
+                let address = ptr as u64 + (k % 16_000) * 256;
+                let mut record = [0u32; 3];
+                crate::descriptor::create_cbv(
+                    std::ptr::null(),
+                    &[address as u32, (address >> 32) as u32, 256, 0],
+                    record.as_mut_ptr() as u64,
+                );
+                assert_eq!(record[2] >> 30, 1, "named whole");
+                record
+            })
+            .collect();
+        let memory = [private_memory(SLOTS as usize * 32), private_memory(SLOTS as usize * 32)];
+        let mut ms = [Vec::new(), Vec::new()];
+        for sweep in 0..SWEEPS {
+            for (which, heap) in [&made, &records].into_iter().enumerate() {
+                // SAFETY: the test's own memory, written and read here only.
+                let mem = unsafe {
+                    std::slice::from_raw_parts_mut(memory[which].as_ptr().cast_mut(), SLOTS as usize * 32)
+                };
+                for slot in 0..CHANGED {
+                    let record = views[(sweep % 2) * CHANGED + slot];
+                    for (j, word) in record.iter().enumerate() {
+                        mem[slot * 32 + 4 * j..][..4].copy_from_slice(&word.to_le_bytes());
+                    }
+                }
+                let start = mem.as_ptr() as u64;
+                let t = std::time::Instant::now();
+                heap.sync_slots_bytes(0, SLOTS, start, 32, start, mem);
+                ms[which].push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+        assert!(made.made(7) && !records.made(7));
+        for (name, ms) in ["a host view made per record", "views read from the records"].iter().zip(&mut ms) {
+            // The first sweep fills empty slots.
+            let mut rest = ms[1..].to_vec();
+            rest.sort_by(f64::total_cmp);
+            let median = rest[rest.len() / 2];
+            println!(
+                "{name}: {median:.2} ms a sweep of {SLOTS} slots, {CHANGED} changed = {:.0} ns per changed slot (first sweep {:.2} ms, least {:.2} ms)",
+                median * 1e6 / CHANGED as f64,
+                ms[0],
+                rest[0],
+            );
+        }
+        crate::shadow::unregister(buffer as usize, ptr as u64);
+    }
 }

@@ -217,9 +217,21 @@ fn build(
     used: Vec<UsedResource>,
     threads: u32,
 ) -> HostShader {
+    build_waves(words, layout, used, threads, false)
+}
+
+/// [`build`], for a wave64 program run in halves on a host of 32-lane waves
+/// with `wave64`.
+fn build_waves(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    threads: u32,
+    wave64: bool,
+) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
-        wave64: false,
+        wave64,
         vgprs: 8,
         layout,
         used,
@@ -248,7 +260,7 @@ fn build(
         atomic_lock_rounds: false,
         atomic_umax: false,
         bias_as_gradients: false,
-        host_wave32: false,
+        host_wave32: wave64,
         narrow_waves: false,
         uav_size_level0: false,
         view_marks: false,
@@ -1120,6 +1132,180 @@ fn a_constant_buffer_is_taken_from_the_titles_record() {
             )
             .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
         assert_eq!(words[0], vec![9; 32], "{label}: without the option");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A page table for title memory at `pages` (title address of a 64 KiB
+/// page, heap index of the views of the memory holding it, that memory's
+/// title address), all in one 256 MiB region; the null pair at `null`.
+fn pages_table(pages: &[(u64, u32, u64)], null: u32) -> Vec<u32> {
+    let mut t = vec![0u32; 4096];
+    let first = pages[0].0;
+    t[(first >> 28) as usize] = 1;
+    for _ in 0..2 * 4096 {
+        t.extend([null, 0]);
+    }
+    for &(page, view, start) in pages {
+        assert_eq!(page >> 28, first >> 28);
+        let at = 4096 + 2 * (4096 + (page >> 16 & 0xFFF) as usize);
+        t[at..at + 2].copy_from_slice(&[view, start as u32]);
+    }
+    t
+}
+
+/// A constant buffer that lies across two host copies of title memory (its
+/// first 16 bytes end one copy's last page, the rest begin another's) is
+/// read whole through the title's record: a load that starts on the first
+/// page takes its dwords on the next page from that page's memory, and a
+/// load wholly on the next page too.
+#[test]
+fn a_constant_buffer_across_two_copies_is_read_from_both() {
+    const TITLE: u64 = 0x12_3450_0000;
+    const PAGE: usize = 0x1_0000;
+    const HEAP_AT: usize = 0x100;
+    let layout = vec![
+        param(RootType::Constants, 0),
+        param(RootType::ResourceHeap, 1),
+        param(RootType::Table, 2),
+    ];
+    lower::GPU_RECORDS.set(1);
+    let shader = build(&heap_constants_x8(), layout, vec![entry(ResourceType::Uav, 4, 2)], 32);
+    lower::GPU_RECORDS.set(0);
+    // The constant buffer: 64 bytes from 16 bytes before the first copy's end.
+    let constants = TITLE + PAGE as u64 - 16;
+    let mut first = vec![0u32; PAGE / 4];
+    first[(HEAP_AT + 32) / 4..][..3].copy_from_slice(&constant_record(constants, 64));
+    first[PAGE / 4 - 4..].copy_from_slice(&[100, 101, 102, 103]);
+    let second: Vec<u32> = (104..104 + 64).collect();
+    let heap = TITLE + HEAP_AT as u64;
+    let table = pages_table(&[(TITLE, 2, TITLE), (TITLE + PAGE as u64, 6, TITLE + PAGE as u64)], 4);
+    let own: Vec<u32> = vec![7; 16];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
+                        (2, Root::View { srv: true, data: vec![4; 8] }),
+                        (3, Root::View { srv: true, data: table.clone() }),
+                    ],
+                    views: &[
+                        View::RawUav(32),
+                        View::Buffer { data: &own, stride: Stride::Raw },
+                        View::Memory(&first),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                        View::Memory(&second),
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        // Dwords 2-9 of the constant buffer: two on the first copy's last
+        // page, six on the second's first.
+        let mut want = vec![0; 32];
+        want[..8].copy_from_slice(&[102, 103, 104, 105, 106, 107, 108, 109]);
+        assert_eq!(words[0], want, "{label}");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// A wave64 program on a host of 32-lane waves runs in halves: both halves
+/// read the constant buffer through the title's record.
+#[test]
+fn a_wave64_program_in_halves_reads_constants_from_the_titles_record() {
+    const TITLE: u64 = 0x12_3450_0000;
+    const HEAP_AT: usize = 0x100;
+    const CONSTANTS_AT: usize = 0x400;
+    let layout = vec![
+        param(RootType::Constants, 0),
+        param(RootType::ResourceHeap, 1),
+        param(RootType::Table, 2),
+    ];
+    lower::GPU_RECORDS.set(1);
+    let shader = build_waves(HEAP_CONSTANT_WAVE32, layout, vec![entry(ResourceType::Uav, 4, 2)], 64, true);
+    lower::GPU_RECORDS.set(0);
+    assert_eq!(shader.root_srvs, [VIEW_STRIDES, super::HEAP_RECORDS]);
+    let constants = TITLE + CONSTANTS_AT as u64;
+    let mut memory = vec![0u32; 0x800 / 4];
+    memory[(HEAP_AT + 32) / 4..][..3].copy_from_slice(&constant_record(constants, 16));
+    memory[CONSTANTS_AT / 4..][..4].copy_from_slice(&[70, 80, 90, 100]);
+    let heap = TITLE + HEAP_AT as u64;
+    let table = pages_table(&[(TITLE, 2, TITLE)], 4);
+    let own: Vec<u32> = vec![7, 8, 9, 10];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match u.root {
+                RootType::Constants => 1,
+                RootType::Table => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (1, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
+                        (2, Root::View { srv: true, data: vec![4; 6] }),
+                        (3, Root::View { srv: true, data: table.clone() }),
+                    ],
+                    views: &[
+                        View::RawUav(64),
+                        View::Buffer { data: &own, stride: Stride::Raw },
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![90; 64], "{label}: all 64 lanes, both halves");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

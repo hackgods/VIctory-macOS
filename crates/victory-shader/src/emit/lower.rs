@@ -310,6 +310,26 @@ thread_local! {
 /// `descriptor::VIEW_TAG`).
 pub(crate) const RECORD_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+/// A read through a handle made from a title record
+/// ([`Lower::record_read`]), for [`Lower::raw_buffer_load`].
+#[derive(Clone, Copy)]
+struct RecordRead {
+    /// The offset handed out with the handle.
+    given: V,
+    /// The offset in the view that it stands for.
+    user: V,
+    /// The last offset in the view a dword may be read at.
+    last: V,
+    /// The handle of the memory holding the access's last byte where that
+    /// lies on the next 64 KiB page (the null view's elsewhere), the
+    /// access's offset in it, whether the access crosses, and the bytes of
+    /// it before the page's end.
+    tail: V,
+    tail_at: V,
+    crosses: V,
+    before: V,
+}
+
 /// What the title's record at a heap index names, read by the shader
 /// (`emit`, "Views from the title's records").
 #[derive(Clone, Copy)]
@@ -506,10 +526,8 @@ struct Lower<'a> {
     entry_records: Map<(EntryAddress, u8), RecordView>,
     block_records: Map<(usize, Site, u8), RecordView>,
     join_records: Map<String, RecordView>,
-    /// Handles made from a record ([`Lower::raw_view`]): the offset handed
-    /// out with the handle, the offset in the view it stands for, and the
-    /// last offset in the view a dword may be read at.
-    record_reads: Map<V, (V, V, V)>,
+    /// Handles made from a record ([`Lower::raw_view`]).
+    record_reads: Map<V, RecordRead>,
     /// The offsets [`Lower::memory`] returned ([`Lower::raw_run`]).
     memory_offsets: HashSet<V>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
@@ -2294,7 +2312,7 @@ impl<'a> Lower<'a> {
                 && GPU_RECORDS.get() & 1 != 0
                 && let Some(record) = self.record_for(src)?
             {
-                return Ok(self.record_read(src, record, off));
+                return Ok(self.record_read(src, record, off, bytes));
             }
             let read_end = (!write && bytes >= 4)
                 .then(|| self.s.m.int_value(off))
@@ -2720,31 +2738,52 @@ impl<'a> Lower<'a> {
         // Through a handle made from a title record, the dwords past the
         // end of the view the record names read 0, as each did through the
         // host view of that size (D3D12 bounds raw loads per component).
-        if let Some(&(given, user, last)) = self.record_reads.get(&args[0]) {
-            let m = &mut self.s.m;
-            let user = if args[1] == given {
-                user
+        // And the dwords of an access that crosses onto the next 64 KiB page
+        // are read through the view of the memory holding that page, which
+        // need not be the first page's (two copies of title memory, or
+        // pages of a heap that do not follow each other).
+        if let Some(&read) = self.record_reads.get(&args[0]) {
+            // How far this load is from the access's start.
+            let moved = if args[1] == read.given {
+                self.s.m.i32(0)
             } else {
-                let moved = m.bin(block, Bin::Sub, args[1], given);
-                m.bin(block, Bin::Add, user, moved)
+                self.s.m.bin(block, Bin::Sub, args[1], read.given)
             };
+            let tail_at = self.s.m.bin(block, Bin::Add, read.tail_at, moved);
+            let tail = self.s.op(
+                block,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[read.tail, tail_at, args[2], args[3], args[4]],
+            );
+            let m = &mut self.s.m;
+            let user = m.bin(block, Bin::Add, read.user, moved);
             let fields = m.int_value(args[3]).map_or(0xF, |mask| mask as u8);
-            let first = m.cmp(block, pred::IULE, user, last);
-            let mut held = [None; 4];
-            for (k, held) in held.iter_mut().enumerate() {
+            let first = m.cmp(block, pred::IULE, user, read.last);
+            let mut masked = [None; 4];
+            for (k, field) in masked.iter_mut().enumerate() {
                 if fields >> k & 1 == 0 {
                     continue;
                 }
-                *held = Some(if k == 0 {
+                let step = m.i32(4 * k as u32);
+                let held = if k == 0 {
                     first
                 } else {
-                    let step = m.i32(4 * k as u32);
                     let at = m.bin(block, Bin::Add, user, step);
-                    let inside = m.cmp(block, pred::IULE, at, last);
+                    let inside = m.cmp(block, pred::IULE, at, read.last);
                     m.bin(block, Bin::And, first, inside)
+                };
+                let from = m.bin(block, Bin::Add, moved, step);
+                let past = m.cmp(block, pred::IUGE, from, read.before);
+                let past = m.bin(block, Bin::And, read.crosses, past);
+                *field = Some(super::bitcode::Masked {
+                    held,
+                    tail: Some((past, tail)),
                 });
             }
-            m.masked.insert(r, held);
+            m.masked.insert(r, masked);
         }
         r
     }
@@ -2924,10 +2963,13 @@ impl<'a> Lower<'a> {
     /// memory the page table names at its address plus `off`; for any other
     /// record, the host's own view of the slot. One handle at the index
     /// chosen (handles cannot be chosen between). Dwords read through it
-    /// past the constant buffer's size read 0 ([`Self::raw_buffer_load`]).
-    // shortcut: as `memory`, one lookup per access: its bytes are taken to
-    // lie in the memory that holds its first byte's page.
-    fn record_read(&mut self, src: &Source, record: RecordView, off: V) -> (V, V) {
+    /// past the constant buffer's size read 0, and the dwords of an access
+    /// of `bytes` bytes that crosses onto the next 64 KiB page are read
+    /// through that page's memory, looked up only where the access crosses
+    /// ([`Self::raw_buffer_load`]). May end in a new block.
+    // shortcut: a dword that itself lies across two pages (an address that
+    // is not 4-byte aligned) is read whole from the page it starts on.
+    fn record_read(&mut self, src: &Source, record: RecordView, off: V, bytes: u32) -> (V, V) {
         // The host's own views of the heap are still read for other records.
         if self.is_heap_direct(src) {
             self.heap[0] = true;
@@ -2946,7 +2988,41 @@ impl<'a> Lower<'a> {
         let all = self.s.m.i32(u32::MAX);
         let last = self.s.m.bin(c, Bin::Sub, record.size, four);
         let last = self.s.m.select(c, record.constant, last, all);
-        self.record_reads.insert(h, (at, off, last));
+        // The access's last byte on the next page: that page's memory.
+        let (page, low) = (self.s.m.i32(1 << 16), self.s.m.i32(0xFFFF));
+        let in_page = self.s.m.bin(c, Bin::And, lo, low);
+        let before = self.s.m.bin(c, Bin::Sub, page, in_page);
+        let size = self.s.m.i32(bytes.max(1));
+        let crosses = self.s.m.cmp(c, pred::IUGT, size, before);
+        let crosses = self.s.m.bin(c, Bin::And, crosses, record.constant);
+        let crosses = self.s.m.bin(c, Bin::And, crosses, fits);
+        let guard = self.begin_guarded(Some(crosses));
+        let (tail_view, tail_start) = {
+            let end = self.s.m.i32(bytes.max(1) - 1);
+            let (end_lo, end_hi) = self.add64(lo, hi, end, false);
+            self.page_view(end_lo, end_hi)
+        };
+        let zero = self.s.m.i32(0);
+        let [tail_view, tail_start] = self.end_guarded(guard, &[(tail_view, null), (tail_start, zero)])[..]
+        else {
+            unreachable!("two values in, two out")
+        };
+        let c = self.cur;
+        let tail = self.s.heap_handle(c, tail_view, false, true, (11, 0));
+        self.s.view_index.remove(&tail);
+        let tail_at = self.s.m.bin(c, Bin::Sub, lo, tail_start);
+        self.record_reads.insert(
+            h,
+            RecordRead {
+                given: at,
+                user: off,
+                last,
+                tail,
+                tail_at,
+                crosses,
+                before,
+            },
+        );
         (h, at)
     }
 

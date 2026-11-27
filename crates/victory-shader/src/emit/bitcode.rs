@@ -195,6 +195,14 @@ enum MdDef {
     Node(Vec<Option<Md>>),
 }
 
+/// A field of a load in [`Module::masked`]: read where `held`, from
+/// `other` where `tail`.
+#[derive(Clone, Copy)]
+pub(crate) struct Masked {
+    pub held: V,
+    pub tail: Option<(V, V)>,
+}
+
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
@@ -211,10 +219,13 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: Map<V, (V, V)>,
-    /// Structures whose first four fields read as 0 where a condition does
-    /// not hold (a load's dwords past the end of what its view names):
-    /// each field's condition. [`Module::extract`] applies it.
-    pub masked: Map<V, [Option<V>; 4]>,
+    /// Loads whose first four fields are not all their own: per field, the
+    /// condition under which it is read at all (else 0: a dword past the
+    /// end of what its view names) and, where it holds, the condition under
+    /// which the field of another load is taken instead (a dword on the
+    /// next page of memory, read through that page's view).
+    /// [`Module::extract`] applies both.
+    pub masked: Map<V, [Option<Masked>; 4]>,
 }
 
 impl Module {
@@ -435,9 +446,16 @@ impl Module {
             }
             None => x,
         };
-        let held = self.masked.get(&agg).and_then(|fields| *fields.get(index as usize)?);
-        match held {
-            Some(held) => {
+        let field = self.masked.get(&agg).and_then(|fields| *fields.get(index as usize)?);
+        match field {
+            Some(Masked { held, tail }) => {
+                let x = match tail {
+                    Some((cond, other)) => {
+                        let y = self.push(block, ty, Op::Extract(other, index));
+                        self.select(block, cond, y, x)
+                    }
+                    None => x,
+                };
                 let zero = self.f32(0);
                 self.select(block, held, x, zero)
             }

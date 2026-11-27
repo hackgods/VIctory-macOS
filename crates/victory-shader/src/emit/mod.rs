@@ -134,8 +134,13 @@
 //!   slots) or a heap of no slots reads the host's view at the index, as
 //!   without the option. The host keeps the title heap's memory in a copy
 //!   the page table names, and makes no view for a record named whole.
-//!   shortcut: one page lookup per access, as title memory: its bytes are
-//!   taken to lie in the memory that holds its first byte's page.
+//!   An access that crosses onto the next 64 KiB page looks that page up
+//!   too (only where it crosses) and takes its dwords there from that
+//!   page's memory: two copies of title memory, or pages of a heap that
+//!   do not follow each other, read as the one range they are to the
+//!   title.
+//!   shortcut: a dword that itself lies across two pages (an address that
+//!   is not 4-byte aligned) is read whole from the page it starts on.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the

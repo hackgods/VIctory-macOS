@@ -30,6 +30,9 @@ fn reservations_hold_title_memory_in_place_through_tiles() {
     unsafe {
         std::env::set_var("VICTORY_INPLACE_SECTIONS", "1");
         std::env::set_var("VICTORY_INPLACE_TILES", "1");
+        // Pages shown twice left to one GPU address per page, which needs
+        // the runtime to tell which pages those are.
+        std::env::set_var("VICTORY_INPLACE_TILES_SHOWN_ONCE", "1");
     }
     if !victory_gpu::in_place_tiles() {
         eprintln!("no title memory in place here (not Rosetta with D3DMetal): skipped");
@@ -65,7 +68,7 @@ fn reservations_hold_title_memory_in_place_through_tiles() {
     assert_eq!(XMemMapPhysicalPages(second, 1, [pages[0]].as_ptr()), second);
     assert!(tiled(a, 4 * PAGE), "tiles follow the page mapped again");
     // A page the title shows at `a + 3 * PAGE` too: shown twice, so left to
-    // one GPU address per page (aliased tiles are not taken for coherent).
+    // one GPU address per page (`VICTORY_INPLACE_TILES_SHOWN_ONCE`).
     assert_eq!(XMemMapPhysicalPages(second, 1, [pages[1]].as_ptr()), second);
     assert!(!tiled(a, 4 * PAGE), "a page shown twice");
     assert!(

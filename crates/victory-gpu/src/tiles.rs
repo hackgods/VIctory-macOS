@@ -86,11 +86,16 @@ pub fn in_place_tiles() -> bool {
 }
 
 /// Whether two tiles mapped onto one heap tile read what a shader wrote
-/// through the other within one list (the probe
-/// `tests::aliased_tiles_within_one_list`). Where not, pages the title shows
-/// at more than one address are left to `crate::alias`'s one address per
-/// page.
-const ALIASED_TILES_COHERENT: bool = false;
+/// through the other within one list: they do under D3DMetal on an M5 Pro
+/// (`tests::aliased_tiles_within_one_list`: all 8,192 words after a UAV
+/// barrier, between two tiles and between a tile and the heap's own
+/// buffer, either way), so pages the title shows at more than one address
+/// stay in place through tiles. `VICTORY_INPLACE_TILES_SHOWN_ONCE=1` leaves
+/// them to `crate::alias`'s one GPU address per page instead.
+fn aliased_tiles_coherent() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| !crate::switch::on("VICTORY_INPLACE_TILES_SHOWN_ONCE"))
+}
 
 /// The title's reservations of 64 KiB pages for physical pages, by start:
 /// their end.
@@ -294,7 +299,7 @@ impl Region {
                 .is_some_and(|t| t.iter().all(Option::is_some))
         };
         mapped
-            && (ALIASED_TILES_COHERENT
+            && (aliased_tiles_coherent()
                 || resolver().is_some_and(|resolve| {
                     (first..=last)
                         .all(|t| resolve(self.base + t as u64 * TILE).is_some_and(|a| !a.shared))
@@ -369,9 +374,9 @@ pub fn title_memory_tiled(start: u64, len: u64) -> bool {
 }
 
 /// Whether shadows through tiles are let go where the title shows one of
-/// their pages at another address too ([`ALIASED_TILES_COHERENT`]).
+/// their pages at another address too ([`aliased_tiles_coherent`]).
 pub(crate) fn keep_pages_shown_once() -> bool {
-    in_place_tiles() && !ALIASED_TILES_COHERENT
+    in_place_tiles() && !aliased_tiles_coherent()
 }
 
 /// Whether `buffer` is a region's reserved buffer (a shadow over it follows
@@ -708,7 +713,7 @@ mod tests {
     /// submission. The page is copied out in a submission of its own, but
     /// in two cases that ask how a copy in the same list is ordered.
     /// Reported, not asserted: it decides the design
-    /// ([`super::ALIASED_TILES_COHERENT`]).
+    /// ([`super::aliased_tiles_coherent`]).
     #[test]
     fn aliased_tiles_within_one_list() {
         use crate::compute::{Param, pipeline};
@@ -1173,6 +1178,30 @@ mod tests {
             super::remap_counts()[0] >= before[0] + 6,
             "a tile mapped again each time"
         );
+    }
+
+    /// A page the title shows at a second address stays in place through
+    /// tiles (aliased tiles are coherent within a list under D3DMetal:
+    /// `aliased_tiles_within_one_list`): the buffer is kept, and reads it.
+    #[test]
+    fn pages_shown_twice_stay_in_place_through_tiles() {
+        let Some(title) = Title::new(0x7e57_9000, [(0, 0), (0, 1), (0, 2)]) else {
+            return;
+        };
+        let shadow = title.shadow();
+        let at = title.start + TILE as u64;
+        SHOWS
+            .lock()
+            .unwrap()
+            .insert(at, (title.heaps[0].clone(), 1, true));
+        crate::watch::title_memory_aliased(at as usize, &[]);
+        assert!(
+            std::sync::Arc::ptr_eq(&title.shadow(), &shadow),
+            "still in place"
+        );
+        assert!(super::title_memory_tiled(title.start, 3 * TILE as u64));
+        let (list, _out, data) = title.record(1);
+        assert_eq!(Title::run(&list, data), vec![0xa1; TILE]);
     }
 
     /// Pages of two heaps out of order (no run of one section, which

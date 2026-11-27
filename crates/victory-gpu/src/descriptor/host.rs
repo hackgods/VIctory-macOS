@@ -1741,6 +1741,30 @@ fn buffer_srv(
             Some(HeldSource::Widened(widened, shadow.clone())),
         )));
     }
+    let stride = u64::from(buffer.StructureByteStride);
+    if stride > 0 && raw_structured() {
+        // Scalar and offset-only buffer reads emit `rawBufferLoad` on a raw
+        // handle (`victory_shader::emit`), which D3D12 leaves undefined on a
+        // structured SRV (NVIDIA treats the byte offset as an element index,
+        // hanging `WindNew` loops). NVIDIA, WARP and D3DMetal all read both
+        // raw handles and structured handles accurately from a raw view of the
+        // same bytes; under Wine/D3DMetal any dword-aligned start (`+8B` or
+        // `+680B`) works too, while native D3D12 requires 16-byte alignment.
+        let (byte, dwords) = (first * stride, u64::from(count) * stride / 4);
+        let align = if crate::shader_cache::under_wine() { 4 } else { 16 };
+        match u32::try_from(dwords) {
+            Ok(dwords) if byte.is_multiple_of(align) && stride.is_multiple_of(4) => {
+                desc.Format = DXGI_FORMAT_R32_TYPELESS;
+                desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    FirstElement: byte / 4,
+                    NumElements: dwords,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                };
+            }
+            _ => once!(byte, stride, "structured buffer view not made raw: unaligned"),
+        }
+    }
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
         host.device
@@ -1750,6 +1774,23 @@ fn buffer_srv(
         shadow.buffer.clone(),
         own.then(|| HeldSource::Shadow(shadow)),
     )))
+}
+
+/// Whether structured buffer views are made raw ([`buffer_srv`]): under Wine
+/// (D3DMetal) and on NVIDIA hosts, both of which serve structured-handle and
+/// raw-handle `rawBufferLoad`s from a raw view of the same bytes.
+/// `VICTORY_RAW_STRUCTURED=0` or `=1` overrides.
+fn raw_structured() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_RAW_STRUCTURED").as_deref() {
+            Ok("0" | "false" | "off") => false,
+            Ok("1" | "true" | "on") => true,
+            _ => crate::shader_cache::under_wine() || crate::host::host_vendor() == 0x10DE,
+        };
+        tracing::info!(on, "structured buffer views made raw");
+        on
+    })
 }
 
 /// Whether `count` elements of `element` bytes from element `first` lie in
@@ -3234,6 +3275,8 @@ mod tests {
             (93u32, 0u32, 4u32, bgrx_uav),  // B8G8R8X8_UNORM_SRGB + UNKNOWN -> linear 88
             (92u32, 88u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM
             (92u32, 93u32, 4u32, bgrx_uav), // B8G8R8X8_TYPELESS -> B8G8R8X8_UNORM_SRGB
+            (86u32, 86u32, 4u32, true),     // B5G5R5A1_UNORM, widened if unsupported
+            (115u32, 115u32, 4u32, true),   // B4G4R4A4_UNORM, widened if unsupported
             (40u32, 40u32, 4u32, false),    // D32_FLOAT + UAV flag (no depth flag) -> null fallback
             (55u32, 55u32, 4u32, false),    // D16_UNORM + UAV flag (no depth flag) -> null fallback
             (39u32, 40u32, 4u32, false),    // R32_TYPELESS + D32_FLOAT view -> null fallback
@@ -3762,5 +3805,270 @@ void main(uint3 id : SV_DispatchThreadID) {
             unsigned, 65_536,
             "patterns unchanged, moved as unsigned integers"
         );
+    }
+
+    /// End-to-end test of [`buffer_srv`] converting a structured buffer SRV
+    /// (`StructureByteStride = 680`, starting at `FirstElement = 1` = `+680`
+    /// bytes, `8 mod 16`) into a raw SRV and reading it through a translated
+    /// DXIL compute shader via MUBUF raw byte offset (`0xC4`), SMEM scalar
+    /// byte offset (`0xC4`), and MUBUF structured element+field (`[2] + 12`).
+    #[test]
+    fn structured_buffer_srv_made_raw_reads_byte_and_element_offsets() {
+        use crate::pipeline::{Shader, Translated, host::HostPipeline};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource,
+            emit, io, ir, resource, structure,
+        };
+
+        let Some(host) = host() else {
+            return;
+        };
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: valid feature support query.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if ok.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return;
+        }
+
+        let code_words: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0 (SRV slot 0)
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0303,
+            0xFA00_0000, // s_load_dwordx4 s[12:15], s[6:7], 0x0 (UAV slot 1)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF420_0404,
+            0xFA00_00C4, // s_buffer_load_dword s16, s[8:11], 0xC4
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E08_0210, // v_mov_b32 v4, s16
+            0xE030_00C4,
+            0x8002_0100, // buffer_load_dword v1, off, s[8:11], 0 offset:196
+            0x7E04_0282, // v_mov_b32 v2, 2
+            0xE030_200C,
+            0x8002_0302, // buffer_load_dword v3, v2, s[8:11], 0 idxen offset:12
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xE070_0000,
+            0x8003_0100, // buffer_store_dword v1, off, s[12:15], 0 offset:0
+            0xE070_0004,
+            0x8003_0400, // buffer_store_dword v4, off, s[12:15], 0 offset:4
+            0xE070_0008,
+            0x8003_0300, // buffer_store_dword v3, off, s[12:15], 0 offset:8
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: (0..2)
+                .map(|slot| RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: slot,
+                    slot,
+                })
+                .collect(),
+            used: vec![
+                UsedResource {
+                    kind: ResourceType::Srv,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 680,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                },
+                UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 1,
+                    slot: 1,
+                },
+            ],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 2 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut container = vec![0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[20..24].copy_from_slice(&1u32.to_le_bytes());
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let c = Container::parse(&container).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let hs = emit::emit(&c, &native, &p, &st, &io, &res).unwrap();
+        let ud_spec = hs.user_data.clone();
+        let shader = Shader::for_test(
+            "compute",
+            Translated {
+                host: hs,
+                used: native.used,
+            },
+        );
+        let Some(hp) = HostPipeline::new(&[shader], None, |_, _| {}) else {
+            panic!("synthetic structured-SRV pipeline");
+        };
+
+        // Allocate 8 KiB of title memory (2048 dwords) filled with distinct words.
+        let bytes_len = 8192usize;
+        let mut backing: Vec<u32> = (0..(bytes_len / 4) as u32)
+            .map(|i| 0x2000_0000 + i)
+            .collect();
+        let mem = backing.as_mut_ptr();
+        crate::shadow::register(mem as usize, mem as u64, bytes_len as u64);
+
+        // SAFETY: shader-visible heap with 2 slots.
+        let d3d_heap: ID3D12DescriptorHeap = unsafe {
+            host.device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .unwrap()
+        };
+        // SAFETY: live descriptor heap.
+        let cpu = unsafe { d3d_heap.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: plain device query.
+        let step = unsafe {
+            host.device
+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+        } as usize;
+
+        // Structured SRV: stride = 680, FirstElement = 1 (+680B = +170 dwords), NumElements = 4.
+        let srv_desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_UNKNOWN,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: 1,
+                    NumElements: 4,
+                    StructureByteStride: 680,
+                    Flags: D3D12_BUFFER_SRV_FLAG_NONE,
+                },
+            },
+        };
+        let _kept = buffer_srv(mem as u64, bytes_len as u64, srv_desc, cpu)
+            .expect("buffer_srv succeeds")
+            .expect("holds shadow buffer");
+
+        let list = host.new_list().unwrap();
+        let shadow = crate::shadow::find(mem as u64, bytes_len as u64).expect("registered shadow");
+        shadow.refresh(&list, mem as u64, bytes_len as u64);
+
+        let mut uav_buf: Option<ID3D12Resource> = None;
+        // SAFETY: valid default UAV buffer description.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 256,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut uav_buf,
+                )
+                .unwrap();
+        }
+        let uav_buf = uav_buf.unwrap();
+        let uav_desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 8,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: valid UAV slot 1.
+        unsafe {
+            host.device.CreateUnorderedAccessView(
+                &uav_buf,
+                None,
+                Some(&uav_desc),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: cpu.ptr + step,
+                },
+            );
+        }
+
+        let mut ud = vec![0u32; hp.stages[0].user_data.map_or(1, |(_, n)| n as usize)];
+        for u in &ud_spec {
+            ud[u.index as usize] = 32 * u32::from(u.slot);
+        }
+        let (readback, rb_ptr) = list.readback(host, 256).unwrap();
+        // SAFETY: open list with heap, root signature, constants, and PSO bound.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(d3d_heap.clone())]);
+            list.list.SetComputeRootSignature(&hp.root);
+            list.list
+                .SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
+            list.list.SetPipelineState(&hp.pso);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(
+                &uav_buf,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            list.list.CopyResource(&readback, &uav_buf);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        // SAFETY: GPU execution finished; read 3 dwords from mapped readback.
+        let got = unsafe { *rb_ptr.cast::<[u32; 3]>() };
+        // SAFETY: plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        crate::shadow::unregister(mem as usize, mem as u64);
+        drop(backing);
+
+        let expected = [
+            0x2000_0000 + 170 + 49,  // MUBUF raw @ 0xC4
+            0x2000_0000 + 170 + 49,  // SMEM scalar raw @ 0xC4
+            0x2000_0000 + 170 + 343, // MUBUF structured [2] + 12
+        ];
+        assert_eq!(got, expected);
     }
 }

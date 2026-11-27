@@ -492,6 +492,25 @@ pub(crate) fn device_removed() -> bool {
     host().is_some_and(|h| unsafe { h.device.GetDeviceRemovedReason() }.is_err())
 }
 
+/// The PCI vendor id of the host device's adapter (NVIDIA 0x10DE), 0 if it
+/// cannot be told.
+pub(crate) fn host_vendor() -> u32 {
+    static VENDOR: OnceLock<u32> = OnceLock::new();
+    *VENDOR.get_or_init(|| {
+        let Some(host) = host() else { return 0 };
+        // SAFETY: plain DXGI queries for the device's own adapter.
+        let vendor = unsafe {
+            let luid = host.device.GetAdapterLuid();
+            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid))
+                .and_then(|a| a.GetDesc1())
+                .map_or(0, |d| d.VendorId)
+        };
+        tracing::info!(vendor = format_args!("{vendor:#x}"), "host adapter vendor");
+        vendor
+    })
+}
+
 /// DXGI may return hardware for `EnumWarpAdapter` (notably under Proton).
 /// Reject it before creating a device in diagnostics' software-only mode.
 fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
@@ -1722,6 +1741,8 @@ struct Deferred {
     slots: std::collections::HashSet<(usize, u32)>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -4059,6 +4080,16 @@ impl HostList {
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
         self.deferred().textures.insert(key)
+    }
+
+    pub(crate) fn alias_source_changed(
+        &self,
+        view: &ID3D12Resource,
+        source: &ID3D12Resource,
+    ) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
     }
 
     /// Runs `work` on host memory at submission, in order with the copies.

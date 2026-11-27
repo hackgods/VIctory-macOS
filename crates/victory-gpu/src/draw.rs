@@ -66,6 +66,10 @@ pub(crate) struct State {
     depth: usize,
     /// Last render target and depth keys set on the host list.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -261,6 +265,17 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     roots[slot] = root;
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 impl State {
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
@@ -438,6 +453,8 @@ impl State {
             return;
         };
         self.targets.clear();
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         let mut rtv_views = Vec::with_capacity(handles.len());
         let mut rtv_keys = Vec::with_capacity(handles.len());
         for &h in handles {
@@ -454,8 +471,12 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
+            let desc = record.desc();
+            if rtv_views.len() < 8 {
+                formats[rtv_views.len()] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
+            }
             rtv_keys.push((texture.as_raw() as usize, record.key()));
-            rtv_views.push((texture, record.desc()));
+            rtv_views.push((texture, desc));
         }
         if self
             .hdr_rtvs
@@ -471,11 +492,14 @@ impl State {
             && let Some(texture) = crate::resource::host_resource(record.resource)
         {
             self.depth = record.resource as usize;
+            let desc = record.depth_desc();
+            formats[8] = bound_format(&texture, desc.as_ref().map(|d| d.Format));
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
             dsv_key = Some((texture.as_raw() as usize, record.key()));
-            dsv_view = Some((texture, record.depth_desc()));
+            dsv_view = Some((texture, desc));
         }
+        self.target_formats = formats;
         if bind_cache_enabled()
             && self
                 .host_targets
@@ -585,7 +609,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1947,7 +1972,8 @@ impl State {
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -2332,10 +2358,10 @@ fn readable(list: &HostList, u: &UsedResource, view: &View, marked: bool) {
         (View::Shader(resource, _), ResourceType::Srv) => {
             // A view of memory the GPU writes through another title texture
             // whose host copy this one could not share reads that copy.
-            if let Some(a) = crate::resource::alias_source(*resource as This) {
-                crate::texture::alias_copy(list, a.get(), *resource as This);
-            }
-            if let Some(t) = crate::resource::host_copy(*resource as This)
+            let copied = crate::resource::alias_source(*resource as This)
+                .is_some_and(|a| crate::texture::alias_copy(list, a.get(), *resource as This));
+            if !copied
+                && let Some(t) = crate::resource::host_copy(*resource as This)
                 && t.title_written()
             {
                 crate::texture::upload(list, *resource as This, &t.texture);

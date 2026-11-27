@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
+use crate::census_fast::{Fast, Unordered};
 use crate::census_maps::{Counts, Hashing};
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -38,9 +39,24 @@ const KINDS: [&str; 4] = ["buffer", "unordered buffer", "placed texture", "other
 
 /// A heap's slots that view title memory, and the distinct buffer ranges
 /// and textures among them (with how many slots view each).
-#[derive(Default)]
 pub(crate) struct Viewed {
     inner: Mutex<Inner>,
+    /// mac: with `VICTORY_CENSUS_FAST=1` (`crate::census_fast`): the kept
+    /// answer of [`unordered_writes`] and its generation.
+    fast: Option<Fast<Shadow>>,
+}
+
+impl Default for Viewed {
+    fn default() -> Self {
+        Viewed::new(crate::mac_switches::census_fast())
+    }
+}
+
+impl Viewed {
+    /// A census, with the fast parts (`fast`) or as before.
+    pub(crate) fn new(fast: bool) -> Self {
+        Viewed { inner: Mutex::new(Inner::new(fast)), fast: fast.then(Fast::default) }
+    }
 }
 
 pub(crate) type Range = (usize, u64, u64, bool);
@@ -65,10 +81,13 @@ struct Inner {
     /// lists, and remerging the world's 130,000 ranges each time cost 0.15
     /// s per frame).
     ends: HashMap<(usize, bool), Ends>,
+    /// mac: with `VICTORY_CENSUS_FAST=1`: the unordered ranges of `ranges`
+    /// alone, changed where `ranges` gains or loses one ([`Inner::count`]).
+    unordered: Option<Unordered<Shadow>>,
 }
 
-impl Default for Inner {
-    fn default() -> Self {
+impl Inner {
+    fn new(fast: bool) -> Self {
         let [quick, _] = crate::mac_switches::quick_sync(crate::shader_cache::under_wine);
         Inner {
             slots: HashMap::with_hasher(Hashing::new(quick)),
@@ -76,6 +95,7 @@ impl Default for Inner {
             textures: BTreeMap::new(),
             hulls: HashMap::new(),
             ends: HashMap::new(),
+            unordered: fast.then(Unordered::new),
         }
     }
 }
@@ -93,8 +113,12 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
-    fn count(&mut self, seen: &Seen, add: bool) {
+    /// One more (`add`) or one fewer slot views what `seen` reads. Whether
+    /// the census's unordered ranges changed (mac: told only with
+    /// `VICTORY_CENSUS_FAST=1`; false without it).
+    fn count(&mut self, seen: &Seen, add: bool) -> bool {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
+        let mut unordered_changed = false;
         match seen {
             Seen::Buffer(shadow, address, len, uav) => {
                 let key = (Arc::as_ptr(shadow) as usize, *address, address + len, *uav);
@@ -104,6 +128,18 @@ impl Inner {
                 let now = e.0;
                 if now == 0 {
                     self.ranges.remove(&key);
+                }
+                // mac: an unordered range came or went (`crate::census_fast`).
+                if (was == 0) != (now == 0)
+                    && key.3
+                    && let Some(unordered) = &mut self.unordered
+                {
+                    if now > 0 {
+                        unordered.came(key, shadow);
+                    } else {
+                        unordered.went(&key);
+                    }
+                    unordered_changed = true;
                 }
                 // A range came or went: its copy's hull may change.
                 if (was == 0) != (now == 0) {
@@ -137,6 +173,7 @@ impl Inner {
             }
             Seen::Left(_) => {}
         }
+        unordered_changed
     }
 }
 
@@ -153,12 +190,17 @@ impl Viewed {
     pub(crate) fn set_seen(&self, index: u32, seen: Option<Seen>) {
         // mac: a wait for it is counted with `VICTORY_HEAP_LOCKS`.
         let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
+        let mut changed = false;
         if let Some(old) = inner.slots.remove(&index) {
-            inner.count(&old, false);
+            changed |= inner.count(&old, false);
         }
         if let Some(seen) = seen {
-            inner.count(&seen, true);
+            changed |= inner.count(&seen, true);
             inner.slots.insert(index, seen);
+        }
+        // mac: told before the lock goes (`VICTORY_CENSUS_FAST=1`).
+        if changed && let Some(fast) = &self.fast {
+            fast.changed();
         }
     }
 
@@ -425,6 +467,24 @@ pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)
         .collect()
 }
 
+/// mac: with `VICTORY_CENSUS_FAST=1`, [`widened_writes`] without walking
+/// every range under the census lock (`crate::census_fast`): the answer
+/// kept since the heap's unordered ranges last changed, with no census lock
+/// at all, or one made from those ranges alone. The same ranges (in another
+/// order where the census is in hash maps, whose order is none anyway).
+/// None without the switch.
+pub(crate) fn unordered_writes(viewed: &Viewed) -> Option<Arc<[(Arc<Shadow>, usize, usize)]>> {
+    let fast = viewed.fast.as_ref()?;
+    if !crate::under_wine() {
+        return Some(Arc::new([]));
+    }
+    if let Some(kept) = fast.kept() {
+        return Some(kept);
+    }
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    inner.unordered.as_ref().map(|unordered| fast.answer(unordered))
+}
+
 /// Draws and dispatches run with heap-indexing shaders, those of them
 /// writing through the heap, textures uploaded for heaps (diagnostics).
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -665,6 +725,78 @@ void main(uint3 id : SV_DispatchThreadID) {
         set(2, None);
         assert!(hull().is_empty());
         crate::shadow::unregister(at as usize, at);
+    }
+
+    /// Three host copies of test memory, registered (none: no host GPU
+    /// here), and what unregisters them.
+    fn three_copies(memory: &[u8]) -> (Option<Vec<Arc<Shadow>>>, impl Fn() + use<>) {
+        let at = memory.as_ptr() as u64;
+        for k in 0..3u64 {
+            crate::shadow::register((at + 0x1000 * k) as usize, at + 0x1000 * k, 0x1000);
+        }
+        let release = move || {
+            for k in 0..3u64 {
+                crate::shadow::unregister((at + 0x1000 * k) as usize, at + 0x1000 * k);
+            }
+        };
+        let copies: Option<Vec<_>> = (0..3u64).map(|k| crate::shadow::find(at + 0x1000 * k, 0x1000)).collect();
+        (copies, release)
+    }
+
+    /// A census's answers as plain numbers, sorted: the ranges unordered
+    /// views write, the hulls, each of `slots` slots' range.
+    type Plain = (Vec<(usize, usize, usize)>, Vec<(usize, u64, u64, bool)>, Vec<Option<Range>>);
+
+    fn plain(writes: &[(Arc<Shadow>, usize, usize)], viewed: &Viewed, slots: u32) -> Plain {
+        let mut w: Vec<_> = writes.iter().map(|(s, a, l)| (Arc::as_ptr(s) as usize, *a, *l)).collect();
+        w.sort_unstable();
+        let mut h: Vec<_> = viewed.ranges().iter().map(|h| (Arc::as_ptr(&h.0) as usize, h.1, h.2, h.3)).collect();
+        h.sort_unstable();
+        (w, h, (0..slots).map(|s| viewed.range_at(s)).collect())
+    }
+
+    /// mac: a census with `VICTORY_CENSUS_FAST`'s parts answers as one
+    /// without, after slots rewritten at random with views of three copies
+    /// (shader and unordered views, the same range again, empty ranges,
+    /// none): the ranges unordered views write (kept or made anew), the
+    /// hulls, each slot's range.
+    #[test]
+    fn the_fast_census_answers_as_the_old_one() {
+        let memory = vec![0u8; 0x3000];
+        let at = memory.as_ptr() as u64;
+        let (Some(copies), release) = three_copies(&memory) else {
+            return; // no host GPU here
+        };
+        let (old, fast) = (Viewed::new(false), Viewed::new(true));
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut kept = 0;
+        for step in 0..20_000u32 {
+            let slot = (next() % 200) as u32;
+            let seen = (step % 7 != 0).then(|| {
+                let k = next() % 3;
+                let from = at + 0x1000 * k + (next() % 64) * 16;
+                let len = if next() % 40 == 0 { 0 } else { 16 + next() % 256 };
+                Seen::Buffer(copies[k as usize].clone(), from, len, next() % 3 == 0)
+            });
+            old.set_seen(slot, seen.clone());
+            fast.set_seen(slot, seen);
+            if step % 3 == 0 {
+                kept += usize::from(fast.fast.as_ref().expect("the fast parts").kept().is_some());
+                let answer = unordered_writes(&fast).expect("the fast parts");
+                let slots = if step % 101 == 0 { 200 } else { 0 };
+                assert_eq!(plain(&answer, &fast, slots), plain(&widened_writes(&old), &old, slots), "step {step}");
+            }
+        }
+        assert!(unordered_writes(&old).is_none(), "nothing without the switch");
+        assert!(!crate::under_wine() || kept > 100, "kept answers are tested: {kept}");
+        drop((old, fast));
+        release();
     }
 
     /// The title writes a buffer and a texture, and views of them and of an

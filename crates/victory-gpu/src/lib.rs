@@ -41,6 +41,8 @@ mod capture;
 #[cfg(any(windows, test))]
 mod caption;
 #[cfg(any(windows, test))]
+mod census_fast;
+#[cfg(any(windows, test))]
 mod census_maps;
 #[cfg(windows)]
 mod composite;

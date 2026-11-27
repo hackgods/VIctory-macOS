@@ -3103,6 +3103,11 @@ impl HostList {
             match event {
                 WidenedEvent::Write(write) => expanded.push(WidenedEvent::Write(write)),
                 WidenedEvent::Heap(heap) => {
+                    // mac: the kept answer with `VICTORY_CENSUS_FAST=1`.
+                    if let Some(writes) = crate::bindless::unordered_writes(&heap) {
+                        expanded.extend(writes.iter().cloned().map(WidenedEvent::Write));
+                        continue;
+                    }
                     expanded.extend(
                         crate::bindless::widened_writes(&heap)
                             .into_iter()

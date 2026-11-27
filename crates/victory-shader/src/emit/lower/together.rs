@@ -162,11 +162,30 @@ fn decided(x: &Parts, same: &Set<Value>, b: usize) -> bool {
         }
         _ => false,
     };
-    uniform
+    let scc = uniform
         && x.p.blocks[b].insts.last().is_some_and(|i| {
             matches!(i.name(), "s_cbranch_scc0" | "s_cbranch_scc1")
                 && i.read(Reg::Scc).is_some_and(|v| same.contains(&v))
-        })
+        });
+    scc || x.mac.whole_wave && decided_per_lane(x, same, b)
+}
+
+/// Mac ([`Mac::whole_wave`]): whether the branch block `b` ends in sends
+/// every thread of the group the same way in the per-lane form, whatever
+/// the instruction: its per-lane condition is made of SCC values that are
+/// group values alone. The console's compiler writes a uniform `if` on a
+/// constant as `s_cselect_b64 s, exec, 0`, `s_and_b64 vcc, exec, s` and
+/// `s_cbranch_vccnz`; with EXEC every lane there, the structure pass reads
+/// that as the SCC of the compare.
+fn decided_per_lane(x: &Parts, same: &Set<Value>, b: usize) -> bool {
+    let LaneExit::Branch { when, .. } = x.st.exits[b] else {
+        return false;
+    };
+    let atoms = x.st.bools.support(when);
+    !atoms.is_empty()
+        && atoms
+            .iter()
+            .all(|a| matches!(a, Atom::Uniform(v) if same.contains(v)))
 }
 
 /// What a thread group runs together.

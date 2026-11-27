@@ -184,6 +184,10 @@ struct Checks {
     /// every thread that has not ended meets (`VICTORY_HALVES_LDS_ROUNDS=1`,
     /// as `run`).
     lds_rounds: bool,
+    /// With `walk`: regions with whole-wave code are walked too, and a
+    /// first-lane read under a narrowed EXEC is handed over
+    /// (`VICTORY_HALVES_WHOLE_WAVE=1`, as `run`).
+    whole_wave: bool,
 }
 
 pub fn run(
@@ -252,6 +256,10 @@ pub fn run(
     if lds_rounds {
         println!("LDS          of one-wave groups ordered across loop rounds where it can be (VICTORY_HALVES_LDS_ROUNDS=1)");
     }
+    let whole_wave = victory_gpu::shader_cache::halves_whole_wave();
+    if whole_wave {
+        println!("halves       walk whole-wave code and hand first lanes over under a narrowed EXEC, where exact (VICTORY_HALVES_WHOLE_WAVE=1)");
+    }
     if victory_gpu::shader_cache::descriptor_as_data() {
         println!(
             "descriptors  dwords a program only reads as numbers come from their source (VICTORY_DESCRIPTOR_AS_DATA=1)"
@@ -305,6 +313,7 @@ pub fn run(
                                 across,
                                 wide,
                                 lds_rounds,
+                                whole_wave,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -674,6 +683,7 @@ fn translate(
                         halves_across: checks.across,
                         wide_loads: checks.wide,
                         lds_rounds: checks.lds_rounds,
+                        halves_whole_wave: checks.whole_wave,
                         descriptor_as_data: victory_gpu::shader_cache::descriptor_as_data(),
                         ..Default::default()
                     };

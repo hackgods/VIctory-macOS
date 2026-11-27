@@ -197,7 +197,7 @@ fn the_test_programs_are_what_their_comments_say() {
 /// `words` as a wave64 compute program of one row of `threads`, translated
 /// as `emit` does: with `mac.walk` through [`walk::open`], and as it is
 /// where that declines.
-fn translated(
+pub(super) fn translated(
     words: &[u32],
     threads: u32,
     host_wave32: bool,
@@ -234,7 +234,7 @@ fn translated(
     let start = (&p, &st, &io, &res);
     if mac.walk
         && host_wave32
-        && let Some(exact) = walk::open(&native, start, lower)
+        && let Some(exact) = walk::open(&native, start, mac.whole_wave, lower)
     {
         return Ok(exact);
     }

@@ -143,6 +143,12 @@ pub(crate) struct Mac {
     /// barriers where every thread that has not ended meets
     /// ([`super::lds_rounds`], `emit::Options::lds_rounds`).
     pub lds_rounds: bool,
+    /// With [`Mac::walk`]: a first-lane read under a narrowed EXEC is handed
+    /// over across the halves (the console's EXEC as a ballot, then its
+    /// first lane's value), also in a block the group runs together
+    /// ([`super::exchange`], `emit::Options::halves_whole_wave`; the walk's
+    /// part is `emit::walk`).
+    pub whole_wave: bool,
     /// In halves, a read across them in a block every lane runs once is
     /// handed over through group-shared memory, exact across the halves
     /// ([`super::exchange`], `emit::Options::halves_exchange`). Also: a

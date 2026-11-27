@@ -64,6 +64,36 @@ pub(crate) struct Skip {
     /// For a region with a join where EXEC is still read: each block of the
     /// region that leaves for the join, with EXEC at its end.
     pub leaves: Vec<(usize, Value)>,
+    /// The block where the region's way out joins the code that went round
+    /// it; none for an early-out (mac: `emit::walk`, whole-wave code).
+    pub join: Option<usize>,
+}
+
+/// The VGPRs `inst` reads as operands: its reads without the old values of
+/// the VGPRs it writes, which [`Inst::reads`] holds as well (lanes outside
+/// EXEC keep them). `None` where the instruction is not one the IR keeps.
+/// Mac: `emit::walk` follows what whole-wave code leaves in a register.
+pub(crate) fn operand_vgprs(inst: &Inst, wave64: bool) -> Option<Vec<u8>> {
+    let lanes = if wave64 { 2 } else { 1 };
+    let (reads, _) = super::effects_with(
+        &inst.machine,
+        &inst.fields,
+        inst.name(),
+        lanes,
+        256,
+        None,
+        false,
+    )
+    .ok()??;
+    Some(
+        reads
+            .into_iter()
+            .filter_map(|(reg, _)| match reg {
+                Reg::V(v) => Some(v),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 /// Whether block `b` only ends the program.
@@ -215,6 +245,7 @@ pub(crate) fn walked(p: &Program, wanted: &[bool]) -> Option<(Program, Vec<Skip>
             inside,
             exec,
             leaves,
+            join,
         });
     }
     Some((q, skips))

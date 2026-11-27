@@ -1208,6 +1208,136 @@ void main() {
         drop(copy);
     }
 
+    /// A title-memory program reads a copy longer than a raw view holds
+    /// (512 MiB, 2^27 elements) past its first 512 MiB as anywhere else:
+    /// the page table's entry for the address, and the view it names, give
+    /// the title's bytes there, not zeros. #322's aliased regions are this
+    /// long. Two programs: one reads the entry, the other reads through the
+    /// view it names, as translated shaders index `views[entry]`.
+    #[test]
+    fn a_long_copy_is_read_past_its_first_512_mib() {
+        use crate::compute::{Param, pipeline, srv};
+        use crate::watch::PAGE;
+        let _guard = gpu_test_lock();
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        const LOOKUP: &str = "cbuffer c : register(b0) { uint lo; uint hi; uint at; };\n\
+            ByteAddressBuffer table : register(t0, space2);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            [numthreads(1, 1, 1)] void main() {\n\
+                bool inside = hi < 256;\n\
+                uint l1 = inside ? (hi << 4 | lo >> 28) : 0;\n\
+                uint block = inside ? table.Load(l1 * 4) : 0;\n\
+                uint entry = block << 12 | (lo >> 16 & 0xFFF);\n\
+                dst.Store2(at, table.Load2((4096 + 2 * entry) * 4));\n\
+            }\n";
+        const READ: &str = "cbuffer c : register(b0) { uint offset; uint at; };\n\
+            ByteAddressBuffer view : register(t0);\n\
+            RWByteAddressBuffer dst : register(u0);\n\
+            [numthreads(4, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
+                dst.Store(at + id.x * 4, view.Load(offset + id.x * 4));\n\
+            }\n";
+        let lookup = pipeline(
+            LOOKUP,
+            windows::core::s!("page table entry"),
+            0,
+            &[
+                Param::Constants {
+                    register: 0,
+                    count: 3,
+                },
+                Param::Srv {
+                    register: 0,
+                    space: 2,
+                },
+                Param::Uav { register: 0 },
+            ],
+        );
+        let read = pipeline(
+            READ,
+            windows::core::s!("read a view"),
+            0,
+            &[
+                Param::Constants {
+                    register: 0,
+                    count: 2,
+                },
+                Param::Table(&[srv(0, 1)]),
+                Param::Uav { register: 0 },
+            ],
+        );
+        let (Ok((lookup_root, lookup_pso)), Ok((read_root, read_pso))) = (lookup, read) else {
+            return; // no compiler for the programs here
+        };
+        let (out, data) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        // 600 MiB of title memory, a copy of all of it, and four words 520
+        // MiB in.
+        let bytes = 600 << 20;
+        let memory = pool(bytes / PAGE);
+        let at = memory + (520 << 20);
+        for k in 0..4 {
+            // SAFETY: our pool.
+            unsafe { (at as *mut u32).add(k).write_volatile(0x5150 + k as u32) };
+        }
+        crate::shadow::register(memory, memory as u64, bytes as u64);
+        let copy = crate::shadow::find(memory as u64, bytes as u64).expect("a copy");
+        // The page table's entry for that address, from a submission that
+        // binds it (which also brings the copy up to date).
+        let list = host.new_list().unwrap();
+        let map = bind(&list, OURS).expect("a page table");
+        let constants = [at as u32, (at >> 32) as u32, 0];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetComputeRootSignature(&lookup_root);
+            list.list
+                .SetComputeRoot32BitConstants(0, 3, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootShaderResourceView(1, map.table);
+            list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+            list.list.SetPipelineState(&lookup_pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the mapped output, the GPU done with it.
+        let [slot, base] = unsafe {
+            [
+                data.cast::<u32>().read_volatile(),
+                data.cast::<u32>().add(1).read_volatile(),
+            ]
+        };
+        assert_ne!(slot, 0, "the address has an entry");
+        // Through the view that entry names, at the offset it gives.
+        let list = host.new_list().unwrap();
+        let constants = [(at as u32).wrapping_sub(base), 16];
+        // SAFETY: an open list, live objects of ours.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+            list.list.SetComputeRootSignature(&read_root);
+            list.list
+                .SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+            list.list.SetComputeRootDescriptorTable(1, views.gpu(slot));
+            list.list.SetComputeRootUnorderedAccessView(2, out_gpu);
+            list.list.SetPipelineState(&read_pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: as above.
+        let words: Vec<u32> = (0..4)
+            .map(|k| unsafe { data.cast::<u32>().add(4 + k).read_volatile() })
+            .collect();
+        assert_eq!(
+            words,
+            [0x5150, 0x5151, 0x5152, 0x5153],
+            "the title's words 520 MiB into the copy"
+        );
+        crate::shadow::unregister(memory, memory as u64);
+        drop(copy);
+    }
+
     /// A copy unregistered between submissions: the next rewrite drops its
     /// name — a lagging table would name a freed pair, and a pair reused
     /// for another copy silently redirects shader reads, worse than a

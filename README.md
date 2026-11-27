@@ -169,6 +169,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_WATCH=<rva>,...` | logs a title u32 when it changes |
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X` | presses keys at those seconds, focus or not |
+| `VICTORY_KEYS=menu:Enter` | presses Enter every 3 s from the first start screen on, never again after the first frame of more than 50 draws, 10 s after the last start screen's pipeline rise, or 180 s after the first start screen; `menu:Enter:<seconds>:<draws>` sets the spacing and the draws; mixes with timed entries |
 | `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |

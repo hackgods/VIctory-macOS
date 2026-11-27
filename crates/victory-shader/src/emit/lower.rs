@@ -24,6 +24,7 @@ mod atomics;
 mod barriers;
 mod bvh;
 mod f64;
+mod first_lane;
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
 #[path = "half_views.rs"]
@@ -428,6 +429,9 @@ struct Lower<'a> {
     /// In halves: VGPR values the same in every lane of the console wave
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
+    /// The results of first-lane reads each host half makes by itself
+    /// ([`first_lane::read_alone`]).
+    first_alone: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
     pops: bool,
@@ -704,6 +708,13 @@ impl<'a> Lower<'a> {
         let mut console_lanes = false;
         let (mut halves, mut halves_refused) = (false, None);
         let mut alike_cache: Option<HashSet<Value>> = None;
+        // First-lane reads each 32-lane host half of a console wave makes
+        // by itself (`first_lane`).
+        let first_alone = if x.host_wave32 {
+            first_lane::read_alone(x)
+        } else {
+            HashSet::new()
+        };
         let mut split_barriers = Set::default();
         let mut pred = predicate::PredicatePlan::empty(Vec::new());
         if let StageIo::Cs(cs) = x.native.io {
@@ -746,7 +757,7 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            } || (first_lane_halves && halves::needs_first_lane(x, &mut alike_cache));
+            } || (first_lane_halves && halves::needs_first_lane(x, &mut alike_cache, &first_alone));
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -941,6 +952,7 @@ impl<'a> Lower<'a> {
             } else {
                 HashSet::new()
             },
+            first_alone,
             pops: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
                 if db_shader_control & 1 << 16 != 0),
             depth_before_shader: matches!(x.native.io, StageIo::Ps { db_shader_control, .. }
@@ -7611,7 +7623,10 @@ impl<'a> Lower<'a> {
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
                 let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                     if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
-                if self.halves && !self.one_host_wave() && is_vec && !is_alike {
+                // Each half's own first active lane is the console's
+                // (`first_lane`): read it, with no exchange.
+                let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
+                if self.halves && !self.one_host_wave() && is_vec && !is_alike && !alone {
                     if !self.across_here() {
                         return Err(halves::FIRST_ACROSS);
                     }

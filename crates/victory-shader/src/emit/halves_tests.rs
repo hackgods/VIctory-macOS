@@ -4777,7 +4777,8 @@ fn early_exited_lanes_leave_a_later_loop_as_the_console_on_every_gpu() {
     let n = native(&words, true, 64, 0);
     let on = lowered_entry_exit(&n, true).expect("halves, entry exit");
     let off = lowered_entry_exit(&n, false).expect("halves");
-    assert_eq!((on.loop_entry_exits, off.loop_entry_exits), (1, 0));
+    // The loop runs in lockstep (`FlatExit::LockstepExit`), which wins.
+    assert_eq!((on.loop_entry_exits, off.loop_entry_exits), (0, 0));
     assert_eq!((on.wave_size, off.wave_size), (Some(32), Some(32)));
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         for l in [&on, &off] {

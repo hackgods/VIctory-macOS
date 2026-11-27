@@ -545,7 +545,10 @@ mod tests {
     fn the_loop_exit_is_rewritten_only_with_the_switch_and_where_exact() {
         let plain = fixture(Spoiler::None);
         assert_eq!(rewritten(&plain, false), 0);
-        assert_eq!(rewritten(&plain, true), 1);
+        // The fixture's loop is a `while` loop that `predicate.rs` runs in
+        // lockstep (`FlatExit::LockstepExit`); that form wins and the
+        // rewrite skips it (`plain`).
+        assert_eq!(rewritten(&plain, true), 0);
         assert_eq!(rewritten(&fixture(Spoiler::ScalarAfter), true), 0);
         assert_eq!(rewritten(&fixture(Spoiler::NeighbourInside), true), 0);
         assert_eq!(rewritten(&fixture(Spoiler::SampleInside), true), 0);

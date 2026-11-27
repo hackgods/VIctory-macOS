@@ -1010,6 +1010,36 @@ impl Shadow {
         self.tracked.as_ref().and_then(crate::watch::Tracked::bit)
     }
 
+    /// From ScarlettMac 4921b7e6: whether [`Shadow::update`] of
+    /// `[address, address + len)` would copy nothing and change nothing
+    /// (`VICTORY_SYNC_EPOCH`, `crate::mac_switches::sync_epoch`): the copy is
+    /// not aliased, the range is all tracked memory (an untracked part is
+    /// copied whole at each use), no list declared that shaders write in it
+    /// (ScarlettMac's rule; `update` copies the same nothing there, kept to
+    /// stay strict), and no page of it is in the tracker's changed set
+    /// ([`crate::watch::Tracked::unchanged`]), which is all `update` takes
+    /// for tracked memory: then its take finds no run to copy, no unmapped
+    /// run to zero, and nothing to put into a snapshot.
+    pub(crate) fn synced(&self, address: usize, len: usize) -> bool {
+        if self.aliased {
+            return false;
+        }
+        let Some(t) = &self.tracked else {
+            return false;
+        };
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to || !t.untracked(from, to).is_empty() {
+            return false;
+        }
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.iter().any(|&(a, b)| a < to && b > from) {
+            return false;
+        }
+        drop(pending);
+        t.unchanged(from, to)
+    }
+
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
     /// write-watched). Returns the bytes copied.
@@ -2824,6 +2854,55 @@ pub(crate) mod tests {
         assert_eq!([title(p + 20), title(p + 21), title(p + 22), title(p + PAGE + 5)], [1, 2, 3, 9]);
         assert_eq!(bytes(&copy), 0, "the snapshot goes with the last range");
         unregister(p, p as u64);
+    }
+
+    /// From ScarlettMac 4921b7e6 (`VICTORY_SYNC_EPOCH`): a range is
+    /// [`Shadow::synced`] only while [`Shadow::update`] of it would copy
+    /// nothing. A page the title wrote, a kernel write under way, and a
+    /// range shaders may write each make it due; a refresh or a copy-back
+    /// makes it synced again.
+    #[test]
+    fn a_range_no_page_of_changed_since_it_was_taken_is_synced() {
+        let len = 2 * PAGE;
+        let p = crate::watch::tests::pool(2);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            crate::watch::tests::free(p);
+            return; // no host GPU here
+        };
+        // A new copy has every page changed: the first refresh takes them.
+        assert!(!copy.synced(p, len), "nothing is taken yet");
+        assert_eq!(copy.update(p, len), len, "the first refresh copies it whole");
+        assert!(copy.synced(p, len), "taken: refreshing it again copies nothing");
+        assert_eq!(copy.update(p, len), 0, "and so it does");
+        assert!(copy.synced(p + PAGE, 8), "a range of it too");
+        // SAFETY: a byte of our pool; the page's guard takes the write.
+        unsafe { (p as *mut u8).add(PAGE + 8).write_volatile(0x5a) };
+        assert!(!copy.synced(p, len), "the page the title wrote is due again");
+        assert!(!copy.synced(p + PAGE + 100, 1), "so is any range on it");
+        assert!(copy.synced(p, PAGE), "the page it did not write is not");
+        assert_eq!(copy.update(p, len), PAGE, "its page is copied");
+        assert_eq!(copy.read_host(p as u64 + PAGE as u64 + 8, 1)[0] & 0xff, 0x5a);
+        assert!(copy.synced(p, len), "taken again: synced again");
+        // A write the guards do not see is under way: due while it lasts,
+        // and after it.
+        let writing = crate::watch::writing(p + 16, 4);
+        assert!(!copy.synced(p, 32), "a kernel write is under way");
+        drop(writing);
+        assert!(!copy.synced(p, 32), "the kernel wrote it");
+        assert_eq!(copy.update(p, len), PAGE);
+        assert!(copy.synced(p, len));
+        // Shaders may write it: never left out while they may.
+        copy.writing(p, len, false);
+        assert!(!copy.synced(p, len), "a range shaders may write");
+        copy.copy_back(p, len);
+        assert!(copy.synced(p, len), "the title's again once its shaders are done");
+        assert_eq!(copy.update(p, len), 0);
+        // Outside the copy, nothing is synced.
+        assert!(!copy.synced(p + len, 8));
+        unregister(p, p as u64);
+        crate::watch::tests::free(p);
     }
 
     /// Publishing a widened view cannot miss a source update that runs while

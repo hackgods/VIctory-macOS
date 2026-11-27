@@ -600,17 +600,29 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<Sub>);
 /// slice) if only those were.
 pub(crate) type Sub = (u32, Option<std::ops::Range<u32>>);
 
-/// The texture workers: up to a quarter of the CPUs (four at most), none
-/// where that is fewer than two.
+/// The texture workers: a quarter of the CPUs, four at most, unless
+/// `VICTORY_TEXTURE_WORKERS` asks for another count (from ScarlettMac
+/// 4921b7e6, `crate::mac_switches::texture_workers`); none where that is
+/// fewer than two, the work then running on the submitting thread. The same
+/// threads run the parallel refreshes and copy-backs of buffer copies and
+/// the placed views' slots ([`in_parallel`]).
 fn workers() -> Option<&'static rayon::ThreadPool> {
     static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     WORKERS
         .get_or_init(|| {
-            let threads = std::thread::available_parallelism()
-                .map_or(4, |n| n.get() / 4)
-                .clamp(1, 4);
-            if threads < 2 {
-                return None;
+            // 16 when the count cannot be had: a quarter of that is the four
+            // the uploads ran on then.
+            let cpus = std::thread::available_parallelism().map_or(16, |n| n.get());
+            let asked = std::env::var("VICTORY_TEXTURE_WORKERS").ok();
+            let threads = crate::mac_switches::texture_workers(asked.as_deref(), cpus)?;
+            if let Some(asked) = &asked {
+                tracing::info!(
+                    threads,
+                    asked,
+                    cpus,
+                    "VICTORY_TEXTURE_WORKERS: the worker threads that read, hash and detile changed textures and \
+                     split buffer refreshes and copy-backs, the submitting thread not among them"
+                );
             }
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -627,9 +639,10 @@ fn workers() -> Option<&'static rayon::ThreadPool> {
         .as_ref()
 }
 
-/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
-/// at most: the title's own threads need the rest). Reuse the workers and
-/// their thread-local scratch across submissions.
+/// Runs `f(i)` for each `i` below `n` on the workers ([`workers`]: a quarter
+/// of the CPUs, four at most, or the count `VICTORY_TEXTURE_WORKERS` asks
+/// for; the title's own threads need the rest). Reuse the workers and their
+/// thread-local scratch across submissions.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     if n > 1
         && let Some(pool) = workers()

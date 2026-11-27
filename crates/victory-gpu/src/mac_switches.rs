@@ -436,6 +436,48 @@ fn census_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// From ScarlettMac 4921b7e6: whether a submission's refresh of a buffer
+/// range none of whose pages the title wrote since the host copy took them
+/// is left out (`VICTORY_SYNC_EPOCH=1`, `crate::shadow::Shadow::synced`):
+/// `Shadow::update` would copy nothing there, and asking costs the copy's
+/// locks and a place in the submission's batch. Off (unset, `0`, or
+/// anything else): every request is refreshed, as before. Nothing with
+/// `VICTORY_FLIGHTS=1`, where refreshes are asked for while the submission
+/// before still runs and its copy-back can still change title memory.
+pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = epoch(std::env::var("VICTORY_SYNC_EPOCH").ok().as_deref());
+        let on = asked && !flights();
+        if on {
+            tracing::info!(
+                "VICTORY_SYNC_EPOCH=1: a refresh of a buffer range no page of changed since the copy took it is left out"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_SYNC_EPOCH=1 does nothing with VICTORY_FLIGHTS=1");
+        }
+        on
+    })
+}
+
+/// [`sync_epoch`]'s rule: `1` turns it on; every other value leaves it off.
+fn epoch(value: Option<&str>) -> bool {
+    setting(value, false)
+}
+
+/// From ScarlettMac 4921b7e6: `VICTORY_TEXTURE_WORKERS`'s rule
+/// (`crate::texture`'s worker threads): a count of 2 or more, at most the
+/// CPUs, asks for that many; anything else (and unset) leaves the quarter
+/// of the CPUs, four at most, as before. `None` where that is fewer than
+/// two: the work runs on the submitting thread.
+pub(crate) fn texture_workers(value: Option<&str>, cpus: usize) -> Option<usize> {
+    let threads = match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(asked) if asked >= 2 => asked.min(cpus.max(1)),
+        _ => (cpus / 4).clamp(1, 4),
+    };
+    (threads >= 2).then_some(threads)
+}
+
 /// Whether a heap sync pass also holds the census updates of the slots
 /// `HostHeap::mirror` and `HostHeap::make_null` make in it, and enters them
 /// a batch at a time (`crate::bindless::Pass`, `crate::census_fast::Hold`)
@@ -732,7 +774,36 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
+    use super::{
+        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, texture_workers, uav_size,
+        writers,
+    };
+
+    #[test]
+    fn texture_workers_are_a_quarter_of_the_cpus_unless_asked_for() {
+        for off in [None, Some(""), Some("0"), Some("1"), Some("many")] {
+            assert_eq!(texture_workers(off, 18), Some(4), "{off:?}");
+            assert_eq!(texture_workers(off, 14), Some(3), "{off:?}");
+            assert_eq!(texture_workers(off, 8), Some(2), "{off:?}");
+            assert_eq!(texture_workers(off, 4), None, "{off:?}");
+            assert_eq!(texture_workers(off, 1), None, "{off:?}");
+        }
+        assert_eq!(texture_workers(Some("6"), 18), Some(6));
+        assert_eq!(texture_workers(Some(" 6 "), 14), Some(6));
+        assert_eq!(texture_workers(Some("64"), 14), Some(14));
+        assert_eq!(texture_workers(Some("2"), 18), Some(2));
+        // Two asked for on a one-CPU machine: none, as before.
+        assert_eq!(texture_workers(Some("2"), 1), None);
+    }
+
+    #[test]
+    fn the_epoch_skip_is_on_only_when_asked_for() {
+        assert!(epoch(Some("1")));
+        // Unset, `0`, or a word: every request refreshes, as the bench needs.
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("yes")] {
+            assert!(!epoch(off), "{off:?}");
+        }
+    }
 
     /// How many tests have the copy-order split forced on right now.
     pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

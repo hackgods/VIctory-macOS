@@ -140,8 +140,15 @@ pub(crate) enum C {
     TwinToDepthBytes,
     TwinToTwin,
     TwinToTwinBytes,
+    /// Heap syncs: slots whose records differ from what they hold, the time
+    /// making them (with the re-reads), the slots made again (or nulled),
+    /// and the kernel calls re-reading their records under the slot lock.
+    SyncStale,
+    SyncMirrorUs,
+    SyncMade,
+    SyncRereads,
 }
-const COUNTERS: usize = C::TwinToTwinBytes as usize + 1;
+const COUNTERS: usize = C::SyncRereads as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -443,6 +450,15 @@ pub(crate) fn log(frames: f64) {
         c[C::GroupCalls as usize],
         c[C::GroupBarriers as usize],
         c[C::GroupCalls as usize],
+    );
+    tracing::info!(
+        "  heap sync per frame: {:.0} slots looked at, {:.0} stale, {:.0} made again in {:.1} ms with {:.0} \
+         re-reads",
+        c[C::SyncSlots as usize],
+        c[C::SyncStale as usize],
+        c[C::SyncMade as usize],
+        ms(c[C::SyncMirrorUs as usize]),
+        c[C::SyncRereads as usize],
     );
     tracing::info!(
         "  depth twin copies per frame: {:.1} into depth ({:.2} MB), {:.1} into twin ({:.2} MB)",

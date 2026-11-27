@@ -148,9 +148,79 @@ pub(crate) fn learn(missed: &[Missed]) {
             }
             None => {
                 MADE[2].fetch_add(1, Ordering::Relaxed);
+                describe_once(m);
             }
         }
     }
+}
+
+/// What the host's memory map holds at a miss left without a copy, logged
+/// once per 256 MiB region (up to 32): its state, type and allocation at
+/// the address, and the first allocation in the region if any. Runs of 27
+/// November missed the regions at 0x7150000000 and 0x7160000000 every
+/// frame with nothing committed in them.
+fn describe_once(missed: Missed) {
+    static SEEN: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+    let at = match missed {
+        Missed::Page(a) | Missed::Region(a) => a,
+    };
+    let region = at & !(REGION - 1);
+    {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&region) || seen.len() >= 32 {
+            return;
+        }
+        seen.push(region);
+    }
+    let here = query(at.max(LOWEST));
+    let first = first_allocated(region.max(LOWEST), region + REGION).map(query);
+    tracing::info!(
+        address = format_args!("{at:#x}"),
+        page = matches!(missed, Missed::Page(_)),
+        ?here,
+        ?first,
+        "title memory reached by a pointer has no committed memory to copy (VICTORY_POINTER_PAGES)"
+    );
+}
+
+/// The host's memory map at `at`: (state, type, protection, allocation
+/// base, region base, region size), as hex text.
+fn query(at: u64) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 {
+        return "none".into();
+    }
+    format!(
+        "state {:#x} type {:#x} protect {:#x} allocation {:#x} region {:#x}+{:#x}",
+        info.State, info.Type, info.Protect, info.AllocationBase as u64, info.BaseAddress as u64, info.RegionSize
+    )
+}
+
+/// The first address in `[start, end)` that is reserved or committed.
+fn first_allocated(start: u64, end: u64) -> Option<u64> {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = start;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        if unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) } == 0 {
+            return None;
+        }
+        if info.State != MEM_FREE {
+            return Some(p.max(info.BaseAddress as u64));
+        }
+        let next = info.BaseAddress as u64 + info.RegionSize as u64;
+        if next <= p {
+            return None;
+        }
+        p = next;
+    }
+    None
 }
 
 /// Copies asked for since the last call: (for pages, for regions, left

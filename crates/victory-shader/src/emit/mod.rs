@@ -319,6 +319,8 @@ mod waterfall_tests;
 mod walk;
 #[cfg(test)]
 mod walk_tests;
+#[cfg(test)]
+mod whole_wave_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};

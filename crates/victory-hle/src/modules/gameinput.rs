@@ -1229,6 +1229,8 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
+        /// macOS port: `VICTORY_INPUT_REFOCUS`.
+        refocus: super::mac::Refocus,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1261,16 +1263,19 @@ mod host {
             // macOS port: scripted keys also in the normal build, so a test
             // run needs nobody at the keyboard (empty unless VICTORY_KEYS is set).
             let mut down = scripted();
-            if focused() {
+            let focused = focused();
+            let mut held = Vec::new();
+            if focused {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
-                let held: Vec<u8> = (0x08..=0xFE_u8)
+                held = (0x08..=0xFE_u8)
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
                     .collect();
-                down.extend(held);
             }
+            self.refocus.filter(focused, &mut held);
+            down.extend(held);
             down.into_iter().map(key_state).collect()
         }
 

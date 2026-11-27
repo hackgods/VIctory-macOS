@@ -17,6 +17,13 @@
 //! XInput values are raw: a stick at rest reads up to several per cent off
 //! centre, more on a worn pad, and every wobble of it was a new reading. The
 //! title has a dead zone of its own; this one comes before it.
+//!
+//! `VICTORY_INPUT_REFOCUS=1`: keys already down when the title's window gets
+//! the focus back are left out until they are seen up. Wine's macOS driver
+//! posts a key's release only while our app is active (`cocoa_app.m`,
+//! `NSEventTypeKeyUp` goes through only for keys it saw go down, and only to
+//! our windows), so a key let go in another app, Cmd among them after
+//! Cmd-Tab, stays down in `GetAsyncKeyState` until it is pressed again.
 
 use super::{FALLBACK, PADS, PadState};
 
@@ -94,6 +101,45 @@ impl Latch {
             right_trigger: self.triggers[1],
             ..pad
         }
+    }
+}
+
+/// Keys held across a focus change; see the module notes.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default)]
+pub(super) struct Refocus {
+    /// `None` until the environment was read.
+    on: Option<bool>,
+    focused: bool,
+    /// Down when the focus came back, and not seen up since.
+    ignored: Vec<u8>,
+}
+
+#[cfg(any(windows, test))]
+impl Refocus {
+    /// Takes out of `held` (virtual keys the host reports down while
+    /// `focused`, none without it) the keys held across a focus change.
+    pub(super) fn filter(&mut self, focused: bool, held: &mut Vec<u8>) {
+        let on = *self.on.get_or_insert_with(|| {
+            let on = std::env::var("VICTORY_INPUT_REFOCUS")
+                .is_ok_and(|v| !matches!(v.trim(), "" | "0" | "off"));
+            if on {
+                tracing::info!(
+                    "input refocus: keys down when the focus comes back wait for their release (VICTORY_INPUT_REFOCUS)"
+                );
+            }
+            on
+        });
+        if !on {
+            return;
+        }
+        if focused && !self.focused && !held.is_empty() {
+            tracing::info!(keys = ?held, "input refocus: keys left out until released");
+            self.ignored = held.clone();
+        }
+        self.focused = focused;
+        self.ignored.retain(|k| held.contains(k));
+        held.retain(|k| !self.ignored.contains(k));
     }
 }
 
@@ -247,6 +293,36 @@ mod tests {
         assert_eq!(buttons(&mut mac, 0, 20), A);
         // Never handed out: shown as the host has it after `LATCH_MAX`.
         assert_eq!(buttons(&mut mac, 0, LATCH_MAX + 1), 0);
+    }
+
+    #[test]
+    fn keys_held_across_a_focus_change_wait_for_their_release() {
+        let mut refocus = Refocus {
+            on: Some(true),
+            ..Refocus::default()
+        };
+        let mut keys = |focused, mut held: Vec<u8>| {
+            refocus.filter(focused, &mut held);
+            held
+        };
+        assert_eq!(keys(true, vec![]), [0u8; 0]);
+        assert_eq!(keys(true, vec![b'W']), [b'W']);
+        // Away: nothing; back with Wine still holding W (its release went
+        // to another app) and Cmd (0x5B).
+        assert_eq!(keys(false, vec![]), [0u8; 0]);
+        assert_eq!(keys(true, vec![b'W', 0x5B]), [0u8; 0]);
+        assert_eq!(keys(true, vec![b'W', 0x5B, b'A']), [b'A']);
+        // W seen up once: pressed again, it counts.
+        assert_eq!(keys(true, vec![0x5B]), [0u8; 0]);
+        assert_eq!(keys(true, vec![b'W', 0x5B]), [b'W']);
+        // Off: unchanged.
+        let mut off = Refocus {
+            on: Some(false),
+            ..Refocus::default()
+        };
+        let mut held = vec![b'W'];
+        off.filter(true, &mut held);
+        assert_eq!(held, [b'W']);
     }
 
     #[test]

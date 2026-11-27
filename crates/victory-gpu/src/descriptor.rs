@@ -620,9 +620,12 @@ pub(crate) enum View {
 /// title releases it, its entries are freed for reuse under a new
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
-/// next. Views without a resource object (constant buffers, placed memory
-/// views) are capped oldest-first (`VICTORY_OWNERLESS_VIEWS`) so they cannot
-/// accumulate without bound over a long run.
+/// next.
+/// shortcut: views without a resource object (constant buffers, memory
+/// views, samplers) are kept for the run; they are bounded by the title's
+/// memory and sampler states. None can be freed by age: a descriptor naming
+/// one may lie anywhere in title memory (a table written once at load, or
+/// copied as bytes), and freeing the oldest left the world's tables null.
 #[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
@@ -634,10 +637,6 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
-    /// Entries of views that no resource releases (constant buffers and
-    /// placed memory views), oldest first, with the generation each was made
-    /// at: past [`ownerless_cap`] the oldest is freed.
-    ownerless: std::collections::VecDeque<(u32, u32)>,
 }
 
 /// Read by every view written and every slot a draw binds, on the
@@ -649,22 +648,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
-    ownerless: std::collections::VecDeque::new(),
 });
-
-/// How many table entries of views without a resource are kept
-/// ([`Views::ownerless`]). Past this cap the oldest entries are freed and
-/// their generation bumped so stale handles read as empty.
-/// `VICTORY_OWNERLESS_VIEWS=<n>` keeps `n` (`0`: unlimited).
-fn ownerless_cap() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("VICTORY_OWNERLESS_VIEWS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1 << 20)
-    })
-}
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 impl View {
@@ -679,44 +663,19 @@ impl View {
 }
 
 impl Views {
-    fn count_address(&mut self, view: &View, added: bool) {
-        let kind = match view {
-            View::Constant(..) => 0,
-            View::Placed(..) => 1,
-            _ => return,
-        };
-        let n = &mut self.address_entries[kind];
-        *n = if added { *n + 1 } else { n.saturating_sub(1) };
-    }
-
-    fn free_ownerless(&mut self, i: u32, generation: u32) -> bool {
-        let Some((view, current)) = self.list.get(i as usize).cloned() else {
-            return false;
-        };
-        if current != generation || self.index.get(&view) != Some(&i) {
-            return false;
+    /// Counts a new entry of a view without a resource object, which stays.
+    fn count_address(&mut self, view: &View) {
+        match view {
+            View::Constant(..) => self.address_entries[0] += 1,
+            View::Placed(..) => self.address_entries[1] += 1,
+            _ => {}
         }
-        self.index.remove(&view);
-        self.count_address(&view, false);
-        self.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        self.free.push(i);
-        true
     }
 
-    /// Inserts or looks up `view`, evicting oldest ownerless entries to keep
-    /// at most `cap` (`0`: unlimited). Returns `(index, generation, evicted)`.
-    fn entry_kept(&mut self, view: View, cap: usize) -> (u32, u32, bool) {
+    /// Looks up `view`, or inserts it: its `(index, generation)`.
+    fn entry_kept(&mut self, view: View) -> (u32, u32) {
         if let Some(&i) = self.index.get(&view) {
-            return (i, self.list[i as usize].1, false);
-        }
-        let ownerless =
-            view.resources() == [0, 0] && matches!(view, View::Constant(..) | View::Placed(..));
-        let mut evicted = false;
-        if ownerless && cap != 0 {
-            while self.ownerless.len() >= cap {
-                let (old_i, old_gen) = self.ownerless.pop_front().expect("at or over cap");
-                evicted |= self.free_ownerless(old_i, old_gen);
-            }
+            return (i, self.list[i as usize].1);
         }
         let i = match self.free.pop() {
             Some(i) => {
@@ -729,15 +688,12 @@ impl Views {
             }
         };
         let generation = self.list[i as usize].1;
-        self.count_address(&view, true);
+        self.count_address(&view);
         for r in view.resources().into_iter().filter(|&r| r != 0) {
             self.by_resource.entry(r).or_default().push(i);
         }
         self.index.insert(view, i);
-        if ownerless && cap != 0 {
-            self.ownerless.push_back((i, generation));
-        }
-        (i, generation, evicted)
+        (i, generation)
     }
 }
 
@@ -774,10 +730,7 @@ fn record(handle: u64, view: View) {
         return;
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
-    let (i, generation, evicted) = views.entry_kept(view, ownerless_cap());
-    if evicted {
-        VIEWS_FORGOT.fetch_add(1, std::sync::atomic::Ordering::Release);
-    }
+    let (i, generation) = views.entry_kept(view);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -1798,8 +1751,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// Views without a resource object are never freed, however many are
+    /// made after them: a slot written once still names its view (the
+    /// world's tables went null once #414's cap of them was reached).
     #[test]
-    fn ownerless_entries_are_capped() {
+    fn ownerless_entries_are_kept() {
         let mut views = Views::default();
         let placed = |n: u32| View::Placed(false, [n; 14], [n; 16]);
         let live_counts = |v: &Views| {
@@ -1815,52 +1771,21 @@ pub(crate) mod tests {
                 .get(i as usize)
                 .is_some_and(|(v, g)| *g == generation && v == view)
         };
-
-        let mut handles = Vec::new();
-        for n in 0..10u32 {
-            let (i, g, evicted) = views.entry_kept(placed(n), 4);
-            assert_eq!(evicted, n >= 4);
-            handles.push((i, g));
-            assert_eq!(views.address_entries, live_counts(&views));
+        let first = views.entry_kept(placed(0));
+        let constant = views.entry_kept(View::Constant(0x5678, 256));
+        for n in 1..5000u32 {
+            views.entry_kept(placed(n));
+            views.entry_kept(View::Constant(0x1_0000 + 256 * u64::from(n), 256));
         }
-        assert_eq!(views.index.len(), 4, "four kept");
-        assert!(views.list.len() <= 4, "entries reused in place: {}", views.list.len());
-        for (n, &h) in handles.iter().enumerate().take(6) {
-            assert!(!named(&views, h, &placed(n as u32)), "entry {n} stale");
-        }
-        for (n, &h) in handles.iter().enumerate().skip(6) {
-            assert!(named(&views, h, &placed(n as u32)), "entry {n} kept");
-        }
-        // Re-recording a live entry reuses it without evicting.
-        assert_eq!(views.entry_kept(placed(9), 4), (handles[9].0, handles[9].1, false));
-        // A resource-owned view is never evicted by ownerless churn.
-        let shader = View::Shader(0x1234, None);
-        let (si, sg, evicted) = views.entry_kept(shader.clone(), 4);
-        assert!(!evicted);
-        for n in 10..40 {
-            views.entry_kept(placed(n), 4);
-        }
-        views.entry_kept(View::Constant(0x5678, 256), 4);
-        assert!(named(&views, (si, sg), &shader));
-        assert_eq!(views.index.len(), 5, "1 resource view + 4 ownerless");
-        assert_eq!(views.address_entries, [1, 3]);
-        assert_eq!(views.address_entries, live_counts(&views));
-        // Cap 1 keeps only the latest ownerless view.
-        let mut single = Views::default();
-        let (a_i, a_g, _) = single.entry_kept(View::Constant(0x1000, 64), 1);
-        let (b_i, b_g, evicted) = single.entry_kept(View::Constant(0x2000, 64), 1);
-        assert!(evicted);
-        assert!(!named(&single, (a_i, a_g), &View::Constant(0x1000, 64)));
-        assert!(named(&single, (b_i, b_g), &View::Constant(0x2000, 64)));
-        assert_eq!(single.address_entries, [1, 0]);
-        // Cap 0 keeps all entries without growing `ownerless`.
-        let ownerless_before = views.ownerless.len();
-        for n in 40..60 {
-            let (_, _, evicted) = views.entry_kept(placed(n), 0);
-            assert!(!evicted);
-        }
-        assert_eq!(views.index.len(), 5 + 20);
-        assert_eq!(views.ownerless.len(), ownerless_before);
+        assert!(named(&views, first, &placed(0)), "the first placed view");
+        assert!(
+            named(&views, constant, &View::Constant(0x5678, 256)),
+            "the first constant view"
+        );
+        // Recording it again finds the same entry.
+        assert_eq!(views.entry_kept(placed(0)), first);
+        assert_eq!(views.index.len(), 2 * 5000);
+        assert_eq!(views.address_entries, [5000, 5000]);
         assert_eq!(views.address_entries, live_counts(&views));
         let _ = views_kept();
     }

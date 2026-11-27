@@ -42,6 +42,8 @@ use crate::descriptor::host::HostHeap;
 use crate::host::HostList;
 use crate::shadow::Shadow;
 
+pub(crate) mod pointer_pages;
+
 /// Bits in a list's dirty-page bitmap (one per level-2 entry across all blocks).
 const BITMAP_BITS: usize = (CAPACITY + 1) * BLOCK;
 /// 32-bit words in a dirty-page bitmap.
@@ -371,6 +373,15 @@ pub(crate) fn log_frame() {
     uses.sort_by(|a, b| b.1.cmp(a.1));
     let uses: Vec<String> = uses.iter().take(32).map(|(p, n)| format!("{n} {p}")).collect();
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
+    if pointer_pages::on() {
+        let [pages, regions, left] = pointer_pages::take();
+        tracing::info!(
+            pages,
+            regions,
+            left,
+            "title memory reached by pointers this frame (VICTORY_POINTER_PAGES): copies asked for missed pages and regions, and misses left with none (not committed)"
+        );
+    }
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
@@ -549,6 +560,10 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let block = entry / BLOCK;
+            // Mac (`VICTORY_POINTER_PAGES=2`): the null page is no miss.
+            if pointer_pages::null_page_free() && pointer_pages::is_null_page(&l.blocks, entry, BLOCK) {
+                continue;
+            }
             if block == 0
                 || l.blocks.get(block).is_none()
                 || l.owner.get(entry).is_none_or(|o| o.is_none())
@@ -602,6 +617,10 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let mut writes = Vec::new();
+        // Mac (`VICTORY_POINTER_PAGES=1`): every miss, for copies of them.
+        let learning = pointer_pages::on();
+        let null_free = pointer_pages::null_page_free();
+        let mut learn = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
             if *mark == 0 {
@@ -616,15 +635,22 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    if learning {
+                        learn.push(pointer_pages::Missed::Region((entry as u64) << 28));
+                    }
                     continue;
                 };
                 let at = (l1 << 28 | page << 16) as u64;
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
+                    _ if null_free && pointer_pages::is_null_page(blocks, entry, BLOCK) => {}
                     _ => {
                         pages += 1;
                         missed.push(at);
+                        if learning {
+                            learn.push(pointer_pages::Missed::Page(at));
+                        }
                     }
                 }
             }
@@ -649,6 +675,11 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 "title memory page written back"
             );
             written += 1;
+        }
+        // The copies come after this list's copy-backs: a page that has one
+        // from now on is in the next submission's table.
+        if learning {
+            pointer_pages::learn(&learn);
         }
         stats(|s| {
             s.written += written;
@@ -795,6 +826,29 @@ mod tests {
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
         assert!(has_missed(&marks, &l));
+    }
+
+    /// `VICTORY_POINTER_PAGES=2`: a read of the null page (region 0's
+    /// first page, in a block) is no miss; any other page still is.
+    #[test]
+    fn the_null_page_is_no_miss_under_pointer_pages_2() {
+        let l = Layout {
+            copies: Vec::new(),
+            bits: Vec::new(),
+            blocks: vec![usize::MAX, 0],
+            owner: vec![None; 2 * BLOCK],
+        };
+        let mut marks = vec![0u32; BITMAP_WORDS];
+        marks[BLOCK / 32] = 1 << (BLOCK % 32);
+        assert!(has_missed(&marks, &l), "a miss as before");
+        pointer_pages::NULL_FREE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let free = has_missed(&marks, &l);
+        let next = BLOCK + 1;
+        marks[next / 32] |= 1 << (next % 32);
+        let other = has_missed(&marks, &l);
+        pointer_pages::NULL_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!free, "the null page alone");
+        assert!(other, "the page after it");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -1165,6 +1219,81 @@ void main() {
         if FRAMES.load(std::sync::atomic::Ordering::Relaxed) == frame {
             assert_eq!(kept, 0x44, "a submission that missed nothing keeps its writes");
         }
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+    }
+
+    /// `VICTORY_POINTER_PAGES=1`: memory a shader reaches only by address,
+    /// in a 256 MiB region no copy is in, reads 0; once a list marked it
+    /// missed, it has a copy, and the next submission reads its bytes.
+    #[test]
+    fn memory_reached_by_a_pointer_has_a_copy_after_its_miss() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let (Some((write_root, writer)), Some((read_root, reader))) = (pipeline(WRITE), pipeline(SOURCE)) else {
+            return; // no compiler for the shader here
+        };
+        let (out, out_cpu) = host.shared_buffer(256).unwrap();
+        // SAFETY: a live buffer.
+        let out_gpu = unsafe { out.GetGPUVirtualAddress() };
+        let alloc = |len: usize, from: u64| {
+            (0..256u64)
+                .map(|k| from + (k << 28))
+                // SAFETY: a fresh allocation where nothing is mapped, or none.
+                .map(|hint| unsafe { VirtualAlloc(hint as *const _, len, MEM_RESERVE | MEM_COMMIT | crate::watch::tests::MEM_WRITE_WATCH, PAGE_READWRITE) } as usize)
+                .find(|&p| p != 0)
+                .expect("memory below 2^40")
+        };
+        // A page with a copy, which the write shader writes; and 4 MiB in a
+        // region of its own that nothing views (a structure's nodes).
+        let p = alloc(PAGE, 0x60_0000_0000);
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        let q = alloc(4 << 20, 0x68_0000_0000);
+        let node = q + 32;
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (node as *mut u32).write_volatile(0x77) };
+        let list = host.new_list().unwrap();
+        let submit = |root: &windows::Win32::Graphics::Direct3D12::ID3D12RootSignature,
+                      pso: &windows::Win32::Graphics::Direct3D12::ID3D12PipelineState,
+                      uav: Option<u64>,
+                      constants: &[u32]| {
+            let map = bind(&list, OURS).expect("a page table");
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, uav.unwrap_or(map.dirty));
+                list.list.SetComputeRoot32BitConstants(3, constants.len() as u32, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        };
+        let read = || -> u32 {
+            submit(&read_root, &reader, Some(out_gpu), &[node as u32, (node >> 32) as u32, 0]);
+            // SAFETY: the mapped output, the GPU done with it.
+            unsafe { out_cpu.cast::<u32>().read_volatile() }
+        };
+        pointer_pages::FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = pointer_pages::take();
+        assert_eq!(read(), 0, "no copy holds it yet: it reads 0");
+        // A write through the copy, and a read of the node marked missed.
+        let at = p + 16;
+        submit(&write_root, &writer, None, &[at as u32, (at >> 32) as u32, 0x22, node as u32, (node >> 32) as u32]);
+        let [pages, regions, _] = pointer_pages::take();
+        pointer_pages::FORCED.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!((pages, regions), (0, 1), "its region had no block: a copy for the region's first bytes");
+        assert!(crate::shadow::all().iter().any(|c| c.range().0 <= node as u64 && node as u64 + 4 <= c.range().0 + c.range().1), "a copy holds the node");
+        assert_eq!(read(), 0x77, "the next submission reads the node");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
     }

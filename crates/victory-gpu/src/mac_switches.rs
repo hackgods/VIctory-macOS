@@ -579,6 +579,31 @@ fn spans_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// From VIctory-macOS #452 (18f33b86): whether a title copy made while a
+/// submission is prepared (not into memory shown at two addresses) makes
+/// only the pending refreshes whose queued ranges reach its window, leaving
+/// the others queued until the submission's flush (`crate::host`,
+/// `Batch::title_copied`). Off: every title copy makes all pending
+/// refreshes first, as before. Only with `VICTORY_FLUSH_OVERLAPPING=1`, read
+/// once.
+pub(crate) fn flush_overlapping() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = overlapping_rule(std::env::var("VICTORY_FLUSH_OVERLAPPING").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_FLUSH_OVERLAPPING=1: a title copy makes only the pending refreshes it can change (VIctory-macOS #452)"
+            );
+        }
+        on
+    })
+}
+
+/// `VICTORY_FLUSH_OVERLAPPING`'s rule: on only for `1`.
+fn overlapping_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// `VICTORY_METAL_BC_CASTS`'s rule: on only for `1`.
 fn bc_casts_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
@@ -878,8 +903,8 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, spans_rule,
-        texture_workers, uav_size, writers,
+        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
+        spans_rule, texture_workers, uav_size, writers,
     };
 
     thread_local! {
@@ -904,6 +929,14 @@ pub(crate) mod tests {
     impl Drop for SpansHere {
         fn drop(&mut self) {
             SPANS_HERE.with(|on| on.set(false));
+        }
+    }
+
+    #[test]
+    fn flushing_only_overlapping_refreshes_is_on_only_when_asked_for() {
+        assert!(overlapping_rule(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("yes")] {
+            assert!(!overlapping_rule(off), "{off:?}");
         }
     }
 

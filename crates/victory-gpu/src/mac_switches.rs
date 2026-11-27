@@ -758,6 +758,10 @@ fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
 /// once stays until the slot is rewritten, a slot left null is made when a
 /// shader reads it.
 pub(crate) fn placed_at_once() -> PlacedAtOnce {
+    #[cfg(test)]
+    if let Some(mode) = tests::PLACED_HERE.with(std::cell::Cell::get) {
+        return mode;
+    }
     static ON: OnceLock<PlacedAtOnce> = OnceLock::new();
     let a = *ON.get_or_init(|| {
         let mode = placed_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
@@ -1176,6 +1180,50 @@ pub(crate) mod tests {
         fn drop(&mut self) {
             SPANS_HERE.with(|on| on.set(false));
         }
+    }
+
+    thread_local! {
+        /// `placed_at_once` on this thread, whatever the environment says
+        /// ([`PlacedHere`]).
+        pub(crate) static PLACED_HERE: std::cell::Cell<Option<super::PlacedAtOnce>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// While it lives, `placed_at_once` is `mode` on this thread: for tests
+    /// that assert what a heap sync does with a placed view under one rule,
+    /// so that `VICTORY_PLACED_AT_ONCE` set for the suite (or `=read`'s
+    /// history, one per process, filled by other tests) does not change it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct PlacedHere(Option<super::PlacedAtOnce>);
+
+    impl PlacedHere {
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn new(mode: super::PlacedAtOnce) -> Self {
+            PlacedHere(PLACED_HERE.with(|here| here.replace(Some(mode))))
+        }
+    }
+
+    impl Drop for PlacedHere {
+        fn drop(&mut self) {
+            PLACED_HERE.with(|here| here.set(self.0));
+        }
+    }
+
+    #[test]
+    fn a_placed_rule_pinned_here_holds_on_this_thread_only() {
+        use super::{PlacedAtOnce, placed_at_once};
+        let outside = placed_at_once();
+        {
+            let _read = PlacedHere::new(PlacedAtOnce::Read);
+            assert_eq!(placed_at_once(), PlacedAtOnce::Read);
+            {
+                let _off = PlacedHere::new(PlacedAtOnce::Off);
+                assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+            }
+            assert_eq!(placed_at_once(), PlacedAtOnce::Read, "the outer pin is back");
+            assert_eq!(std::thread::spawn(placed_at_once).join().unwrap(), outside, "other threads keep theirs");
+        }
+        assert_eq!(placed_at_once(), outside);
     }
 
     #[test]

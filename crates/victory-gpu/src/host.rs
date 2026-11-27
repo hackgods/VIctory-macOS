@@ -4150,6 +4150,10 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
+    /// As `extents`, for the copies whose refreshes are still pending: a
+    /// title copy flushes only the ones its bytes can be in (from
+    /// pragyaangaur/VIctory-macOS 3da303b, #533).
+    pending_extents: victory_formats::extents::Extents,
     /// Aliased memory asked for (`crate::alias`), by copy: never copied,
     /// counted once per submission for the frame line.
     zero_copy: AddressMap<crate::ranges::Ranges>,
@@ -4208,10 +4212,18 @@ impl Batch {
             }
             return;
         }
-        let i = *self.pending.entry(key).or_insert_with(|| {
-            self.refreshes.push((shadow.clone(), Default::default()));
-            self.refreshes.len() - 1
-        });
+        let i = match self.pending.get(&key) {
+            Some(&i) => i,
+            None => {
+                let (start, len) = shadow.range();
+                self.pending_extents
+                    .flushed(key, start as usize, (start + len) as usize);
+                self.refreshes.push((shadow.clone(), Default::default()));
+                let i = self.refreshes.len() - 1;
+                self.pending.insert(key, i);
+                i
+            }
+        };
         for (from, to) in todo {
             self.refreshes[i].1.insert(from, to, JOIN);
         }
@@ -4244,28 +4256,37 @@ impl Batch {
         }
         // Flush only pending refreshes whose ranges overlap the destination
         // window; disjoint copies stay queued so they coalesce across lists.
+        // The index reaches the copies whose memory can hold the window's
+        // bytes; the rest are left queued without a look.
         let mut overlapping = Vec::new();
-        let mut i = 0;
-        while i < self.refreshes.len() {
-            let overlaps = {
-                let (shadow, ranges) = &self.refreshes[i];
-                let (start, slen) = shadow.range();
-                let (s_start, s_end) = (start as usize, start.saturating_add(slen) as usize);
-                s_start < to
-                    && s_end > from
-                    && ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from)
+        let mut stale = 0;
+        for key in self.pending_extents.overlapping(from, to) {
+            let Some(&i) = self.pending.get(&key) else {
+                stale += 1;
+                continue;
             };
-            if overlaps {
-                let (shadow, ranges) = self.refreshes.swap_remove(i);
-                let key = std::sync::Arc::as_ptr(&shadow) as usize;
-                self.pending.remove(&key);
-                if let Some((moved, _)) = self.refreshes.get(i) {
-                    self.pending
-                        .insert(std::sync::Arc::as_ptr(moved) as usize, i);
-                }
-                overlapping.push((shadow, ranges));
-            } else {
-                i += 1;
+            let (_, ranges) = &self.refreshes[i];
+            if !ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from) {
+                continue;
+            }
+            let (shadow, ranges) = self.refreshes.swap_remove(i);
+            self.pending.remove(&key);
+            if let Some((moved, _)) = self.refreshes.get(i) {
+                self.pending
+                    .insert(std::sync::Arc::as_ptr(moved) as usize, i);
+            }
+            overlapping.push((shadow, ranges));
+        }
+        // The entries of the copies flushed above name nothing pending any
+        // more; once they outnumber the live ones, filing the live ones
+        // again costs less than walking past the dead ones.
+        if stale > self.refreshes.len() {
+            self.pending_extents.clear();
+            for (shadow, _) in &self.refreshes {
+                let (start, len) = shadow.range();
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                self.pending_extents
+                    .flushed(key, start as usize, (start + len) as usize);
             }
         }
         if !overlapping.is_empty() {
@@ -4284,6 +4305,7 @@ impl Batch {
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
         self.pending.clear();
+        self.pending_extents.clear();
         let work = std::mem::take(&mut self.refreshes);
         self.flush_work(work)
     }

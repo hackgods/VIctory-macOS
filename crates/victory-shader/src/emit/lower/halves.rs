@@ -76,8 +76,7 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves.
     pub(super) fn halves_lds(group: u32, lds_dwords: u32) -> Option<Why> {
-        (lds_dwords > 0 && group > HALF && group <= 64)
-            .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
+        (lds_dwords > 0 && group > HALF && group <= 64).then_some(LDS_ACROSS)
     }
 
     /// The flat thread id, relabelled so that each host wave holds a run of
@@ -392,6 +391,24 @@ impl Lower<'_> {
         Ok(self.s.m.select(c, upper, hi, lo))
     }
 
+    /// `v_readfirstlane_b32` of `x` under EXEC `exec` in literal halves: the
+    /// console's first lane of EXEC across both halves, lane zero when EXEC
+    /// is empty (#435).
+    pub(super) fn first_lane_of_exec(&mut self, x: V, exec: V) -> Result<V, Why> {
+        let c = self.cur;
+        let (lo, hi) = self.ballot_across_halves(exec, c)?;
+        let (zero, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let first_lo = self.unary_bits(c, 32, lo);
+        let first_hi = self.unary_bits(c, 32, hi);
+        let upper = self.s.m.bin(c, Bin::Add, first_hi, k32);
+        let has_lo = self.s.m.cmp(c, pred::NE, lo, zero);
+        let has_hi = self.s.m.cmp(c, pred::NE, hi, zero);
+        // The console reads lane zero when EXEC is empty.
+        let upper = self.s.m.select(c, has_hi, upper, zero);
+        let lane = self.s.m.select(c, has_lo, first_lo, upper);
+        self.read_lane_across(x, lane)
+    }
+
     /// `v_readfirstlane_b32` of `x`, in halves ([`Lower::across_here`]): the
     /// first active lane across both 32-lane halves. When `active` is `None`,
     /// every lane is active and the lower half's lane 0 wins; when `active` is
@@ -561,6 +578,28 @@ impl Lower<'_> {
             Op::MinF => self.binary(36, lo, hi),
             Op::MaxF => self.binary(35, lo, hi),
         })
+    }
+}
+
+pub(super) const LDS_ACROSS: Why =
+    "LDS one console wave64 shares without barriers, on a host of 32-lane waves";
+pub(super) const REDUCTION_ACROSS: Why =
+    "a wave reduction over both 32-lane halves (wave64 on a 32-lane host)";
+pub(super) const READ_ACROSS: Why =
+    "a lane read that may cross 32-lane halves (wave64 on a 32-lane host)";
+
+/// Whether both halves calculate the same selector for a lane read or write.
+pub(super) fn uniform_selector(inst: &Inst, alike: &Set<Value>) -> bool {
+    let Fields::Valu(v) = &inst.fields else {
+        return false;
+    };
+    match v.src.get(1) {
+        Some(Operand::Const(k)) => crate::resource::inline(*k).is_some(),
+        Some(Operand::Literal(_) | Operand::Scalar { code: NULL, .. }) => true,
+        Some(Operand::Scalar { code, .. }) => {
+            inst.read(Reg::S(*code)).is_some_and(|v| alike.contains(&v))
+        }
+        _ => false,
     }
 }
 

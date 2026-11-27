@@ -1234,12 +1234,12 @@ impl Lower<'_> {
                 _ => {
                     let blk = self.block[b].ok_or("an unreachable join")?;
                     let v = self.s.m.phi(blk, self.s.t.i1);
-                    self.pending_masks.push((v, b, i));
+                    self.pending_masks.push((v, b, i, None));
                     v
                 }
             };
             let v = self.s.m.select(at, act_body, m_body, m_d);
-            self.mask_phis.insert(id, v);
+            self.mask_phis.insert(Atom::Phi(id), v);
             return Ok(v);
         }
 
@@ -1265,7 +1265,7 @@ impl Lower<'_> {
             });
         }
         let v = acc.unwrap_or_else(|| self.s.m.bool(false));
-        self.mask_phis.insert(id, v);
+        self.mask_phis.insert(Atom::Phi(id), v);
         Ok(v)
     }
 

@@ -279,7 +279,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
-    if !locks
+    let precise = options.precise_marks;
+    if !precise
+        && !locks
         && !bias
         && !narrow
         && !no_literal
@@ -290,7 +292,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 2048] = [const { OnceLock::new() }; 2048];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,10 +302,14 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | usize::from(precise) << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
+        if precise {
+            h.update(b"precise write marks");
+        }
         if locks {
             h.update(b"atomic locks");
         }
@@ -359,7 +365,23 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         // Only for the pipelines a dispatch counted in threads needs it
         // for (`crate::pipeline::thread_limited`).
         thread_limits: false,
+        precise_marks: precise_marks(),
     }
+}
+
+/// Whether stores mark the pages they write only where they change what is
+/// there (`VICTORY_PRECISE_MARKS=1`; off by default): the host then
+/// compares and copies back only pages shaders changed, not every page they
+/// stored to.
+pub(crate) fn precise_marks() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_PRECISE_MARKS");
+        if on {
+            tracing::info!("stores mark their pages only where they change them (VICTORY_PRECISE_MARKS)");
+        }
+        on
+    })
 }
 
 /// The translation of a console shader container, from the cache when

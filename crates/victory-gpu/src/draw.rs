@@ -6777,4 +6777,224 @@ void main() {
         run_shadow_preserve_gpu_write_repro(p, len);
         crate::watch::tests::free(p);
     }
+
+    /// Runs a translated one-thread compute program that writes dword 0 of
+    /// a title buffer through a raw unordered view in a table, as `ops` say
+    /// (MUBUF opcode, which of the root constants `values` it takes as
+    /// data, byte offset), with write marks, precise or not. The buffer
+    /// starts as `start`. Returns the buffer's first dword in title memory
+    /// after the submission, and the marked pages the copy-back compared,
+    /// each with whether it differed.
+    fn marked_store(precise: bool, start: u32, values: [u32; 2], ops: &[(u32, u8, u16)]) -> Option<(u32, Vec<bool>)> {
+        use crate::pipeline::{Shader, Translated, host::HostPipeline};
+        use victory_shader::native::{ComputeIo, StageIo};
+        use victory_shader::{
+            Container, HwStage, NativeProgram, RootParam, RootType, emit, io, ir, resource,
+            structure,
+        };
+        let host = crate::host::host()?;
+        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        // SAFETY: valid feature support query.
+        let ok = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_SHADER_MODEL,
+                (&raw mut sm).cast(),
+                size_of_val(&sm) as u32,
+            )
+        };
+        if ok.is_err() || sm.HighestShaderModel.0 < D3D_SHADER_MODEL_6_6.0 {
+            return None;
+        }
+        let mut code: Vec<u32> = vec![
+            0xBE85_0380, // s_mov_b32 s5, 0: s[4:5] the table at s4
+            0x3D << 26 | 2 << 18 | 8 << 6 | 4 >> 1,
+            125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0: the unordered view
+            0x7E00_0200 | 1 << 17, // v_mov_b32 v1, s0
+            0x7E00_0200 | 2 << 17 | 1, // v_mov_b32 v2, s1
+            0xBF8C_0000, // s_waitcnt
+        ];
+        for &(op, value, at) in ops {
+            // MUBUF `op` of v(1 + value) at byte `at` through s[8:11].
+            code.extend([
+                0x38 << 26 | op << 18 | u32::from(at),
+                0x80 << 24 | (8 >> 2) << 16 | (1 + u32::from(value)) << 8,
+            ]);
+        }
+        code.push(0xBF81_0000); // s_endpgm
+        let param = |root, sgprs, user_data, slot| RootParam {
+            root,
+            table_offset_dwords: 0,
+            sgprs,
+            base_register: 0,
+            user_data,
+            slot,
+        };
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![param(RootType::Constants, 4, 0, 0), param(RootType::Table, 1, 4, 1)],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 8 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut container = vec![0; 32];
+        container[..4].copy_from_slice(b"DXBC");
+        container[20..24].copy_from_slice(&1u32.to_le_bytes());
+        container[24..28].copy_from_slice(&32u32.to_le_bytes());
+        let c = Container::parse(&container).unwrap();
+        let p = ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let options = emit::Options {
+            view_marks: true,
+            precise_marks: precise,
+            ..Default::default()
+        };
+        let hs = emit::emit_with(&c, &native, &p, &st, &io, &res, options).unwrap();
+        assert!(hs.view_marks, "the store's pages are marked");
+        let shader = Shader::for_test(
+            "compute",
+            Translated {
+                host: hs,
+                used: native.used,
+                used_written: Vec::new(),
+                write_unknown: true,
+                threads: None,
+            },
+        );
+        let hp = HostPipeline::new(&[shader], None, |_, _| {}).expect("the pipeline");
+
+        let memory = crate::watch::tests::pool(1);
+        #[repr(C)]
+        struct Extended {
+            desc: [u32; 4],
+            address: u64,
+            size: u64,
+        }
+        let extended = Extended {
+            desc: [0, 4, 1, 0],
+            address: memory as u64,
+            size: 4 * 32,
+        };
+        let mut heap = std::ptr::null();
+        let iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                std::ptr::from_ref(&extended.desc).cast(),
+                &iid,
+                &mut heap,
+            ),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let out = buffer(256);
+        let out_bytes = crate::resource::buffer_bytes(out).unwrap().0 as u64;
+        // SAFETY: inside the title buffer.
+        unsafe { (out_bytes as *mut u32).write(start) };
+        let raw: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_uav(std::ptr::null(), out, std::ptr::null(), &raw, title_heap.start);
+        crate::shadow::MARKED_SEEN.with(|seen| seen.borrow_mut().clear());
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        state.set_heaps(&[heap]);
+        state.set_constants(true, 0, &[values[0], values[1], 0, 0], 0);
+        state.set_table(true, 1, title_heap.start);
+        assert!(state.bind(&list, &hp, true), "the dispatch is bound");
+        // SAFETY: an open list with everything bound.
+        unsafe { list.list.Dispatch(1, 1, 1) };
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: inside the title buffer.
+        let after = unsafe { (out_bytes as *const u32).read_volatile() };
+        let page = out_bytes as usize & !(crate::watch::PAGE - 1);
+        let seen: Vec<bool> = crate::shadow::MARKED_SEEN.with(|seen| {
+            seen.borrow_mut()
+                .drain(..)
+                .filter(|&(p, _)| p == page)
+                .map(|(_, differs)| differs)
+                .collect()
+        });
+        assert_eq!(
+            crate::object::slot::<extern "system" fn(This) -> u32>(heap, 0x10)(heap),
+            0
+        );
+        crate::watch::tests::free(memory);
+        Some((after, seen))
+    }
+
+    /// Precise write marks (`VICTORY_PRECISE_MARKS`): a store of dwords
+    /// marks its page only if it changes what is there, so a page shaders
+    /// stored the same values to is neither compared nor written back;
+    /// every change is marked and lands in title memory, also one that a
+    /// later store of the same dispatch puts back. Atomics and the byte
+    /// store made of two atomics mark whatever they write, as all stores
+    /// do without the switch.
+    #[test]
+    fn precise_marks_mark_only_stores_that_change_what_is_there() {
+        const STORE: u32 = 0x1C;
+        const STORE_BYTE: u32 = 0x18;
+        const ATOMIC_ADD: u32 = 0x32;
+        const OLD: u32 = 0x1111_2222;
+        const NEW: u32 = 0x3333_4444;
+        // Marked, and whether the page differed from title memory.
+        const UNMARKED: &[bool] = &[];
+        const SAME: &[bool] = &[false];
+        const CHANGED: &[bool] = &[true];
+        let Some(first) = marked_store(false, OLD, [OLD, 0], &[(STORE, 0, 0)]) else {
+            return; // no host GPU with SM 6.6 here
+        };
+        // Without the switch every store marks: compared, found the same.
+        assert_eq!(first, (OLD, SAME.to_vec()), "as before: a store of the same value");
+        let run = |precise, values, ops: &[(u32, u8, u16)]| marked_store(precise, OLD, values, ops).expect("the same host");
+        for precise in [false, true] {
+            // A store that changes the dword marks and lands.
+            assert_eq!(run(precise, [NEW, 0], &[(STORE, 0, 0)]), (NEW, CHANGED.to_vec()), "{precise}");
+            // Two stores to the dword, the second putting the old value
+            // back: the first saw the old value and marked; nothing differs.
+            assert_eq!(
+                run(precise, [NEW, OLD], &[(STORE, 0, 0), (STORE, 1, 0)]),
+                (OLD, SAME.to_vec()),
+                "{precise}"
+            );
+            // Atomics mark whatever they write.
+            assert_eq!(run(precise, [0, 0], &[(ATOMIC_ADD, 0, 0)]), (OLD, SAME.to_vec()), "{precise}");
+            assert_eq!(run(precise, [5, 0], &[(ATOMIC_ADD, 0, 0)]), (OLD + 5, CHANGED.to_vec()), "{precise}");
+            // A byte store (two atomics on its dword): the same byte, and another.
+            assert_eq!(run(precise, [0x22, 0], &[(STORE_BYTE, 0, 1)]), (OLD, SAME.to_vec()), "{precise}");
+            assert_eq!(
+                run(precise, [0xAB, 0], &[(STORE_BYTE, 0, 1)]),
+                (0x1111_AB22, CHANGED.to_vec()),
+                "{precise}"
+            );
+        }
+        // With the switch, a store of what is there marks nothing.
+        assert_eq!(run(true, [OLD, 0], &[(STORE, 0, 0)]), (OLD, UNMARKED.to_vec()));
+        // The store after it, which changes the dword, still marks.
+        assert_eq!(
+            run(true, [OLD, NEW], &[(STORE, 0, 0), (STORE, 1, 0)]),
+            (NEW, CHANGED.to_vec())
+        );
+    }
 }

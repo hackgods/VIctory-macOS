@@ -581,6 +581,10 @@ pub struct Options {
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,
+    /// A store of dwords through a buffer view marks its pages only if it
+    /// changes a dword of what is there, which it loads first ("Write
+    /// marks"). Atomics and typed stores mark as before.
+    pub precise_marks: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1094,6 +1098,7 @@ fn emit_pruned(
         halves_rendezvous: options.halves_rendezvous,
     };
     let (literal, limits) = (!options.disable_literal_halves, options.thread_limits);
+    lower::PRECISE_MARKS.set(options.precise_marks);
     let (l, heap_index_sources) = match lower::lower_limited(
         &parts(st, res),
         keep,

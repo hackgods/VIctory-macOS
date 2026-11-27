@@ -977,7 +977,10 @@ impl Shadow {
                     merge_writeback(&mut title, host, before)
                 }
             };
+            #[cfg(test)]
+            MARKED_SEEN.with(|seen| seen.borrow_mut().push((page, differs)));
             if differs {
+                MARK_PAGES[1].fetch_add(1, Ordering::Relaxed);
                 match writes.last_mut() {
                     Some((_, end)) if *end == from => *end = to,
                     _ => writes.push((from, to)),
@@ -1803,6 +1806,32 @@ thread_local! {
     static MARKED_COPY_BACK_PARALLEL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Pages shaders marked as written through views that were compared with
+/// title memory (`[0]`), and those of them that differed and went back
+/// (`[1]`), since the last [`marks_line`].
+static MARK_PAGES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(test)]
+thread_local! {
+    /// The marked pages this thread compared since a test last took them,
+    /// and whether each differed from title memory.
+    pub(crate) static MARKED_SEEN: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Logs [`MARK_PAGES`] per frame over `frames`: how many of the pages
+/// shaders marked they had changed (`VICTORY_PRECISE_MARKS` marks only
+/// those).
+pub(crate) fn marks_line(frames: f64) {
+    let [marked, changed] = [0, 1].map(|i| MARK_PAGES[i].swap(0, Ordering::Relaxed));
+    if marked != 0 {
+        tracing::info!(
+            "write marks: {:.0} pages/frame marked by shaders and compared, {:.0} of them changed and written back",
+            marked as f64 / frames,
+            changed as f64 / frames,
+        );
+    }
+}
+
 pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_withheld: bool) {
     let (mut marked, mut held) = (Vec::new(), Vec::new());
     for memory in [false, true] {
@@ -1871,6 +1900,7 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         list.dedup();
     }
     let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
+    MARK_PAGES[0].fetch_add((total_bytes / PAGE) as u64, Ordering::Relaxed);
     let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
     let parallel = parallel_copies_enabled()
         && by_copy.len() >= 2

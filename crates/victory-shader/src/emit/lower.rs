@@ -21,6 +21,8 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod atomics;
+mod marks;
+pub(crate) use marks::PRECISE_MARKS;
 mod barriers;
 mod bvh;
 mod f64;
@@ -1287,10 +1289,11 @@ impl<'a> Lower<'a> {
             args.resize(3 + 4, iu);
             args.push(self.s.m.i8((1u8 << n) - 1));
             args.push(self.s.m.i32(4));
+            let changes = self.store_changes(&args, u32::from(n));
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
             let bytes = self.s.m.i32(4 * u32::from(n));
-            self.mark_view_write(h, off, bytes, None);
+            self.mark_view_write(h, off, bytes, changes);
             self.end_guarded(at, &[]);
             return Ok(());
         }
@@ -10876,8 +10879,9 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
+            let changes = if typed { None } else { self.store_changes(&args, count) };
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
-            self.mark_view_write(args[0], byte, bytes, None);
+            self.mark_view_write(args[0], byte, bytes, changes);
             self.end_guarded(at, &[]);
             return Ok(());
         }

@@ -981,4 +981,111 @@ mod tests {
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
     }
+
+    /// Bench (`--ignored --nocapture`, release): what the pieces of copying
+    /// a marked 64 KiB page back cost, and what a guard fault that would
+    /// fetch it lazily costs. Per page: reading title memory into a buffer
+    /// and comparing it with the copy (as `copy_back_marked` does), the
+    /// same compare in place, eight bytes at a time, and writing the page;
+    /// then making a page inaccessible, and a title thread touching it (a
+    /// fault whose handler opens the page and returns).
+    #[test]
+    #[ignore = "bench"]
+    fn bench_copy_back_page_against_a_guard_fault() {
+        const PAGES: usize = 2000;
+        static BASE: AtomicUsize = AtomicUsize::new(0);
+        static FAULTS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "system" fn on_fault(info: *mut EXCEPTION_POINTERS) -> i32 {
+            // SAFETY: `info` is provided by the exception dispatch.
+            unsafe {
+                let rec = &*(*info).ExceptionRecord;
+                let base = BASE.load(Ordering::Relaxed);
+                let addr = rec.ExceptionInformation[1];
+                if rec.ExceptionCode as u32 == 0xC000_0005 && base != 0 && addr >= base && addr < base + PAGES * PAGE {
+                    let mut old = 0;
+                    VirtualProtect((addr & !(PAGE - 1)) as *const _, PAGE, PAGE_READWRITE, &mut old);
+                    FAULTS.fetch_add(1, Ordering::Relaxed);
+                    return -1;
+                }
+                0
+            }
+        }
+        let len = PAGES * PAGE;
+        // SAFETY: a fresh allocation, freed below.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        let mut host = vec![0u8; len];
+        for (i, b) in host.iter_mut().enumerate() {
+            *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[3];
+        }
+        // SAFETY: both `len` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(host.as_ptr(), title, len) };
+        let per_page = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e6 / PAGES as f64;
+        let mut scratch = vec![0u8; PAGE];
+        let mut same = 0usize;
+        let t = std::time::Instant::now();
+        for p in 0..PAGES {
+            // SAFETY: inside the allocation.
+            let at = unsafe { title.add(p * PAGE) };
+            if crate::host::read_into(at, &mut scratch) && scratch[..] == host[p * PAGE..][..PAGE] {
+                same += 1;
+            }
+        }
+        let read_compare = per_page(t);
+        let t = std::time::Instant::now();
+        for p in 0..PAGES {
+            // SAFETY: inside the allocation.
+            let page = unsafe { std::slice::from_raw_parts(title.add(p * PAGE), PAGE) };
+            same += usize::from(page == &host[p * PAGE..][..PAGE]);
+        }
+        let in_place = per_page(t);
+        let t = std::time::Instant::now();
+        for p in 0..PAGES {
+            // SAFETY: inside the allocation, 8-byte aligned.
+            let a = unsafe { std::slice::from_raw_parts(title.add(p * PAGE).cast::<u64>(), PAGE / 8) };
+            // SAFETY: bytes as words; the middle part is aligned.
+            let (_, b, _) = unsafe { host[p * PAGE..][..PAGE].align_to::<u64>() };
+            let mut differs = 0u64;
+            for (x, y) in a.iter().zip(b) {
+                differs |= x ^ y;
+            }
+            same += usize::from(differs == 0 && b.len() == PAGE / 8);
+        }
+        let by_words = per_page(t);
+        let t = std::time::Instant::now();
+        for p in 0..PAGES {
+            // SAFETY: inside the allocation.
+            crate::host::write_mapped(unsafe { title.add(p * PAGE) }, host[p * PAGE..].as_ptr(), PAGE);
+        }
+        let write = per_page(t);
+        // Guards: each page made inaccessible, then touched by this thread.
+        // SAFETY: our allocation and handler, removed below.
+        let (protect, fault) = unsafe {
+            let handler = AddVectoredExceptionHandler(1, Some(on_fault));
+            BASE.store(title as usize, Ordering::Relaxed);
+            let mut old = 0;
+            let t = std::time::Instant::now();
+            for p in 0..PAGES {
+                VirtualProtect(title.add(p * PAGE).cast(), PAGE, windows_sys::Win32::System::Memory::PAGE_NOACCESS, &mut old);
+            }
+            let protect = per_page(t);
+            let mut sum = 0u64;
+            let t = std::time::Instant::now();
+            for p in 0..PAGES {
+                sum += u64::from(title.add(p * PAGE + 64).read_volatile());
+            }
+            let fault = per_page(t);
+            std::hint::black_box(sum);
+            BASE.store(0, Ordering::Relaxed);
+            RemoveVectoredExceptionHandler(handler);
+            (protect, fault)
+        };
+        assert_eq!(FAULTS.load(Ordering::Relaxed), PAGES);
+        println!(
+            "per 64 KiB page: read + compare {read_compare:.2} us, compare in place {in_place:.2} us, by 8 bytes {by_words:.2} us, write {write:.2} us; make inaccessible {protect:.2} us, touch (fault, handler opens it) {fault:.2} us; {same} of {} compares equal",
+            3 * PAGES
+        );
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(title.cast(), 0, MEM_RELEASE) };
+    }
 }

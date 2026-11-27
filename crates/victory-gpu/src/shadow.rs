@@ -2259,20 +2259,39 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     entry.shadow.clone()
 }
 
+/// Which title buffers in place [`forget_in_place`] lets go.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InPlace {
+    /// All of them.
+    All,
+    /// Those on a heap's own buffer, not those through tiles.
+    Direct,
+    /// Those through tiles only.
+    Tiled,
+}
+
 /// Title buffers in place on XMem physical pages (`crate::alias`) that
 /// overlap `[from, to)`, where the title mapped other pages or none: let go,
 /// so that the next lookup finds them again, in place or copied, but (with
 /// `keep_tiled`) those through tile mappings, which follow the pages.
 /// Returns them, for the host views made from them to be made again.
-pub(crate) fn forget_in_place(from: u64, to: u64, keep_tiled: bool) -> Vec<Arc<Shadow>> {
+pub(crate) fn forget_in_place(from: u64, to: u64, which: InPlace) -> Vec<Arc<Shadow>> {
     let mut map = buffers();
     let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
     let mut gone = Vec::new();
     for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
-        // Through tiles (`crate::tiles`) a buffer follows the title's pages.
         if entry.end > from
             && entry.shadow.as_ref().is_some_and(|s| {
-                s.aliased && !(keep_tiled && crate::tiles::is_region_buffer(&s.buffer))
+                s.aliased && {
+                    // Through tiles (`crate::tiles`) a buffer follows the
+                    // title's pages.
+                    let tiled = crate::tiles::is_region_buffer(&s.buffer);
+                    match which {
+                        InPlace::All => true,
+                        InPlace::Direct => !tiled,
+                        InPlace::Tiled => tiled,
+                    }
+                }
             })
         {
             gone.extend(entry.shadow.take());

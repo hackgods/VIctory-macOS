@@ -1380,6 +1380,9 @@ fn mark_copies(g: &Guards, first: usize, last: usize) {
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    for &page in std::iter::once(&at).chain(others) {
+        crate::alias::forget_tiled_shown_twice(page as u64, PAGE as u64);
+    }
     let mut g = guards();
     let page = at / PAGE;
     for &other in others {

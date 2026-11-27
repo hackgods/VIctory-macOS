@@ -61,13 +61,20 @@ fn reservations_hold_title_memory_in_place_through_tiles() {
     assert_eq!(XMemMapPhysicalPages(second, 1, std::ptr::null()), second);
     assert!(!tiled(a, 2 * PAGE));
     assert!(tiled(a.wrapping_byte_add(2 * PAGE), 2 * PAGE));
-    // Mapped again, with another page: in place again (tiles follow).
+    // Mapped again, with the page it showed: in place again (tiles follow).
     assert_eq!(XMemMapPhysicalPages(second, 1, [pages[0]].as_ptr()), second);
-    // That page is now shown twice (at `a` too): left to one address per
-    // page unless aliased tiles are coherent.
-    let _ = tiled(a, 2 * PAGE);
+    assert!(tiled(a, 4 * PAGE), "tiles follow the page mapped again");
+    // A page the title shows at `a + 3 * PAGE` too: shown twice, so left to
+    // one GPU address per page (aliased tiles are not taken for coherent).
     assert_eq!(XMemMapPhysicalPages(second, 1, [pages[1]].as_ptr()), second);
-    assert!(tiled(a, 4 * PAGE), "the page shown once again");
+    assert!(!tiled(a, 4 * PAGE), "a page shown twice");
+    assert!(
+        tiled(a.wrapping_byte_add(2 * PAGE), PAGE),
+        "a page shown once"
+    );
+    // Shown once again: through tiles again.
+    assert_eq!(XMemMapPhysicalPages(second, 1, [pages[0]].as_ptr()), second);
+    assert!(tiled(a, 4 * PAGE), "every page shown once again");
 
     XMemMapPhysicalPages(a, 4, std::ptr::null());
     assert!(!tiled(a, PAGE));

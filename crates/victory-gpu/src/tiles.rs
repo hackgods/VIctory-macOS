@@ -119,8 +119,8 @@ struct Region {
     reserved: ID3D12Resource,
     gpu: u64,
     /// Per tile: the heap (its address, as a key) and the tile of it shown
-    /// there, whether the title shows it elsewhere too; `None` for none.
-    tiles: Mutex<Vec<Option<(usize, u32, bool)>>>,
+    /// there; `None` for none.
+    tiles: Mutex<Vec<Option<(usize, u32)>>>,
     /// The heaps its tiles map onto, kept while it lives.
     heaps: Mutex<Vec<Arc<PhysicalHeap>>>,
 }
@@ -213,8 +213,7 @@ static REMAPPED: [std::sync::atomic::AtomicU64; 2] =
 
 impl Region {
     /// Maps `count` tiles from `first` to what the title shows there now,
-    /// on the host queue; returns whether any of them is now no heap's (or
-    /// shared, where aliased tiles are not coherent).
+    /// on the host queue; returns whether any of them is now no heap's.
     fn map(&self, first: u32, count: u32) -> bool {
         let Some(resolve) = resolver() else {
             return true;
@@ -238,17 +237,16 @@ impl Region {
             let now = resolve(at);
             let key = now
                 .as_ref()
-                .map(|a| (Arc::as_ptr(&a.heap) as usize, a.tile, a.shared));
+                .map(|a| (Arc::as_ptr(&a.heap) as usize, a.tile));
             // As it is (reserved tiles start with none): nothing to map.
             if tiles[t as usize] == key {
-                lost |= key.is_none_or(|(_, _, shared)| shared && !ALIASED_TILES_COHERENT);
+                lost |= key.is_none();
                 flush(&mut run);
                 continue;
             }
             tiles[t as usize] = key;
             match now {
-                Some(TileAt { heap, tile, shared }) => {
-                    lost |= shared && !ALIASED_TILES_COHERENT;
+                Some(TileAt { heap, tile, .. }) => {
                     let next = run
                         .as_ref()
                         .is_some_and(|(s, h, o)| Arc::ptr_eq(h, &heap) && *s + o.len() as u32 == t);
@@ -283,15 +281,24 @@ impl Region {
     }
 
     /// Whether every page of `[start, start + len)` is shown from a heap
-    /// (and once, where aliased tiles are not coherent).
+    /// (and, where aliased tiles are not coherent, shown at no other
+    /// address now: asked of the runtime, which knows; when that changes
+    /// later, `crate::alias::forget_tiled_shown_twice` lets such memory go).
     fn backs(&self, start: u64, len: u64) -> bool {
-        let tiles = self.tiles.lock().unwrap_or_else(|e| e.into_inner());
         let first = ((start - self.base) / TILE) as usize;
         let last = ((start + len.max(1) - 1 - self.base) / TILE) as usize;
-        tiles.get(first..=last).is_some_and(|t| {
-            t.iter()
-                .all(|t| t.is_some_and(|(_, _, shared)| !shared || ALIASED_TILES_COHERENT))
-        })
+        let mapped = {
+            let tiles = self.tiles.lock().unwrap_or_else(|e| e.into_inner());
+            tiles
+                .get(first..=last)
+                .is_some_and(|t| t.iter().all(Option::is_some))
+        };
+        mapped
+            && (ALIASED_TILES_COHERENT
+                || resolver().is_some_and(|resolve| {
+                    (first..=last)
+                        .all(|t| resolve(self.base + t as u64 * TILE).is_some_and(|a| !a.shared))
+                }))
     }
 }
 
@@ -359,6 +366,12 @@ pub(crate) fn tiled(start: u64, len: u64) -> Option<(ID3D12Resource, u64, u64)> 
 /// tile mappings now ([`tiled`]).
 pub fn title_memory_tiled(start: u64, len: u64) -> bool {
     tiled(start, len).is_some()
+}
+
+/// Whether shadows through tiles are let go where the title shows one of
+/// their pages at another address too ([`ALIASED_TILES_COHERENT`]).
+pub(crate) fn keep_pages_shown_once() -> bool {
+    in_place_tiles() && !ALIASED_TILES_COHERENT
 }
 
 /// Whether `buffer` is a region's reserved buffer (a shadow over it follows

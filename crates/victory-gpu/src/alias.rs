@@ -763,7 +763,12 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
     if from == to {
         return;
     }
-    let gone = crate::shadow::forget_in_place(from, to, !lost);
+    let which = if lost {
+        crate::shadow::InPlace::All
+    } else {
+        crate::shadow::InPlace::Direct
+    };
+    let gone = crate::shadow::forget_in_place(from, to, which);
     if gone.is_empty() {
         return;
     }
@@ -813,6 +818,36 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             "title memory in place let go: the title mapped other pages there"
         );
     }
+}
+
+/// The title now shows the page at `at` at another address too: title
+/// buffers through tiles over it are let go where aliased tiles are not
+/// coherent (`crate::tiles::keep_pages_shown_once`), for one GPU address per
+/// physical page; their pages stay what they were, so nothing reads stale
+/// and nothing is refused: the next lookup finds them again, on the heap's
+/// own buffer or copied. Host view slots made from them are made again.
+pub(crate) fn forget_tiled_shown_twice(at: u64, len: u64) {
+    if !crate::tiles::keep_pages_shown_once() || IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let gone =
+        crate::shadow::forget_in_place(at, at.saturating_add(len), crate::shadow::InPlace::Tiled);
+    if gone.is_empty() {
+        return;
+    }
+    {
+        let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
+        for shadow in &gone {
+            if map.remove(&shadow.range().0).is_some() {
+                IN_PLACE_COUNT.fetch_sub(1, Ordering::Release);
+            }
+        }
+    }
+    LET_GO
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(gone);
+    LET_GO_PENDING.store(true, Ordering::Release);
 }
 
 /// Title memory once in place that the title mapped other pages over, by

@@ -332,9 +332,11 @@ pub fn run(
 /// the shader cache `run` reads (`<cache>/shaders`, decision 0003), by the
 /// same code, so a run finds it translated or refused. With `pipelines`,
 /// then the shader pack's pipelines go into the pipeline library
-/// (`prebuild`).
+/// (`prebuild`). With `VICTORY_WARM_ONLY` ([`warm_only`]), only the
+/// containers it lists.
 pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    let only = warm_only()?;
     let shaders = victory_core::Config::load()?.cache_subdir("shaders")?;
     let Some(dir) = victory_gpu::shader_cache::use_shader_cache(shaders.clone()) else {
         anyhow::bail!("no shader cache in {}", shaders.display());
@@ -346,8 +348,8 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
     }
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
-    // Containers already cached, translated now, refused now.
-    let counts = [const { AtomicUsize::new(0) }; 3];
+    // Containers already cached, translated now, refused now, not listed.
+    let counts = [const { AtomicUsize::new(0) }; 4];
     for root in &paths {
         for entry in walkdir::WalkDir::new(root)
             .into_iter()
@@ -377,6 +379,13 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                                 if !lock(&seen).insert(hash) {
                                     continue;
                                 }
+                                if only
+                                    .as_ref()
+                                    .is_some_and(|only| !only.contains(&hash.to_hex()[..16]))
+                                {
+                                    counts[3].fetch_add(1, Ordering::Relaxed);
+                                    continue;
+                                }
                                 let one = std::time::Instant::now();
                                 let (done, cached) =
                                     victory_gpu::shader_cache::host_shader(container);
@@ -399,7 +408,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
                         })
                     })
                     .collect();
-                let [c, t, r] = &counts;
+                let [c, t, r, _] = &counts;
                 report(
                     entry.path(),
                     jobs.len(),
@@ -420,7 +429,7 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
             });
         }
     }
-    let [cached, translated, refused] = counts.map(AtomicUsize::into_inner);
+    let [cached, translated, refused, unlisted] = counts.map(AtomicUsize::into_inner);
     let bytes: u64 = walkdir::WalkDir::new(&dir)
         .into_iter()
         .filter_map(Result::ok)
@@ -434,6 +443,9 @@ pub fn warm(paths: Vec<PathBuf>, jobs: Option<usize>, pipelines: bool) -> Result
         cached + translated + refused,
         started.elapsed().as_secs_f64()
     );
+    if only.is_some() {
+        println!("             {unlisted} passed over (not in VICTORY_WARM_ONLY)");
+    }
     if pipelines {
         crate::prebuild::run(&paths, threads)?;
     }
@@ -862,6 +874,32 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
     }
 }
 
+/// `VICTORY_WARM_ONLY=<file>`: the containers the warm-up translates, by the
+/// first 16 hex digits of their BLAKE3, as a run logs a shader's hash (`shader
+/// translated ... hash=`), one per line: say, every shader earlier runs used,
+/// a few thousand of the title's tens of thousands. Unset: every container.
+fn warm_only() -> Result<Option<HashSet<String>>> {
+    let Some(path) = std::env::var_os("VICTORY_WARM_ONLY") else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("VICTORY_WARM_ONLY {}: {e}", Path::new(&path).display()))?;
+    let hashes = listed_hashes(&text);
+    println!("warm only    {} listed containers", hashes.len());
+    Ok(Some(hashes))
+}
+
+/// The 16-digit hashes at the starts of `text`'s lines, lower case; other
+/// lines are left out.
+fn listed_hashes(text: &str) -> HashSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter_map(|line| line.get(..16))
+        .filter(|hash| hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
 /// The worker threads to use: `--jobs`, else one per core.
 fn thread_count(jobs: Option<usize>) -> usize {
     jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
@@ -873,6 +911,18 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    /// `VICTORY_WARM_ONLY` lines: a hash as the runtime logs it (16 hex
+    /// digits), anything after it ignored, other lines left out.
+    #[test]
+    fn warm_only_lists_logged_shader_hashes() {
+        let list = super::listed_hashes(
+            "ce2fc10ab6471ab8\n  0DDAB4B63B1394E0 compute\n\nnot a hash at all\n77360df21e12ea4\n# comment line\n",
+        );
+        let mut got: Vec<_> = list.into_iter().collect();
+        got.sort();
+        assert_eq!(got, ["0ddab4b63b1394e0", "ce2fc10ab6471ab8"]);
+    }
+
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.
     #[test]
     fn emit_dump_inside_repo_is_refused() {

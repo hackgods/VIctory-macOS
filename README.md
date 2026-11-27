@@ -187,6 +187,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_TRACE_SHADERS=<hash>,...` | with `VICTORY_D3D12_DRED`, every draw and dispatch of a listed shader logged with what it binds (user data, heap slots, root views and their first dwords; the first 500, and all of them in listed capture frames); the records of its indirect executions are read back and logged in every frame (records with work, the first four, the frame) |
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
+| `VICTORY_WARM_ONLY=<file>` | `translate --cache` translates only the containers listed by hash, one per line (the 16 hex digits a run logs as `shader translated ... hash=`), say every shader earlier runs used, instead of all of them |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_LITERAL_HALVES=0` | disable the literal translation retry for 64-thread wave64 compute shaders on 32-lane hosts (separate shader cache entries) |

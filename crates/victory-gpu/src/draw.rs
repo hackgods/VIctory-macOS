@@ -821,16 +821,27 @@ impl State {
         // to date at submission (`crate::bindless`).
         if p.stages.iter().any(|s| s.translated().host.heap) {
             let writes = p.stages.iter().any(|s| s.translated().host.heap_writes);
-            if let Some(host) = (self.heaps[0] != 0)
-                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
-                .flatten()
-            {
-                list.defer_heap(&host.viewed);
-                for buffer in host.widened_buffers() {
-                    list.mark_widened_read(&buffer);
-                }
-                if writes {
-                    list.mark_widened_heap(&host.viewed);
+            if self.heaps[0] != 0 {
+                let title_heap = crate::descriptor::heap(self.heaps[0] as This);
+                if let Some(host) = title_heap.host() {
+                    list.defer_heap(&host.viewed);
+                    for buffer in host.widened_buffers() {
+                        list.mark_widened_read(&buffer);
+                    }
+                    if writes {
+                        list.mark_widened_heap(&host.viewed);
+                    }
+                    // VIctory-macOS #417: the background uploader looks at
+                    // the heap once a frame (`VICTORY_HEAP_WORKER=1`).
+                    if crate::heap_worker::on() {
+                        static KICKED_FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
+                        let frame = crate::queue::presented();
+                        if KICKED_FRAME.load(Ordering::Relaxed) != frame
+                            && KICKED_FRAME.swap(frame, Ordering::Relaxed) != frame
+                        {
+                            crate::heap_worker::kick(title_heap);
+                        }
+                    }
                 }
             }
             crate::bindless::note_draw(writes);

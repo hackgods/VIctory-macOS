@@ -4144,6 +4144,21 @@ struct Batch {
     cut: bool,
 }
 
+/// `VICTORY_SYNC_EPOCH` since the last frame line: ranges of copies with
+/// changed pages that were not current yet (asked), those of them left out
+/// because none of their pages changed, and the bytes those asked for.
+static EPOCH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The frame line's part for `VICTORY_SYNC_EPOCH` (`frames` since the last
+/// one), empty with the switch off.
+fn epoch_line(frames: f64) -> String {
+    if !crate::mac_switches::sync_epoch(unwaited::flights::on) {
+        return String::new();
+    }
+    let [asked, left, bytes] = EPOCH.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!("; sync epoch: {left:.0} of {asked:.0} ranges asked left out unchanged ({:.1} MB)", bytes / 1e6)
+}
+
 /// How far apart a copy's pending ranges may be and still be done as one,
 /// the bytes between copied too: a call that copies a range costs about
 /// what copying this much does at the 6-7 GB/s testers saw (a guess, not
@@ -4190,6 +4205,24 @@ impl Batch {
                 crate::copystat::add(crate::copystat::C::SkippedBytes, (end - address) as u64);
             }
             return;
+        }
+        // From ScarlettMac 4921b7e6 (`VICTORY_SYNC_EPOCH=1`): a range no
+        // page of which the title wrote since the copy took it is left out,
+        // decided here, where `clean` above decides for the whole copy.
+        // The refresh it would get at the next flush copies the same
+        // nothing: every step of the submission that writes title memory
+        // flushes first (`title_copied`, `title_written`), the submission
+        // before has been finished and copied back (no flights), and its
+        // pages stay in the changed set until a take, so what the title's
+        // threads write meanwhile is for the next submission either way.
+        // Not entered in `current`: a later list asks again, as cheaply.
+        if crate::mac_switches::sync_epoch(unwaited::flights::on) {
+            EPOCH[0].fetch_add(1, Ordering::Relaxed);
+            if shadow.synced(address, len) {
+                EPOCH[1].fetch_add(1, Ordering::Relaxed);
+                EPOCH[2].fetch_add(len as u64, Ordering::Relaxed);
+                return;
+            }
         }
         let i = *self.pending.entry(key).or_insert_with(|| {
             self.refreshes.push((shadow.clone(), Default::default()));
@@ -5055,6 +5088,8 @@ impl Meter {
             let zero_copy = crate::alias::frame_line(report_frames);
             // mac: the guard lock's waits and the protection calls, always.
             let guards = crate::watch::frame_line(report_frames);
+            // From ScarlettMac 4921b7e6: with `VICTORY_SYNC_EPOCH=1` only.
+            let epoch = epoch_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5079,7 +5114,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}",
+                 batched){zero_copy}{guards}{epoch}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

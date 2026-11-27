@@ -867,6 +867,29 @@ impl Tracked {
         self.changed.2
     }
 
+    /// From ScarlettMac 4921b7e6: whether no page of `[from, to)` is in the
+    /// changed set, so that [`Tracked::take`] of the range would find
+    /// nothing (`VICTORY_SYNC_EPOCH`, `crate::shadow::Shadow::synced`). A
+    /// page leaves the set only as a take guards it (or finds nothing
+    /// mapped) or [`Tracked::taken`] guards it after a copy-back, and comes
+    /// back at a fault, a [`writing`] (at its start and its end), a remap, a
+    /// shader write to aliased memory ([`notify_written`]) or a [`retake`].
+    /// One look at the set under its lock, as `take` looks; a write racing
+    /// the answer is found by the next asking, as one racing a take.
+    pub(crate) fn unchanged(&self, from: usize, to: usize) -> bool {
+        let (from, to) = (from.max(self.start), to.min(self.end));
+        if from >= to || self.clean() {
+            return true;
+        }
+        self.changed
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .range(from / PAGE..to.div_ceil(PAGE))
+            .next()
+            .is_none()
+    }
+
     /// The parts of `[from, to)` that are not tracked (see
     /// [`Tracked::untracked`] field): to be copied whole at each use.
     pub(crate) fn untracked(&self, from: usize, to: usize) -> Vec<(usize, usize)> {

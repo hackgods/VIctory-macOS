@@ -436,6 +436,35 @@ fn census_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// From ScarlettMac 4921b7e6: whether a submission's refresh of a buffer
+/// range none of whose pages the title wrote since the host copy took them
+/// is left out (`VICTORY_SYNC_EPOCH=1`, `crate::shadow::Shadow::synced`):
+/// `Shadow::update` would copy nothing there, and asking costs the copy's
+/// locks and a place in the submission's batch. Off (unset, `0`, or
+/// anything else): every request is refreshed, as before. Nothing with
+/// `VICTORY_FLIGHTS=1`, where refreshes are asked for while the submission
+/// before still runs and its copy-back can still change title memory.
+pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = epoch(std::env::var("VICTORY_SYNC_EPOCH").ok().as_deref());
+        let on = asked && !flights();
+        if on {
+            tracing::info!(
+                "VICTORY_SYNC_EPOCH=1: a refresh of a buffer range no page of changed since the copy took it is left out"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_SYNC_EPOCH=1 does nothing with VICTORY_FLIGHTS=1");
+        }
+        on
+    })
+}
+
+/// [`sync_epoch`]'s rule: `1` turns it on; every other value leaves it off.
+fn epoch(value: Option<&str>) -> bool {
+    setting(value, false)
+}
+
 /// Whether a heap sync pass also holds the census updates of the slots
 /// `HostHeap::mirror` and `HostHeap::make_null` make in it, and enters them
 /// a batch at a time (`crate::bindless::Pass`, `crate::census_fast::Hold`)
@@ -680,7 +709,16 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
+    use super::{copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
+
+    #[test]
+    fn the_epoch_skip_is_on_only_when_asked_for() {
+        assert!(epoch(Some("1")));
+        // Unset, `0`, or a word: every request refreshes, as the bench needs.
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("yes")] {
+            assert!(!epoch(off), "{off:?}");
+        }
+    }
 
     /// How many tests have the copy-order split forced on right now.
     pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

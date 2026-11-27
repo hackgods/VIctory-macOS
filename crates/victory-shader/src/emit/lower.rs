@@ -2749,41 +2749,45 @@ impl<'a> Lower<'a> {
             } else {
                 self.s.m.bin(block, Bin::Sub, args[1], read.given)
             };
-            let tail_at = self.s.m.bin(block, Bin::Add, read.tail_at, moved);
-            let tail = self.s.op(
-                block,
-                "rawBufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                139,
-                &[read.tail, tail_at, args[2], args[3], args[4]],
-            );
-            let m = &mut self.s.m;
-            let user = m.bin(block, Bin::Add, read.user, moved);
-            let fields = m.int_value(args[3]).map_or(0xF, |mask| mask as u8);
-            let first = m.cmp(block, pred::IULE, user, read.last);
+            let user = self.s.m.bin(block, Bin::Add, read.user, moved);
+            let fields = self.s.m.int_value(args[3]).map_or(0xF, |mask| mask as u8);
+            let first = self.s.m.cmp(block, pred::IULE, user, read.last);
+            let one = self.s.m.i8(1);
             let mut masked = [None; 4];
             for (k, field) in masked.iter_mut().enumerate() {
                 if fields >> k & 1 == 0 {
                     continue;
                 }
-                let step = m.i32(4 * k as u32);
+                let step = self.s.m.i32(4 * k as u32);
                 let held = if k == 0 {
                     first
                 } else {
-                    let at = m.bin(block, Bin::Add, user, step);
-                    let inside = m.cmp(block, pred::IULE, at, read.last);
-                    m.bin(block, Bin::And, first, inside)
+                    let at = self.s.m.bin(block, Bin::Add, user, step);
+                    let inside = self.s.m.cmp(block, pred::IULE, at, read.last);
+                    self.s.m.bin(block, Bin::And, first, inside)
                 };
-                let from = m.bin(block, Bin::Add, moved, step);
-                let past = m.cmp(block, pred::IUGE, from, read.before);
-                let past = m.bin(block, Bin::And, read.crosses, past);
+                let from = self.s.m.bin(block, Bin::Add, moved, step);
+                let past = self.s.m.cmp(block, pred::IUGE, from, read.before);
+                let past = self.s.m.bin(block, Bin::And, read.crosses, past);
+                // Each dword in a load of its own: the access's offset in
+                // the next page's memory is below 0 (it starts on the page
+                // before), and an offset wraps from one load to the next,
+                // not within a load.
+                let tail_at = self.s.m.bin(block, Bin::Add, read.tail_at, from);
+                let tail = self.s.op(
+                    block,
+                    "rawBufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    139,
+                    &[read.tail, tail_at, args[2], one, args[4]],
+                );
                 *field = Some(super::bitcode::Masked {
                     held,
-                    tail: Some((past, tail)),
+                    tail: Some((past, tail, 0)),
                 });
             }
-            m.masked.insert(r, masked);
+            self.s.m.masked.insert(r, masked);
         }
         r
     }

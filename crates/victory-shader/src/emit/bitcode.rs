@@ -195,12 +195,12 @@ enum MdDef {
     Node(Vec<Option<Md>>),
 }
 
-/// A field of a load in [`Module::masked`]: read where `held`, from
-/// `other` where `tail`.
+/// A field of a load in [`Module::masked`]: read where `held`, and where
+/// `tail`'s condition holds from that field of its other load.
 #[derive(Clone, Copy)]
 pub(crate) struct Masked {
     pub held: V,
-    pub tail: Option<(V, V)>,
+    pub tail: Option<(V, V, u32)>,
 }
 
 #[derive(Default)]
@@ -450,8 +450,8 @@ impl Module {
         match field {
             Some(Masked { held, tail }) => {
                 let x = match tail {
-                    Some((cond, other)) => {
-                        let y = self.push(block, ty, Op::Extract(other, index));
+                    Some((cond, other, field)) => {
+                        let y = self.push(block, ty, Op::Extract(other, field));
                         self.select(block, cond, y, x)
                     }
                     None => x,

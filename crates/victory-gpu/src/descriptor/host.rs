@@ -1411,12 +1411,14 @@ impl HostHeap {
         // ran the host out of memory (run b2).
         // mac: with `VICTORY_PLACED_AT_ONCE=1` (or `keep`), not when the
         // texture's host texture is made already: then the view makes nothing
-        // new; with `=all`, never.
+        // new; with `=all`, never; with `=read`, not when a shader read the
+        // slot through the heap lately (`crate::placed_read`).
         let at_once = crate::mac_switches::placed_at_once();
         let later = !for_draw
             && is_placed_texture(&view)
             && at_once != crate::mac_switches::PlacedAtOnce::All
-            && !made_at_once(&view, at_once);
+            && !made_at_once(&view, at_once)
+            && !(at_once == crate::mac_switches::PlacedAtOnce::Read && crate::placed_read::at_once(index));
         // mac: a heap sync ahead of the submission leaves the slot as it is,
         // for the sync before it: made now, its read mark would be forgotten
         // under the running submission's shaders (`super::ahead`).
@@ -1424,6 +1426,9 @@ impl HostHeap {
             self.left.lock().unwrap_or_else(|e| e.into_inner()).0.push(index);
             super::ahead::left();
             return Some(view);
+        }
+        if later && at_once == crate::mac_switches::PlacedAtOnce::Read {
+            crate::placed_read::skipped();
         }
         if !later {
             // What the view needs (the texture it views, the copy of the
@@ -1450,7 +1455,7 @@ impl HostHeap {
             // reads the slot: `make_read` then makes it, as the held texture
             // is not the view's (`needs_remake`).
             let keep_old = later
-                && at_once == crate::mac_switches::PlacedAtOnce::Keep
+                && at_once.keeps()
                 && self.kept.get(index as usize, |held| held.is_some());
             self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));

@@ -134,12 +134,18 @@ impl std::ops::AddAssign for Count {
     }
 }
 
-/// All samples of something, those running, those alone.
+/// All samples of something, those running, those alone, those in file
+/// I/O and those not looked at; the rest waited.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Acc {
     pub(crate) all: Count,
     pub(crate) running: Count,
     pub(crate) alone: Count,
+    /// mac: in a file read (`NtReadFile`): neither running nor waiting.
+    pub(crate) io: Count,
+    /// mac: not looked at (the thread had just taken an exception): what
+    /// it did is not known, so it is neither running nor waiting.
+    pub(crate) unseen: Count,
 }
 
 impl Acc {
@@ -151,6 +157,17 @@ impl Acc {
         if s.alone {
             self.alone.add(s.us);
         }
+        if s.io {
+            self.io.add(s.us);
+        }
+        if s.unseen {
+            self.unseen.add(s.us);
+        }
+    }
+
+    /// The time in waits: what is neither running, nor in I/O, nor unseen.
+    pub(crate) fn waiting_us(&self) -> u64 {
+        self.all.us - self.running.us - self.io.us - self.unseen.us
     }
 }
 
@@ -159,6 +176,8 @@ impl std::ops::AddAssign for Acc {
         self.all += other.all;
         self.running += other.running;
         self.alone += other.alone;
+        self.io += other.io;
+        self.unseen += other.unseen;
     }
 }
 
@@ -173,10 +192,14 @@ pub(crate) struct Sample<'a> {
     pub(crate) function: u64,
     /// The wall time the sample stands for.
     pub(crate) us: u64,
-    /// Not in a wait.
+    /// Looked at, and in neither a wait nor file I/O.
     pub(crate) running: bool,
-    /// The only sampled thread running in its round.
+    /// The only sampled thread seen running in its round.
     pub(crate) alone: bool,
+    /// mac: in a file read.
+    pub(crate) io: bool,
+    /// mac: not looked at (the [`SKIPPED`] mark).
+    pub(crate) unseen: bool,
 }
 
 /// The sums of a set of samples (a thread's, or all).
@@ -493,13 +516,18 @@ pub(crate) fn render(
     let a = all.acc;
     let _ = writeln!(
         out,
-        "samples: {} ({} running, {} alone, {:.0}% walked); running {:.1} {unit}, waiting {:.1}, alone {:.1}",
+        "samples: {} ({} running, {} alone, {} in I/O, {} not looked at, {:.0}% walked); running {:.1} {unit}, \
+         waiting {:.1}, in I/O {:.1}, not looked at {:.1}, alone {:.1}",
         a.all.samples,
         a.running.samples,
         a.alone.samples,
+        a.io.samples,
+        a.unseen.samples,
         share(all.walked, a.all.samples),
         scale.per(a.running.us),
-        scale.per(a.all.us - a.running.us),
+        scale.per(a.waiting_us()),
+        scale.per(a.io.us),
+        scale.per(a.unseen.us),
         scale.per(a.alone.us),
         unit = scale.unit()
     );
@@ -526,8 +554,9 @@ pub(crate) fn render(
     }
     let _ = writeln!(
         out,
-        "running = not in one of the {} wait functions known; alone = the only sampled thread running in its round; \
-         {} = thread milliseconds{}; each sample stands for the time since that thread's previous one",
+        "running = looked at and not in one of the {} waits known nor in file I/O; alone = the only sampled thread \
+         seen running in its round (threads not looked at that round do not count); not looked at = the thread had \
+         just taken an exception; {} = thread milliseconds{}; each sample stands for the time since that thread's previous one",
         h.waits_known,
         scale.unit(),
         if h.frames > 0 {
@@ -727,19 +756,21 @@ pub(crate) fn render(
             Some(code) => format!(", ended (exit code {code})"),
             None => String::new(),
         };
-        if acc.running.samples == 0 {
+        if acc.running.samples == 0 && acc.io.samples == 0 && acc.unseen.samples == 0 {
             quiet.push(format!("{} \"{}\"{ended}", t.id, t.name));
             continue;
         }
         let _ = writeln!(
             out,
-            "thread {} \"{}\" started at {}{ended}: running {:.2} {unit}, waiting {:.2}, alone {:.2}; {} samples, {:.0}% walked; \
-             {} looks; {} exceptions, {} starts while watched ({:.1} a second lately)",
+            "thread {} \"{}\" started at {}{ended}: running {:.2} {unit}, waiting {:.2}, in I/O {:.2}, not looked at {:.2}, \
+             alone {:.2}; {} samples, {:.0}% walked; {} looks; {} exceptions, {} starts while watched ({:.1} a second lately)",
             t.id,
             t.name,
             modules.place(t.start),
             scale.per(acc.running.us),
-            scale.per(acc.all.us - acc.running.us),
+            scale.per(acc.waiting_us()),
+            scale.per(acc.io.us),
+            scale.per(acc.unseen.us),
             scale.per(acc.alone.us),
             acc.all.samples,
             share(t.totals.walked, acc.all.samples),
@@ -885,7 +916,57 @@ mod tests {
             us,
             running,
             alone,
+            io: false,
+            unseen: false,
         }
+    }
+
+    /// mac: samples not looked at and samples in file I/O are counted on
+    /// their own: never running, never in the running tables, and not
+    /// waiting either.
+    #[test]
+    fn unseen_and_io_samples_are_neither_running_nor_waiting() {
+        let mut t = Totals::with_callers();
+        t.add(&sample(&[0x1_4000_1010], 0x1_4000_1000, 1000, true, true));
+        t.add(&sample(&[0x1_4000_1010], 0x1_4000_1000, 400, false, false));
+        t.add(&Sample {
+            io: true,
+            ..sample(&[0x6fff_ffc0_ea40], 0, 300, false, false)
+        });
+        t.add(&Sample {
+            unseen: true,
+            ..sample(&[SKIPPED], 0, 200, false, false)
+        });
+        let a = t.acc;
+        assert_eq!(a.all, Count { samples: 4, us: 1900 });
+        assert_eq!(a.running, Count { samples: 1, us: 1000 });
+        assert_eq!(a.alone, Count { samples: 1, us: 1000 });
+        assert_eq!(a.io, Count { samples: 1, us: 300 });
+        assert_eq!(a.unseen, Count { samples: 1, us: 200 });
+        assert_eq!(a.waiting_us(), 400);
+        // The mark of a look left out has no running time in any table.
+        assert_eq!(t.buckets[&bucket(SKIPPED)].running.samples, 0);
+        assert_eq!(t.chains.as_ref().unwrap().values().map(|c| c.samples).sum::<u64>(), 1);
+        let header = Header {
+            seconds: 1.0,
+            frames: 1,
+            ..Header::default()
+        };
+        let threads = [ThreadView {
+            id: 7,
+            name: "t",
+            start: 0,
+            ended: None,
+            exceptions: 0,
+            starts: 0,
+            looks: 3,
+            rate: 0.0,
+            totals: &t,
+        }];
+        let text = render(&header, &modules(), &t, &threads, &[], &|at| format!("{at:#x}"));
+        assert!(text.contains("1 in I/O, 1 not looked at"), "{text}");
+        assert!(text.contains("waiting 0.40, in I/O 0.30, not looked at 0.20, alone 1.00"), "{text}");
+        assert!(!text.contains("not looked at (an exception)"), "a running table shows the left-out mark:\n{text}");
     }
 
     #[test]

@@ -141,6 +141,9 @@ struct Watched {
     start: u64,
     /// Samples in a row in a wait.
     waits_in_row: u32,
+    /// mac: its last look was left out (an exception): what it does now is
+    /// not known, so a round it is not due in does not count it running.
+    unseen_last: bool,
     /// Its previous sample (microseconds since the sampler started; 0: none).
     last_us: u64,
     failures: u32,
@@ -161,11 +164,22 @@ struct Watched {
     totals: Totals,
 }
 
+/// mac: what a sampled thread was doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    Running,
+    Waiting,
+    /// In file I/O.
+    Io,
+    /// Not looked at (it had just taken an exception).
+    Unseen,
+}
+
 /// A sample of this round, before it is known whether its thread ran alone.
 struct Pending {
     thread: usize,
     us: u64,
-    running: bool,
+    state: State,
     function: u64,
     depth: usize,
     frames: [u64; MAX_DEPTH],
@@ -488,14 +502,18 @@ impl Sampler {
                         .max(t.looked_us + interval_us(t.rate, risk, exposure));
                 }
                 if now < t.next_us {
-                    // Not due: as it was at its last look.
-                    running += usize::from(t.waits_in_row == 0);
+                    // Not due: as it was at its last look (not known after
+                    // a look left out).
+                    running += usize::from(t.waits_in_row == 0 && !t.unseen_last);
                     continue;
                 }
             }
             let t = &self.threads[i];
             if self.quiet_rounds > 0 && marked(place(t.id), self.rounds + 1, self.quiet_rounds) {
-                // Just took an exception: not looked at; busy meanwhile.
+                // Just took an exception: not looked at. mac: what it does
+                // meanwhile is not known, so the sample is neither running
+                // nor waiting, and the round's count of running threads
+                // (for "alone") leaves it out.
                 self.skipped += 1;
                 let at = self.us();
                 let t = &mut self.threads[i];
@@ -505,13 +523,13 @@ impl Sampler {
                 };
                 t.last_us = at;
                 t.waits_in_row = 0;
-                running += 1;
+                t.unseen_last = true;
                 let mut frames = [0; MAX_DEPTH];
                 frames[0] = SKIPPED;
                 pending.push(Pending {
                     thread: i,
                     us,
-                    running: true,
+                    state: State::Unseen,
                     function: 0,
                     depth: 1,
                     frames,
@@ -544,12 +562,14 @@ impl Sampler {
                 )
             };
             let rip = self.frames[0];
-            let is_running = !self.is_wait(rip);
+            let state = self.state_of(rip);
+            let is_running = state == State::Running;
             let function = self.function_of(rip);
             let fallback = self.period_us * if waiting { idle } else { 1 };
             let exposure = self.exposure_us();
             let t = &mut self.threads[i];
             t.failures = 0;
+            t.unseen_last = false;
             t.looks += 1;
             t.looked_us = at;
             t.next_us = at + interval_us(t.rate, self.config.risk, exposure);
@@ -559,10 +579,11 @@ impl Sampler {
                 _ => fallback,
             };
             t.last_us = at;
-            t.waits_in_row = if is_running {
-                0
-            } else {
+            // A thread in file I/O is looked at as often as a running one.
+            t.waits_in_row = if state == State::Waiting {
                 t.waits_in_row.saturating_add(1)
+            } else {
+                0
             };
             running += usize::from(is_running);
             let mut frames = [0; MAX_DEPTH];
@@ -570,7 +591,7 @@ impl Sampler {
             pending.push(Pending {
                 thread: i,
                 us,
-                running: is_running,
+                state,
                 function,
                 depth: n,
                 frames,
@@ -578,12 +599,15 @@ impl Sampler {
         }
         self.running_rounds[running.min(self.running_rounds.len() - 1)] += 1;
         for p in &pending {
+            let is_running = p.state == State::Running;
             let sample = Sample {
                 frames: &p.frames[..p.depth],
                 function: p.function,
                 us: p.us,
-                running: p.running,
-                alone: p.running && running == 1,
+                running: is_running,
+                alone: is_running && running == 1,
+                io: p.state == State::Io,
+                unseen: p.state == State::Unseen,
             };
             self.all.add(&sample);
             self.threads[p.thread].totals.add(&sample);
@@ -654,6 +678,11 @@ impl Sampler {
 
     fn is_wait(&self, rip: u64) -> bool {
         self.waits.iter().any(|&(from, to)| rip >= from && rip < to)
+    }
+
+    /// What a thread standing at `rip` is doing.
+    fn state_of(&self, rip: u64) -> State {
+        if self.is_wait(rip) { State::Waiting } else { State::Running }
     }
 
     /// Where the function holding `rip` starts, by unwind data; 0 if none.
@@ -802,6 +831,7 @@ impl Sampler {
             name,
             start,
             waits_in_row: 0,
+            unseen_last: false,
             last_us: 0,
             failures: 0,
             ended: None,

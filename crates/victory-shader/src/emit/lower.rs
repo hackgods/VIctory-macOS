@@ -7624,8 +7624,13 @@ impl<'a> Lower<'a> {
                 // for a value the same in both halves, or where the group is
                 // one host wave.
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
-                let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                // Alike in the lanes that made it: in a block predication
+                // runs in every lane the others hold an old value, and a
+                // half may have none of the first. There it is read as any
+                // other: from a lane of the predicate, between the halves.
+                let is_alike = self.pred_active(self.cur_ir).is_none()
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
                 let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));

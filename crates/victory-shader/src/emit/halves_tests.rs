@@ -4354,3 +4354,158 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+
+/// Two first-lane reads of values the same in every lane that makes them,
+/// in an `s_and_saveexec_b64` region whose EXEC is `mask_words`'s:
+/// `v4 = 42` then `v4 = 1.0 + v4` (1.0, read into `s12`) and `v5 = 1.0 + v4`
+/// (2.0, read into `s13`). The lanes outside the region never make `v4` or
+/// `v5`. Every lane stores `v2` and `v6`, which take the two reads after
+/// EXEC is restored (every lane), or with `inside` in the region (its lanes
+/// only, the others keeping 0: reads only the lanes that ran them see).
+/// `with_mbcnt`: a `v_mbcnt` first, so the program runs in halves on a
+/// 32-lane host whatever else it holds.
+fn alike_reads_in_a_region(mask_words: &[u32], with_mbcnt: bool, inside: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+    ]);
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    w.extend(mask_words);
+    let moves = [
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0x7E0C_020D, // v_mov_b32 v6, s13
+    ];
+    w.extend([
+        0xBE80_246A,                               // s_and_saveexec_b64 s[0:1], vcc
+        0xBF88_0005 + 2 * u32::from(inside), // s_cbranch_execz (past the region)
+        0x7E08_02AA,                               // v_mov_b32 v4, 42
+        0x0608_08F2,                               // v_add_f32 v4, 1.0, v4
+        0x7E18_0504,                               // v_readfirstlane_b32 s12, v4
+        0x060A_08F2,                               // v_add_f32 v5, 1.0, v4
+        0x7E1A_0505,                               // v_readfirstlane_b32 s13, v5
+    ]);
+    if inside {
+        w.extend(moves);
+    }
+    w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    if !inside {
+        w.extend(moves);
+    }
+    w.extend(store(2, 0));
+    w.extend(store(6, 4));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_alike_read_programs_are_what_their_comments_say() {
+    let words = alike_reads_in_a_region(&MASK_LANES_40_41, true, false);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_mov_b32 v6, 0",
+        "v_mbcnt_lo_u32_b32 v1, -1, 0",
+        "v_cmp_eq_u32 vcc, 20, v3",
+        "s_and_saveexec_b64 s[0:1], vcc",
+        "s_cbranch_execz",
+        "v_mov_b32 v4, 42",
+        "v_add_f32 v4, 1.0, v4",
+        "v_readfirstlane_b32 s12, v4",
+        "v_add_f32 v5, 1.0, v4",
+        "v_readfirstlane_b32 s13, v5",
+        "s_mov_b64 exec, s[0:1]",
+        "v_mov_b32 v2, s12",
+        "v_mov_b32 v6, s13",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// Lanes 8 and 9 of every console wave (its lower half).
+const MASK_WAVE_LANES_8_9: [u32; 2] = [
+    0x3606_00BE, // v_and_b32 v3, 62, v0
+    0x7D84_0688, // v_cmp_eq_u32 vcc, 8, v3
+];
+/// Lanes 40 and 41 of every console wave (its upper half).
+const MASK_WAVE_LANES_40_41: [u32; 2] = [
+    0x3606_00BE, // v_and_b32 v3, 62, v0
+    0x7D84_06A8, // v_cmp_eq_u32 vcc, 40, v3
+];
+
+/// A first-lane read of a value the same in every lane that makes it reads
+/// a lane that made it. The halves run such a region in every lane, under a
+/// predicate: the host wave's first lane may be outside it and hold an old
+/// value (the read took that one), and a half with no lane of the region
+/// holds none at all (it takes the other half's). `inside`: only the
+/// region's lanes see the reads, each half making them by itself
+/// (`first_lane::read_alone`), from a lane of the region too.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_of_an_alike_value_in_a_region_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    type InRegion = fn(u32) -> bool;
+    let masks: [(&str, &[u32; 2], InRegion); 3] = [
+        ("lower_8_9", &MASK_WAVE_LANES_8_9, |t| t & 62 == 8),
+        ("upper_40_41", &MASK_WAVE_LANES_40_41, |t| t & 62 == 40),
+        ("both_12_44", &MASK_LANES_12_44, |t| t & 31 == 12),
+    ];
+    for (label, mask, in_region) in masks {
+        for with_mbcnt in [false, true] {
+            for threads in [64, 128] {
+                for inside in [false, true] {
+                    let words = alike_reads_in_a_region(mask, with_mbcnt, inside);
+                    let want: Vec<u32> = (0..threads)
+                        .flat_map(|t| {
+                            if !inside || in_region(t) {
+                                [1.0f32.to_bits(), 2.0f32.to_bits()]
+                            } else {
+                                [0, 0]
+                            }
+                        })
+                        .collect();
+                    let found = differences_with_buffer(
+                        true, &words, threads, 2, &want, 0, false, false, &[0; 4],
+                    );
+                    failed.extend(found.into_iter().map(|m| {
+                        format!("{label}(mbcnt={with_mbcnt}, inside={inside}) {threads} threads: {m}")
+                    }));
+                }
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// The masks are what their comments say.
+#[test]
+fn the_wave_lane_masks_are_what_their_comments_say() {
+    for (mask, want) in [
+        (&MASK_WAVE_LANES_8_9, "v_cmp_eq_u32 vcc, 8, v3"),
+        (&MASK_WAVE_LANES_40_41, "v_cmp_eq_u32 vcc, 40, v3"),
+    ] {
+        let code: Vec<u8> = mask
+            .iter()
+            .chain(&[S_ENDPGM])
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let text: Vec<String> = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect();
+        assert_eq!(text[..2], ["v_and_b32 v3, 62, v0", want]);
+    }
+}

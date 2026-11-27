@@ -958,6 +958,16 @@ impl Shadow {
             if !crate::host::read_into(from as *const u8, &mut title) {
                 continue;
             }
+            // Diagnostics: how densely the shaders changed this page (what
+            // differs from the copy's bytes before the submission).
+            #[cfg(feature = "diagnostics")]
+            {
+                let before: &[u8] = match &saved {
+                    None => &title[..],
+                    Some(before) => &before[from - page..to - page],
+                };
+                copy_back_probe::add(host, before);
+            }
             let differs = match &saved {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
@@ -3920,5 +3930,55 @@ pub(crate) mod tests {
         assert!(ranges_disjoint(&[(0x1000, 0x1000), (0x2000, 0x1000)]));
         assert!(ranges_disjoint(&[(0x2000, 0x1000), (0x1000, 0x1000)]));
         assert!(!ranges_disjoint(&[(0x1000, 0x1500), (0x2000, 0x1000)]));
+    }
+}
+
+/// Diagnostics: how densely the shaders change the pages that go back
+/// (`copy_back_marked`), logged every 5 s. Every marked page that differs
+/// goes back whole; the counts say how much of that a finer grain (4 KiB,
+/// 256 B) would leave out.
+#[cfg(feature = "diagnostics")]
+mod copy_back_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    static PAGES: AtomicU64 = AtomicU64::new(0);
+    static DIFFERING: AtomicU64 = AtomicU64::new(0);
+    static BYTES: AtomicU64 = AtomicU64::new(0);
+    static CHUNKS_4K: AtomicU64 = AtomicU64::new(0);
+    static CHUNKS_256: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+    /// One page looked at: `host` the copy's bytes after the submission,
+    /// `before` what they were before it (same length).
+    pub(super) fn add(host: &[u8], before: &[u8]) {
+        PAGES.fetch_add(1, Relaxed);
+        let changed = |grain: usize| {
+            host.chunks(grain).zip(before.chunks(grain)).filter(|(a, b)| a != b).count() as u64
+        };
+        let c4 = changed(4 << 10);
+        if c4 != 0 {
+            DIFFERING.fetch_add(1, Relaxed);
+            BYTES.fetch_add(host.len() as u64, Relaxed);
+            CHUNKS_4K.fetch_add(c4, Relaxed);
+            CHUNKS_256.fetch_add(changed(256), Relaxed);
+        }
+        let Ok(mut last) = LAST.try_lock() else { return };
+        let now = std::time::Instant::now();
+        if now.duration_since(*last.get_or_insert(now)).as_secs() < 5 {
+            return;
+        }
+        *last = Some(now);
+        let (pages, differing, bytes) = (PAGES.swap(0, Relaxed), DIFFERING.swap(0, Relaxed), BYTES.swap(0, Relaxed));
+        let (c4, c256) = (CHUNKS_4K.swap(0, Relaxed), CHUNKS_256.swap(0, Relaxed));
+        tracing::info!(
+            pages,
+            differing,
+            whole_mb = bytes as f64 / 1048576.0,
+            by_4k_mb = (c4 * 4096) as f64 / 1048576.0,
+            by_256_mb = (c256 * 256) as f64 / 1048576.0,
+            frame = crate::frame::current(),
+            "copy-back density (5 s): pages looked at, of them differing (written whole now), and what 4 KiB or 256 B grains would write"
+        );
     }
 }

@@ -109,6 +109,17 @@ fn lower_wave(
     used: Vec<UsedResource>,
     wave64: bool,
 ) -> Result<Lowered, crate::ShaderError> {
+    lower_mac(words, layout, used, wave64, Default::default())
+}
+
+/// [`lower_wave`] with the Mac line's switches `mac`.
+fn lower_mac(
+    words: &[u32],
+    layout: Vec<RootParam>,
+    used: Vec<UsedResource>,
+    wave64: bool,
+    mac: super::Mac,
+) -> Result<Lowered, crate::ShaderError> {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let sgprs: u32 = layout.iter().map(|p| p.sgprs).sum();
     let native = NativeProgram {
@@ -145,7 +156,7 @@ fn lower_wave(
         host_wave32: false,
         narrow_waves: false,
         halves_local: Default::default(),
-        mac: Default::default(),
+        mac,
         view_marks: false,
     })
 }
@@ -1925,4 +1936,109 @@ fn a_box32_nodes_tail_reuses_its_heads_lookup() {
     assert!(table[4] == again && at(again) == 2, "{loads:?} {table:?}");
     let through_head = loads.iter().filter(|&&b| b != 0 && b < again);
     assert_eq!(through_head.count(), 4 + 3, "{loads:?} {table:?}");
+}
+
+/// Mac: `s_buffer_load_dword<x4|x8|x16>` (by `count`) at byte `offset` (the
+/// immediate) of a raw SRV at table dword 0 (s0), each dword stored to the
+/// raw UAV at table dword 4 so all are read, lowered with
+/// `Mac::wide_loads` = `wide`: the `rawBufferLoad` calls, as their offset
+/// and mask (after 64bitMango 759c4d6b's test).
+fn scalar_load_raw_loads(count: u32, offset: i32, wide: bool) -> Vec<(Option<u32>, Option<u32>)> {
+    let op = match count {
+        4 => 10,
+        8 => 11,
+        16 => 12,
+        _ => unreachable!(),
+    };
+    let mut words = vec![
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0202,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0
+        0xF408_0302,
+        0xFA00_0010, // s_load_dwordx4 s[12:15], s[4:5], 0x10
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF400_0404 | (op << 18),
+        0xFA00_0000 | (offset as u32 & 0x1F_FFFF), // s_buffer_load_dword<x4|x8|x16> s[16:..], s[8:11], <offset>
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+    ];
+    for k in 0..count {
+        words.extend([
+            0x7E02_0210 + k,       // v_mov_b32 v1, s<16 + k>
+            0xE070_0000 | (4 * k), // buffer_store_dword v1, off, s[12:15], 0 offset:<4k>
+            0x8003_0100,
+        ]);
+    }
+    words.push(S_ENDPGM);
+    let view = |kind, table_offset_dwords| UsedResource {
+        kind,
+        root: RootType::Table,
+        table_offset_dwords,
+        lower_bound: 0,
+        stride: 0,
+        dwords: 4,
+        user_data: 0,
+        slot: 0,
+    };
+    let mac = super::Mac {
+        wide_loads: wide,
+        ..Default::default()
+    };
+    let l = lower_mac(
+        &words,
+        vec![root(RootType::Table, 0, 0)],
+        vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 4)],
+        false,
+        mac,
+    );
+    // The SRV's loads only: the stores read nothing.
+    l.unwrap().raw_load_args
+}
+
+/// The offset of every dword `calls` (as [`scalar_load_raw_loads`] gives
+/// them) read, in order.
+fn dword_offsets(calls: &[(Option<u32>, Option<u32>)]) -> Vec<u32> {
+    calls
+        .iter()
+        .flat_map(|&(at, mask)| {
+            let (at, mask) = (at.unwrap(), mask.unwrap());
+            (0..4)
+                .filter(move |k| mask >> k & 1 != 0)
+                .map(move |k| at.wrapping_add(4 * k))
+        })
+        .collect()
+}
+
+/// Mac: with `wide_loads`, the dwords of one scalar load are read four a
+/// call; without it, a call each.
+#[test]
+fn the_dwords_of_one_scalar_load_are_read_four_a_call_when_wide() {
+    for count in [4, 8, 16] {
+        let wide = scalar_load_raw_loads(count, 0, true);
+        assert_eq!(wide.len(), count as usize / 4, "{count} dwords, wide: {wide:x?}");
+        assert!(wide.iter().all(|&(_, mask)| mask == Some(0xF)), "{wide:x?}");
+        let narrow = scalar_load_raw_loads(count, 0, false);
+        assert_eq!(narrow.len(), count as usize, "{count} dwords, a call each");
+        assert_eq!(dword_offsets(&wide), dword_offsets(&narrow), "{count} dwords: the same bytes");
+    }
+}
+
+/// Mac: a load whose dwords wrap past 32 bits (`0xffff_fffc` plus 4 is 0
+/// for a call a dword) reads its wrapping group a dword a call, at the
+/// offsets the lowering without the switch reads; the groups after it,
+/// and a load whose last dword is at `0xffff_fffc`, four a call.
+#[test]
+fn a_scalar_load_wrapping_past_32_bits_is_read_a_dword_a_call() {
+    // (dwords, the calls the switch makes)
+    for (count, calls) in [(4, 4), (8, 5), (16, 7)] {
+        let narrow = scalar_load_raw_loads(count, -4, false);
+        let wide = scalar_load_raw_loads(count, -4, true);
+        let offsets: Vec<u32> = (0..count).map(|k| (4 * k).wrapping_sub(4)).collect();
+        assert_eq!(dword_offsets(&narrow), offsets, "{count} dwords, a call each");
+        assert_eq!(dword_offsets(&wide), offsets, "{count} dwords, wide");
+        assert_eq!(wide.len(), calls, "{count} dwords, wide: {wide:x?}");
+    }
+    // Its last dword at 0xffff_fffc, its bytes below 2^32: one call.
+    let wide = scalar_load_raw_loads(4, -16, true);
+    assert_eq!(wide, [(Some(0xffff_fff0), Some(0xF))]);
 }

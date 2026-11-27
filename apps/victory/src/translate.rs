@@ -177,6 +177,9 @@ struct Checks {
     /// With half-local reads: the Mac port's hand-over across the halves
     /// comes before them (`VICTORY_HALVES_ACROSS=1`, as `run`).
     across: bool,
+    /// The dwords of one console load are read four a call
+    /// (`VICTORY_SHADER_OPT=64`, as `run`; mac).
+    wide: bool,
 }
 
 pub fn run(
@@ -237,6 +240,10 @@ pub fn run(
     if across {
         println!("halves       hand reads over as VIctory-macOS does, before half-local reads (VICTORY_HALVES_ACROSS=1)");
     }
+    let wide = victory_gpu::shader_cache::wide_loads();
+    if wide {
+        println!("loads        the dwords of one console load four a call (VICTORY_SHADER_OPT=64)");
+    }
     let pairs: Vec<(String, String)> = std::env::var("VICTORY_PAIRS")
         .unwrap_or_default()
         .split(',')
@@ -283,6 +290,7 @@ pub fn run(
                                 exchange,
                                 walk,
                                 across,
+                                wide,
                             };
                             while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                                 translate(job, entry.path(), &seen, &mut t, &mut checks);
@@ -650,6 +658,7 @@ fn translate(
                         halves_exchange: checks.exchange,
                         halves_walk: checks.walk,
                         halves_across: checks.across,
+                        wide_loads: checks.wide,
                         ..Default::default()
                     };
                     let _ = emit::uav_size_queries();

@@ -1028,11 +1028,10 @@ fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
 fn a_reduction_after_a_loop_lanes_leave_passes_between_halves() {
     let words = sum_after_a_loop_lanes_leave();
     for threads in [64, 96, 128] {
+        // The loop runs in lockstep (`FlatExit::LockstepExit`): its lanes
+        // leave together at the cap, so the reduction is not refused.
         let why = super::with_cap_barriers(true, || refusal(&words, threads, 0));
-        assert!(
-            why.contains("a wave reduction over both 32-lane halves"),
-            "{threads}: {why}"
-        );
+        assert_eq!(why, "translated", "{threads}");
         let translated = super::with_cap_barriers(false, || refusal(&words, threads, 0));
         assert_eq!(translated, "translated", "{threads}");
     }

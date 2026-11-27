@@ -1830,6 +1830,7 @@ mod tests {
             view
         };
         LOOSE_VIEW.store(view as usize, Ordering::Relaxed);
+        clear_remapped(view as u64, (view as usize + TEST_SECTION) as u64);
         *LOOSE_HEAP.lock().unwrap() = Some(heap.clone());
         TEST_RESOLVER.with(|c| c.set(Some(loose_resolve)));
 

@@ -460,6 +460,37 @@ pub(crate) fn census_batch() -> bool {
     })
 }
 
+/// Whether block-compressed host textures are made castable only to their
+/// sRGB partner (`crate::resource::castable_metal`, VIctory-macOS #499):
+/// Metal views block-compressed memory only in its own compression and
+/// aborts the process (SIGABRT `0x80000101`) on a view in another; Series
+/// 1.0.2.1 reuses BC5 memory as BC7 in the world. Such memory then gets its
+/// own host texture, as on hosts that refuse castable lists, and a copy that
+/// asked for a same-family cast (BC5 UNORM as SNORM) no longer finds it in the
+/// list. Only with `VICTORY_METAL_BC_CASTS=1` and under Wine (`wine`, asked
+/// only then), read once (at the first colour host texture).
+pub(crate) fn metal_bc_casts(wine: impl FnOnce() -> bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = bc_casts_rule(std::env::var("VICTORY_METAL_BC_CASTS").ok().as_deref());
+        let on = asked && wine();
+        if on {
+            tracing::info!(
+                "VICTORY_METAL_BC_CASTS=1: block-compressed host textures are castable only to their sRGB partner; \
+                 memory viewed in another compression gets its own host texture"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_METAL_BC_CASTS=1 does nothing outside Wine");
+        }
+        on
+    })
+}
+
+/// `VICTORY_METAL_BC_CASTS`'s rule: on only for `1`.
+fn bc_casts_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
 /// What a heap sync does with a slot it finds rewritten with a view of a
 /// placed texture (`VICTORY_PLACED_AT_ONCE`, notes/flicker.md). Without it
 /// the slot is left null until a shader has read it: one submission of
@@ -520,7 +551,15 @@ pub(crate) fn placed_at_once() -> PlacedAtOnce {
 
 #[cfg(test)]
 mod census_tests {
-    use super::census_rule;
+    use super::{bc_casts_rule, census_rule};
+
+    #[test]
+    fn metal_bc_casts_are_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("2")] {
+            assert!(!bc_casts_rule(off), "{off:?}");
+        }
+        assert!(bc_casts_rule(Some("1")) && bc_casts_rule(Some(" 1 ")));
+    }
 
     #[test]
     fn the_census_switch_is_off_unless_it_is_1() {

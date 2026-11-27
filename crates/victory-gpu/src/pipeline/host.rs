@@ -477,6 +477,75 @@ pub(crate) struct HostPipeline {
     pub(crate) marks: Option<(u32, u32)>,
 }
 
+/// The mesh and pixel stages [`HostPipeline::new`] makes a mesh pipeline
+/// of when they are not the shaders' own translations.
+///
+/// Mesh shaders whose standalone output footprint (packed or Metal-
+/// aligned) exceeds Metal's 32 KiB limit are re-translated together with
+/// their paired pixel shader, pruning unread outputs and repacking
+/// attribute order to eliminate alignment padding holes. When the paired pixel
+/// shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
+/// mesh pipelines have no geometry stage, so lower those reads to
+/// hardware center interpolation (`VICTORY_MESH_PER_VERTEX_CENTER`).
+fn linked_mesh(
+    mesh: Option<&Arc<Shader>>,
+    pixel: Option<&Arc<Shader>>,
+) -> Option<(Arc<Shader>, Option<Arc<Shader>>)> {
+    let ps_deltas = mesh.is_some()
+        && super::mesh_per_vertex_center()
+        && pixel
+            .and_then(|ps| ps.translated())
+            .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
+    mesh.and_then(|ms| {
+        let over_limit = super::link_mesh_outputs()
+            && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
+        if over_limit {
+            super::translate_linked(ms, pixel.map(Arc::as_ref), ps_deltas)
+        } else if ps_deltas {
+            let ps = pixel?;
+            let ps_center = super::translate_pixel_center(ps)?;
+            Some((ms.clone(), Some(ps_center)))
+        } else {
+            None
+        }
+    })
+}
+
+/// For `victory replay --retranslate` (`crate::replay::play::retranslate`):
+/// the DXIL each stage of a pipeline of the title's containers `stages`
+/// (stage and container) gets from this build with this run's switches, as
+/// [`HostPipeline::new`] chooses it ([`linked_mesh`]), and whether it is
+/// one made for the pipeline alone. Geometry shaders the host layer makes
+/// for a pipeline (rectangles, vertex deltas) are not among them: a replay
+/// keeps the recorded ones.
+pub(crate) fn retranslated(
+    stages: &[(&'static str, &[u8])],
+) -> Vec<(Result<Vec<u8>, String>, bool)> {
+    let shaders: Vec<Arc<Shader>> = stages
+        .iter()
+        .map(|(stage, bytes)| super::shader(stage, bytes))
+        .collect();
+    let find = |stage| shaders.iter().find(|s| s.stage == stage);
+    let linked = find("mesh").and_then(|ms| linked_mesh(Some(ms), find("pixel")));
+    shaders
+        .iter()
+        .map(|s| {
+            let alone = match (&linked, s.stage) {
+                // With only the pixel shader made again, the mesh stage is
+                // the shader's own.
+                (Some((ms, _)), "mesh") if !Arc::ptr_eq(ms, s) => Some(ms),
+                (Some((_, Some(ps))), "pixel") => Some(ps),
+                _ => None,
+            };
+            let dxil = alone.unwrap_or(s).translated().map(|t| t.host.dxil.clone());
+            (
+                dxil.ok_or_else(|| "it does not translate (the log says why)".to_owned()),
+                alone.is_some(),
+            )
+        })
+        .collect()
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
@@ -527,31 +596,7 @@ impl HostPipeline {
         for (s, _) in &stages {
             s.translated()?;
         }
-        // Mesh shaders whose standalone output footprint (packed or Metal-
-        // aligned) exceeds Metal's 32 KiB limit are re-translated together with
-        // their paired pixel shader, pruning unread outputs and repacking
-        // attribute order to eliminate alignment padding holes. When the paired pixel
-        // shader reads non-provoking vertex values (`VICTORY_P10`/`VICTORY_P20`),
-        // mesh pipelines have no geometry stage, so lower those reads to
-        // hardware center interpolation (`VICTORY_MESH_PER_VERTEX_CENTER`).
-        let ps_deltas = mesh.is_some()
-            && super::mesh_per_vertex_center()
-            && find("pixel")
-                .and_then(|ps| ps.translated())
-                .is_some_and(|ps| victory_shader::emit::needs_vertex_deltas(&ps.host.dxil));
-        let linked = mesh.and_then(|ms| {
-            let over_limit = super::link_mesh_outputs()
-                && over_limit_mesh_output_bytes(&ms.translated()?.host.dxil).is_some();
-            if over_limit {
-                super::translate_linked(ms, find("pixel").map(Arc::as_ref), ps_deltas)
-            } else if ps_deltas {
-                let ps = find("pixel")?;
-                let ps_center = super::translate_pixel_center(ps)?;
-                Some((ms.clone(), Some(ps_center)))
-            } else {
-                None
-            }
-        });
+        let linked = linked_mesh(mesh, find("pixel"));
         let stages: Vec<(&Arc<Shader>, D3D12_SHADER_VISIBILITY)> = match &linked {
             Some((ms, ps)) => {
                 let mut v = vec![(ms, D3D12_SHADER_VISIBILITY_MESH)];
@@ -1125,6 +1170,24 @@ mod tests {
             t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
         }
         b
+    }
+
+    /// `victory replay --retranslate`: an answer for every stage, in
+    /// order; a container that does not translate is refused, and with no
+    /// mesh stage that translates nothing is made for the pipeline alone.
+    #[test]
+    fn every_stage_is_translated_again_or_refused() {
+        // Bytes of their own: containers are shared by content.
+        let made = retranslated(&[
+            ("mesh", b"not a mesh shader"),
+            ("pixel", b"not a pixel shader"),
+        ]);
+        assert_eq!(made.len(), 2);
+        for (dxil, alone) in made {
+            assert!(dxil.is_err_and(|e| e.contains("does not translate")));
+            assert!(!alone);
+        }
+        assert!(retranslated(&[]).is_empty());
     }
 
     #[test]

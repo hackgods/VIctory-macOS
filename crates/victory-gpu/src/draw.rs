@@ -3431,6 +3431,19 @@ void main() { dst.Store4(0, asuint(src[1])); }
     /// after that barrier must see the heap's then-current UAV range.
     #[test]
     fn a_late_widened_view_follows_a_bindless_write() {
+        late_widened_view(1);
+    }
+
+    /// mac: the same with three heap-writing draws of the heap before the
+    /// barrier (`VICTORY_CENSUS_FAST=1` puts its ranges in once).
+    #[test]
+    fn a_heap_written_by_several_draws_before_its_barrier_widens_as_by_one() {
+        late_widened_view(3);
+    }
+
+    /// [`a_late_widened_view_follows_a_bindless_write`] with `marks`
+    /// heap-writing draws before the barrier.
+    fn late_widened_view(marks: usize) {
         if !crate::under_wine() {
             return;
         }
@@ -3494,6 +3507,9 @@ void main() { dst.Store4(0, asuint(src[1])); }
         // descriptor and the range sampled for widening must name the new view.
         crate::descriptor::create_uav(null, src, null, &new_raw, title_heap.start);
         viewed.set(0, Some(&new), true);
+        for _ in 1..marks {
+            list.mark_widened_heap(&viewed);
+        }
         // SAFETY: an open list.
         unsafe {
             list.list.ResourceBarrier(&[crate::host::uav_barrier()]);

@@ -181,6 +181,29 @@ impl Tickets {
     }
 }
 
+/// For each of a barrier's events (`Some(heap)` for a heap-writing draw,
+/// none for a write of its own): whether it is the last of its heap's.
+/// `crate::host::HostList::sync_widened` puts a heap's ranges in once, where
+/// its last draw stood: every draw of a heap before a barrier stands for the
+/// same ranges (they are read at the barrier), and of equal writes only the
+/// last one decides what a widened view gets (`crate::widened::sync`: a
+/// patch's later segments win; a direct copy is chosen when all writes over
+/// a view are equal).
+pub(crate) fn last_of_each(heaps: impl IntoIterator<Item = Option<usize>>) -> Vec<bool> {
+    let heaps: Vec<Option<usize>> = heaps.into_iter().collect();
+    let mut last = vec![false; heaps.len()];
+    let mut met: Vec<usize> = Vec::new();
+    for (i, heap) in heaps.iter().enumerate().rev() {
+        if let Some(heap) = heap
+            && !met.contains(heap)
+        {
+            met.push(*heap);
+            last[i] = true;
+        }
+    }
+    last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,6 +604,17 @@ mod tests {
             }
             assert_eq!(c.slots.get(&(slot as u32)).map(|(k, _)| *k), Some(range(v).0), "slot {slot}");
         }
+    }
+
+    #[test]
+    fn each_heap_is_marked_at_its_last_event() {
+        assert_eq!(last_of_each([]), Vec::<bool>::new());
+        assert_eq!(last_of_each([None, None]), [false, false]);
+        assert_eq!(last_of_each([Some(1), None, Some(1), None]), [false, false, true, false]);
+        assert_eq!(
+            last_of_each([Some(1), Some(2), None, Some(1), Some(3), Some(2)]),
+            [false, false, false, true, true, true]
+        );
     }
 
     #[test]

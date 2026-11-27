@@ -67,6 +67,8 @@ pub(crate) fn as_holder<R>(holds: bool, f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) mod unwaited;
+// mac: `VICTORY_WIDENED_IN_PLACE` (VIctory-macOS #520).
+mod widened_in_place;
 
 /// What the end of a submission ([`Host::finish`]) needs from its start:
 /// how long the host GPU was waited for, the list the device was removed
@@ -1214,6 +1216,11 @@ pub(crate) struct HostList {
     /// and ordered events written since the last barrier.
     widened_writes: Mutex<Vec<WidenedWrite>>,
     widened_pending: Mutex<Vec<WidenedEvent>>,
+    /// mac: with `VICTORY_WIDENED_IN_PLACE=1`, the writes taken from
+    /// `widened_pending` that no barrier widened yet (heap events expanded),
+    /// kept from barrier to barrier and use to use (`widened_in_place`).
+    /// Empty without the switch.
+    widened_new: Mutex<Vec<WidenedWrite>>,
     /// Exact source shadows whose buffers widening commands read. Their COM
     /// objects alone do not keep an arena slice out of the reuse pool.
     widened_sources: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>>,
@@ -1680,6 +1687,7 @@ impl Host {
                 rebind: false.into(),
                 widened_writes: Mutex::default(),
                 widened_pending: Mutex::default(),
+                widened_new: Mutex::default(),
                 widened_sources: Mutex::default(),
                 widened_ready: Mutex::default(),
                 widened_states: Mutex::default(),
@@ -2878,6 +2886,7 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_new.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3110,6 +3119,10 @@ impl HostList {
     /// After the title's buffer/UAV barrier, widen the shadow ranges written
     /// before it so later SRVs in this submission see the UAV output.
     pub(crate) fn sync_widened(&self) {
+        // mac: `VICTORY_WIDENED_IN_PLACE=1`, without copying the history.
+        if crate::mac_switches::widened_in_place() {
+            return self.sync_widened_in_place();
+        }
         let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
         let events = std::mem::take(&mut *pending);
         let mut expanded = Vec::new();
@@ -3170,7 +3183,8 @@ impl HostList {
         if writes.is_empty() {
             return;
         }
-        let Some(views) = crate::widened::sync(self, &writes, synced, &ready) else {
+        crate::widened::count_history(false, writes.len());
+        let Some(views) = crate::widened::sync(self, &writes[..synced], &writes[synced..], &ready) else {
             return;
         };
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
@@ -3211,7 +3225,14 @@ impl HostList {
     /// Returns widened buffers to common so the CPU can refresh them before
     /// the next submission.
     fn widen_close(&self) {
-        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // mac: with `VICTORY_WIDENED_IN_PLACE=1` the buffers keep their room
+        // for the list's next use, but not a peak's.
+        if crate::mac_switches::widened_in_place() {
+            self.empty_widened();
+        } else {
+            self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.widened_new.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let states = std::mem::take(&mut *self.widened_states.lock().unwrap_or_else(|e| e.into_inner()));
@@ -5143,6 +5164,8 @@ impl Meter {
             crate::ray_skip::log(report_frames);
             crate::texback::log(report_frames);
             crate::physical_runs::log(report_frames);
+            // mac: widened views and their barrier history copies.
+            crate::widened::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
             // mac: the view table and its lock (`VICTORY_VIEW_INLINE`), always.

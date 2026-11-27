@@ -746,20 +746,30 @@ pub(crate) fn refresh_slot(
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier. Computed heap indices do not name ordinary write steps.
 pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
+    let mut out = Vec::new();
+    widened_writes_into(viewed, &mut out);
+    out
+}
+
+/// [`widened_writes`] added to `out` (with `VICTORY_WIDENED_IN_PLACE=1` the
+/// list's buffer, kept from barrier to barrier: the world's heaps have tens
+/// of thousands). From VIctory-macOS #520.
+pub(crate) fn widened_writes_into(viewed: &Viewed, out: &mut Vec<(Arc<Shadow>, usize, usize)>) {
     if !crate::under_wine() {
-        return Vec::new();
+        return;
     }
-    viewed
-        .inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ranges
-        .iter()
-        .filter(|((_, address, end, uav), _)| *uav && address < end)
-        .map(|((_, address, end, _), (_, shadow))| {
-            (shadow.clone(), *address as usize, (end - address) as usize)
-        })
-        .collect()
+    out.extend(
+        viewed
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ranges
+            .iter()
+            .filter(|((_, address, end, uav), _)| *uav && address < end)
+            .map(|((_, address, end, _), (_, shadow))| {
+                (shadow.clone(), *address as usize, (end - address) as usize)
+            }),
+    );
 }
 
 /// mac: with `VICTORY_CENSUS_FAST=1`, [`widened_writes`] without walking

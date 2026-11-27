@@ -528,8 +528,36 @@ pub(crate) fn metal_bc_casts(wine: impl FnOnce() -> bool) -> bool {
     })
 }
 
+/// Whether a list's buffer barriers take the UAV writes since the last one
+/// into its widened history in place (`crate::host::widened_in_place`,
+/// VIctory-macOS #520): the old way copies the whole history and the new
+/// writes into a list made for `crate::widened::sync` at every barrier that
+/// has widened RGB32 views to refresh (about 90,000 writes and 2 MB in
+/// hackgods' world frames, 50 to 90 ms a frame of growing and freeing heap
+/// blocks), and makes the list of a barrier's expanded writes again each
+/// time. In place, the buffers stay with the list, and keep their room from
+/// one use to the next. The same writes reach `sync` in the same order.
+/// Only with `VICTORY_WIDENED_IN_PLACE=1`, read once (at the first barrier).
+pub(crate) fn widened_in_place() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = in_place_rule(std::env::var("VICTORY_WIDENED_IN_PLACE").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_WIDENED_IN_PLACE=1: buffer barriers take new UAV writes into the widened history without copying it"
+            );
+        }
+        on
+    })
+}
+
 /// `VICTORY_METAL_BC_CASTS`'s rule: on only for `1`.
 fn bc_casts_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// `VICTORY_WIDENED_IN_PLACE`'s rule: on only for `1`.
+fn in_place_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
@@ -645,7 +673,7 @@ mod view_inline_tests {
 
 #[cfg(test)]
 mod census_tests {
-    use super::{bc_casts_rule, census_rule};
+    use super::{bc_casts_rule, census_rule, in_place_rule};
 
     #[test]
     fn metal_bc_casts_are_off_unless_it_is_1() {
@@ -653,6 +681,14 @@ mod census_tests {
             assert!(!bc_casts_rule(off), "{off:?}");
         }
         assert!(bc_casts_rule(Some("1")) && bc_casts_rule(Some(" 1 ")));
+    }
+
+    #[test]
+    fn widened_in_place_is_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("2")] {
+            assert!(!in_place_rule(off), "{off:?}");
+        }
+        assert!(in_place_rule(Some("1")) && in_place_rule(Some(" 1 ")));
     }
 
     #[test]

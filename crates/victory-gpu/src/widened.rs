@@ -162,18 +162,79 @@ enum GroupKind {
     Patch(Prepared),
 }
 
+/// mac: the list histories `HostList::sync_widened` copied to call [`sync`]
+/// (`VICTORY_WIDENED_IN_PLACE` off) or took in place (on): calls and bytes
+/// (the copy, history and new writes, at 24 bytes a write) since the last
+/// frame line, by `[copied, in place]`.
+pub(crate) static HISTORY: [[std::sync::atomic::AtomicU64; 2]; 2] = [
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+    [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ],
+];
+
+/// mac: counts one [`sync`] call over `writes` writes, copied (`in_place`
+/// false) or not.
+pub(crate) fn count_history(in_place: bool, writes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = writes * std::mem::size_of::<(Arc<Shadow>, usize, usize)>();
+    let [calls, total] = &HISTORY[usize::from(in_place)];
+    calls.fetch_add(1, Relaxed);
+    total.fetch_add(bytes as u64, Relaxed);
+}
+
+/// mac: with the frame line (`frames` since the last one), once widened
+/// views exist or with `VICTORY_WIDENED_IN_PLACE=1`: the live widened views
+/// and the list histories copied for [`sync`], or taken without a copy.
+pub(crate) fn log(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let in_place = crate::mac_switches::widened_in_place();
+    if !in_place && !crate::shadow::WIDENED_ANY.load(Relaxed) {
+        return;
+    }
+    let [[copies, copied], [kept, saved]] = HISTORY
+        .each_ref()
+        .map(|c| c.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames));
+    tracing::info!(
+        "{}",
+        line(
+            crate::shadow::widened_all().len(),
+            in_place,
+            [copies, copied / 1e6, kept, saved / 1e6]
+        )
+    );
+}
+
+/// [`log`]'s line: live views, the switch, then per frame the histories
+/// copied and their MB, those taken in place and the MB that saved.
+fn line(views: usize, in_place: bool, [copies, copied_mb, kept, saved_mb]: [f64; 4]) -> String {
+    let switch = if in_place { "1" } else { "off" };
+    format!(
+        "widened RGB32 views: {views} live; barrier history copies {copies:.1}/frame ({copied_mb:.2} MB), \
+         skipped {kept:.1}/frame ({saved_mb:.2} MB saved) (VICTORY_WIDENED_IN_PLACE={switch})"
+    )
+}
+
 struct Group {
     view: Arc<Widened>,
     kind: GroupKind,
 }
 
-/// Refreshes the widened views touched by writes before a buffer barrier.
-/// History is replayed for new views and views touched by this barrier, so a
-/// partial patch keeps widened-only bytes from earlier barriers.
+/// Refreshes the widened views touched by writes before a buffer barrier:
+/// `new`, the writes since the last one, after `history`, those of the
+/// list's earlier barriers (two slices, so that with
+/// `VICTORY_WIDENED_IN_PLACE=1` no list made of both is needed; from
+/// VIctory-macOS #520). History is replayed for new views and views touched
+/// by this barrier, so a partial patch keeps widened-only bytes from earlier
+/// barriers.
 pub(crate) fn sync(
     list: &HostList,
-    writes: &[(Arc<Shadow>, usize, usize)],
-    synced: usize,
+    history: &[(Arc<Shadow>, usize, usize)],
+    new: &[(Arc<Shadow>, usize, usize)],
     ready: &HashSet<usize>,
 ) -> Option<Vec<usize>> {
     let views = crate::shadow::widened_all();
@@ -190,8 +251,7 @@ pub(crate) fn sync(
     for view in &views {
         list.keep(&view.buffer);
     }
-    let synced = synced.min(writes.len());
-    let pending_keys: HashSet<_> = writes[synced..]
+    let pending_keys: HashSet<_> = new
         .iter()
         .flat_map(|(_, from, len)| {
             let to = from.saturating_add(*len);
@@ -209,19 +269,25 @@ pub(crate) fn sync(
         })
         .cloned()
         .collect();
+    // With no view to replay it to, the history makes no job (as before:
+    // its writes met no candidate).
+    let replayed = if history_views.is_empty() {
+        &[][..]
+    } else {
+        history
+    };
+    let writes = replayed
+        .iter()
+        .map(|write| (write, &history_views))
+        .chain(new.iter().map(|write| (write, &views)));
     let mut jobs = Vec::new();
-    for (index, (shadow, from, len)) in writes.iter().enumerate() {
+    for ((shadow, from, len), candidates) in writes {
         let to = from.saturating_add(*len);
         if *from >= to {
             continue;
         }
         let (start, size) = shadow.range();
         let end = start.saturating_add(size);
-        let candidates = if index < synced {
-            &history_views
-        } else {
-            &views
-        };
         for view in candidates {
             let Some((first, last)) = view.overlap(*from, to) else {
                 continue;
@@ -509,4 +575,16 @@ fn patch(list: &HostList, copier: &Copier, view: &Widened, prepared: Prepared) {
     }
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("patch rgb32 {segments} ranges over {count} elements"));
+}
+
+#[cfg(test)]
+mod line_tests {
+    #[test]
+    fn the_history_line_names_both_counts() {
+        assert_eq!(
+            super::line(3, true, [0.0, 0.0, 55.0, 99.5]),
+            "widened RGB32 views: 3 live; barrier history copies 0.0/frame (0.00 MB), \
+             skipped 55.0/frame (99.50 MB saved) (VICTORY_WIDENED_IN_PLACE=1)"
+        );
+    }
 }

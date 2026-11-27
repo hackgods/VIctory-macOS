@@ -2123,6 +2123,7 @@ mod tests {
         let shadow = crate::shadow::find(at, 64).expect("memory in place");
         assert!(shadow.is_aliased());
         assert_eq!(shadow.gpu(at), heap.gpu_address() + PAGE as u64 + 100);
+        assert_eq!(shadow.offset(at), PAGE as u64 + 100);
         assert!(is_in_place(at, 64));
         let again = crate::shadow::find(at + 1000, 16).expect("the same pages");
         assert!(std::sync::Arc::ptr_eq(&shadow, &again));

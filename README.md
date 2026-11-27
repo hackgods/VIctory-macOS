@@ -171,6 +171,7 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_POKE=<rva>:<byte>,...` | writes a title byte twice a second (a hang watchdog's tick, say) |
 | `VICTORY_KEYS=30:Enter,35:X,2-120/1:Down` | presses keys at those seconds, focus or not: `<from>-<to>:<key>` holds the key that whole time, `/<every>[+<hold>]:<key>` presses it again every `<every>` seconds (each press `<hold>` long, 0.2 s by default, bounds in front, e.g. `2-200/3+2.5:Enter`); times are seconds, scientific notation included (`1e-3:Enter`) |
 | `VICTORY_KEYS_FILE=<path>` | one key name per line, each pressed 0.2 s once its line is newline-terminated, in order (`Add-Content <path> Enter`) |
+| `VICTORY_SKIP_BINK=1` | the title's Bink movies that do not loop (logos, intros) end at once, put on their last frame before their first is shown (`all`: looping ones too, which then stay dark); in every build |
 | `VICTORY_FRAME_HZ=60` | tests a 60 Hz frame interval for the runtime's flip events |
 | `VICTORY_CRASH_BREAKPOINTS=1` | appends first-chance breakpoints to `crashes.log`, including ones a handler may recover from |
 | `VICTORY_CRASH_SAVE=<rva>:<len>,...` | saves title memory to the cache folder on a crash |

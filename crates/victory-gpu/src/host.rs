@@ -2418,6 +2418,9 @@ impl Host {
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
         }
+        // Views of title memory in place where the title has since mapped
+        // other pages: made again from their records before they are read.
+        crate::alias::remake_let_go();
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]

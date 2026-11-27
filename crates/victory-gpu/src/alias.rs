@@ -649,7 +649,7 @@ pub(crate) fn in_place_shadow(
     start: u64,
     len: u64,
 ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-    if len == 0 || !in_place_sections() {
+    if len == 0 || !in_place_sections() || remapped_before(start, len) {
         return None;
     }
     let (heap, offset) = resolver()?(start, len)?;
@@ -757,12 +757,31 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
         }
     }
     drop(map);
-    crate::shadow::forget_in_place(from, to);
-    // shortcut: host view slots made from the buffer keep the section's
-    // pages until the title writes their descriptors again (copies would
-    // be refreshed from the new pages). Rare: counted to see if it is not.
-    static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = LET_GO.fetch_add(1, Ordering::Relaxed) + 1;
+    // Never in place there again: a list recorded before the title mapped
+    // other pages there and submitted after it read the old pages through
+    // the addresses it was recorded with (slots are made again, below; a
+    // list's own views cannot be). So that can happen once a range at most,
+    // and the log below counts it.
+    REMAPPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(from)
+        .and_modify(|end| *end = (*end).max(to))
+        .or_insert(to);
+    REMAPPED_COUNT.fetch_add(1, Ordering::Release);
+    let gone = crate::shadow::forget_in_place(from, to);
+    // Host view slots made from them still show the section's pages: they
+    // are made again before the next submission ([`remake_let_go`]), as
+    // slots made from copies show the new pages once those are refreshed.
+    if !gone.is_empty() {
+        LET_GO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(gone);
+        LET_GO_PENDING.store(true, Ordering::Release);
+    }
+    static EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 16 || n.is_power_of_two() {
         tracing::info!(
             from = format_args!("{from:#x}"),
@@ -771,6 +790,73 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             "title memory in place let go: the title mapped other pages there"
         );
     }
+}
+
+/// Title memory once in place that the title mapped other pages over, by
+/// start: its end. Never in place again ([`in_place_shadow`]).
+static REMAPPED: std::sync::RwLock<std::collections::BTreeMap<u64, u64>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+static REMAPPED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Forgets that `[start, end)` was remapped: tests whose memory may lie
+/// where another test's was.
+#[cfg(test)]
+pub(crate) fn clear_remapped(start: u64, end: u64) {
+    REMAPPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&from, &mut to| to <= start || from >= end);
+}
+
+/// Whether any of `[start, start + len)` was in place once and remapped.
+fn remapped_before(start: u64, len: u64) -> bool {
+    if REMAPPED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let refused = REMAPPED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..end)
+        .any(|(_, &stop)| stop > start);
+    if refused {
+        static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                n,
+                "title buffer not in place: the title remapped pages there before"
+            );
+        }
+    }
+    refused
+}
+
+/// Title buffers in place let go since the last [`remake_let_go`].
+static LET_GO: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+static LET_GO_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes again every host view slot made from title memory in place that
+/// was let go since the last call, from the record it was made from: the
+/// view then shows what the title maps there now. Called before each
+/// submission's heap sync; returns the slots made again.
+pub(crate) fn remake_let_go() -> usize {
+    if !LET_GO_PENDING.swap(false, Ordering::AcqRel) {
+        return 0;
+    }
+    let gone = std::mem::take(&mut *LET_GO.lock().unwrap_or_else(|e| e.into_inner()));
+    if gone.is_empty() {
+        return 0;
+    }
+    let made = crate::descriptor::remake_holding(&gone);
+    tracing::info!(
+        buffers = gone.len(),
+        slots = made,
+        "host views of title memory in place let go made again"
+    );
+    made
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
@@ -1341,6 +1427,7 @@ mod tests {
             }
             (section, views)
         };
+        clear_remapped(views[0] as u64, views[0] as u64 + TEST_SECTION as u64);
         TEST_VIEW.store(views[0] as usize, Ordering::Relaxed);
         *TEST_HEAP.lock().unwrap() = Some(heap.clone());
         TEST_RESOLVER.with(|c| c.set(Some(test_resolve)));
@@ -1397,6 +1484,13 @@ mod tests {
         assert!(!is_in_place(start, len as u64));
         let again = crate::shadow::find(start + 16, 64).expect("a copy");
         assert!(!again.is_aliased());
+        // Never in place there again, even where a section on a heap shows.
+        TEST_RESOLVER.with(|c| c.set(Some(test_resolve)));
+        assert!(
+            in_place_shadow(start, len as u64).is_none(),
+            "remapped before"
+        );
+        TEST_RESOLVER.with(|c| c.set(None));
 
         drop((again, shadow));
         crate::shadow::unregister(resource, start);

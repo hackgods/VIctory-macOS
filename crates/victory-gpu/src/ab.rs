@@ -17,7 +17,9 @@
 //! side of the moment ([`flag`], [`value`]); each such read decides a whole
 //! step (a batch, a range, a heap pass, a texture's refresh, a copy-back),
 //! so a flip during another thread's submission leaves no step half in one
-//! mode. Only switches whose two
+//! mode. Switches read while the title records a list ([`flag_at`],
+//! [`value_at`]) read the side its title list took at its reset
+//! (`crate::list`, `crate::host::HostList::ab`). Only switches whose two
 //! sides can follow each other between frames are accepted ([`SWITCHES`]):
 //! none that changes shader translation, a pipeline, how resources are laid
 //! out or made, or the async set. A name that is not one of them is
@@ -31,7 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 /// The switches a toggle may name, and `none`, which flips sides and
 /// changes nothing (the A/A check).
-pub(crate) const SWITCHES: [&str; 11] = [
+pub(crate) const SWITCHES: [&str; 16] = [
     "VICTORY_SYNC_EPOCH",
     "VICTORY_FLUSH_OVERLAPPING",
     "VICTORY_COPY_BACK_SPLIT",
@@ -42,6 +44,11 @@ pub(crate) const SWITCHES: [&str; 11] = [
     "VICTORY_SNAPSHOT_SPANS",
     "VICTORY_QUICK_SYNC",
     "VICTORY_PLACED_AT_ONCE",
+    "VICTORY_BATCH_CLAMPS",
+    "VICTORY_DISPATCH_CLAMPS",
+    "VICTORY_COPY_ORDER",
+    "VICTORY_WIDENED_IN_PLACE",
+    "VICTORY_RAY_SKIP",
     NOTHING,
 ];
 
@@ -277,13 +284,20 @@ fn pick<T>(
     }
 }
 
+/// Whether the toggle asked for names switch `name` (what is known only
+/// while a part is on, such as `VICTORY_RAY_SKIP`'s programs, is then
+/// learnt for both sides).
+pub(crate) fn names(name: &str) -> bool {
+    toggle().is_some_and(|t| t.name == name)
+}
+
 /// An on/off switch read now: `a` (side A, as the environment set it), or
 /// on side B the opposite, or `rule` of side B's value.
 pub(crate) fn flag(name: &str, a: bool, rule: impl FnOnce(&str) -> bool) -> bool {
     flag_at(name, side(), a, rule)
 }
 
-/// [`flag`] on side `b`.
+/// [`flag`] on side `b` (a title list's, taken at its reset).
 pub(crate) fn flag_at(name: &str, b: bool, a: bool, rule: impl FnOnce(&str) -> bool) -> bool {
     pick(at(name, b), a, |a| !a, rule)
 }
@@ -439,8 +453,8 @@ mod tests {
             Ok(spec("VICTORY_PLACED_AT_ONCE", Some("1"), 10.0))
         );
         assert_eq!(
-            parse("VICTORY_PLACED_AT_ONCE=a:b:12"),
-            Ok(spec("VICTORY_PLACED_AT_ONCE", Some("a:b"), 12.0)),
+            parse("VICTORY_COPY_ORDER=split:4096:12"),
+            Ok(spec("VICTORY_COPY_ORDER", Some("split:4096"), 12.0)),
             "a value with a colon: the seconds are after the last"
         );
         assert_eq!(parse("none:10"), Ok(spec(NOTHING, None, 10.0)));
@@ -588,6 +602,7 @@ mod tests {
             None,
             "no toggle: no side B even if asked"
         );
+        assert!(!super::names("VICTORY_DIRTY_ROWS"));
         assert!(super::flag("VICTORY_DIRTY_ROWS", true, |_| false));
         assert!(!super::flag_at("VICTORY_DIRTY_ROWS", true, false, |_| true));
         assert_eq!(

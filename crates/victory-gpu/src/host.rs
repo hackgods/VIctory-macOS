@@ -1271,6 +1271,9 @@ pub(crate) struct HostList {
     /// Clamps of the list after it recorded here but not yet run
     /// (`crate::indirect`, batches): recorded where the run of clamps ends.
     pub(crate) clamp_batch: Mutex<Option<crate::indirect::Pending>>,
+    /// mac: the `VICTORY_AB` side (`crate::ab`) of the title list it records
+    /// for, taken at that list's reset ([`HostList::ab`]).
+    ab: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1703,6 +1706,7 @@ impl Host {
                 orders: Default::default(),
                 hoisted: Mutex::default(),
                 clamp_batch: Mutex::new(None),
+                ab: false.into(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2708,6 +2712,19 @@ impl Host {
 }
 
 impl HostList {
+    /// mac: the `VICTORY_AB` side (`crate::ab`; false: A) the switches read
+    /// while it records: its title list's, from that list's reset, which
+    /// it takes when it becomes the list's current one (`crate::list`).
+    /// Lists of ours: always A.
+    pub(crate) fn ab(&self) -> bool {
+        self.ab.load(Ordering::Relaxed)
+    }
+
+    /// mac: [`HostList::ab`] from now on.
+    pub(crate) fn set_ab(&self, b: bool) {
+        self.ab.store(b, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -3122,8 +3139,9 @@ impl HostList {
     /// After the title's buffer/UAV barrier, widen the shadow ranges written
     /// before it so later SRVs in this submission see the UAV output.
     pub(crate) fn sync_widened(&self) {
-        // mac: `VICTORY_WIDENED_IN_PLACE=1`, without copying the history.
-        if crate::mac_switches::widened_in_place() {
+        // mac: `VICTORY_WIDENED_IN_PLACE=1`, without copying the history
+        // (on the list's `VICTORY_AB` side, the same from reset to close).
+        if crate::mac_switches::widened_in_place_at(self.ab()) {
             return self.sync_widened_in_place();
         }
         let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -3230,7 +3248,7 @@ impl HostList {
     fn widen_close(&self) {
         // mac: with `VICTORY_WIDENED_IN_PLACE=1` the buffers keep their room
         // for the list's next use, but not a peak's.
-        if crate::mac_switches::widened_in_place() {
+        if crate::mac_switches::widened_in_place_at(self.ab()) {
             self.empty_widened();
         } else {
             self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3459,7 +3477,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             // What the commands read, for the order of title copies.
-            if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+            if crate::mac_switches::copy_order_split_at(self.ab()).is_some_and(|longest| len <= longest) {
                 deferred.reads.insert(address, address.saturating_add(len), 0);
             }
             deferred
@@ -3479,7 +3497,7 @@ impl HostList {
     /// The title records a copy into `[dst, dst + len)` in this list
     /// (noted with `VICTORY_COPY_ORDER=split`, for [`copy_order_parts`]).
     pub(crate) fn title_copies(&self, dst: usize, len: usize) {
-        if len > 0 && crate::mac_switches::copy_order_split().is_some() {
+        if len > 0 && crate::mac_switches::copy_order_split_at(self.ab()).is_some() {
             self.deferred().copied.push((dst, len));
         }
     }
@@ -3775,7 +3793,7 @@ impl HostList {
     /// into them recorded here keeps its order with the draw
     /// (`VICTORY_COPY_ORDER=split`).
     pub(crate) fn note_hoisted_read(&self, address: usize, len: usize) {
-        if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+        if crate::mac_switches::copy_order_split_at(self.ab()).is_some_and(|longest| len <= longest) {
             self.deferred().reads.insert(address, address.saturating_add(len), 0);
         }
     }
@@ -4091,7 +4109,12 @@ pub(crate) fn take_copy_splits() -> u64 {
 pub(crate) fn copy_order_parts(
     lists: Vec<std::sync::Arc<HostList>>,
 ) -> Vec<Vec<std::sync::Arc<HostList>>> {
-    if lists.len() < 2 || crate::mac_switches::copy_order_split().is_none() {
+    // mac: with `VICTORY_AB` flipping the split (`crate::ab`), from what
+    // each list noted on its own side: a list recorded without it noted
+    // nothing, and is not split at.
+    if lists.len() < 2
+        || (crate::mac_switches::copy_order_split().is_none() && !crate::ab::names("VICTORY_COPY_ORDER"))
+    {
         return vec![lists];
     }
     // One list's lock at a time (a title may submit a list twice). Most

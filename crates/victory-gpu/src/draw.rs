@@ -100,7 +100,7 @@ pub(crate) struct State {
     /// the list ([`State::cut`]).
     fixed: Fixed,
     /// The run of indirect draws being recorded whose clamps go to the host
-    /// list before (`crate::indirect::hoisting`).
+    /// list before (`crate::indirect::hoisting_at`).
     hoist: Option<Hoist>,
 }
 
@@ -108,7 +108,7 @@ pub(crate) struct State {
 /// before the one at `into`, still open, as long as that one has `writes`
 /// dispatches and copies (a later one may write the arguments). Those of
 /// indirect dispatches as long as it has `orders` barriers, syncs and
-/// copies (`crate::indirect::hoisting_dispatches`).
+/// copies (`crate::indirect::hoisting_dispatches_at`).
 struct Hoist {
     clamps: std::sync::Arc<HostList>,
     into: usize,
@@ -390,12 +390,13 @@ impl State {
     }
 
     /// Whether an indirect dispatch recorded now would have its clamp
-    /// hoisted (`crate::indirect::hoisting_dispatches`): one that is not
-    /// dropped or left out before its clamp.
-    pub(crate) fn dispatch_hoistable(&self) -> bool {
+    /// hoisted (`crate::indirect::hoisting_dispatches_at`): one that is not
+    /// dropped or left out before its clamp (on `VICTORY_AB` side `b`, the
+    /// list's, `crate::ab`).
+    pub(crate) fn dispatch_hoistable(&self, b: bool) -> bool {
         let pipeline = self.pipeline as This;
         !crate::pipeline::held_back(pipeline)
-            && !crate::pipeline::ray_pass_is_left_out(pipeline)
+            && !crate::pipeline::ray_pass_is_left_out(pipeline, b)
             && crate::pipeline::host_pipeline(pipeline).is_some_and(|p| p.compute)
     }
 
@@ -1303,7 +1304,8 @@ impl State {
         }
         // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
         // `crate::ray_skip`): left out, and counted there, not as dropped.
-        if crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+        // (mac: on the list's `VICTORY_AB` side, `crate::ab`.)
+        if crate::pipeline::ray_pass_left_out(self.pipeline as This, list.ab()) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!(
@@ -2160,7 +2162,7 @@ impl State {
         // A ray pass with no structure to work on (`VICTORY_RAY_SKIP`,
         // `crate::ray_skip`): left out before its arguments are refreshed
         // and clamped, and counted there, not as a dropped execution.
-        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This) {
+        if kind == DISPATCH && crate::pipeline::ray_pass_left_out(self.pipeline as This, list.ab()) {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| {
                 format!(
@@ -2209,7 +2211,7 @@ impl State {
         // An indirect dispatch's too, with VICTORY_DISPATCH_CLAMPS: a run of
         // them ends at a barrier, not at a dispatch.
         let hoists = if kind == DISPATCH {
-            crate::indirect::hoisting_dispatches() && self.hoists_dispatches_into(list)
+            crate::indirect::hoisting_dispatches_at(list.ab()) && self.hoists_dispatches_into(list)
         } else {
             self.hoists_into(list)
         };

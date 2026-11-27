@@ -584,7 +584,8 @@ struct Pipeline {
     #[cfg(windows)]
     ambient: u8,
     /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
-    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off,
+    /// unless `VICTORY_AB` flips it: then what either side leaves out).
     #[cfg(windows)]
     ray_pass: u8,
 }
@@ -680,12 +681,19 @@ pub(crate) fn held_back(this: This) -> bool {
 /// acceleration-structure builder does not run this frame
 /// ([`builder::runs`]), so there is nothing to trace against. Counted
 /// there when it is.
+///
+/// mac: on `VICTORY_AB` side `b` (`crate::ab`), the recording list's: the
+/// parts that side leaves out.
 #[cfg(windows)]
-pub(crate) fn ray_pass_left_out(this: This) -> bool {
+pub(crate) fn ray_pass_left_out(this: This, b: bool) -> bool {
     if this.is_null() {
         return false;
     }
     let kind = pipeline(this).ray_pass;
+    if kind == 0 {
+        return false;
+    }
+    let kind = kind & crate::ray_skip::parts_at(b);
     if kind == 0 || builder::runs() {
         return false;
     }
@@ -696,8 +704,11 @@ pub(crate) fn ray_pass_left_out(this: This) -> bool {
 /// [`ray_pass_left_out`], asked ahead and not counted (mac: hoisted clamps
 /// of indirect dispatches, `crate::list`).
 #[cfg(windows)]
-pub(crate) fn ray_pass_is_left_out(this: This) -> bool {
-    !this.is_null() && pipeline(this).ray_pass != 0 && !builder::runs()
+pub(crate) fn ray_pass_is_left_out(this: This, b: bool) -> bool {
+    !this.is_null() && {
+        let kind = pipeline(this).ray_pass;
+        kind != 0 && (kind & crate::ray_skip::parts_at(b)) != 0
+    } && !builder::runs()
 }
 
 /// What the title pipeline's programs are to the ambient stand-in

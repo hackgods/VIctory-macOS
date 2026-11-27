@@ -1644,6 +1644,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         self.probe_written(list);
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        list.note_work(true);
         self.ambient(list);
     }
 
@@ -1892,6 +1893,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     self.note_hdr_draw();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    list.note_work(false);
                     true
                 }
                 Err(_) => false,
@@ -2513,6 +2515,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2609,6 +2612,7 @@ impl State {
             };
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2749,25 +2753,54 @@ impl State {
         // and before anything of this call is recorded, so a cut leaves
         // nothing of it behind.
         let blocker = if crate::indirect::batch_clamps_enabled() {
-            list.clamp_blocker(arguments, len, count)
+            crate::indirect::blocker(list, (arguments, len), count)
         } else {
             None
         };
         let hoist = crate::indirect::batch_clamps_enabled() && blocker.is_none();
-        if !hoist
+        let in_place = blocker == Some(crate::host::ClampBlock::InPlace);
+        // Held out of the prelude: clamped in a group pass if one can take
+        // it (`crate::indirect::groups_enabled`), a pass recorded here if the
+        // group open in the list cannot; else in a new host list if a cut
+        // pays; else inline. A seat records nothing when there is none.
+        let seat = (!hoist
+            && blocker.is_some()
+            && !in_place
+            && crate::indirect::groups_enabled()
+            && crate::indirect::groupable(kind, stride, max, count.is_some()))
+        .then(|| {
+            crate::indirect::note_source(&args);
+            list.clamp_group_seat(
+                (&args.buffer, args_gpu),
+                (arguments, len),
+                crate::indirect::recent_sources,
+            )
+        })
+        .flatten();
+        if seat.is_none()
+            && !hoist
             && may_cut
             && blocker.is_some()
+            && !in_place
             && crate::indirect::clamp_cuts_enabled()
             && list.clamp_cut_pays()
         {
             return None;
+        }
+        if !hoist {
+            crate::indirect::note_held_out(blocker);
+        }
+        if seat.as_ref().is_some_and(|&(_, opened)| opened) {
+            // The pass binds a compute pipeline of its own.
+            self.host_pipeline = 0;
+            self.host_roots[1] = 0;
         }
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
             s.refresh(list, *at, 4);
         }
         let counted = counter.as_ref().map(|(s, at)| s.gpu(*at));
-        let inline_clamped = if hoist {
+        let inline_clamped = if hoist || seat.is_some() {
             None
         } else {
             // Bounded first: the inline clamp binds a compute pipeline of its
@@ -2817,11 +2850,21 @@ impl State {
             }
             return Some(false);
         }
-        let (clamped, dst_offset, needs_done) = match inline_clamped {
-            Some(clamped) => (clamped, 0, true),
-            None => {
+        let (clamped, dst_offset, needs_done) = match (inline_clamped, seat) {
+            (Some(clamped), _) => (clamped, 0, true),
+            (None, Some((seat, _))) => {
                 let Some((clamped, dst_offset)) =
-                    crate::indirect::enqueue(list, args_gpu, (kind, stride, max), counted)
+                    list.clamp_group_join(&seat, args_gpu, (kind, stride))
+                else {
+                    why("not bounded (no place in its clamp group)");
+                    return Some(false);
+                };
+                (clamped, dst_offset, false)
+            }
+            (None, None) => {
+                let record = (Some(&args.buffer), args_gpu);
+                let Some((clamped, dst_offset)) =
+                    crate::indirect::enqueue_from(list, record, (kind, stride, max), counted)
                 else {
                     why("not bounded (no hoisted argument buffer)");
                     return Some(false);
@@ -2873,10 +2916,12 @@ impl State {
         if kind == DISPATCH {
             self.probe_hdr_compute(list);
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            list.note_work(true);
             self.ambient(list);
         } else {
             self.note_hdr_draw();
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            list.note_work(false);
         }
         Some(true)
     }

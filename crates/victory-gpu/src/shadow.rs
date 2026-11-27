@@ -73,6 +73,32 @@ pub(crate) fn shadow_keep_enabled() -> bool {
     })
 }
 
+/// The most bytes of title memory one call reads for a run of marked pages
+/// ([`Shadow::copy_back_marked`]).
+const COPYBACK_RUN_MAX: usize = 2 << 20;
+
+thread_local! {
+    /// The buffer a run is read into, kept between calls: a fresh one of a
+    /// megabyte costs a page fault for each of its pages (~90 us under Wine).
+    static RUN_BUFFER: std::cell::Cell<Vec<u8>> = const { std::cell::Cell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static RUNS_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_COPYBACK_RUNS=0` reads each marked page with its own call (the
+/// way before runs); on by default.
+fn copyback_runs_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(v) = RUNS_OVERRIDE.with(std::cell::Cell::get) {
+        return v;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPYBACK_RUNS").is_none_or(|v| v != "0"))
+}
+
 /// Non-zero 64-bit hash of a shadow piece (`0` means "unknown / forgotten").
 /// Processes 32-byte blocks across four independent lanes for ILP.
 fn piece_hash(bytes: &[u8]) -> u64 {
@@ -938,6 +964,9 @@ impl Shadow {
         let mut taken = Vec::new();
         let mut title = Vec::new();
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        // The pages to compare, the kept ones out: runs of contiguous ones
+        // are read from title memory with one call each.
+        let mut todo = Vec::with_capacity(pages.len());
         for &page in pages {
             let (from, to) = (page.max(start), (page + PAGE).min(end));
             if from >= to {
@@ -951,20 +980,65 @@ impl Shadow {
                 crate::copystat::add(crate::copystat::C::MarkedKept, 1);
                 continue;
             }
+            todo.push((page, from, to, saved));
+        }
+        // The run being compared: `run` holds title memory from `run_from`,
+        // up to the page before `todo[run_end]`; `run_ok` if its read worked
+        // (else its pages are read one at a time, as without runs).
+        let runs = copyback_runs_enabled();
+        let (mut run, mut run_from, mut run_end, mut run_ok) = (RUN_BUFFER.take(), 0, 0, false);
+        for i in 0..todo.len() {
+            let (page, from, to) = (todo[i].0, todo[i].1, todo[i].2);
+            let saved = todo[i].3.take();
             let n = to - from;
+            if i == run_end {
+                run_end = i + 1;
+                run_ok = false;
+                run_from = from;
+                let mut bytes = n;
+                while runs
+                    && run_end < todo.len()
+                    && todo[run_end].1 == todo[run_end - 1].2
+                    && bytes + (todo[run_end].2 - todo[run_end].1) <= COPYBACK_RUN_MAX
+                {
+                    bytes += todo[run_end].2 - todo[run_end].1;
+                    run_end += 1;
+                }
+                if run_end > i + 1 {
+                    if run.len() < bytes {
+                        run.resize(bytes, 0);
+                    }
+                    run_ok = crate::host::read_into(from as *const u8, &mut run[..bytes]);
+                }
+            }
             // SAFETY: inside the mapping; only the submitting thread writes it.
             let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(from - start), n) };
-            title.resize(n, 0);
-            if !crate::host::read_into(from as *const u8, &mut title) {
-                continue;
-            }
+            let title: &mut [u8] = if run_ok {
+                &mut run[from - run_from..][..n]
+            } else if runs {
+                // A page on its own, or after a failed run: one call a page,
+                // into the kept buffer.
+                if run.len() < n {
+                    run.resize(n, 0);
+                }
+                if !crate::host::read_into(from as *const u8, &mut run[..n]) {
+                    continue;
+                }
+                &mut run[..n]
+            } else {
+                title.resize(n, 0);
+                if !crate::host::read_into(from as *const u8, &mut title) {
+                    continue;
+                }
+                &mut title
+            };
             let differs = match &saved {
                 // The title's bytes are the copy's from before: what differs
                 // is the shaders'.
-                None => *host != title[..],
+                None => *host != *title,
                 Some(before) => {
                     let before = &before[from - page..to - page];
-                    merge_writeback(&mut title, host, before)
+                    merge_writeback(title, host, before)
                 }
             };
             if differs {
@@ -988,6 +1062,7 @@ impl Shadow {
             }
         }
         drop(before);
+        RUN_BUFFER.set(run);
         let mut written = 0;
         for (from, to) in writes {
             let len = to - from;
@@ -3743,6 +3818,170 @@ pub(crate) mod tests {
             assert_eq!(read(at), 0x11);
         }
         assert_eq!(copy.copy_back_marked(&pages), 0);
+        drop(copy);
+        crate::watch::tests::free(base);
+    }
+
+    /// Scoped test guard for `VICTORY_COPYBACK_RUNS` on the current thread.
+    struct RunsGuard(Option<bool>);
+
+    impl RunsGuard {
+        fn set(on: bool) -> Self {
+            Self(RUNS_OVERRIDE.with(|c| c.replace(Some(on))))
+        }
+    }
+
+    impl Drop for RunsGuard {
+        fn drop(&mut self) {
+            RUNS_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+
+    /// What `copy_back_marked` leaves in title memory for `pages` marked
+    /// pages of a copy, with the switch `runs`: the GPU wrote a byte in each
+    /// page of `gpu`, the title wrote the bytes of `title` after the copy
+    /// took the pages, `unmap` is a page of the copy unmapped meanwhile, and
+    /// `arm` is a marked submission's arming. Returns the bytes written and
+    /// all of title memory that stayed mapped.
+    fn marked_run_outcome(
+        runs: bool,
+        pages: usize,
+        gpu: &[usize],
+        title: &[(usize, u8)],
+        unmap: Option<usize>,
+        arm: bool,
+    ) -> Option<(usize, Vec<u8>)> {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let host = host()?;
+        let _runs = RunsGuard::set(runs);
+        let base = crate::watch::tests::pool(pages);
+        let len = pages * PAGE;
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        // SAFETY: a live D3D12 buffer.
+        let gpu_address = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu_address, base as u64, len as u64);
+        assert!(copy.marked(), "the title allocation is tracked");
+        // SAFETY: a private allocation, untouched by the GPU.
+        unsafe {
+            for i in 0..len {
+                ((base + i) as *mut u8).write_volatile((i / 7) as u8);
+            }
+        }
+        copy.update(base, len);
+        if arm {
+            copy.writing(base, len, true);
+            copy.writing(base, len, false);
+        }
+        for &page in gpu {
+            copy.write_host((base + page * PAGE + 8) as u64, &[0xa5]);
+        }
+        for &(at, byte) in title {
+            // SAFETY: a byte of our allocation.
+            unsafe { ((base + at) as *mut u8).write_volatile(byte) };
+        }
+        if let Some(page) = unmap {
+            // SAFETY: a page of our allocation, not used after.
+            unsafe { VirtualFree((base + page * PAGE) as *mut _, PAGE, MEM_DECOMMIT) };
+        }
+        let marked: Vec<usize> = (0..pages).map(|i| base + i * PAGE).collect();
+        let written = copy.copy_back_marked(&marked);
+        let mut bytes = Vec::new();
+        for page in (0..pages).filter(|&i| Some(i) != unmap) {
+            for i in 0..PAGE {
+                // SAFETY: a mapped byte of our allocation.
+                bytes.push(unsafe { ((base + page * PAGE + i) as *const u8).read_volatile() });
+            }
+        }
+        drop(copy);
+        crate::watch::tests::free(base);
+        Some((written, bytes))
+    }
+
+    /// Runs of marked pages, one of them unmapped inside the run, leave title
+    /// memory as the page-at-a-time path does.
+    #[test]
+    fn marked_runs_match_pages_one_by_one_with_an_unmapped_page() {
+        let gpu = [0, 1, 2, 4, 5, 7];
+        let on = marked_run_outcome(true, 8, &gpu, &[], Some(3), false);
+        let off = marked_run_outcome(false, 8, &gpu, &[], Some(3), false);
+        assert_eq!(on, off);
+        if let Some((written, bytes)) = on {
+            assert_eq!(written, gpu.len() * PAGE, "the mapped pages went back");
+            assert_eq!(bytes[8], 0xa5);
+        }
+    }
+
+    /// A page the title writes during the submission (armed or not) ends the
+    /// same with and without runs, and the shaders' other pages go back.
+    #[test]
+    fn marked_runs_match_pages_one_by_one_when_the_title_writes() {
+        let gpu = [0, 1, 2, 3, 5, 6];
+        // Page 1 (shader byte at 8, title byte at 40), page 4 (title only),
+        // page 6 (both, the title on the shader's byte's neighbor).
+        let title = [(PAGE + 40, 0x11), (4 * PAGE + 40, 0x22), (6 * PAGE + 9, 0x33)];
+        for arm in [false, true] {
+            let on = marked_run_outcome(true, 8, &gpu, &title, None, arm);
+            let off = marked_run_outcome(false, 8, &gpu, &title, None, arm);
+            assert_eq!(on, off, "armed: {arm}");
+            if let Some((_, bytes)) = on {
+                assert_eq!(bytes[8], 0xa5, "page 0 went back");
+                assert_eq!(bytes[PAGE + 40], 0x11, "the title's byte stays");
+                assert_eq!(bytes[4 * PAGE + 40], 0x22);
+            }
+        }
+    }
+
+    /// Microseconds per marked page of `copy_back_marked` over runs of 1, 4,
+    /// 16 and 64 pages, with and without runs (`--ignored --nocapture`).
+    #[test]
+    #[ignore = "a bench"]
+    fn bench_marked_copy_back_runs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let base = crate::watch::tests::pool(64);
+        let len = 64 * PAGE;
+        let (buffer, data) = host.shared_buffer(len as u64).unwrap();
+        // SAFETY: a live D3D12 buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let copy = Shadow::new(buffer, data, gpu, base as u64, len as u64);
+        // SAFETY: a private allocation.
+        unsafe { (base as *mut u8).write_bytes(0x11, len) };
+        copy.update(base, len);
+        for pages in [1usize, 4, 16, 64] {
+            let marked: Vec<usize> = (0..pages).map(|i| base + i * PAGE).collect();
+            // Interleaved rounds of the two paths; the least time of each
+            // (the machine is shared, a mean would carry its load).
+            let mut per_page = [f64::MAX; 2];
+            let mut reads = [f64::MAX; 2];
+            let mut buf = vec![0u8; pages * PAGE];
+            for _ in 0..40 {
+                for (k, runs) in [false, true].into_iter().enumerate() {
+                    let _runs = RunsGuard::set(runs);
+                    let t = std::time::Instant::now();
+                    for _ in 0..10 {
+                        copy.copy_back_marked(&marked);
+                    }
+                    per_page[k] = per_page[k].min(t.elapsed().as_secs_f64() * 1e6 / (10 * pages) as f64);
+                    // The title reads alone: a call a page, or one for the run.
+                    let t = std::time::Instant::now();
+                    for _ in 0..10 {
+                        if runs {
+                            assert!(crate::host::read_into(base as *const u8, &mut buf));
+                        } else {
+                            for (i, chunk) in buf.chunks_mut(PAGE).enumerate() {
+                                assert!(crate::host::read_into((base + i * PAGE) as *const u8, chunk));
+                            }
+                        }
+                    }
+                    reads[k] = reads[k].min(t.elapsed().as_secs_f64() * 1e6 / (10 * pages) as f64);
+                }
+            }
+            eprintln!(
+                "bench {pages:>2} pages: copy_back_marked {:.2} us/page one by one, {:.2} runs; title read alone {:.2} one by one, {:.2} run",
+                per_page[0], per_page[1], reads[0], reads[1]
+            );
+        }
         drop(copy);
         crate::watch::tests::free(base);
     }

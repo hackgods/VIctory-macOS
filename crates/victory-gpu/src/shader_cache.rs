@@ -206,6 +206,13 @@ pub fn halves_exchange() -> bool {
     crate::mac_switches::exchange()
 }
 
+/// Whether the dwords of one console load are read four a call
+/// (`victory_shader::emit::Options::wide_loads`, `VICTORY_SHADER_OPT=64`;
+/// the rule is in `mac_switches`).
+pub fn wide_loads() -> bool {
+    crate::mac_switches::wide_loads()
+}
+
 /// Whether, with that, every lane walks the skips around a hand-over
 /// (`victory_shader::emit::Options::halves_walk`, `VICTORY_HALVES_WALK=1`;
 /// the rule is in `mac_switches`).

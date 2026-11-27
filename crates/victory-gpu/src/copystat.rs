@@ -147,8 +147,20 @@ pub(crate) enum C {
     SyncMirrorUs,
     SyncMade,
     SyncRereads,
+    /// Of making them: preparing their views (before the slot lock),
+    /// making views (count and time) and of those the ones for a key a sync
+    /// made a view of before, copying descriptors, keeping what the slots
+    /// view (resources, the heap's census), and slots a title thread wrote
+    /// meanwhile (left to `mirror`).
+    SyncPrepareUs,
+    SyncCreates,
+    SyncCreateUs,
+    SyncCreatesAgain,
+    SyncCopyUs,
+    SyncKeepUs,
+    SyncAgain,
 }
-const COUNTERS: usize = C::SyncRereads as usize + 1;
+const COUNTERS: usize = C::SyncAgain as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -452,12 +464,20 @@ pub(crate) fn log(frames: f64) {
     );
     tracing::info!(
         "  heap sync per frame: {:.0} slots looked at, {:.0} stale, {:.0} made again in {:.1} ms with {:.0} \
-         re-reads",
+         re-reads: preparing views {:.1} ms, {:.0} views made in {:.1} ms ({:.0} of a key made before), \
+         descriptor copies {:.1} ms, keeping {:.1} ms; {:.0} rewritten meanwhile",
         c[C::SyncSlots as usize],
         c[C::SyncStale as usize],
         c[C::SyncMade as usize],
         ms(c[C::SyncMirrorUs as usize]),
         c[C::SyncRereads as usize],
+        ms(c[C::SyncPrepareUs as usize]),
+        c[C::SyncCreates as usize],
+        ms(c[C::SyncCreateUs as usize]),
+        c[C::SyncCreatesAgain as usize],
+        ms(c[C::SyncCopyUs as usize]),
+        ms(c[C::SyncKeepUs as usize]),
+        c[C::SyncAgain as usize],
     );
     tracing::info!(
         "  depth twin copies per frame: {:.1} into depth ({:.2} MB), {:.1} into twin ({:.2} MB)",

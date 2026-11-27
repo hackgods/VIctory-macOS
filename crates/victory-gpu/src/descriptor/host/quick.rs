@@ -203,6 +203,9 @@ impl HostHeap {
         let mut by_key: HashMap<u64, Option<usize>, Hashing> =
             HashMap::with_capacity_and_hasher(stale.len(), Hashing::new(true));
         let mut resolved: Vec<Resolved> = Vec::new();
+        // mac: the census updates of the slots made here, entered a batch
+        // at a time with `VICTORY_CENSUS_FAST=1` (at once without it).
+        let mut census = self.viewed.batch();
         for &index in stale {
             let handle = at(index);
             // SAFETY: a record in title heap memory the caller found mapped.
@@ -223,10 +226,13 @@ impl HostHeap {
                 }
                 _ => None,
             };
-            if !found.is_some_and(|(host, r)| self.show(host, index, handle, &resolved[r])) {
+            if !found.is_some_and(|(host, r)| self.show(host, index, handle, &resolved[r], &mut census)) {
                 self.mirror(index, handle, false);
             }
+            census.enter_if_full();
         }
+        // Before the pass returns (its thread reads the census next).
+        drop(census);
         // The pins go here, with no lock of the heap held.
     }
 
@@ -234,8 +240,17 @@ impl HostHeap {
     /// `handle`, unless the slot is made from it already: `mirror`'s steps
     /// under the slot lock for a buffer shader view the host makes. False,
     /// with nothing done, if the title has written another record there
-    /// meanwhile (`mirror` then makes the slot from that one).
-    fn show(&self, host: &Host, index: u32, handle: u64, resolved: &Resolved) -> bool {
+    /// meanwhile (`mirror` then makes the slot from that one). The census
+    /// update goes to `census` (mac: entered later with
+    /// `VICTORY_CENSUS_FAST=1`).
+    fn show(
+        &self,
+        host: &Host,
+        index: u32,
+        handle: u64,
+        resolved: &Resolved,
+        census: &mut crate::bindless::Batch<'_>,
+    ) -> bool {
         let Resolved { record, view, made: from } = resolved;
         let key = u64::from(record[2]) << 32 | u64::from(record[1]);
         let mut made = self.made.lock(index);
@@ -258,7 +273,7 @@ impl HostHeap {
         };
         // A shader view has no write mark.
         self.set_mark(index, None);
-        self.viewed.set_seen(index, Some(from.seen.clone()));
+        census.set_seen(index, Some(from.seen.clone()));
         self.keep(index, Some((from.buffer.clone(), from.held())));
         // A buffer view is ready as soon as it is made (only a texture's
         // view left null waits for a draw).
@@ -369,9 +384,9 @@ mod tests {
         let record = unsafe { (at(2) as *const [u32; 3]).read_unaligned() };
         let part = Resolved { record, view, made };
         let host = host().expect("a host");
-        assert!(!quick.show(host, 3, at(3), &part), "slot 3 holds another record");
+        assert!(!quick.show(host, 3, at(3), &part, &mut quick.viewed.batch()), "slot 3 holds another record");
         assert_eq!(shown(&quick, 3), before[3]);
-        assert!(quick.show(host, 2, at(2), &part), "slot 2 holds it, and is made from it already");
+        assert!(quick.show(host, 2, at(2), &part, &mut quick.viewed.batch()), "slot 2 holds it, and is made from it already");
         assert_eq!(shown(&quick, 2), before[2]);
         drop(part);
 

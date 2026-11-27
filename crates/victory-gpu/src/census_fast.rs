@@ -4,17 +4,29 @@
 //!
 //! The census lock was the largest serial resource of a frame at the prison
 //! cell (`notes/profile-first-run.md`: per frame 1,025 waits for 243.9 ms by
-//! the title's threads, 1,405 for 117.5 ms by heap syncs). The user that held
-//! it longest: the ranges a heap's unordered views write
-//! (`bindless::widened_writes`) were found by walking every range of the
-//! census (130,000 to 150,000 in the world, five in six of them not
-//! unordered) under the lock, once for every heap-writing draw of a list at
-//! its next barrier. Here the census keeps its unordered ranges apart
-//! ([`Unordered`], changed exactly where its ranges come and go) and the
-//! last answer ([`Fast::kept`]), valid while the census's unordered ranges
-//! stay as they were: a generation counted up under the lock at each change
-//! of them ([`Fast::changed`]). A query whose generation is the kept
-//! answer's does not take the census lock at all.
+//! the title's threads, 1,405 for 117.5 ms by heap syncs). Two users held or
+//! took it most:
+//!
+//! 1. The ranges a heap's unordered views write (`bindless::widened_writes`)
+//!    were found by walking every range of the census (130,000 to 150,000
+//!    in the world, five in six of them not unordered) under the lock, once
+//!    for every heap-writing draw of a list at its next barrier. Here the
+//!    census keeps its unordered ranges apart ([`Unordered`], changed
+//!    exactly where its ranges come and go) and the last answer
+//!    ([`Fast::kept`]), valid while the census's unordered ranges stay as
+//!    they were: a generation counted up under the lock at each change of
+//!    them ([`Fast::changed`]). A query whose generation is the kept
+//!    answer's does not take the census lock at all.
+//! 2. A heap sync entered every slot it made under the census lock, one
+//!    lock a slot (25,000 to 35,000 a frame). Here the slots of a pass made
+//!    the quick way are entered [`BATCH`] at a time
+//!    (`bindless::Batch`). A slot's lock is then let go before its census
+//!    entry is in, so another thread can make the slot again in between;
+//!    every census update therefore carries a ticket drawn where the slot
+//!    was made ([`Fast::ticket`], under the slot's lock), and an update older
+//!    than the one a slot's entry is from is dropped ([`Tickets::newer`]).
+//!    The census so ends with what the slot was made from last, as it did
+//!    when the update went in under the slot's lock.
 //!
 //! Plain std, outside the Windows-only census, so that the tests run on any
 //! host.
@@ -34,6 +46,11 @@ pub(crate) type Range = (usize, u64, u64, bool);
 /// A range unordered views write: the copy, the title address, the bytes
 /// (what `bindless::widened_writes` gives).
 pub(crate) type Write<S> = (Arc<S>, usize, usize);
+
+/// Census updates of a heap sync pass entered under one hold of the lock.
+/// A pass is up to 2,048 slots; a hold of this many keeps the title's
+/// threads waiting for it some tens of microseconds at most.
+pub(crate) const BATCH: usize = 256;
 
 /// The census's unordered ranges alone, with their copies, kept under the
 /// census lock where its range counts change (`bindless::Inner::count`).
@@ -82,11 +99,13 @@ pub(crate) struct Fast<S> {
     /// The last answer of [`Fast::answer`] and the generation it is of;
     /// none since the last change.
     kept: Mutex<Option<(u64, Arc<[Write<S>]>)>>,
+    /// The last ticket drawn ([`Fast::ticket`]).
+    tickets: AtomicU64,
 }
 
 impl<S> Default for Fast<S> {
     fn default() -> Self {
-        Fast { generation: AtomicU64::new(0), kept: Mutex::new(None) }
+        Fast { generation: AtomicU64::new(0), kept: Mutex::new(None), tickets: AtomicU64::new(0) }
     }
 }
 
@@ -129,6 +148,37 @@ impl<S> Fast<S> {
         *kept = Some((now, writes.clone()));
         writes
     }
+
+    /// A ticket for a census update of a slot, drawn under the slot's lock
+    /// where the slot is made: of two makings of a slot, the later one has
+    /// the larger ticket (the slot's lock orders them, and every ticket is
+    /// drawn from this one counter).
+    pub(crate) fn ticket(&self) -> u64 {
+        self.tickets.fetch_add(1, Relaxed) + 1
+    }
+}
+
+/// Per slot, the ticket of the update its census entry is from (0: none
+/// yet). Kept under the census lock.
+#[derive(Default)]
+pub(crate) struct Tickets(Vec<u64>);
+
+impl Tickets {
+    /// Whether an update of slot `index` with `ticket` is later than the one
+    /// the slot's entry is from; if it is, it becomes the slot's. An update
+    /// that is not is dropped by the caller: the slot was made again since,
+    /// and that making's update is in or on its way.
+    pub(crate) fn newer(&mut self, index: u32, ticket: u64) -> bool {
+        let i = index as usize;
+        if self.0.len() <= i {
+            self.0.resize(i + 1, 0);
+        }
+        if ticket <= self.0[i] {
+            return false;
+        }
+        self.0[i] = ticket;
+        true
+    }
 }
 
 #[cfg(test)]
@@ -153,11 +203,12 @@ mod tests {
 
     /// A census as `bindless::Inner` counts it, with the fast parts: the
     /// slots, how many slots view each range (and its copy), the unordered
-    /// ranges apart.
+    /// ranges apart, the tickets.
     struct Census {
         slots: HashMap<u32, (Range, Arc<Copy>)>,
         counts: HashMap<Range, (u32, Arc<Copy>)>,
         unordered: Unordered<Copy>,
+        tickets: Tickets,
         /// Whether a change of the unordered ranges is told (false: the
         /// negative control of the tests below).
         tell: bool,
@@ -165,7 +216,13 @@ mod tests {
 
     impl Census {
         fn new() -> Self {
-            Census { slots: HashMap::new(), counts: HashMap::new(), unordered: Unordered::new(), tell: true }
+            Census {
+                slots: HashMap::new(),
+                counts: HashMap::new(),
+                unordered: Unordered::new(),
+                tickets: Tickets::default(),
+                tell: true,
+            }
         }
 
         /// `bindless::Inner::count`: whether the unordered ranges changed.
@@ -188,8 +245,11 @@ mod tests {
             false
         }
 
-        /// `bindless::Viewed::set_seen` with the switch.
-        fn set(&mut self, fast: &Fast<Copy>, index: u32, seen: Option<(Range, Arc<Copy>)>) {
+        /// `bindless::Viewed::set_seen` (with the switch, ticket `ticket`).
+        fn set(&mut self, fast: &Fast<Copy>, index: u32, ticket: u64, seen: Option<(Range, Arc<Copy>)>) {
+            if !self.tickets.newer(index, ticket) {
+                return;
+            }
             let mut changed = false;
             if let Some((key, copy)) = self.slots.remove(&index) {
                 changed |= self.count(key, &copy, false);
@@ -254,7 +314,11 @@ mod tests {
                 let key = (Arc::as_ptr(&copies[c]) as usize, start, start + len, rng.next() % 3 == 0);
                 (key, copies[c].clone())
             });
-            census.lock().unwrap().set(&fast, slot, seen);
+            {
+                let mut c = census.lock().unwrap();
+                let ticket = fast.ticket();
+                c.set(&fast, slot, ticket, seen);
+            }
             // Queries between some changes only, two in a row now and then.
             for _ in 0..(step % 3) {
                 let (answer, was_kept) = query(&census, &fast);
@@ -295,7 +359,9 @@ mod tests {
         let census = Mutex::new(Census::new());
         let fast = Fast::default();
         let set = |slot: u32, seen: Option<(u64, u64, bool)>| {
-            census.lock().unwrap().set(&fast, slot, seen.map(|(s, e, u)| ((pa, s, e, u), a.clone())));
+            let mut c = census.lock().unwrap();
+            let ticket = fast.ticket();
+            c.set(&fast, slot, ticket, seen.map(|(s, e, u)| ((pa, s, e, u), a.clone())));
         };
         let answer = || plain(&query(&census, &fast).0);
         assert_eq!(answer(), []);
@@ -321,7 +387,11 @@ mod tests {
         // Two heaps: each answers for itself.
         let other = Mutex::new(Census::new());
         let other_fast = Fast::default();
-        other.lock().unwrap().set(&other_fast, 0, Some(((pa, 0x10, 0x20, true), a.clone())));
+        {
+            let mut c = other.lock().unwrap();
+            let ticket = other_fast.ticket();
+            c.set(&other_fast, 0, ticket, Some(((pa, 0x10, 0x20, true), a.clone())));
+        }
         assert_eq!(plain(&query(&other, &other_fast).0), [(pa, 0x10, 0x10)]);
         assert_eq!(answer(), [], "the first heap's answer is its own");
         set(5, Some((0x30, 0x40, true)));
@@ -337,7 +407,11 @@ mod tests {
         let (pa, pb) = (Arc::as_ptr(&a) as usize, Arc::as_ptr(&b) as usize);
         let census = Mutex::new(Census::new());
         let fast = Fast::default();
-        let set = |slot: u32, seen: Option<(Range, Arc<Copy>)>| census.lock().unwrap().set(&fast, slot, seen);
+        let set = |slot: u32, seen: Option<(Range, Arc<Copy>)>| {
+            let mut c = census.lock().unwrap();
+            let ticket = fast.ticket();
+            c.set(&fast, slot, ticket, seen);
+        };
         set(0, Some(((pa, 0x100, 0x200, true), a.clone())));
         set(1, Some(((pb, 0x100, 0x200, true), b.clone())));
         assert_eq!(query(&census, &fast).0.len(), 2);
@@ -363,7 +437,9 @@ mod tests {
         std::thread::scope(|s| {
             s.spawn(|| {
                 for k in 0..N {
-                    census.lock().unwrap().set(&fast, k as u32, Some(((pc, 16 * k, 16 * k + 8, true), copy.clone())));
+                    let mut c = census.lock().unwrap();
+                    let ticket = fast.ticket();
+                    c.set(&fast, k as u32, ticket, Some(((pc, 16 * k, 16 * k + 8, true), copy.clone())));
                 }
             });
             for _ in 0..3 {
@@ -381,5 +457,140 @@ mod tests {
             }
         });
         assert_eq!(query(&census, &fast).0.len(), N as usize);
+    }
+
+    /// Census updates entered late (a pass's batch) and at once (the title's
+    /// threads), in an order of makings the slot locks give: each slot ends
+    /// with what its last making entered, and without the tickets it would
+    /// not (the order of this test has late updates entered after a later
+    /// making's).
+    #[test]
+    fn late_updates_older_than_a_slots_last_making_are_dropped() {
+        let copy = Arc::new(Copy(0));
+        let pc = Arc::as_ptr(&copy) as usize;
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        for with_tickets in [true, false] {
+            let fast = Fast::default();
+            let mut census = Census::new();
+            // The last making of each slot, in the order of the makings.
+            let mut last: HashMap<u32, Option<Range>> = HashMap::new();
+            let mut batch: Vec<(u32, u64, Option<(Range, Arc<Copy>)>)> = Vec::new();
+            let mut late_after_newer = 0;
+            // Without tickets every update wins as it is entered: each gets
+            // a ticket of its own at entry.
+            let mut entered = 0u64;
+            for step in 0..40_000u64 {
+                let slot = (rng.next() % 64) as u32;
+                let seen = (rng.next() % 5 != 0).then(|| {
+                    let start = (rng.next() % 32) * 16;
+                    ((pc, start, start + 16, rng.next() % 4 == 0), copy.clone())
+                });
+                last.insert(slot, seen.as_ref().map(|s| s.0));
+                // The making draws its ticket (under the slot's lock).
+                let ticket = fast.ticket();
+                if rng.next() % 2 == 0 {
+                    batch.push((slot, ticket, seen));
+                } else {
+                    if batch.iter().any(|(s, ..)| *s == slot) {
+                        late_after_newer += 1;
+                    }
+                    entered += 1;
+                    census.set(&fast, slot, if with_tickets { ticket } else { entered }, seen);
+                }
+                if rng.next() % 16 == 0 || step == 39_999 {
+                    for (slot, ticket, seen) in batch.drain(..) {
+                        entered += 1;
+                        census.set(&fast, slot, if with_tickets { ticket } else { entered }, seen);
+                    }
+                }
+            }
+            let ends: HashMap<u32, Option<Range>> =
+                last.keys().map(|&s| (s, census.slots.get(&s).map(|(k, _)| *k))).collect();
+            assert!(late_after_newer > 100, "late updates entered after a later making's: {late_after_newer}");
+            assert_eq!(ends == last, with_tickets, "with tickets each slot ends with its last making");
+            if with_tickets {
+                // And the counts and unordered ranges are those of the slots.
+                let mut model = Census::new();
+                for (&slot, key) in &last {
+                    let ticket = fast.ticket();
+                    model.set(&fast, slot, ticket, key.map(|k| (k, copy.clone())));
+                }
+                assert_eq!(census.walked(), model.walked());
+                let mut counts: Vec<_> = census.counts.iter().map(|(k, (n, _))| (*k, *n)).collect();
+                let mut want: Vec<_> = model.counts.iter().map(|(k, (n, _))| (*k, *n)).collect();
+                counts.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(counts, want);
+            }
+        }
+    }
+
+    /// The same with threads: a "sync" making slots and entering them in
+    /// batches, a "title thread" making the same slots and entering each at
+    /// once, each making under the slot's own lock. Afterwards every slot's
+    /// census entry is what the slot was made from last.
+    #[test]
+    fn threads_making_the_same_slots_leave_the_census_with_the_slots() {
+        const SLOTS: usize = 128;
+        let fast = Fast::default();
+        let census = Mutex::new(Census::new());
+        let made: Vec<Mutex<u64>> = (0..SLOTS).map(|_| Mutex::new(0)).collect();
+        let next = AtomicU64::new(1);
+        let copy = Arc::new(Copy(0));
+        let pc = Arc::as_ptr(&copy) as usize;
+        let range = |v: u64| ((pc, 16 * (v % 997), 16 * (v % 997) + 16, v % 3 == 0), copy.clone());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut batch = Vec::new();
+                for round in 0..4_000usize {
+                    let slot = (round * 7) % SLOTS;
+                    {
+                        let mut m = made[slot].lock().unwrap();
+                        let v = next.fetch_add(1, Relaxed);
+                        *m = v;
+                        batch.push((slot as u32, fast.ticket(), Some(range(v))));
+                    }
+                    if batch.len() >= 16 {
+                        let mut c = census.lock().unwrap();
+                        for (slot, ticket, seen) in batch.drain(..) {
+                            c.set(&fast, slot, ticket, seen);
+                        }
+                    }
+                }
+                let mut c = census.lock().unwrap();
+                for (slot, ticket, seen) in batch.drain(..) {
+                    c.set(&fast, slot, ticket, seen);
+                }
+            });
+            s.spawn(|| {
+                for round in 0..4_000usize {
+                    let slot = (round * 5) % SLOTS;
+                    let mut m = made[slot].lock().unwrap();
+                    let v = next.fetch_add(1, Relaxed);
+                    *m = v;
+                    let ticket = fast.ticket();
+                    census.lock().unwrap().set(&fast, slot as u32, ticket, Some(range(v)));
+                }
+            });
+        });
+        let c = census.lock().unwrap();
+        for (slot, m) in made.iter().enumerate() {
+            let v = *m.lock().unwrap();
+            if v == 0 {
+                continue;
+            }
+            assert_eq!(c.slots.get(&(slot as u32)).map(|(k, _)| *k), Some(range(v).0), "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn tickets_grow_with_the_slots_and_keep_the_latest() {
+        let mut t = Tickets::default();
+        assert!(t.newer(10, 5));
+        assert!(!t.newer(10, 5), "the same update twice");
+        assert!(!t.newer(10, 4), "an older one");
+        assert!(t.newer(10, 6));
+        assert!(t.newer(3, 1), "slots below grown ones start empty");
+        assert!(t.newer(100_000, 1));
     }
 }

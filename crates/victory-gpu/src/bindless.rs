@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
-use crate::census_fast::{Fast, Unordered};
+use crate::census_fast::{Fast, Tickets, Unordered};
 use crate::census_maps::{Counts, Hashing};
 use crate::descriptor::View;
 use crate::host::HostList;
@@ -84,6 +84,9 @@ struct Inner {
     /// mac: with `VICTORY_CENSUS_FAST=1`: the unordered ranges of `ranges`
     /// alone, changed where `ranges` gains or loses one ([`Inner::count`]).
     unordered: Option<Unordered<Shadow>>,
+    /// mac: with `VICTORY_CENSUS_FAST=1`: per slot, the ticket of the making
+    /// its entry is from ([`Inner::enter`]).
+    tickets: Tickets,
 }
 
 impl Inner {
@@ -96,6 +99,7 @@ impl Inner {
             hulls: HashMap::new(),
             ends: HashMap::new(),
             unordered: fast.then(Unordered::new),
+            tickets: Tickets::default(),
         }
     }
 }
@@ -175,6 +179,81 @@ impl Inner {
         }
         unordered_changed
     }
+
+    /// mac (`VICTORY_CENSUS_FAST=1`): slot `index` holds `seen`, as of the
+    /// making that drew `ticket`, unless a later making of the slot is in
+    /// already (`crate::census_fast::Tickets`).
+    fn enter(&mut self, fast: &Fast<Shadow>, index: u32, ticket: u64, seen: Option<Seen>) {
+        if !self.tickets.newer(index, ticket) {
+            return;
+        }
+        let mut changed = false;
+        if let Some(old) = self.slots.remove(&index) {
+            changed |= self.count(&old, false);
+        }
+        if let Some(seen) = seen {
+            changed |= self.count(&seen, true);
+            self.slots.insert(index, seen);
+        }
+        // Told before the census lock goes.
+        if changed {
+            fast.changed();
+        }
+    }
+}
+
+/// mac: the census updates of a heap sync pass made the quick way
+/// (`crate::descriptor::host`, `sync_quick`), entered under one hold of
+/// the census lock [`crate::census_fast::BATCH`] at a time instead of one
+/// lock a slot (`VICTORY_CENSUS_FAST=1`); without the switch each goes in
+/// at once, as before. Each update carries the ticket of its slot's making,
+/// so a slot made again meanwhile by another thread (entered at once, with
+/// a later ticket) keeps that making's entry. Entered at the latest when
+/// the batch goes: the pass's own thread reads the census after it (the
+/// submission's refreshes) only once the sync has returned.
+pub(crate) struct Batch<'a> {
+    viewed: &'a Viewed,
+    updates: Vec<(u32, u64, Option<Seen>)>,
+}
+
+impl Batch<'_> {
+    /// Where the pass makes slot `index` (under its lock): what
+    /// [`Viewed::set_seen`] enters, now (no switch) or with the batch.
+    pub(crate) fn set_seen(&mut self, index: u32, seen: Option<Seen>) {
+        match &self.viewed.fast {
+            Some(fast) => self.updates.push((index, fast.ticket(), seen)),
+            None => self.viewed.set_seen(index, seen),
+        }
+    }
+
+    /// With no slot lock held: the updates so far, if there are a batch's.
+    pub(crate) fn enter_if_full(&mut self) {
+        if self.updates.len() >= crate::census_fast::BATCH {
+            self.enter();
+        }
+    }
+
+    /// With no slot lock held: the updates so far, under one hold of the
+    /// census lock (waits counted with `VICTORY_HEAP_LOCKS`, as
+    /// [`Viewed::set_seen`]'s).
+    pub(crate) fn enter(&mut self) {
+        let Some(fast) = &self.viewed.fast else {
+            return;
+        };
+        if self.updates.is_empty() {
+            return;
+        }
+        let mut inner = crate::descriptor::slots::locked(&self.viewed.inner, crate::descriptor::slots::CENSUS);
+        for (index, ticket, seen) in self.updates.drain(..) {
+            inner.enter(fast, index, ticket, seen);
+        }
+    }
+}
+
+impl Drop for Batch<'_> {
+    fn drop(&mut self) {
+        self.enter();
+    }
 }
 
 impl Viewed {
@@ -188,20 +267,29 @@ impl Viewed {
     /// [`Viewed::set`] with what the slot's view reads already worked out
     /// (`crate::descriptor::host`, "quick").
     pub(crate) fn set_seen(&self, index: u32, seen: Option<Seen>) {
+        // mac: with `VICTORY_CENSUS_FAST=1` in the order of the slot's
+        // makings, by a ticket drawn here (callers hold the slot's lock), as
+        // a heap sync's batch enters them ([`Batch`]).
+        if let Some(fast) = &self.fast {
+            let ticket = fast.ticket();
+            let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
+            inner.enter(fast, index, ticket, seen);
+            return;
+        }
         // mac: a wait for it is counted with `VICTORY_HEAP_LOCKS`.
         let mut inner = crate::descriptor::slots::locked(&self.inner, crate::descriptor::slots::CENSUS);
-        let mut changed = false;
         if let Some(old) = inner.slots.remove(&index) {
-            changed |= inner.count(&old, false);
+            inner.count(&old, false);
         }
         if let Some(seen) = seen {
-            changed |= inner.count(&seen, true);
+            inner.count(&seen, true);
             inner.slots.insert(index, seen);
         }
-        // mac: told before the lock goes (`VICTORY_CENSUS_FAST=1`).
-        if changed && let Some(fast) = &self.fast {
-            fast.changed();
-        }
+    }
+
+    /// mac: census updates entered together (`VICTORY_CENSUS_FAST=1`).
+    pub(crate) fn batch(&self) -> Batch<'_> {
+        Batch { viewed: self, updates: Vec::new() }
     }
 
     /// The range slot `index` views of a buffer copy (the copy, the title
@@ -758,8 +846,9 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// mac: a census with `VICTORY_CENSUS_FAST`'s parts answers as one
     /// without, after slots rewritten at random with views of three copies
     /// (shader and unordered views, the same range again, empty ranges,
-    /// none): the ranges unordered views write (kept or made anew), the
-    /// hulls, each slot's range.
+    /// none), half of them entered at once and half in a batch entered
+    /// later (as a heap sync pass's): the ranges unordered views write (kept
+    /// or made anew), the hulls, each slot's range.
     #[test]
     fn the_fast_census_answers_as_the_old_one() {
         let memory = vec![0u8; 0x3000];
@@ -776,6 +865,7 @@ void main(uint3 id : SV_DispatchThreadID) {
             rng
         };
         let mut kept = 0;
+        let mut batch = fast.batch();
         for step in 0..20_000u32 {
             let slot = (next() % 200) as u32;
             let seen = (step % 7 != 0).then(|| {
@@ -785,16 +875,82 @@ void main(uint3 id : SV_DispatchThreadID) {
                 Seen::Buffer(copies[k as usize].clone(), from, len, next() % 3 == 0)
             });
             old.set_seen(slot, seen.clone());
-            fast.set_seen(slot, seen);
+            if next() % 2 == 0 {
+                batch.set_seen(slot, seen);
+            } else {
+                fast.set_seen(slot, seen);
+            }
+            if next() % 8 == 0 {
+                batch.enter_if_full();
+                batch.enter();
+            }
             if step % 3 == 0 {
+                batch.enter();
                 kept += usize::from(fast.fast.as_ref().expect("the fast parts").kept().is_some());
                 let answer = unordered_writes(&fast).expect("the fast parts");
                 let slots = if step % 101 == 0 { 200 } else { 0 };
                 assert_eq!(plain(&answer, &fast, slots), plain(&widened_writes(&old), &old, slots), "step {step}");
             }
         }
+        drop(batch);
         assert!(unordered_writes(&old).is_none(), "nothing without the switch");
         assert!(!crate::under_wine() || kept > 100, "kept answers are tested: {kept}");
+        drop((old, fast));
+        release();
+    }
+
+    /// mac: a pass's batch entered after a later making of one of its slots
+    /// (another thread's, entered at once) leaves that slot as the later
+    /// making left it; an update of a batch made after one entered at once
+    /// wins, and a batch is entered when it goes. Without the switch a
+    /// batch enters each update at once.
+    #[test]
+    fn a_batch_entered_late_leaves_a_later_making_in() {
+        let memory = vec![0u8; 0x3000];
+        let at = memory.as_ptr() as u64;
+        let (Some(copies), release) = three_copies(&memory) else {
+            return; // no host GPU here
+        };
+        let view = |k: usize, uav: bool| Some(Seen::Buffer(copies[k].clone(), at + 0x1000 * k as u64, 0x100, uav));
+        let range = |k: usize, uav: bool| Some((Arc::as_ptr(&copies[k]) as usize, at + 0x1000 * k as u64, 0x100, uav));
+        let (old, fast) = (Viewed::new(false), Viewed::new(true));
+        for viewed in [&old, &fast] {
+            viewed.set_seen(0, view(0, true));
+        }
+        // A pass makes slots 0 and 1, then another thread makes slot 0 again
+        // before the pass's batch is entered.
+        let mut batch = fast.batch();
+        batch.set_seen(0, view(1, false));
+        batch.set_seen(1, view(1, true));
+        assert_eq!(fast.range_at(0), range(0, true), "not entered yet");
+        fast.set_seen(0, view(2, true));
+        batch.enter();
+        drop(batch);
+        for (slot, seen) in [(0, view(1, false)), (1, view(1, true)), (0, view(2, true))] {
+            old.set_seen(slot, seen);
+        }
+        assert_eq!(fast.range_at(0), range(2, true), "the later making stays");
+        assert_eq!(fast.range_at(1), range(1, true), "the pass's other slot is in");
+        let answer = |v: &Viewed| match unordered_writes(v) {
+            Some(writes) => plain(&writes, v, 2),
+            None => plain(&widened_writes(v), v, 2),
+        };
+        assert_eq!(answer(&fast), answer(&old), "the counts follow the entries");
+        // A batch's update made after an update entered at once wins, when
+        // the batch goes.
+        fast.set_seen(1, view(0, false));
+        let mut batch = fast.batch();
+        batch.set_seen(1, None);
+        batch.set_seen(0, None);
+        assert_eq!(fast.range_at(1), range(0, false));
+        drop(batch);
+        assert_eq!((fast.range_at(0), fast.range_at(1)), (None, None));
+        assert!(answer(&fast).0.is_empty() && answer(&fast).1.is_empty());
+        // Without the switch: at once.
+        let mut batch = old.batch();
+        batch.set_seen(0, None);
+        assert_eq!(old.range_at(0), None, "entered at once");
+        drop(batch);
         drop((old, fast));
         release();
     }

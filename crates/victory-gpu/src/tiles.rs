@@ -705,7 +705,9 @@ mod tests {
     /// into its second half: through the tile written (a control), the
     /// other tile, or the heap's own buffer; in one list after a barrier
     /// (all UAVs, as the runtime's, or the one resource), or in the next
-    /// submission. Reported, not asserted: it decides the design
+    /// submission. The page is copied out in a submission of its own, but
+    /// in two cases that ask how a copy in the same list is ordered.
+    /// Reported, not asserted: it decides the design
     /// ([`super::ALIASED_TILES_COHERENT`]).
     #[test]
     fn aliased_tiles_within_one_list() {
@@ -753,18 +755,41 @@ mod tests {
         let back = rig.readback(TILE);
         let words = (TILE / 4) as u32;
         let half = (TILE / 2) as u32;
-        let barrier = |on: Option<&ID3D12Resource>| D3D12_RESOURCE_BARRIER {
+        let uav = |on: Option<&ID3D12Resource>| D3D12_RESOURCE_BARRIER {
             Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
             Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
             Anonymous: D3D12_RESOURCE_BARRIER_0 {
                 UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
-                    // SAFETY: a copy of the pointer (or none) without a
-                    // reference of its own, never released; the buffer
-                    // outlives the run.
-                    pResource: unsafe { std::mem::transmute_copy(&on) },
+                    // SAFETY: a copy of the interface pointer (or none)
+                    // without a reference of its own, never released; the
+                    // buffer outlives the run.
+                    pResource: unsafe { std::mem::transmute_copy(&on.cloned()) },
                 }),
             },
         };
+        let transition = |on: &ID3D12Resource, from, to| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    // SAFETY: as in `uav`.
+                    pResource: unsafe { std::mem::transmute_copy(on) },
+                    Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: from,
+                    StateAfter: to,
+                }),
+            },
+        };
+        /// How the page is copied out.
+        #[derive(Clone, Copy, PartialEq)]
+        enum Copy {
+            /// In a submission of its own.
+            Apart,
+            /// In the same list, after the UAV barrier only.
+            AfterUav,
+            /// In the same list, after a transition to a copy source.
+            AfterTransition,
+        }
         /// What a case writes through, reads through and how it is ordered.
         struct Case<'a> {
             name: &'static str,
@@ -776,62 +801,112 @@ mod tests {
             split: bool,
             /// Barriers on the written buffer only, rather than all UAVs.
             narrow: bool,
+            copy: Copy,
         }
-        let both_tiles = |name, src, split, narrow| Case {
+        let case = |name, written, read, src, split, narrow, copy| Case {
             name,
-            written: &reserved,
-            read: &reserved,
+            written,
+            read,
             src,
             split,
             narrow,
+            copy,
         };
+        let other = TILE as u32;
         let cases = [
-            both_tiles(
-                "reserved, all-UAV barrier, control (the tile written)",
+            case(
+                "tile 0, control",
+                &reserved,
+                &reserved,
                 0,
                 false,
                 false,
+                Copy::Apart,
             ),
-            both_tiles("reserved, one-resource barrier, control", 0, false, true),
-            both_tiles(
-                "reserved, all-UAV barrier, the other tile",
-                TILE as u32,
+            case(
+                "tile 0, one-resource barrier, control",
+                &reserved,
+                &reserved,
+                0,
+                false,
+                true,
+                Copy::Apart,
+            ),
+            case(
+                "tile 0, then the other tile",
+                &reserved,
+                &reserved,
+                other,
                 false,
                 false,
+                Copy::Apart,
             ),
-            both_tiles(
-                "reserved, the other tile, next submission",
-                TILE as u32,
+            case(
+                "tile 0, then the other tile, one-resource barrier",
+                &reserved,
+                &reserved,
+                other,
+                false,
+                true,
+                Copy::Apart,
+            ),
+            case(
+                "tile 0, then the other tile, next submission",
+                &reserved,
+                &reserved,
+                other,
                 true,
                 false,
+                Copy::Apart,
             ),
-            Case {
-                name: "heap's own buffer, all-UAV barrier, control",
-                written: &placed,
-                read: &placed,
-                src: 0,
-                split: false,
-                narrow: false,
-            },
-            Case {
-                name: "heap's own buffer, one-resource barrier, control",
-                written: &placed,
-                read: &placed,
-                src: 0,
-                split: false,
-                narrow: true,
-            },
-            Case {
-                name: "written through tile 0, read through the heap's own buffer, all-UAV barrier",
-                written: &reserved,
-                read: &placed,
-                src: 0,
-                split: false,
-                narrow: false,
-            },
+            case(
+                "tile 0, then the heap's own buffer",
+                &reserved,
+                &placed,
+                0,
+                false,
+                false,
+                Copy::Apart,
+            ),
+            case(
+                "heap's own buffer, control",
+                &placed,
+                &placed,
+                0,
+                false,
+                false,
+                Copy::Apart,
+            ),
+            case(
+                "heap's own buffer, then tile 1",
+                &placed,
+                &reserved,
+                other,
+                false,
+                false,
+                Copy::Apart,
+            ),
+            case(
+                "tile 0, control, copied after the barrier in the list",
+                &reserved,
+                &reserved,
+                0,
+                false,
+                false,
+                Copy::AfterUav,
+            ),
+            case(
+                "tile 0, control, copied after a transition in the list",
+                &reserved,
+                &reserved,
+                0,
+                false,
+                false,
+                Copy::AfterTransition,
+            ),
         ];
         for case in &cases {
-            let fence = || barrier(case.narrow.then_some(case.written));
+            let fence = || uav(case.narrow.then_some(case.written));
             // SAFETY: our pipelines and buffers live through the runs.
             let bind = |l: &ID3D12GraphicsCommandList| unsafe {
                 l.SetComputeRootSignature(&root);
@@ -851,14 +926,34 @@ mod tests {
                 l.SetComputeRoot32BitConstants(0, 3, [half, case.src, 0].as_ptr().cast(), 0);
                 l.Dispatch(words / 2 / 64, 1, 1);
                 l.ResourceBarrier(&[fence()]);
+            };
+            // SAFETY: as `bind`.
+            let fetch = |l: &ID3D12GraphicsCommandList| unsafe {
                 l.CopyBufferRegion(&back, 0, case.written, 0, TILE as u64);
             };
+            let uav_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
             rig.record(|l| {
                 bind(l);
                 store(l, words, 0);
                 store(l, words / 2, 7);
                 if !case.split {
                     load(l);
+                }
+                match case.copy {
+                    Copy::Apart => {}
+                    Copy::AfterUav => fetch(l),
+                    // SAFETY: a buffer of ours, in the state it was put in
+                    // by its use as a UAV in this list.
+                    Copy::AfterTransition => unsafe {
+                        l.ResourceBarrier(&[transition(case.written, uav_state, source)]);
+                        fetch(l);
+                        l.ResourceBarrier(&[transition(
+                            case.written,
+                            source,
+                            D3D12_RESOURCE_STATE_COMMON,
+                        )]);
+                    },
                 }
             });
             rig.run().unwrap();
@@ -867,6 +962,10 @@ mod tests {
                     bind(l);
                     load(l);
                 });
+                rig.run().unwrap();
+            }
+            if case.copy == Copy::Apart {
+                rig.record(fetch);
                 rig.run().unwrap();
             }
             let bytes = read(&back);

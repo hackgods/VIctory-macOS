@@ -243,7 +243,11 @@ pub(crate) fn sync_heaps_ahead(ran: &dyn Fn() -> bool) {
 #[cfg(windows)]
 fn fast_skip() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_HEAP_FAST_SKIP"))
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_HEAP_FAST_SKIP");
+        tracing::info!(on, "VICTORY_HEAP_FAST_SKIP");
+        on
+    })
 }
 
 #[cfg(windows)]

@@ -864,6 +864,18 @@ impl HostHeap {
         self.verified(first, last, forgot);
     }
 
+    /// Whether slot `index` was last made from the view record `key`, so
+    /// that in a verified block (no view forgotten since) a look need not
+    /// ask about it: `slots::stale` finds a current view stale only where
+    /// the slot was made from another record. `ready` alone missed the
+    /// slots whose `ready` is left 0 on purpose (a texture view left null,
+    /// a placed texture made when a draw reads it): mac, in the prison cell
+    /// 7-9 % of the slots looked at were such slots, at every look, each
+    /// through the views lock and the slot lock.
+    fn made_from(&self, index: u32, key: u64) -> bool {
+        self.ready[index as usize].load(Ordering::Acquire) == key || self.made.peek(index) == Some(key)
+    }
+
     /// The look of [`HostHeap::sync_slots_bytes`] (`first < last <= count`;
     /// `forgot`: [`views_forgot`] read before the look).
     #[allow(clippy::too_many_arguments)]
@@ -905,11 +917,13 @@ impl HostHeap {
                 continue;
             }
             let key = u64::from(generation) << 32 | u64::from(view);
-            if blocks_verified && self.ready[i as usize].load(Ordering::Acquire) == key {
+            if blocks_verified && self.made_from(i, key) {
                 continue;
             }
             candidates.push((i, record));
         }
+        #[cfg(feature = "diagnostics")]
+        fast_probe::add(u64::from(last - first), candidates.len() as u64, !blocks_verified, forgot);
 
         if !candidates.is_empty() {
             let records: Vec<[u32; 3]> = candidates.iter().map(|&(_, r)| r).collect();
@@ -3575,5 +3589,95 @@ mod tests {
 
         crate::object::release(resource);
         let _ = title_heap.as_mut_ptr();
+    }
+
+    /// A slot made from its record counts as made from it with `ready`
+    /// left 0 (a texture view left null), so a verified look passes it by;
+    /// another record, or none, still does not.
+    #[test]
+    fn a_slot_made_from_its_record_skips_the_look_with_ready_left_zero() {
+        use crate::object::{HRESULT, S_OK};
+        let Some(host) = HostHeap::new(false, 256) else {
+            return;
+        };
+        let desc: [u32; 14] = [1, 0, 0, 0, 64, 0, 1, 1 | 1 << 16, 0, 1, 0, 0, 0, 0];
+        let properties = [1u32, 0, 0, 0, 0];
+        let mut resource = std::ptr::null();
+        let iid = crate::object::guid(
+            0x696442be,
+            0xa72e,
+            0x4059,
+            [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad],
+        );
+        let made: HRESULT = crate::resource::create_committed(
+            std::ptr::null(),
+            properties.as_ptr().cast(),
+            0,
+            desc.as_ptr().cast(),
+            0,
+            std::ptr::null(),
+            &iid,
+            &mut resource,
+        );
+        assert_eq!(made, S_OK);
+        let title_heap = vec![0u8; 256 * 32];
+        let start = title_heap.as_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), resource, std::ptr::null(), start);
+        host.sync_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32]);
+        assert!(host.made(0));
+        // SAFETY: the record create_srv wrote at slot 0.
+        let [_, view, generation] = unsafe { (start as *const [u32; 3]).read_unaligned() };
+        let key = u64::from(generation) << 32 | u64::from(view);
+        assert!(host.made_from(0, key));
+        // As for a texture view left null: `ready` 0, the slot still made from it.
+        host.ready[0].store(0, Ordering::Release);
+        assert!(host.made_from(0, key), "made from the record, ready left 0");
+        assert!(!host.made_from(0, key + 1), "another record");
+        assert!(!host.made_from(1, key), "an empty slot");
+        // The look over the verified block finds nothing stale.
+        let forgot = views_forgot();
+        assert!(host.stale_slots_bytes(0, 128, start, 32, start, &title_heap[..128 * 32], forgot).is_empty());
+        crate::object::release(resource);
+    }
+}
+
+/// Diagnostics: what the fast heap look (`VICTORY_HEAP_FAST_SKIP`) finds,
+/// logged every 5 s: slots looked at, of them candidates for the slow
+/// check, looks whose blocks were not verified, and how far the global
+/// forgotten-view count moved.
+#[cfg(feature = "diagnostics")]
+mod fast_probe {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static SLOTS: AtomicU64 = AtomicU64::new(0);
+    static CANDIDATES: AtomicU64 = AtomicU64::new(0);
+    static LOOKS: AtomicU64 = AtomicU64::new(0);
+    static UNVERIFIED: AtomicU64 = AtomicU64::new(0);
+    static LAST: Mutex<Option<(std::time::Instant, u64)>> = Mutex::new(None);
+
+    pub(super) fn add(slots: u64, candidates: u64, unverified: bool, forgot: u64) {
+        SLOTS.fetch_add(slots, Relaxed);
+        CANDIDATES.fetch_add(candidates, Relaxed);
+        LOOKS.fetch_add(1, Relaxed);
+        if unverified {
+            UNVERIFIED.fetch_add(1, Relaxed);
+        }
+        let Ok(mut last) = LAST.try_lock() else { return };
+        let now = std::time::Instant::now();
+        let (since, forgot_then) = *last.get_or_insert((now, forgot));
+        if now.duration_since(since).as_secs() < 5 {
+            return;
+        }
+        *last = Some((now, forgot));
+        let frames = crate::frame::current();
+        tracing::info!(
+            slots = SLOTS.swap(0, Relaxed),
+            candidates = CANDIDATES.swap(0, Relaxed),
+            looks = LOOKS.swap(0, Relaxed),
+            unverified_looks = UNVERIFIED.swap(0, Relaxed),
+            forgot_moved = forgot.wrapping_sub(forgot_then),
+            frame = frames,
+            "heap fast look (5 s)"
+        );
     }
 }

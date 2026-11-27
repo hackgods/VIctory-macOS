@@ -5211,10 +5211,15 @@ impl Meter {
             frames: self.frames,
             drawn: crate::draw::drawn(),
         };
-        let Some(caption_rates) = self.caption_window.sample(next, Duration::from_secs(1)) else {
+        // mac: at a `VICTORY_AB` flip (`crate::ab`) the frame line's window
+        // ends, so that no line mixes the two sides.
+        let flipped = crate::ab::take_flip();
+        let caption_rates = self.caption_window.sample(next, Duration::from_secs(1));
+        if caption_rates.is_none() && !flipped {
             return;
-        };
-        if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
+        }
+        let report_every = if flipped { Duration::ZERO } else { Duration::from_secs(5) };
+        if let Some(report) = self.report_window.sample(next, report_every) {
             let FrameRates { frames: report_frames, fps, ms, draws } = report;
             let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
                 counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
@@ -5263,8 +5268,9 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}",
-                making = crate::pipeline::making()
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{ab}",
+                making = crate::pipeline::making(),
+                ab = crate::ab::label().map_or(String::new(), |side| format!("; ab={side}"))
             );
             unwaited::log(report_frames);
             crate::ray_skip::log(report_frames);
@@ -5359,6 +5365,7 @@ impl Meter {
                 }
             }
         }
+        let Some(caption_rates) = caption_rates else { return };
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];

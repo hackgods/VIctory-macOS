@@ -1416,7 +1416,7 @@ impl HostHeap {
         let later = !for_draw
             && is_placed_texture(&view)
             && at_once != crate::mac_switches::PlacedAtOnce::All
-            && !made_at_once(&view);
+            && !made_at_once(&view, at_once);
         // mac: a heap sync ahead of the submission leaves the slot as it is,
         // for the sync before it: made now, its read mark would be forgotten
         // under the running submission's shaders (`super::ahead`).
@@ -2632,11 +2632,11 @@ fn is_placed_texture(view: &View) -> bool {
 }
 
 /// mac: whether a heap sync makes the slot of placed texture view `view` at
-/// once (`VICTORY_PLACED_AT_ONCE=1` or `keep`): its host texture is made
-/// already (`crate::resource::placed_made`), so making the view makes no
-/// texture.
-fn made_at_once(view: &View) -> bool {
-    if !crate::mac_switches::placed_at_once().made() {
+/// once (`VICTORY_PLACED_AT_ONCE=1` or `keep`, `at_once` as the caller read
+/// it): its host texture is made already (`crate::resource::placed_made`),
+/// so making the view makes no texture.
+fn made_at_once(view: &View, at_once: crate::mac_switches::PlacedAtOnce) -> bool {
+    if !at_once.made() {
         return false;
     }
     let View::Placed(_, resource, desc) = view else {

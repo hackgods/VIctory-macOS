@@ -54,9 +54,12 @@ pub(crate) fn lock_writers(wine: bool) -> [bool; 2] {
 /// says whether; asked once), where a frame's CPU part is the cost.
 /// `VICTORY_QUICK_SYNC=0`: neither, as before; `maps` or `views`: that part
 /// alone; `1`: both, anywhere. Neither changes what a slot shows.
-pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
+///
+/// mac: `VICTORY_AB=VICTORY_QUICK_SYNC` (`crate::ab`) flips the views part
+/// only (read once a heap sync pass); the maps are how a census is made.
+pub(crate) fn quick_sync(wine: impl Fn() -> bool) -> [bool; 2] {
     static ON: OnceLock<[bool; 2]> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let [maps, views] = *ON.get_or_init(|| {
         let value = std::env::var("VICTORY_QUICK_SYNC").ok();
         let [maps, views] = quick(value.as_deref(), wine());
         tracing::info!(
@@ -65,7 +68,8 @@ pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
             "VICTORY_QUICK_SYNC: the heap census in hash maps, buffer shader views of a heap sync made from one lookup"
         );
         [maps, views]
-    })
+    });
+    [maps, crate::ab::flag("VICTORY_QUICK_SYNC", views, |v| quick(Some(v), wine())[1])]
 }
 
 /// [`quick_sync`]'s rule: census maps, views.
@@ -444,9 +448,12 @@ fn census_rule(value: Option<&str>) -> bool {
 /// anything else): every request is refreshed, as before. Nothing with
 /// `VICTORY_FLIGHTS=1`, where refreshes are asked for while the submission
 /// before still runs and its copy-back can still change title memory.
+///
+/// mac: `VICTORY_AB=VICTORY_SYNC_EPOCH` (`crate::ab`) flips it per range
+/// asked; refused with `VICTORY_FLIGHTS=1` ([`ab_blocked`]).
 pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let asked = epoch(std::env::var("VICTORY_SYNC_EPOCH").ok().as_deref());
         let on = asked && !flights();
         if on {
@@ -457,7 +464,8 @@ pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
             tracing::warn!("VICTORY_SYNC_EPOCH=1 does nothing with VICTORY_FLIGHTS=1");
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_SYNC_EPOCH", a, |v| epoch(Some(v)))
 }
 
 /// [`sync_epoch`]'s rule: `1` turns it on; every other value leaves it off.
@@ -557,13 +565,17 @@ pub(crate) fn widened_in_place() -> bool {
 /// declarations into one segment copied again whenever it grows. Only for
 /// unmarked writes (marked ones keep no snapshot). Only with
 /// `VICTORY_SNAPSHOT_SPANS=1`, read once.
+///
+/// mac: `VICTORY_AB=VICTORY_SNAPSHOT_SPANS` (`crate::ab`): a snapshot keeps
+/// the form its first capture took until copy-back empties it
+/// (`crate::shadow::Shadow::writing`), so a flip changes the next ones.
 pub(crate) fn snapshot_spans() -> bool {
     #[cfg(test)]
     if tests::SPANS_HERE.with(std::cell::Cell::get) {
         return true;
     }
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = spans_rule(std::env::var("VICTORY_SNAPSHOT_SPANS").ok().as_deref());
         if on {
             tracing::info!(
@@ -571,7 +583,8 @@ pub(crate) fn snapshot_spans() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_SNAPSHOT_SPANS", a, |v| spans_rule(Some(v)))
 }
 
 /// `VICTORY_SNAPSHOT_SPANS`'s rule: on only for `1`.
@@ -586,9 +599,12 @@ fn spans_rule(value: Option<&str>) -> bool {
 /// `Batch::title_copied`). Off: every title copy makes all pending
 /// refreshes first, as before. Only with `VICTORY_FLUSH_OVERLAPPING=1`, read
 /// once.
+///
+/// mac: `VICTORY_AB=VICTORY_FLUSH_OVERLAPPING` (`crate::ab`): a submission's
+/// batch takes the side once, when it is made.
 pub(crate) fn flush_overlapping() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = overlapping_rule(std::env::var("VICTORY_FLUSH_OVERLAPPING").ok().as_deref());
         if on {
             tracing::info!(
@@ -596,7 +612,8 @@ pub(crate) fn flush_overlapping() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_FLUSH_OVERLAPPING", a, |v| overlapping_rule(Some(v)))
 }
 
 /// `VICTORY_FLUSH_OVERLAPPING`'s rule: on only for `1`.
@@ -652,9 +669,15 @@ fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
 }
 
 /// `VICTORY_PLACED_AT_ONCE`, read once ([`PlacedAtOnce`]).
+///
+/// mac: `VICTORY_AB=VICTORY_PLACED_AT_ONCE` (`crate::ab`): side B is off
+/// where A is on, else `all`, or `=<value>`; read once a slot a heap sync
+/// makes. A slot made either way stays valid the other way: a view made at
+/// once stays until the slot is rewritten, a slot left null is made when a
+/// shader reads it.
 pub(crate) fn placed_at_once() -> PlacedAtOnce {
     static ON: OnceLock<PlacedAtOnce> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let mode = placed_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
         match mode {
             PlacedAtOnce::Off => {}
@@ -669,7 +692,13 @@ pub(crate) fn placed_at_once() -> PlacedAtOnce {
             ),
         }
         mode
-    })
+    });
+    crate::ab::value(
+        "VICTORY_PLACED_AT_ONCE",
+        a,
+        |a| if a.made() { PlacedAtOnce::Off } else { PlacedAtOnce::All },
+        |v| placed_rule(Some(v)),
+    )
 }
 
 /// Which views a record names whole instead of through the view table
@@ -803,6 +832,61 @@ mod clamp_tests {
     }
 }
 
+/// mac: `VICTORY_AB` (`crate::ab`): side B of each switch read here. The
+/// tests set none of these switches, so side A is each one's default.
+#[cfg(test)]
+mod ab_tests {
+    use super::*;
+
+    /// Runs `f` with `VICTORY_AB=<toggle>` on side `b` on this thread.
+    fn with(toggle: &str, b: bool, f: impl FnOnce()) {
+        crate::ab::force(Some(crate::ab::parse(toggle).unwrap()), b);
+        f();
+        crate::ab::force(None, false);
+    }
+
+    fn unset(names: &[&str]) -> bool {
+        names.iter().all(|n| std::env::var_os(n).is_none())
+    }
+
+    #[test]
+    fn on_off_switches_read_the_opposite_or_the_value_on_side_b() {
+        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_SYNC_EPOCH"]) {
+            return;
+        }
+        assert!(!flush_overlapping() && !snapshot_spans() && !sync_epoch(|| false));
+        with("VICTORY_FLUSH_OVERLAPPING:10", true, || assert!(flush_overlapping()));
+        with("VICTORY_FLUSH_OVERLAPPING:10", false, || assert!(!flush_overlapping(), "side A: as set"));
+        with("VICTORY_FLUSH_OVERLAPPING=0:10", true, || assert!(!flush_overlapping(), "=0 on side B: off (A/A)"));
+        with("VICTORY_SNAPSHOT_SPANS:10", true, || {
+            assert!(snapshot_spans());
+            assert!(!flush_overlapping(), "another switch keeps side A");
+        });
+        with("VICTORY_SYNC_EPOCH:10", true, || assert!(sync_epoch(|| false)));
+    }
+
+    #[test]
+    fn quick_sync_flips_only_its_views() {
+        if !unset(&["VICTORY_QUICK_SYNC"]) {
+            return;
+        }
+        let a = quick_sync(|| true);
+        with("VICTORY_QUICK_SYNC:10", true, || assert_eq!(quick_sync(|| true), [a[0], !a[1]]));
+        with("VICTORY_QUICK_SYNC=views:10", true, || assert_eq!(quick_sync(|| true), [a[0], true]));
+        with("VICTORY_QUICK_SYNC=0:10", true, || assert_eq!(quick_sync(|| true), [a[0], false]));
+    }
+
+    #[test]
+    fn placed_views_are_made_at_once_on_side_b_where_side_a_leaves_them() {
+        if !unset(&["VICTORY_PLACED_AT_ONCE"]) {
+            return;
+        }
+        assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+        with("VICTORY_PLACED_AT_ONCE:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::All));
+        with("VICTORY_PLACED_AT_ONCE=keep:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Keep));
+    }
+}
+
 /// [`lock_writers`]' rule: helper lanes, low keys.
 fn writers(value: Option<&str>, default: bool) -> [bool; 2] {
     match value {
@@ -850,6 +934,21 @@ fn setting(value: Option<&str>, default: bool) -> bool {
         Some("0") => false,
         Some("1") => true,
         _ => default,
+    }
+}
+
+/// mac: why `VICTORY_AB` (`crate::ab`) cannot flip switch `name` in this
+/// run (side B's `value`, if given), asked at the first present: a side
+/// the switch's own rules refuse would measure nothing, or a picture the
+/// line never runs with.
+#[cfg(windows)]
+pub(crate) fn ab_blocked(name: &str, value: Option<&str>) -> Option<String> {
+    let _ = value;
+    match name {
+        "VICTORY_SYNC_EPOCH" if crate::host::unwaited::flights::on() => {
+            Some("VICTORY_SYNC_EPOCH does nothing with VICTORY_FLIGHTS=1".to_owned())
+        }
+        _ => None,
     }
 }
 

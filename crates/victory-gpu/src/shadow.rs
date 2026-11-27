@@ -1702,9 +1702,12 @@ fn parallel_copies_enabled_value(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh flush and
+/// copy-back: only how many threads do the same copies.
 pub(crate) fn parallel_copies_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| parallel_copies_enabled_value(std::env::var_os("VICTORY_PARALLEL_COPIES").as_deref()))
+    let a = *ON.get_or_init(|| parallel_copies_enabled_value(std::env::var_os("VICTORY_PARALLEL_COPIES").as_deref()));
+    crate::ab::flag("VICTORY_PARALLEL_COPIES", a, |v| parallel_copies_enabled_value(Some(std::ffi::OsStr::new(v))))
 }
 
 /// Whether `(start, len)` ranges are pairwise disjoint.
@@ -1750,13 +1753,16 @@ thread_local! {
 /// the next submission waiting. Not for a copy whose memory is shown at
 /// two addresses (a page written through one could be read through the
 /// other by another thread), nor one with widened readers.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per copy's copy-back: only how
+/// many threads write the same pages.
 fn copy_back_split() -> bool {
     #[cfg(test)]
     if let Some(on) = SPLIT_FORCED.with(std::cell::Cell::get) {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
+    let a = *ON.get_or_init(|| {
         let on = crate::switch::on("VICTORY_COPY_BACK_SPLIT");
         if on {
             tracing::info!(
@@ -1764,7 +1770,8 @@ fn copy_back_split() -> bool {
             );
         }
         on
-    })
+    });
+    crate::ab::flag("VICTORY_COPY_BACK_SPLIT", a, |v| crate::switch::value_is_on(Some(std::ffi::OsStr::new(v))))
 }
 
 /// The first split, and the first copy left to one thread as its memory

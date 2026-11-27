@@ -16,6 +16,9 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
+// mac: `VICTORY_AB`, one switch flipped while the game runs; plain std,
+// so its tests run everywhere.
+mod ab;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]

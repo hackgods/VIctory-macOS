@@ -382,10 +382,12 @@ pub(crate) fn log_frame() {
             "title memory reached by pointers this frame (VICTORY_POINTER_PAGES): copies asked for missed pages and regions, and misses left with none (not committed)"
         );
     }
+    // mac: with `VICTORY_AB` only (`crate::ab`): the frame's side and number.
+    let ab = crate::ab::label().map_or(String::new(), |side| format!("; ab={side} frame={}", crate::queue::presented()));
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}){ab}",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,

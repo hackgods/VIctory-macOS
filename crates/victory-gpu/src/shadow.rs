@@ -2718,6 +2718,8 @@ pub(crate) fn near(va: u64) -> String {
 mod parallel_copy_tests;
 #[cfg(test)]
 mod snapshot_bench;
+#[cfg(test)]
+mod widened_bench;
 
 #[cfg(test)]
 pub(crate) mod tests {

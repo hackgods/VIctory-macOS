@@ -781,7 +781,10 @@ impl<'a> Lower<'a> {
                     || n.starts_with("v_mbcnt")
                     || matches!(
                         n,
-                        "v_readlane_b32" | "v_writelane_b32" | "v_permlanex16_b32"
+                        "v_readlane_b32"
+                            | "v_writelane_b32"
+                            | "v_permlane16_b32"
+                            | "v_permlanex16_b32"
                     )
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
                     || reads_mask_as_data(x.st, i)
@@ -3689,6 +3692,12 @@ impl<'a> Lower<'a> {
         {
             return Some(self.lane_bit_of(c, src, lo, hi));
         }
+        Some(self.host_lane_active(src, guard, mesh_quad))
+    }
+
+    /// Whether this host wave is running the source lane under the guard.
+    fn host_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool) -> V {
+        let c = self.cur;
         let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
         let i32t = self.s.t.i32;
         let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
@@ -3711,7 +3720,7 @@ impl<'a> Lower<'a> {
         } else {
             src
         };
-        Some(self.lane_bit_of(c, ballot_lane, lo, hi))
+        self.lane_bit_of(c, ballot_lane, lo, hi)
     }
 
     /// The float value of a register value.
@@ -7528,15 +7537,16 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
             }
-            "v_permlanex16_b32" => {
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
                 self.cross_lane(false)?;
+                let cross_row = name == "v_permlanex16_b32";
                 let (value, low, high) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
                 let lane = self.lane_index();
                 let [two, seven, eight, fifteen, sixteen, row_mask] =
                     [2, 7, 8, 15, 16, !15].map(|n| self.s.m.i32(n));
                 // The nibble for this lane comes from src1 at offsets 0..7
-                // and src2 at offsets 8..15. It indexes the other row of 16
-                // in the same 32-lane half of the wave.
+                // and src2 at offsets 8..15. Only permlanex16 switches
+                // rows. Both source rows are within this host wave.
                 let in_row = self.s.m.bin(c, Bin::And, lane, fifteen);
                 let hi = self.s.m.cmp(c, pred::IUGE, in_row, eight);
                 let selectors = self.s.m.select(c, hi, high, low);
@@ -7545,22 +7555,42 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, selectors, shift);
                 let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
                 let row = self.s.m.bin(c, Bin::And, lane, row_mask);
-                let row = self.s.m.bin(c, Bin::Xor, row, sixteen);
+                let row = if cross_row {
+                    self.s.m.bin(c, Bin::Xor, row, sixteen)
+                } else {
+                    row
+                };
                 let source = self.s.m.bin(c, Bin::Or, row, pick);
+                // In a partial row the selector can name an absent lane
+                // even with no explicit EXEC guard. With FI clear, use a
+                // ballot and a live index for the DXIL lane read.
+                let same_row_active = if !cross_row && v.opsel & 1 == 0 {
+                    Some(self.host_lane_active(source, guard, false))
+                } else {
+                    None
+                };
+                let source =
+                    same_row_active.map_or(source, |on| self.s.m.select(c, on, source, lane));
                 let value = self.read_lane(value, source);
 
                 // With FI clear, guest EXEC controls whether the source
                 // contributes. BOUND_CTRL selects zero or keeps the old dst.
-                if let Some(active) = guard.filter(|_| v.opsel & 1 == 0) {
-                    let src_active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
-                    let src_active = self.read_lane(src_active, source);
+                let src_active = same_row_active.or_else(|| {
+                    let active = guard.filter(|_| v.opsel & 1 == 0)?;
+                    let active = self.s.m.cast(c, Cast::ZExt, active, self.s.t.i32);
+                    let active = self.read_lane(active, source);
                     let zero = self.s.m.i32(0);
-                    let src_active = self.s.m.cmp(c, pred::NE, src_active, zero);
+                    Some(self.s.m.cmp(c, pred::NE, active, zero))
+                });
+                if let Some(src_active) = src_active {
                     if v.opsel & 2 != 0 {
+                        let zero = self.s.m.i32(0);
                         let value = self.s.m.select(c, src_active, value, zero);
                         return int(self, value);
                     }
-                    let write = self.s.m.bin(c, Bin::And, active, src_active);
+                    let write = guard.map_or(src_active, |active| {
+                        self.s.m.bin(c, Bin::And, active, src_active)
+                    });
                     return self.write_i(inst, value, Some(write));
                 }
                 int(self, value)

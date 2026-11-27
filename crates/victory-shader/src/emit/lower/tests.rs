@@ -614,21 +614,24 @@ fn a_waterfall_loop_that_only_sizes_takes_the_kind_of_the_sampled_one() {
 }
 
 #[test]
-fn permlanex16_lowers_in_wave32_and_wave64() {
-    let words = [
-        0xD778_0001,
-        0x0004_0100, // v_permlanex16_b32 v1, v0, s0, s1
-        0xD834_0000,
-        0x0000_0100, // ds_write_b32 v0, v1
-        S_ENDPGM,
-    ];
+fn permlane16_and_permlanex16_lower_in_wave32_and_wave64() {
     let layout = vec![RootParam {
         sgprs: 2,
         ..root(RootType::Constants, 0, 0)
     }];
-    for wave64 in [false, true] {
-        let result = lower_wave(&words, layout.clone(), vec![], wave64).unwrap();
-        assert!(result.wave_ops);
+    for opcode in [0xD777_0001, 0xD778_0001] {
+        let words = [
+            opcode,
+            0x0004_0100, // v_permlane[x]16_b32 v1, v0, s0, s1
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        for wave64 in [false, true] {
+            let result = lower_wave(&words, layout.clone(), vec![], wave64).unwrap();
+            assert!(result.wave_ops);
+            assert_eq!(result.barriers, 0);
+        }
     }
 }
 

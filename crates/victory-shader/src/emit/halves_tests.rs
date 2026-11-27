@@ -5442,6 +5442,80 @@ fn index_waterfall(with_mbcnt: bool, body: &[u32], after: &[u32]) -> Vec<u32> {
     w
 }
 
+/// How the lanes of [`break_loop`] break out of it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Breaks {
+    /// Lane `l` in pass `l & 3`: the lanes with 3 never, so the loop runs
+    /// to its own end.
+    ByLane,
+    /// Lane `l` in pass `l & 1`: no lane is left after the second pass, and
+    /// the console wave leaves the loop there.
+    AllEarly,
+    /// By half: the lanes of host wave `w` in pass `w & 3`, so from the
+    /// second pass on a console wave's first lane left is in its upper half.
+    ByHalf,
+}
+
+/// A loop of three passes, counted in `s30`, that lanes break out of one by
+/// one, as the console compiler lays one out (GTA VI's `9991e29feaa26e3e`
+/// at 0x1f08): each pass takes the lanes whose `v5` is the pass out of the
+/// mask of lanes left (`v_cmpx_eq_u32 exec, s30, v5; s_andn2_b64 s[26:27],
+/// s[26:27], exec`), leaves if none is left (`s_cbranch_scc0`), and else
+/// goes on with those left (`s_and_b64 exec, s[22:23], s[26:27]`). Each
+/// pass reads the first lane left (`v_readfirstlane_b32 s6, v0`) into an
+/// accumulator `v2` and counts in `v3`; a lane that breaks sets `v1` to 1,
+/// one that never does gets 2 after the last pass. Every lane stores
+/// `v2 + (v3 << 16) + (v1 << 24)`. `late`: stores `s30` too, a scalar the
+/// loop writes.
+fn break_loop(breaks: Breaks, late: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0x7E06_0280, // v_mov_b32 v3, 0
+    ]);
+    match breaks {
+        Breaks::ByLane => w.push(0x360A_0083),   // v_and_b32 v5, 3, v0
+        Breaks::AllEarly => w.push(0x360A_0081), // v_and_b32 v5, 1, v0
+        Breaks::ByHalf => w.extend([
+            0x2C0A_0085, // v_lshrrev_b32 v5, 5, v0
+            0x360A_0A83, // v_and_b32 v5, 3, v5
+        ]),
+    }
+    w.extend([
+        0xBE9E_0380, // s_mov_b32 s30, 0
+        0xBE9A_047E, // s_mov_b64 s[26:27], exec
+        0xBE96_047E, // s_mov_b64 s[22:23], exec
+        // the loop
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+        0x4A06_0681, // v_add_nc_u32 v3, 1, v3
+        0x7DA4_0A1E, // v_cmpx_eq_u32 exec, s30, v5
+        0x7E02_0281, // v_mov_b32 v1, 1
+        0x8A9A_7E1A, // s_andn2_b64 s[26:27], s[26:27], exec
+        0xBF84_0005, // s_cbranch_scc0 (past the loop)
+        0x87FE_1A16, // s_and_b64 exec, s[22:23], s[26:27]
+        0x811E_811E, // s_add_i32 s30, s30, 1
+        0xBF02_821E, // s_cmp_gt_i32 s30, 2
+        0xBF84_FFF5, // s_cbranch_scc0 (the loop)
+        0x7E02_0282, // v_mov_b32 v1, 2
+        // past the loop
+        0xBEFE_0416, // s_mov_b64 exec, s[22:23]
+        0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+        0x3402_0298, // v_lshlrev_b32 v1, 24, v1
+        0x4A04_0503, // v_add_nc_u32 v2, v3, v2
+        0x4A04_0501, // v_add_nc_u32 v2, v1, v2
+    ]);
+    w.extend(store(2, 0));
+    if late {
+        w.push(0x7E08_021E); // v_mov_b32 v4, s30
+        w.extend(store(4, 4));
+    }
+    w.push(S_ENDPGM);
+    w
+}
+
 #[test]
 fn the_index_waterfall_programs_are_what_their_comments_say() {
     let words = index_waterfall(true, &[], &[]);
@@ -5517,6 +5591,264 @@ fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
                 differences(&words, threads, 1, &want)
                     .into_iter()
                     .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
+            );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// What each thread of a group of `threads` stores in [`break_loop`] on the
+/// console: its wave64s run by the instructions' own rules.
+#[cfg(windows)]
+fn console_break_loop(breaks: Breaks, threads: u32) -> Vec<u32> {
+    let mut out = vec![0; threads as usize];
+    for base in (0..threads).step_by(64) {
+        let lanes: Vec<u32> = (base..threads.min(base + 64)).collect();
+        let v5 = |t: u32| match breaks {
+            Breaks::ByLane => t & 3,
+            Breaks::AllEarly => t & 1,
+            Breaks::ByHalf => t >> 5 & 3,
+        };
+        let (mut v1, mut v2, mut v3) = (vec![0u32; 64], vec![0u32; 64], vec![0u32; 64]);
+        let mut left = vec![true; lanes.len()];
+        let mut pass = 0;
+        loop {
+            let first = lanes[left.iter().position(|&l| l).expect("a lane is left")];
+            for (n, &t) in lanes.iter().enumerate() {
+                if !left[n] {
+                    continue;
+                }
+                v2[n] += first;
+                v3[n] += 1;
+                if v5(t) == pass {
+                    v1[n] = 1;
+                    left[n] = false;
+                }
+            }
+            if !left.contains(&true) {
+                break;
+            }
+            pass += 1;
+            if pass > 2 {
+                for n in 0..lanes.len() {
+                    if left[n] {
+                        v1[n] = 2;
+                    }
+                }
+                break;
+            }
+        }
+        for (n, &t) in lanes.iter().enumerate() {
+            out[t as usize] = v2[n] + (v3[n] << 16) + (v1[n] << 24);
+        }
+    }
+    out
+}
+
+/// A loop of three passes whose body is a guard in a guard, both skipping
+/// to the loop's end (`if (a) { if (b) { .. } }`, as in GTA VI's
+/// `9991e29feaa26e3e` at 0x2158): in the inner one, a first-lane read
+/// (`v_readfirstlane_b32 s6, v0`) into an accumulator `v2`, which every
+/// lane stores. The outer guard takes the odd lanes, or with `upper` the
+/// upper half of each console wave; the inner one the lanes with bit 1.
+fn nested_guards_first_lane(upper: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        0xBE9E_0380, // s_mov_b32 s30, 0
+        // the loop
+        if upper {
+            0x2C0A_0085 // v_lshrrev_b32 v5, 5, v0
+        } else {
+            0x7E0A_0300 // v_mov_b32 v5, v0
+        },
+        0x360A_0A81, // v_and_b32 v5, 1, v5
+        0x7D84_0A81, // v_cmp_eq_u32 vcc, 1, v5
+        0xBE9C_246A, // s_and_saveexec_b64 s[28:29], vcc
+        0xBF88_0006, // s_cbranch_execz (the loop's end)
+        0x360C_0082, // v_and_b32 v6, 2, v0
+        0x7D84_0C82, // v_cmp_eq_u32 vcc, 2, v6
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+        0xBF88_0002, // s_cbranch_execz (the loop's end)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+        // the loop's end
+        0xBEFE_041C, // s_mov_b64 exec, s[28:29]
+        0x811E_811E, // s_add_i32 s30, s30, 1
+        0xBF02_821E, // s_cmp_gt_i32 s30, 2
+        0xBF84_FFF1, // s_cbranch_scc0 (the loop)
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What thread `t` of a group of `threads` stores in
+/// [`nested_guards_first_lane`] on the console: three times the first
+/// thread of its wave64 that both guards take, if they take it.
+#[cfg(windows)]
+fn console_nested_guards_first_lane(upper: bool, threads: u32, t: u32) -> u32 {
+    let takes = |t: u32| (if upper { t >> 5 } else { t }) & 1 == 1 && t & 2 == 2;
+    let base = t & !63;
+    let first = (base..threads.min(base + 64)).find(|&l| takes(l));
+    match first {
+        Some(first) if takes(t) => 3 * first,
+        _ => 0,
+    }
+}
+
+#[test]
+fn the_break_loop_programs_are_what_their_comments_say() {
+    let text = |words: &[u32]| {
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+    };
+    // The prologue's five words are four instructions.
+    let skip = PROLOGUE.len() - 1;
+    let all = text(&break_loop(Breaks::ByHalf, true));
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_mov_b32 v1, 0",
+        "v_mov_b32 v2, 0",
+        "v_mov_b32 v3, 0",
+        "v_lshrrev_b32 v5, 5, v0",
+        "v_and_b32 v5, 3, v5",
+        "s_mov_b32 s30, 0",
+        "s_mov_b64 s[26:27], exec",
+        "s_mov_b64 s[22:23], exec",
+        "v_readfirstlane_b32 s6, v0",
+        "v_add_nc_u32 v2, s6, v2",
+        "v_add_nc_u32 v3, 1, v3",
+        "v_cmpx_eq_u32 exec, s30, v5",
+        "v_mov_b32 v1, 1",
+        "s_andn2_b64 s[26:27], s[26:27], exec",
+        "s_cbranch_scc0",
+        "s_and_b64 exec, s[22:23], s[26:27]",
+        "s_add_i32 s30, s30, 1",
+        "s_cmp_gt_i32 s30, 2",
+        "s_cbranch_scc0",
+        "v_mov_b32 v1, 2",
+        "s_mov_b64 exec, s[22:23]",
+        "v_lshlrev_b32 v3, 16, v3",
+        "v_lshlrev_b32 v1, 24, v1",
+        "v_add_nc_u32 v2, v3, v2",
+        "v_add_nc_u32 v2, v1, v2",
+    ];
+    for (n, want) in want.iter().enumerate() {
+        let got = &all[skip + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+    assert!(all.iter().any(|t| t == "v_mov_b32 v4, s30"), "{all:?}");
+    let has = |words: &[u32], want: &str| text(words).iter().any(|t| t == want);
+    assert!(has(&break_loop(Breaks::ByLane, false), "v_and_b32 v5, 3, v0"));
+    assert!(has(&break_loop(Breaks::AllEarly, false), "v_and_b32 v5, 1, v0"));
+    let all = text(&nested_guards_first_lane(true));
+    let want = [
+        "v_lshlrev_b32 v16, 5, v0",
+        "v_mov_b32 v2, 0",
+        "s_mov_b32 s30, 0",
+        "v_lshrrev_b32 v5, 5, v0",
+        "v_and_b32 v5, 1, v5",
+        "v_cmp_eq_u32 vcc, 1, v5",
+        "s_and_saveexec_b64 s[28:29], vcc",
+        "s_cbranch_execz",
+        "v_and_b32 v6, 2, v0",
+        "v_cmp_eq_u32 vcc, 2, v6",
+        "s_and_saveexec_b64 s[12:13], vcc",
+        "s_cbranch_execz",
+        "v_readfirstlane_b32 s6, v0",
+        "v_add_nc_u32 v2, s6, v2",
+        "s_mov_b64 exec, s[28:29]",
+        "s_add_i32 s30, s30, 1",
+        "s_cmp_gt_i32 s30, 2",
+        "s_cbranch_scc0",
+    ];
+    for (n, want) in want.iter().enumerate() {
+        let got = &all[skip + n];
+        assert!(got.starts_with(want), "{n}: {got:?}, not {want:?}");
+    }
+    assert!(has(&nested_guards_first_lane(false), "v_mov_b32 v5, v0"));
+}
+
+/// A first-lane read in a counted loop that lanes break out of one by one
+/// runs in halves: the break is predicated away (the lanes that broke stay
+/// in the loop, inactive, to its own end), so every lane of the group runs
+/// every pass and the halves pass the console wave's first lane left
+/// between them. Before, the read was refused there.
+#[test]
+fn a_first_lane_read_in_a_loop_lanes_break_out_of_translates_in_halves() {
+    for breaks in [Breaks::ByLane, Breaks::AllEarly, Breaks::ByHalf] {
+        for threads in [64, 128, 256] {
+            let words = break_loop(breaks, false);
+            let l = lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("{breaks:?} {threads} threads: {e}"));
+            assert_eq!(l.wave_size, Some(32));
+            assert!(l.barriers > 0, "the halves meet in the loop");
+        }
+    }
+}
+
+/// A scalar the loop writes, read after it, keeps the break as it is: the
+/// console wave leaves once its every lane broke, with the count of that
+/// pass, and the lanes kept in the loop would count on. The read stays
+/// refused.
+#[test]
+fn a_loop_lanes_break_out_of_whose_count_is_read_after_it_is_refused() {
+    for threads in [64, 128] {
+        let words = break_loop(Breaks::AllEarly, true);
+        let e = lowered(&native(&words, true, threads, 0), true)
+            .err()
+            .unwrap_or_else(|| panic!("{threads} threads: translated"));
+        assert!(e.to_string().contains("a first-lane read"), "{e}");
+    }
+}
+
+/// A first-lane read under a guard in a guard, both skipping to one join,
+/// runs in halves: the region is laid out flat, the inner guard's body in
+/// step with it. Before, only the outer guard's own block was, and the
+/// read was refused.
+#[test]
+fn a_first_lane_read_under_nested_guards_translates_in_halves() {
+    for upper in [false, true] {
+        for threads in [64, 128, 256] {
+            let words = nested_guards_first_lane(upper);
+            let l = lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("upper={upper} {threads} threads: {e}"));
+            assert_eq!(l.wave_size, Some(32));
+            assert!(l.barriers > 0, "the halves meet at the read");
+        }
+    }
+}
+
+/// Both give the console's lanes on every GPU.
+#[cfg(windows)]
+#[test]
+fn first_lane_reads_past_a_break_and_under_nested_guards_match_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        for breaks in [Breaks::ByLane, Breaks::AllEarly, Breaks::ByHalf] {
+            let words = break_loop(breaks, false);
+            let want = console_break_loop(breaks, threads);
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("{breaks:?} {threads} threads: {m}")),
+            );
+        }
+        for upper in [false, true] {
+            let words = nested_guards_first_lane(upper);
+            let want: Vec<u32> = (0..threads)
+                .map(|t| console_nested_guards_first_lane(upper, threads, t))
+                .collect();
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("nested upper={upper} {threads} threads: {m}")),
             );
         }
     }

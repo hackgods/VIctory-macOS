@@ -265,6 +265,8 @@ struct Stats {
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
+    /// Reads of the null page ([`null_page`]): zeros, no miss.
+    null_pages: u64,
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -380,7 +382,7 @@ pub(crate) fn log_frame() {
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {})",
+         and {} 256 MiB regions with no copy (first: {}), {} reads of the null page (zeros, no miss)",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -389,7 +391,8 @@ pub(crate) fn log_frame() {
         s.withheld_bytes as f64 / 1e6,
         s.missed_pages,
         s.missed_regions,
-        missed.join(" ")
+        missed.join(" "),
+        s.null_pages
     );
 }
 
@@ -557,13 +560,38 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             let block = entry / BLOCK;
             if block == 0
                 || l.blocks.get(block).is_none()
-                || l.owner.get(entry).is_none_or(|o| o.is_none())
+                || l.owner.get(entry).is_none_or(|o| o.is_none()) && !null_page(&l.blocks, entry)
             {
                 return true;
             }
         }
     }
     false
+}
+
+/// From upstream #634 (hackgods): whether bitmap entry `entry` is the null
+/// page, title addresses `[0, 64 KiB)`: never mapped, on the console as on
+/// Windows, so a shader reading it reads zeros there as here (null views),
+/// and writes there go nowhere in both. Not a miss (`VICTORY_NULL_PAGE=0`:
+/// one, as other pages with no copy). In the prison cell shaders read it in
+/// two lists a frame, which kept ~81 MB of views a frame out of title memory
+/// ([`withholding`]), taken from it again at the next refresh. Only told
+/// where the first 256 MiB region has a block: entries of block 0 stand for
+/// every region with none.
+fn null_page(blocks: &[usize], entry: usize) -> bool {
+    null_page_reads_zeros() && is_null_page(blocks, entry)
+}
+
+/// Whether bitmap entry `entry` stands for title addresses `[0, 64 KiB)`.
+fn is_null_page(blocks: &[usize], entry: usize) -> bool {
+    let block = entry / BLOCK;
+    block != 0 && entry.is_multiple_of(BLOCK) && blocks.get(block) == Some(&0)
+}
+
+/// `VICTORY_NULL_PAGE=0`: the null page counts as missed, as before.
+fn null_page_reads_zeros() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NULL_PAGE").is_none_or(|v| v != "0"))
 }
 
 /// `list` uses title memory with view heap `key` bound: the heap's page
@@ -606,7 +634,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks =
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
-        let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
+        let (mut pages, mut regions, mut missed, mut null) = (0, 0, Vec::new(), 0u64);
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -628,6 +656,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
+                    _ if null_page(blocks, entry) => null += 1,
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -661,6 +690,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.withheld += withheld;
             s.missed_pages += pages;
             s.missed_regions += regions;
+            s.null_pages += null;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
         });
@@ -766,6 +796,26 @@ mod tests {
         assert_eq!(look_up(&dwords, 0x40_0010), (106, 0x10));
         assert_eq!(look_up(&dwords, 0).0, 100);
         assert_eq!(owner[BLOCK + 0x40], Some(2));
+    }
+
+    #[test]
+    fn the_null_page_reads_zeros_and_is_no_miss() {
+        let mut owner = vec![None; 3 * BLOCK];
+        owner[BLOCK + 5] = Some(0);
+        // Block 1 holds the first 256 MiB region, block 2 the sixth.
+        let l = Layout { copies: Vec::new(), bits: Vec::new(), blocks: vec![usize::MAX, 0, 5], owner };
+        assert!(is_null_page(&l.blocks, BLOCK));
+        assert!(!is_null_page(&l.blocks, BLOCK + 1), "the next page");
+        assert!(!is_null_page(&l.blocks, 2 * BLOCK), "page 0 of another region");
+        assert!(!is_null_page(&l.blocks, 0), "block 0 stands for every region with none");
+        let mut marks = vec![0u32; BITMAP_WORDS];
+        marks[BLOCK / 32] = 1 << (BLOCK % 32) | 1 << ((BLOCK + 5) % 32);
+        assert!(!has_missed(&marks, &l), "the null page and an owned page");
+        marks[(BLOCK + 1) / 32] |= 1 << ((BLOCK + 1) % 32);
+        assert!(has_missed(&marks, &l), "a page with no copy beside the null page");
+        marks.fill(0);
+        marks[2 * BLOCK / 32] = 1 << (2 * BLOCK % 32);
+        assert!(has_missed(&marks, &l), "page 0 of a region that is not the first");
     }
 
     #[test]

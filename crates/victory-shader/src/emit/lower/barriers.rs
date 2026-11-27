@@ -710,3 +710,49 @@ pub(crate) fn once_per_lane(p: &Program) -> Vec<bool> {
         })
         .collect()
 }
+
+/// The iteration counts of capped loops (`LOOP_LIMIT`) as lowering makes
+/// them.
+impl Lower<'_> {
+    /// A forward edge into loop header `to` (from DXIL block `via`) starts
+    /// its count at 0.
+    pub(super) fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
+        if let Some((_, incoming)) = self.counters.get_mut(&to) {
+            let z = self.s.m.i32(0);
+            incoming.push((z, via));
+        }
+    }
+
+    /// A back edge to header `to` (a back edge keeps its block, no
+    /// critical-edge block): the count goes up; the result compares it with
+    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
+    pub(super) fn count_iteration(&mut self, to: usize, p: u8) -> V {
+        let c = self.cur;
+        let (phi, _) = self.counters[&to];
+        let one = self.s.m.i32(1);
+        let next = self.s.m.bin(c, Bin::Add, phi, one);
+        let limit = self.s.m.i32(crate::emit::loop_limit());
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        self.s.m.cmp(c, p, next, limit)
+    }
+
+    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
+    pub(super) fn abort_block(&mut self) -> usize {
+        if let Some(a) = self.abort {
+            return a;
+        }
+        let a = self.s.m.new_block();
+        if self.s.pixel {
+            let t = self.s.m.bool(true);
+            self.s
+                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
+        }
+        self.s.m.terminate(a, Term::Ret);
+        self.abort = Some(a);
+        a
+    }
+}

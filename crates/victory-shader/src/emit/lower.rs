@@ -827,12 +827,12 @@ impl<'a> Lower<'a> {
                 let base_step = in_step(p, x.st);
                 predicate::PredicatePlan::build(p, x.st, base_step, one_wave_lds, x.host_wave32)
             } else {
-                predicate::PredicatePlan::empty(Vec::new())
+                let lds = x.st.literal || one_wave_lds;
+                predicate::PredicatePlan::empty(if lds { in_step(p, x.st) } else { Vec::new() })
             };
             // The console's one wave is several host waves: LDS no longer
             // passes between its lanes without a barrier.
             let mut synced = false;
-            // Literal halves sync a one-wave group's LDS too (#435).
             if one_wave_lds || x.st.literal && one_wave && group > 32 && s.lds_dwords > 0 {
                 // shortcut: a read in divergent code of what divergent code
                 // wrote gets no barrier (none could be placed there); the
@@ -7617,7 +7617,11 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_writelane_b32" => {
-                // The lane given takes the scalar; the others keep their value.
+                // The lane given takes the scalar, active or not, which a
+                // predicated block's merge loses for an inactive one.
+                if !self.x.st.literal && self.pred_active(self.cur_ir).is_some() {
+                    return Err(halves::WRITE_ACROSS);
+                }
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a lane write");
@@ -11401,48 +11405,6 @@ impl<'a> Lower<'a> {
         let _ = Exit::End;
         self.s.m.terminate(self.cur, term);
         Ok(())
-    }
-
-    /// A forward edge into loop header `to` (from DXIL block `via`) starts
-    /// its count at 0.
-    fn enter_loop(&mut self, _from: usize, to: usize, via: usize) {
-        if let Some((_, incoming)) = self.counters.get_mut(&to) {
-            let z = self.s.m.i32(0);
-            incoming.push((z, via));
-        }
-    }
-
-    /// A back edge to header `to` (a back edge keeps its block, no
-    /// critical-edge block): the count goes up; the result compares it with
-    /// [`LOOP_LIMIT`] by `p` (below: go on; at or above: stop).
-    fn count_iteration(&mut self, to: usize, p: u8) -> V {
-        let c = self.cur;
-        let (phi, _) = self.counters[&to];
-        let one = self.s.m.i32(1);
-        let next = self.s.m.bin(c, Bin::Add, phi, one);
-        let limit = self.s.m.i32(super::loop_limit());
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        self.s.m.cmp(c, p, next, limit)
-    }
-
-    /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.
-    fn abort_block(&mut self) -> usize {
-        if let Some(a) = self.abort {
-            return a;
-        }
-        let a = self.s.m.new_block();
-        if self.s.pixel {
-            let t = self.s.m.bool(true);
-            self.s
-                .op(a, "discard", Attr::NoUnwind, self.s.t.void, 82, &[t]);
-        }
-        self.s.m.terminate(a, Term::Ret);
-        self.abort = Some(a);
-        a
     }
 
     /// The DXIL block a branch from IR block `from` to `to` goes to.

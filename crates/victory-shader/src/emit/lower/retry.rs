@@ -50,6 +50,7 @@ pub(crate) fn lower_limited(
                     | halves::REDUCTION_ACROSS
                     | halves::FIRST_ACROSS
                     | halves::READ_ACROSS
+                    | halves::WRITE_ACROSS
                     | CAP_BARRIER,
                 ..
             })

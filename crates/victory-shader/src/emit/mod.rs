@@ -612,6 +612,17 @@ pub struct Options {
     /// LakshanSivakumar/Native-Victory-macOS 0ae6cfcd. Mac; the shader cache
     /// keys on it.
     pub thread_counts: bool,
+    /// With [`Options::halves_walk`]: the walk also opens a region whose
+    /// whole-wave code (EXEC set to every lane, as the console's compiler
+    /// does for a wave's sums and prefix sums) runs in lanes outside the
+    /// EXEC the skip tested, where nothing after the region reads what that
+    /// code leaves in their VGPRs (`walk`, "Whole-wave code"); and a
+    /// first-lane read under a narrowed EXEC is handed over across the
+    /// halves: the console's EXEC as a ballot, then its first lane's value
+    /// (`lower::exchange`). The title's ray bin offsets
+    /// (`sr_tracing:CS_GenerateRayBinOffsets`) then count their packets
+    /// over the whole console wave. Mac; the shader cache keys on it.
+    pub halves_whole_wave: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -3716,3 +3727,4 @@ mod tests {
         }
     }
 }
+

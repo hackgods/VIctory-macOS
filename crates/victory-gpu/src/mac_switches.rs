@@ -163,6 +163,29 @@ pub(crate) fn lds_rounds() -> bool {
     })
 }
 
+/// Whether the halves' walk also opens regions holding whole-wave code, and
+/// a first-lane read under a narrowed EXEC is handed over across the halves
+/// (`victory_shader::emit::Options::halves_whole_wave`; `notes/far-ray.md`):
+/// only with `VICTORY_HALVES_WHOLE_WAVE=1`, and only where
+/// `VICTORY_HALVES_EXCHANGE=1` and `VICTORY_HALVES_WALK=1` are on. The
+/// title's ray bin offsets (`sr_tracing:CS_GenerateRayBinOffsets`,
+/// `9d1d228b02e56a96`) and shader bin offsets
+/// (`shader_binning_utils:CS_GenerateShaderBinOffsets`, `8dd8d739047fe557`)
+/// then count over the whole console wave instead of each half alone.
+/// Exact where it applies; a program it does not make exact stays as it was.
+pub(crate) fn whole_wave() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_WHOLE_WAVE").ok().as_deref(), false);
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_WHOLE_WAVE=1: the halves' walk opens regions with whole-wave code, and first-lane reads under a narrowed EXEC are handed over, where that is exact"
+            );
+        }
+        on
+    })
+}
+
 /// Whether a size query on a writable image asks for level 0 in every
 /// program (`victory_shader::emit::Options::uav_size_level0`): only with
 /// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC

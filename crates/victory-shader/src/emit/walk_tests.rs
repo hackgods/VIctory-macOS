@@ -234,7 +234,7 @@ fn translated(
     let start = (&p, &st, &io, &res);
     if mac.walk
         && host_wave32
-        && let Some(exact) = walk::open(&native, start, lower)
+        && let Some(exact) = walk::open(&native, start, false, lower)
     {
         return Ok(exact);
     }

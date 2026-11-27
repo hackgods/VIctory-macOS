@@ -1185,9 +1185,14 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        // mac: with `VICTORY_PLACED_AT_ONCE=1`, not when the texture's host
-        // texture is made already: then the view makes nothing new.
-        let later = !for_draw && is_placed_texture(&view) && !made_at_once(&view);
+        // mac: with `VICTORY_PLACED_AT_ONCE=1` (or `keep`), not when the
+        // texture's host texture is made already: then the view makes nothing
+        // new; with `=all`, never.
+        let at_once = crate::mac_switches::placed_at_once();
+        let later = !for_draw
+            && is_placed_texture(&view)
+            && at_once != crate::mac_switches::PlacedAtOnce::All
+            && !made_at_once(&view);
         // mac: a heap sync ahead of the submission leaves the slot as it is,
         // for the sync before it: made now, its read mark would be forgotten
         // under the running submission's shaders (`super::ahead`).
@@ -1216,6 +1221,13 @@ impl HostHeap {
             }
         }
         {
+            // mac: with `VICTORY_PLACED_AT_ONCE=keep`, a slot left for later
+            // that holds a host view keeps it (and its mark) until a shader
+            // reads the slot: `make_read` then makes it, as the held texture
+            // is not the view's (`needs_remake`).
+            let keep_old = later
+                && at_once == crate::mac_switches::PlacedAtOnce::Keep
+                && self.kept.get(index as usize, |held| held.is_some());
             self.ready[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
             self.note_address(index, Some(&view));
@@ -1223,7 +1235,7 @@ impl HostHeap {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
                 // mac: `VICTORY_FLICKER_WATCH=1`: why it is null when read.
-                if crate::flicker::on() {
+                if crate::flicker::on() && !keep_old {
                     let shown = self.kept.get(index as usize, |held| held.is_some());
                     crate::flicker::nulled(index, if shown { crate::flicker::Why::Shown } else { crate::flicker::Why::Fresh });
                 }
@@ -1235,8 +1247,10 @@ impl HostHeap {
             } else {
                 make_marked(&view, self.cpu(index))
             };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
+            if !keep_old {
+                self.set_mark(index, mark);
+            }
+            if kept.is_none() && !self.sampler && !keep_old {
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
@@ -1245,7 +1259,11 @@ impl HostHeap {
             let kept = kept.flatten();
             // A texture's view left null is made again when a draw reads it.
             let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
-            self.keep(index, kept);
+            if keep_old {
+                crate::flicker::kept_old();
+            } else {
+                self.keep(index, kept);
+            }
             self.ready[index as usize].store(ready, Ordering::Release);
         }
         Some(view)
@@ -2210,10 +2228,11 @@ fn is_placed_texture(view: &View) -> bool {
 }
 
 /// mac: whether a heap sync makes the slot of placed texture view `view` at
-/// once (`VICTORY_PLACED_AT_ONCE=1`): its host texture is made already
-/// (`crate::resource::placed_made`), so making the view makes no texture.
+/// once (`VICTORY_PLACED_AT_ONCE=1` or `keep`): its host texture is made
+/// already (`crate::resource::placed_made`), so making the view makes no
+/// texture.
 fn made_at_once(view: &View) -> bool {
-    if !crate::mac_switches::placed_at_once() {
+    if !crate::mac_switches::placed_at_once().made() {
         return false;
     }
     let View::Placed(_, resource, desc) = view else {

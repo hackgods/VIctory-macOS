@@ -94,6 +94,27 @@ fn take_from(map: &Mutex<Option<HashMap<u32, Why>>>, slot: u32) -> Option<Why> {
     map.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.remove(&slot)
 }
 
+/// Slots that kept their old view instead of a null one
+/// (`VICTORY_PLACED_AT_ONCE=keep`) since the last line.
+static KEPT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A slot kept its old view until a shader reads it, instead of a null one.
+pub(crate) fn kept_old() {
+    if on() {
+        KEPT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The line for slots that kept their old view; none if there were none.
+pub(crate) fn kept_line(frame: u64, kept: usize) -> Option<String> {
+    (kept > 0).then(|| {
+        format!(
+            "flicker watch: heap slots rewritten with views of placed textures not made yet that kept their old view \
+             until read instead of a null one (VICTORY_PLACED_AT_ONCE=keep), since the last such line: frame={frame} kept={kept}"
+        )
+    })
+}
+
 /// What a slot read while null viewed, when it is a placed texture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Placed {
@@ -186,6 +207,9 @@ pub(crate) fn reads_line(frame: u64, first: usize, reads: &[Read]) -> Option<Str
 pub(crate) fn log_reads(frame: u64, first: usize, reads: &[Read]) {
     if let Some(line) = reads_line(frame, first, reads) {
         tracing::warn!("{line}");
+    }
+    if let Some(line) = kept_line(frame, KEPT.swap(0, std::sync::atomic::Ordering::Relaxed)) {
+        tracing::info!("{line}");
     }
 }
 
@@ -286,6 +310,12 @@ mod tests {
         let line = reads_line(0, reads.len(), &reads).unwrap();
         assert_eq!(line.matches("; slot ").count(), NAMED);
         assert!(line.ends_with("; 3 more"), "{line}");
+    }
+
+    #[test]
+    fn slots_that_kept_their_view_have_a_line_only_when_there_are_some() {
+        assert_eq!(kept_line(4, 0), None);
+        assert!(kept_line(4, 3).unwrap().ends_with("frame=4 kept=3"));
     }
 
     #[test]

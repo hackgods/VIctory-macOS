@@ -460,22 +460,61 @@ pub(crate) fn census_batch() -> bool {
     })
 }
 
-/// Whether a heap sync makes a slot rewritten with a view of a placed
-/// texture at once when that texture's host texture is made already,
-/// instead of leaving it null until a shader has read it (one submission of
-/// zeros for the draws that pick it by index: an object black for a frame,
-/// notes/flicker.md). Making such a view makes no texture, which is what the
-/// null rule spares. Only with `VICTORY_PLACED_AT_ONCE=1`, read once.
-pub(crate) fn placed_at_once() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+/// What a heap sync does with a slot it finds rewritten with a view of a
+/// placed texture (`VICTORY_PLACED_AT_ONCE`, notes/flicker.md). Without it
+/// the slot is left null until a shader has read it: one submission of
+/// zeros for the draws that pick it by index, an object black for a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacedAtOnce {
+    /// Unset, empty or `0`: as before.
+    Off,
+    /// `1`: the slot is made at once when the texture's host texture is
+    /// made already (making the view then makes no texture).
+    Made,
+    /// `keep`: as `1`, and a slot that held a host view keeps it until a
+    /// shader has read the slot (the old texture for that submission
+    /// instead of zeros; the title moving a texture leaves the same texels).
+    Keep,
+    /// `all`: every such slot is made at once, its texture made if it is
+    /// not yet (the host textures the null rule spares: memory).
+    All,
+}
+
+impl PlacedAtOnce {
+    /// Whether a view whose host texture is made is made at once.
+    pub(crate) fn made(self) -> bool {
+        self != PlacedAtOnce::Off
+    }
+}
+
+/// `VICTORY_PLACED_AT_ONCE`'s rule.
+fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
+    match value.map(str::trim) {
+        Some("1") => PlacedAtOnce::Made,
+        Some("keep") => PlacedAtOnce::Keep,
+        Some("all") => PlacedAtOnce::All,
+        _ => PlacedAtOnce::Off,
+    }
+}
+
+/// `VICTORY_PLACED_AT_ONCE`, read once ([`PlacedAtOnce`]).
+pub(crate) fn placed_at_once() -> PlacedAtOnce {
+    static ON: OnceLock<PlacedAtOnce> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = census_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
-        if on {
-            tracing::info!(
+        let mode = placed_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
+        match mode {
+            PlacedAtOnce::Off => {}
+            PlacedAtOnce::Made => tracing::info!(
                 "VICTORY_PLACED_AT_ONCE=1: heap slots rewritten with views of placed textures whose host texture is made are made at once, not left null until read"
-            );
+            ),
+            PlacedAtOnce::Keep => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=keep: as =1, and a slot that showed a view keeps it until a shader reads the slot, not null"
+            ),
+            PlacedAtOnce::All => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=all: every heap slot rewritten with a view of a placed texture is made at once, its texture made if need be"
+            ),
         }
-        on
+        mode
     })
 }
 
@@ -494,9 +533,18 @@ mod census_tests {
 
     #[test]
     fn placed_views_at_once_are_off_by_default() {
+        use super::{PlacedAtOnce, placed_rule};
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("true"), Some("2"), Some("Keep")] {
+            assert_eq!(placed_rule(off), PlacedAtOnce::Off, "{off:?}");
+            assert!(!placed_rule(off).made());
+        }
+        assert_eq!(placed_rule(Some(" 1 ")), PlacedAtOnce::Made);
+        assert_eq!(placed_rule(Some("keep")), PlacedAtOnce::Keep);
+        assert_eq!(placed_rule(Some("all")), PlacedAtOnce::All);
+        assert!([PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All].iter().all(|m| m.made()));
         // Read once; the tests never set it.
         if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
-            assert!(!super::placed_at_once());
+            assert_eq!(super::placed_at_once(), PlacedAtOnce::Off);
         }
     }
 

@@ -24,7 +24,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use victory_formats::texture::{changed_runs, walk_changed, Desc, Dimension, Layout, Swizzle};
+use victory_formats::texture::{Desc, Dimension, Layout, Swizzle, changed_runs, walk_changed};
 
 /// One page a submission changes.
 const PAGE: usize = 64 * 1024;
@@ -153,7 +153,53 @@ fn median(mut samples: Vec<Duration>) -> Duration {
     samples[samples.len() / 2]
 }
 
+fn compare_changes() {
+    let changed: &[(&str, &[(usize, usize)])] = &[
+        ("equal", &[]),
+        ("single", &[(64 * 1024, 128 * 1024)]),
+        (
+            "separated",
+            &[(64 * 1024, 128 * 1024), (896 * 1024, 960 * 1024)],
+        ),
+        ("dense", &[(0, COMPARE_CHUNK)]),
+    ];
+    let mut kept = vec![0; COMPARE_CHUNK];
+    let mut runs = Vec::new();
+    for (name, regions) in changed {
+        let mut fresh = vec![0; COMPARE_CHUNK];
+        for &(start, end) in *regions {
+            fresh[start..end].fill(1);
+        }
+        let mut expected = vec![0; COMPARE_CHUNK];
+        let mut expected_runs = Vec::new();
+        walk_changed(37, &mut expected, &fresh, &mut expected_runs);
+        let mut samples = Vec::new();
+        for i in 0..(64 + 8) {
+            kept.fill(0);
+            runs.clear();
+            let start = Instant::now();
+            changed_runs(37, black_box(&mut kept), black_box(&fresh), &mut runs);
+            let elapsed = start.elapsed();
+            assert_eq!(runs, expected_runs);
+            assert_eq!(kept, expected);
+            if i >= 8 {
+                samples.push(elapsed.as_nanos());
+            }
+        }
+        samples.sort_unstable();
+        println!(
+            "bench_tex_compare_{name}_ns {:?} runs={}",
+            samples,
+            expected_runs.len()
+        );
+    }
+}
+
 fn main() {
+    if std::env::var_os("VICTORY_BENCH_COMPARE_ONLY").is_some() {
+        compare_changes();
+        return;
+    }
     let cases = [
         (
             "bc7",

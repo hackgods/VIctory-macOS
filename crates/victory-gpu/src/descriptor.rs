@@ -741,11 +741,18 @@ pub(crate) enum View {
 /// generation, so descriptors (and host slots made from them) naming the
 /// old one go stale instead of naming whatever is made at the same address
 /// next.
-/// shortcut: views without a resource object (constant buffers, memory
-/// views, samplers) are kept for the run; they are bounded by the title's
-/// memory and sampler states. None can be freed by age: a descriptor naming
-/// one may lie anywhere in title memory (a table written once at load, or
-/// copied as bytes), and freeing the oldest left the world's tables null.
+/// shortcut: views without a resource object are kept for the run. None
+/// can be freed by age: a descriptor naming one may lie anywhere in title
+/// memory (a table written once at load, or copied as bytes), and freeing
+/// the oldest left the world's tables null. Samplers are bounded by the
+/// title's sampler states. Constant buffer views and views of placed
+/// memory are not: a title writes thousands of constant buffer views a
+/// frame, each at the address its constants have that frame, and as
+/// entries they grew the table without end (about 0.28 GB a minute, found
+/// in 64bitMango's fork). So those two kinds are not entries where their
+/// record can name them whole ([`inline_words`]); the table keeps only the
+/// shapes of placed views ([`SHAPES`]), as many as the title has kinds of
+/// textures and buffers. `VICTORY_VIEW_INLINE=0` makes them entries again.
 #[cfg_attr(test, derive(Default))]
 struct Views {
     /// Each entry's view and generation.
@@ -771,6 +778,187 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
+// A record is the tag and two words, `i` and `generation` (the host keeps
+// them as one 64-bit key per slot). The top two bits of `generation` say
+// what the other 62 bits are: 0, entry `i` of the table at that
+// generation; [`CONSTANT`], a constant buffer view, whole; [`PLACED`], a
+// view of placed memory: its address and the number of its shape.
+const KIND_SHIFT: u32 = 30;
+/// Table generations stay below the kind bits (and above 0).
+const GENERATION_MASK: u32 = (1 << KIND_SHIFT) - 1;
+const CONSTANT: u32 = 1;
+const PLACED: u32 = 2;
+/// Bits of a constant buffer view's address in its record: any address a
+/// program can have. The 15 bits above them are its size.
+const CONSTANT_ADDRESS_BITS: u32 = 47;
+/// Bits of a placed view's address in its record: placed memory is title
+/// memory, which lies below 1 TiB. The 22 bits above them number its shape.
+const PLACED_ADDRESS_BITS: u32 = 40;
+const SHAPE_LIMIT: usize = 1 << (62 - PLACED_ADDRESS_BITS);
+
+/// The next generation of a table entry after `generation`: never 0 (no
+/// view) and never into the kind bits.
+fn next_generation(generation: u32) -> u32 {
+    (generation.wrapping_add(1) & GENERATION_MASK).max(1)
+}
+
+/// A view of placed memory without its address: whether it is unordered
+/// access, the resource description, and the view's words but the two that
+/// hold the address (10 and 11).
+type Shape = (bool, [u32; 14], [u32; 14]);
+
+/// The shapes of placed views named whole in their records, by number, and
+/// where each is. Only ever added to: as many as the title has kinds of
+/// textures and buffers, however often it moves them. A lock of its own:
+/// nearly every placed view has a shape seen before, which readers share.
+struct Shapes {
+    list: Vec<Shape>,
+    index: std::collections::BTreeMap<Shape, u32>,
+}
+
+static SHAPES: std::sync::RwLock<Shapes> = std::sync::RwLock::new(Shapes {
+    list: Vec::new(),
+    index: std::collections::BTreeMap::new(),
+});
+
+/// The number of shapes in [`SHAPES`], for [`view_gen_current`] to know a
+/// record's shape without the lock (stored after the shape is there).
+static SHAPES_KNOWN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether constant buffer views and views of placed memory are named whole
+/// in their records ([`Views`]): unless `VICTORY_VIEW_INLINE=0`.
+fn view_inline() -> bool {
+    #[cfg(test)]
+    if tests::ENTRIES_ONLY.with(|only| only.get()) {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_INLINE").is_none_or(|v| v != "0"))
+}
+
+/// The two record words of the 62 bits `payload` of kind `kind`.
+fn kind_words(kind: u32, payload: u64) -> [u32; 2] {
+    [payload as u32, kind << KIND_SHIFT | (payload >> 32) as u32]
+}
+
+/// The 62 bits two record words carry beside their kind.
+fn payload(i: u32, generation: u32) -> u64 {
+    u64::from(generation & GENERATION_MASK) << 32 | u64::from(i)
+}
+
+/// The record words that name the constant buffer view of `size` bytes at
+/// `address` whole; `None` if they cannot: an address past 47 bits, or a
+/// size of 16 KiB or more that is no multiple of 256 or reaches 4 MiB (the
+/// size has 15 bits: bytes below 16 KiB, else units of 256 bytes). Such a
+/// view is a table entry.
+fn constant_words(address: u64, size: u32) -> Option<[u32; 2]> {
+    if address >> CONSTANT_ADDRESS_BITS != 0 {
+        return None;
+    }
+    let code = if size < 1 << 14 {
+        u64::from(size)
+    } else if size.is_multiple_of(256) && size >> 8 < 1 << 14 {
+        1 << 14 | u64::from(size >> 8)
+    } else {
+        return None;
+    };
+    Some(kind_words(CONSTANT, code << CONSTANT_ADDRESS_BITS | address))
+}
+
+/// The constant buffer view [`constant_words`] named.
+fn constant_of(i: u32, generation: u32) -> View {
+    let payload = payload(i, generation);
+    let code = (payload >> CONSTANT_ADDRESS_BITS) as u32;
+    let size = if code >> 14 == 0 { code } else { (code & 0x3fff) << 8 };
+    View::Constant(payload & ((1 << CONSTANT_ADDRESS_BITS) - 1), size)
+}
+
+/// A placed view's shape and its address.
+fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut rest = [0u32; 14];
+    rest[..10].copy_from_slice(&desc[..10]);
+    rest[10..].copy_from_slice(&desc[12..]);
+    ((unordered, *resource, rest), u64::from(desc[10]) | u64::from(desc[11]) << 32)
+}
+
+/// The number of `shape`, a new one if it is not there yet; `None` when the
+/// shapes are full (the view is then a table entry).
+fn shape_number(shape: Shape) -> Option<u32> {
+    if let Some(&at) = SHAPES.read().unwrap_or_else(|e| e.into_inner()).index.get(&shape) {
+        return Some(at);
+    }
+    let mut shapes = SHAPES.write().unwrap_or_else(|e| e.into_inner());
+    // Looked up again: another thread may have entered it meanwhile.
+    if let Some(&at) = shapes.index.get(&shape) {
+        return Some(at);
+    }
+    if shapes.list.len() >= SHAPE_LIMIT {
+        return None;
+    }
+    let at = shapes.list.len() as u32;
+    shapes.list.push(shape);
+    shapes.index.insert(shape, at);
+    SHAPES_KNOWN.store(shapes.list.len(), std::sync::atomic::Ordering::Release);
+    Some(at)
+}
+
+/// The view of placed memory named by the record words, if its shape is known.
+fn placed_of(i: u32, generation: u32) -> Option<View> {
+    let payload = payload(i, generation);
+    let address = payload & ((1 << PLACED_ADDRESS_BITS) - 1);
+    let shapes = SHAPES.read().unwrap_or_else(|e| e.into_inner());
+    let &(unordered, resource, rest) = shapes.list.get((payload >> PLACED_ADDRESS_BITS) as usize)?;
+    let mut desc = [0u32; 16];
+    desc[..10].copy_from_slice(&rest[..10]);
+    (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+    desc[12..].copy_from_slice(&rest[10..]);
+    Some(View::Placed(unordered, resource, desc))
+}
+
+/// The two words that name `view` whole in a record, where its kind allows
+/// and `VICTORY_VIEW_INLINE` is not `0` ([`Views`]); else `None`, and the
+/// view is a table entry.
+fn inline_words(view: &View) -> Option<[u32; 2]> {
+    if !view_inline() {
+        return None;
+    }
+    match view {
+        View::Constant(address, size) => constant_words(*address, *size),
+        View::Placed(unordered, resource, desc) => {
+            let (shape, address) = shape_of(*unordered, resource, desc);
+            if address >> PLACED_ADDRESS_BITS != 0 {
+                return None;
+            }
+            let payload = u64::from(shape_number(shape)?) << PLACED_ADDRESS_BITS | address;
+            Some(kind_words(PLACED, payload))
+        }
+        _ => None,
+    }
+}
+
+/// The view record words of a kind other than a table entry name whole;
+/// `None` for a table entry's words or a placed view of an unknown shape.
+fn inline_view(i: u32, generation: u32) -> Option<View> {
+    match generation >> KIND_SHIFT {
+        CONSTANT => Some(constant_of(i, generation)),
+        PLACED => placed_of(i, generation),
+        _ => None,
+    }
+}
+
+/// Whether record words of a kind other than a table entry name a view: a
+/// constant buffer view always does, a placed view if its shape is known.
+fn inline_current(i: u32, generation: u32) -> bool {
+    match generation >> KIND_SHIFT {
+        CONSTANT => true,
+        PLACED => {
+            let shapes = SHAPES_KNOWN.load(std::sync::atomic::Ordering::Acquire);
+            ((payload(i, generation) >> PLACED_ADDRESS_BITS) as usize) < shapes
+        }
+        _ => false,
+    }
+}
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {
@@ -792,7 +980,10 @@ impl Views {
         }
     }
 
-    /// Looks up `view`, or inserts it: its `(index, generation)`.
+    /// Looks up `view`, or inserts it: its `(index, generation)`. The
+    /// lock-free mirror of generations ([`set_view_gen`]) is the caller's to
+    /// set: it mirrors [`VIEWS`] only, and a test's own table set there
+    /// named [`VIEWS`]'s low entries stale while another test synced them.
     fn entry_kept(&mut self, view: View) -> (u32, u32) {
         if let Some(&i) = self.index.get(&view) {
             return (i, self.list[i as usize].1);
@@ -833,6 +1024,14 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    // A view its record names whole needs neither the table nor its lock.
+    if let Some([i, generation]) = inline_words(&view) {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
     // A view seen before, as most are: its entry is found under the shared
     // lock, which keeps `forget` from making it stale while it is written.
     let known = {
@@ -851,6 +1050,7 @@ fn record(handle: u64, view: View) {
     }
     let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
     let (i, generation) = views.entry_kept(view);
+    // Before the record names it, as the heap syncs check it without the lock.
     set_view_gen(i, generation);
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
@@ -887,6 +1087,9 @@ fn set_view_gen(i: u32, generation: u32) {
 pub(crate) fn view_gen_current(i: u32, generation: u32) -> bool {
     if generation == 0 {
         return false;
+    }
+    if generation >> KIND_SHIFT != 0 {
+        return inline_current(i, generation);
     }
     let chunk = (i >> VIEW_GEN_CHUNK_SHIFT) as usize;
     let offset = (i as usize) & (VIEW_GEN_CHUNK_LEN - 1);
@@ -926,7 +1129,7 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        views.list[i as usize].1 = next_generation(generation);
         set_view_gen(i, 0);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
@@ -986,6 +1189,10 @@ impl Drop for ViewPin {
 /// for it.
 #[cfg(any(windows, test))]
 fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
+    if generation >> KIND_SHIFT != 0 {
+        // Named whole: no resource object to hold.
+        return inline_view(i, generation).map(|view| ViewPin { view, held: [0, 0] });
+    }
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     if *current != generation {
@@ -1023,6 +1230,10 @@ pub(crate) fn views_at_batch(keys: &[u64]) -> Vec<Option<ViewPin>> {
         for &key in keys {
             let i = key as u32;
             let generation = (key >> 32) as u32;
+            if generation >> KIND_SHIFT != 0 {
+                results.push(inline_view(i, generation).map(|view| ViewPin { view, held: [0, 0] }));
+                continue;
+            }
             let Some((view, current)) = views.list.get(i as usize) else {
                 results.push(None);
                 continue;
@@ -1064,7 +1275,12 @@ fn views_current_into(records: &[[u32; 3]], out: &mut Vec<bool>) {
     out.clear();
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     out.extend(records.iter().map(|&[tag, i, generation]| {
-        tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        tag == VIEW_TAG
+            && if generation >> KIND_SHIFT != 0 {
+                inline_current(i, generation)
+            } else {
+                views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            }
     }));
 }
 
@@ -2300,5 +2516,145 @@ pub(crate) mod tests {
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+    }
+
+    thread_local! {
+        /// Set in a test: every view of that test's thread is a table entry,
+        /// as with `VICTORY_VIEW_INLINE=0`.
+        pub(crate) static ENTRIES_ONLY: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// The record of a view written to a fresh slot, and the view it reads back as.
+    fn recorded(view: View) -> ([u32; 3], Option<View>) {
+        let mut slot = [0u32; 4];
+        let handle = slot.as_mut_ptr() as u64;
+        record(handle, view);
+        let read = super::view(handle).map(|pin| (*pin).clone());
+        ([slot[0], slot[1], slot[2]], read)
+    }
+
+    /// Constant buffer views at a new address each, as a title writes them
+    /// every frame, are named whole in their records: the table does not
+    /// grow with them (it grew 0.28 GB a minute in a title when it did),
+    /// and they read back as themselves. As entries, each is one more. Kept
+    /// small: the heap sync tests beside it are sensitive to load.
+    #[test]
+    fn constant_buffer_views_at_new_addresses_add_no_table_entries() {
+        // Constant buffer entries are never freed, so their count only
+        // grows (the table's length need not: entries freed by other tests
+        // are taken again).
+        let constant_entries = || views_kept()[2];
+        let n = 3_000u64;
+        let before = constant_entries();
+        for k in 0..n {
+            let mut slot = [0u32; 4];
+            let address = 0x3_0000_0000 + 256 * k;
+            let desc = [address as u32, (address >> 32) as u32, 256, 0];
+            create_cbv(std::ptr::null(), &desc, slot.as_mut_ptr() as u64);
+            assert_eq!(slot[2] >> KIND_SHIFT, CONSTANT);
+            if k % 100 == 0 {
+                assert_eq!(
+                    view(slot.as_mut_ptr() as u64).as_deref(),
+                    Some(&View::Constant(address, 256))
+                );
+            }
+        }
+        // Other tests may add entries meanwhile; these 3,000 add none.
+        assert!(constant_entries() - before < 100, "the table grew with constant buffer views");
+        ENTRIES_ONLY.with(|only| only.set(true));
+        let before = constant_entries();
+        for k in 0..100 {
+            let (record, read) = recorded(View::Constant(0x4_0000_0000 + 256 * k, 256));
+            assert_eq!(record[2] >> KIND_SHIFT, 0, "an entry with VICTORY_VIEW_INLINE=0");
+            assert_eq!(read, Some(View::Constant(0x4_0000_0000 + 256 * k, 256)));
+        }
+        assert!(constant_entries() - before >= 100);
+        ENTRIES_ONLY.with(|only| only.set(false));
+    }
+
+    /// Every size below 16 KiB and the multiples of 256 below 4 MiB fit in a
+    /// record; other sizes and addresses past 47 bits are table entries, and
+    /// read back the same either way.
+    #[test]
+    fn constant_buffer_views_read_back_whole_or_as_entries() {
+        for (address, size, whole) in [
+            (0, 0, true),
+            (0x1000, 1, true),
+            (0x7fff_ffff_ff00, 256, true),
+            (0x2000, (1 << 14) - 1, true),
+            (0x2000, 1 << 14, true),
+            (0x2000, (4 << 20) - 256, true),
+            (0x2000, 4 << 20, false),
+            (0x2000, (1 << 14) + 4, false),
+            (1 << 47, 256, false),
+        ] {
+            assert_eq!(constant_words(address, size).is_some(), whole, "{address:#x} {size}");
+            let (record, read) = recorded(View::Constant(address, size));
+            assert_eq!(record[2] >> KIND_SHIFT == CONSTANT, whole, "{address:#x} {size}");
+            assert_eq!(read, Some(View::Constant(address, size)), "{address:#x} {size}");
+        }
+    }
+
+    /// Views of placed memory are named by their address and the number of
+    /// their shape: moved, the same shape is not entered again; past 40
+    /// address bits the view is a table entry.
+    #[test]
+    fn placed_views_are_named_by_address_and_shape() {
+        let resource = [7u32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0];
+        let desc = |address: u64| {
+            let mut d = [0x5151u32; 16];
+            (d[10], d[11]) = (address as u32, (address >> 32) as u32);
+            d
+        };
+        let (first, read) = recorded(View::Placed(false, resource, desc(0x10_0000)));
+        assert_eq!(first[2] >> KIND_SHIFT, PLACED);
+        assert_eq!(read, Some(View::Placed(false, resource, desc(0x10_0000))));
+        let shape = |record: [u32; 3]| payload(record[1], record[2]) >> PLACED_ADDRESS_BITS;
+        for k in 1..500u64 {
+            let address = 0x10_0000 + (k << 16);
+            let (record, read) = recorded(View::Placed(false, resource, desc(address)));
+            assert_eq!(record[2] >> KIND_SHIFT, PLACED);
+            assert_eq!(shape(record), shape(first), "one shape for all 500");
+            assert_eq!(read, Some(View::Placed(false, resource, desc(address))));
+        }
+        let (other, read) = recorded(View::Placed(true, resource, desc(0x10_0000)));
+        assert_ne!(other[1..], first[1..], "unordered is another shape");
+        assert_eq!(read, Some(View::Placed(true, resource, desc(0x10_0000))));
+        let far = 1u64 << 40;
+        let (record, read) = recorded(View::Placed(false, resource, desc(far)));
+        assert_eq!(record[2] >> KIND_SHIFT, 0, "an entry past 40 address bits");
+        assert_eq!(read, Some(View::Placed(false, resource, desc(far))));
+    }
+
+    /// The heap syncs' checks take whole records as current and find their
+    /// views by key; a placed record of a shape not entered names nothing.
+    #[test]
+    fn records_named_whole_are_current_for_the_heap_syncs() {
+        let ([_, i, generation], _) = recorded(View::Constant(0x9000, 512));
+        assert!(view_gen_current(i, generation));
+        let key = u64::from(generation) << 32 | u64::from(i);
+        let pins = views_at_batch(&[key]);
+        assert_eq!(pins[0].as_deref(), Some(&View::Constant(0x9000, 512)));
+        let unknown = kind_words(PLACED, ((SHAPE_LIMIT - 1) as u64) << PLACED_ADDRESS_BITS);
+        assert!(!view_gen_current(unknown[0], unknown[1]));
+        assert!(view_at(unknown[0], unknown[1]).is_none());
+        #[cfg(windows)]
+        {
+            let mut current = Vec::new();
+            views_current_into(
+                &[[VIEW_TAG, i, generation], [VIEW_TAG, unknown[0], unknown[1]]],
+                &mut current,
+            );
+            assert_eq!(current, [true, false]);
+        }
+    }
+
+    /// A table entry's generation never reaches the kind bits or 0.
+    #[test]
+    fn table_generations_stay_below_the_kind_bits() {
+        assert_eq!(next_generation(1), 2);
+        assert_eq!(next_generation(GENERATION_MASK), 1);
+        assert_eq!(next_generation(u32::MAX), 1);
     }
 }

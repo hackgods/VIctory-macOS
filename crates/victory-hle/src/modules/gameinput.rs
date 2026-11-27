@@ -22,6 +22,9 @@ use super::xasync::{E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
+#[path = "gameinput_filter.rs"]
+mod filter;
+
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -359,6 +362,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Opt-in input latch and stick deadzone filters.
+    filter: filter::InputFilter,
 }
 
 pub struct Hub {
@@ -400,6 +405,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                filter: filter::InputFilter::default(),
             }),
             returned: Condvar::new(),
         }));
@@ -416,6 +422,7 @@ impl Hub {
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
         let hub = Hub::new(super::gameinput_script::wrap(source));
+        hub.state().filter = filter::InputFilter::from_env();
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -502,23 +509,32 @@ impl State {
             }
             self.seen_input[slot].then_some(pad)
         });
+        self.filter.apply_deadzone(&mut pads);
         #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]
         let _ = (&mut pads, scripted);
         let any_pad = pads.iter().any(Option::is_some);
         for (slot, pad) in pads.into_iter().enumerate() {
+            let pad = self.filter.latch(slot, pad, now);
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| {
             let base = fallback(&keys);
             #[cfg(any(test, feature = "diagnostics"))]
             if !scripted.is_empty() {
-                return Value::Pad(merge_pad(base, fallback(scripted)));
+                return merge_pad(base, fallback(scripted));
             }
-            Value::Pad(base)
+            base
         });
-        self.update(devices, FALLBACK, fallback, now, &mut events);
+        let fallback = self.filter.latch(FALLBACK, fallback, now);
+        self.update(
+            devices,
+            FALLBACK,
+            fallback.map(Value::Pad),
+            now,
+            &mut events,
+        );
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
     }
@@ -652,7 +668,7 @@ extern "system" fn current_reading(
     out: Out,
 ) -> HRESULT {
     let hub = hub(this);
-    let state = hub.state();
+    let mut state = hub.state();
     let newest = |i: usize| {
         state.slots[i]
             .history
@@ -677,7 +693,14 @@ extern "system" fn current_reading(
         sequence = found.map(|r| r.sequence),
         "current reading"
     );
-    hand(out, found)
+    let handed = found.and_then(|r| hub.index(r.device));
+    let hr = hand(out, found);
+    if hr == S_OK
+        && let Some(index) = handed
+    {
+        state.filter.handed(index, now());
+    }
+    hr
 }
 
 /// The reading after (`forward`) or before `reference`: on `device`, or with
@@ -765,9 +788,13 @@ extern "system" fn temporal_reading(
     let Some(index) = hub.index(device) else {
         return fail(out, E_INVALIDARG);
     };
-    let state = hub.state();
+    let mut state = hub.state();
     let history = &state.slots[index].history;
-    hand(out, history.iter().rev().find(|r| r.timestamp <= time))
+    let hr = hand(out, history.iter().rev().find(|r| r.timestamp <= time));
+    if hr == S_OK {
+        state.filter.handed(index, now());
+    }
+    hr
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -2448,5 +2475,87 @@ mod tests {
         let back = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(pad(back).buttons, A);
         release(back);
+    }
+
+    #[test]
+    fn input_latch_delivers_tap_once_preserves_held_and_clears_release() {
+        let (hub, host) = fake();
+        let set_pad = |buttons| {
+            host.lock().unwrap().pads[1] = Some(PadState {
+                buttons,
+                left_x: 0.1,
+                ..Default::default()
+            });
+        };
+        let read_pad = |device| {
+            let r = current(hub, GAMEPAD_KIND, device).unwrap();
+            let buttons = pad(r).buttons;
+            release(r);
+            buttons
+        };
+        let tap_pad = || {
+            set_pad(A);
+            hub.poll();
+            set_pad(0);
+            hub.poll();
+        };
+
+        set_pad(0);
+        hub.poll();
+        // Default (off): a tap that ends before the title polls is missed.
+        tap_pad();
+        assert_eq!(read_pad(1), 0);
+
+        // Enabled: a tap between two polls is delivered once, then cleared.
+        hub.state().filter = filter::for_tests(Some(0), 0.0);
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+        tap_pad();
+        assert_eq!(read_pad(1), A, "tap observed on next reading");
+        hub.poll();
+        assert_eq!(read_pad(1), 0, "cleared once read and released");
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+
+        // Held button stays down across readings and clears after release.
+        set_pad(B);
+        for _ in 0..3 {
+            hub.poll();
+            assert_eq!(read_pad(1), B);
+        }
+        set_pad(0);
+        hub.poll();
+        assert_eq!(read_pad(1), 0);
+
+        // Disconnect physical pad so fallback keyboard pad is active, then tap Enter (A).
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), 0);
+        host.lock().unwrap().keys = vec![key(0x0D)];
+        hub.poll();
+        host.lock().unwrap().keys.clear();
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), A, "fallback pad tap latched");
+        hub.poll();
+        assert_eq!(read_pad(FALLBACK), 0, "fallback pad tap cleared");
+    }
+
+    #[test]
+    fn stick_deadzone_filters_host_pad_through_hub_poll() {
+        let (hub, host) = fake();
+        hub.state().filter = filter::for_tests(None, 0.25);
+        host.lock().unwrap().pads[0] = Some(PadState {
+            left_x: 0.15,
+            left_y: -0.15,
+            right_x: 0.0,
+            right_y: 0.625,
+            ..Default::default()
+        });
+        hub.poll();
+        let r = current(hub, GAMEPAD_KIND, 0).unwrap();
+        let state = pad(r);
+        release(r);
+        assert_eq!((state.left_x, state.left_y), (0.0, 0.0));
+        assert!(state.right_x == 0.0 && (state.right_y - 0.5).abs() < 1e-6);
     }
 }

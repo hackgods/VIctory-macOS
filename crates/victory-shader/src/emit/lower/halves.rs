@@ -647,15 +647,22 @@ pub(super) const FIRST_ACROSS: Why = "a first-lane read of a value that may diff
 /// Whether `x` (a wave64 compute program) has a non-waterfall
 /// `v_readfirstlane_b32` whose vector source may differ between lanes of the
 /// console wave: such a read needs console-wave lane order (and halves on a
-/// 32-lane host) so both halves see the same first active lane.
-pub(super) fn needs_first_lane(x: &Parts, alike: &mut Option<HashSet<Value>>) -> bool {
+/// 32-lane host) so both halves see the same first active lane. Not one each
+/// host half can make by itself (`alone`, [`super::first_lane::read_alone`]).
+pub(super) fn needs_first_lane(
+    x: &Parts,
+    alike: &mut Option<HashSet<Value>>,
+    alone: &HashSet<Value>,
+) -> bool {
     if !x.native.wave64 {
         return false;
     }
     let wf = &x.res.waterfall.reads;
     let is_vec_first = |i: &Inst| -> Option<Value> {
         if i.name() != "v_readfirstlane_b32"
-            || i.writes.first().is_some_and(|w| wf.contains(&w.1))
+            || i.writes
+                .first()
+                .is_some_and(|w| wf.contains(&w.1) || alone.contains(&w.1))
         {
             return None;
         }

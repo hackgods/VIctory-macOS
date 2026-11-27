@@ -9,6 +9,12 @@
 # time: finished steps are skipped. The first run takes about an hour.
 set -eu
 ROOT="${0:A:h}"
+# Resolve an explicit image path relative to the caller before changing folders.
+dmg="${GPTK_DMG:-}"
+case "$dmg" in
+  ''|/*) ;;
+  *) dmg="$PWD/$dmg" ;;
+esac
 cd "$ROOT"
 say() { print -P "%F{cyan}==>%f $*"; }
 die() { print -P "%F{red}error:%f $*" >&2; exit 1; }
@@ -79,9 +85,14 @@ fi
 if [[ -d $WINE_DIR/lib/external/D3DMetal.framework ]]; then
   say "D3DMetal already added"
 else
-  # (N) keeps zsh quiet when nothing matches, (om) puts the newest first.
-  downloads=("$HOME"/Downloads/Game_Porting_Toolkit*.dmg(Nom))
-  dmg="${GPTK_DMG:-${downloads[1]:-}}"
+  if [[ -z $dmg ]]; then
+    # (N) keeps zsh quiet when nothing matches, (om) puts the newest first.
+    downloads=("$HOME"/Downloads/Game_Porting_Toolkit*.dmg(Nom))
+    dmg="${downloads[1]:-}"
+  elif [[ ! -f $dmg ]]; then
+    printf 'GPTK_DMG does not point to a file: %s\n' "$dmg" >&2
+    exit 1
+  fi
   if [[ -z $dmg || ! -f $dmg ]]; then
     print
     print -P "%F{yellow}One manual step is left.%f Apple only gives D3DMetal to people who sign in, so you have to download it yourself:"

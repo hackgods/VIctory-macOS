@@ -72,7 +72,7 @@ pub(crate) fn relook_frames(frame_ms: u64, relook_ms: u64) -> u64 {
 
 /// Classification of an unmade slot reported by GPU read-marks when the
 /// background heap worker is enabled.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnmadeRead {
     None,
     Background,
@@ -266,6 +266,82 @@ fn fast_heap_sync_value(value: Option<&std::ffi::OsStr>) -> bool {
 fn fast_heap_sync() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| fast_heap_sync_value(std::env::var_os("VICTORY_FAST_HEAP_SYNC").as_deref()))
+}
+
+/// Policy for mirroring placed-texture slots during non-draw updates
+/// (`VICTORY_PLACED_AT_ONCE`, off by default).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacedAtOnce {
+    /// Unset, empty, or `0`: leave placed-texture slots null until a draw or
+    /// shader read triggers creation.
+    Off,
+    /// `1`: make the slot at once when the placed texture's host texture
+    /// already exists (creating no new host texture).
+    Made,
+    /// `keep`: like `1`, and when the new texture is not made yet, keep any
+    /// existing host view (and its write mark) in the slot instead of writing
+    /// a null view until a shader read or draw remakes it on demand.
+    Keep,
+    /// `all`: make every placed-texture slot at once.
+    All,
+}
+
+impl PlacedAtOnce {
+    fn parse(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            Some("1") => Self::Made,
+            Some("keep") => Self::Keep,
+            Some("all") => Self::All,
+            _ => Self::Off,
+        }
+    }
+
+    fn makes_existing(self) -> bool {
+        self != Self::Off
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PLACED_AT_ONCE: std::cell::Cell<Option<PlacedAtOnce>> = const { std::cell::Cell::new(None) };
+}
+
+fn placed_at_once() -> PlacedAtOnce {
+    #[cfg(test)]
+    if let Some(mode) = TEST_PLACED_AT_ONCE.get() {
+        return mode;
+    }
+    static MODE: std::sync::OnceLock<PlacedAtOnce> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = PlacedAtOnce::parse(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
+        match mode {
+            PlacedAtOnce::Off => {}
+            PlacedAtOnce::Made => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=1: making rewritten placed-texture slots at once when their host texture already exists"
+            ),
+            PlacedAtOnce::Keep => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=keep: making existing placed textures at once and keeping prior host views until read"
+            ),
+            PlacedAtOnce::All => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=all: making every rewritten placed-texture slot at once"
+            ),
+        }
+        mode
+    })
+}
+
+fn made_at_once(view: &View, mode: PlacedAtOnce) -> bool {
+    if !mode.makes_existing() {
+        return false;
+    }
+    let View::Placed(_, resource, desc) = view else {
+        return false;
+    };
+    crate::resource::placed_made(u64::from(desc[10]) | u64::from(desc[11]) << 32, resource)
+}
+
+fn defer_placed(view: &View, mode: PlacedAtOnce) -> bool {
+    is_placed_texture(view) && mode != PlacedAtOnce::All && !made_at_once(view, mode)
 }
 
 /// CPU-only (`D3D12_DESCRIPTOR_HEAP_FLAG_NONE`) staging heap holding null
@@ -522,6 +598,35 @@ fn live_records(
         i = j;
     }
     live
+}
+
+/// Whether heap syncs leave a made slot as it is when the title wrote bytes
+/// there that are no record of ours (zeros, or its own data between its
+/// descriptors): `VICTORY_STALE_LEFT=1`. Most slots a sync made were such
+/// in a title's world (32,000 of 47,000 a frame in 64bitMango's fork, where
+/// leaving them took heap syncs from 35.4 to 23.4 ms a frame), and no draw
+/// read one through a table. Left, the slot keeps the view it had: a draw
+/// that reads it through a table makes it null then ([`HostHeap::mirror`]
+/// finds no record of ours), a title thread writing a view there makes it,
+/// and the title writing back the record it was made from costs nothing. A
+/// record of ours that names no view (of a released resource) is still
+/// made null.
+/// shortcut: a shader that takes such a slot from the heap at an index from
+/// its data reads the view the slot had, not nothing; and what the slot
+/// views stays entered (`crate::bindless`), so its memory is kept current
+/// until the slot is written again.
+fn stale_left() -> bool {
+    // Tests choose for themselves, so the tests of making such slots null
+    // still run whatever the default.
+    #[cfg(test)]
+    {
+        tests::STALE_LEFT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_STALE_LEFT"))
+    }
 }
 
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
@@ -1388,10 +1493,10 @@ impl HostHeap {
     /// resource view and a raw unordered access view of the first `bytes`
     /// (a multiple of 4) of `buffer`, which they hold; null views for no
     /// buffer.
-    pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, bytes: u64) {
+    pub(crate) fn raw_pair_at(&self, index: u32, buffer: Option<&ID3D12Resource>, first: u64, bytes: u64) {
         let Some(host) = host() else { return };
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw);
-        // a longer copy's rest reads 0 through it.
+        // A buffer view holds at most 2^27 elements (512 MiB raw): the page
+        // table names a longer copy in pieces (`crate::memory::pieces`).
         let elements = (bytes / 4).min(1 << 27) as u32;
         let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R32_TYPELESS,
@@ -1399,7 +1504,7 @@ impl HostHeap {
             Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
             Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_SRV {
-                    FirstElement: 0,
+                    FirstElement: first / 4,
                     NumElements: elements,
                     StructureByteStride: 0,
                     Flags: D3D12_BUFFER_SRV_FLAG_RAW,
@@ -1411,6 +1516,7 @@ impl HostHeap {
             ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
             Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
                 Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first / 4,
                     NumElements: elements,
                     Flags: D3D12_BUFFER_UAV_FLAG_RAW,
                     ..Default::default()
@@ -1528,6 +1634,7 @@ impl HostHeap {
         let buf_end = buf_start.saturating_add(buf.len() as u64);
         let mut legacy_verify = false;
 
+        let left = stale_left();
         if fast {
             let mut stale: Vec<(u32, [u32; 3])> = Vec::new();
             let all_in_buf =
@@ -1556,7 +1663,9 @@ impl HostHeap {
                             ptr = ptr.wrapping_add(step_usize);
                             let [tag, view, generation] = record;
                             if tag != VIEW_TAG || generation == 0 {
-                                if (nonzero_word >> (i & 63)) & 1 != 0 {
+                                if (nonzero_word >> (i & 63)) & 1 != 0
+                                    && !(left && tag != VIEW_TAG)
+                                {
                                     stale.push((i, record));
                                 }
                                 i += 1;
@@ -1606,7 +1715,9 @@ impl HostHeap {
                                 };
                             let [tag, view, generation] = record;
                             if tag != VIEW_TAG || generation == 0 {
-                                if (nonzero_word >> (i & 63)) & 1 != 0 {
+                                if (nonzero_word >> (i & 63)) & 1 != 0
+                                    && !(left && tag != VIEW_TAG)
+                                {
                                     stale.push((i, record));
                                 }
                                 i += 1;
@@ -1673,7 +1784,7 @@ impl HostHeap {
                 };
                 let [tag, view, generation] = record;
                 if tag != VIEW_TAG {
-                    if !legacy_fast || self.made_is_nonzero(i) {
+                    if !left && (!legacy_fast || self.made_is_nonzero(i)) {
                         stale.push(i);
                     }
                     continue;
@@ -1772,17 +1883,20 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         let preparing =
             crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncPrepareUs);
+        let at_once = placed_at_once();
         let pins = views_at_batch(&unique_keys);
         let mut resolved_bufs: Vec<Option<quick::ResolvedBuffer>> =
             Vec::with_capacity(if use_quick { unique_keys.len() } else { 0 });
-        let mut is_placed: Vec<bool> = Vec::with_capacity(unique_keys.len());
+        // Whether a view's slot is left for a draw to make (placed textures,
+        // `defer_placed`); a buffer view `quick::resolve` resolved never is.
+        let mut defer: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut is_tex: Vec<bool> = Vec::with_capacity(unique_keys.len());
         let mut strides: Vec<u32> = Vec::with_capacity(unique_keys.len());
         for pin in &pins {
             if let Some(view) = pin.as_deref() {
                 if use_quick && let Some(resolved_buf) = quick::resolve(view) {
                     strides.push(resolved_buf.stride);
-                    is_placed.push(false);
+                    defer.push(false);
                     is_tex.push(false);
                     resolved_bufs.push(Some(resolved_buf));
                     continue;
@@ -1790,18 +1904,18 @@ impl HostHeap {
                 if use_quick {
                     resolved_bufs.push(None);
                 }
-                let placed = is_placed_texture(view);
-                if !placed {
+                let later = defer_placed(view, at_once);
+                if !later {
                     prepare(view);
                 }
-                is_placed.push(placed);
+                defer.push(later);
                 is_tex.push(is_texture(view));
                 strides.push(view_stride(view) | view_kind(view));
             } else {
                 if use_quick {
                     resolved_bufs.push(None);
                 }
-                is_placed.push(false);
+                defer.push(false);
                 is_tex.push(false);
                 strides.push(0);
             }
@@ -1912,14 +2026,16 @@ impl HostHeap {
                         write_address(data, index as usize, Some(view));
                     }
                 }
-                let later = is_placed[kidx];
+                let later = defer[kidx];
+                let keep_old =
+                    later && at_once == PlacedAtOnce::Keep && self.kept(index);
                 if later {
                     forgot_reads.push(index);
                 }
                 made[index as usize] = key;
 
                 let (kept, mark) = if later {
-                    if !self.sampler {
+                    if !self.sampler && !keep_old {
                         if let (Some(_), Some(st)) = (host, staging) {
                             let null_slot = null_slot_index(false, Some(view));
                             copy_dsts.push(self.cpu(index));
@@ -2067,7 +2183,9 @@ impl HostHeap {
                     (k, m)
                 };
 
-                self.set_mark(index, mark);
+                if !keep_old {
+                    self.set_mark(index, mark);
+                }
                 if !self.sampler {
                     if let Some(resolved_buf) = resolved_buf
                         && kept.is_some()
@@ -2087,7 +2205,9 @@ impl HostHeap {
                 } else {
                     key
                 };
-                kept_updates.push((index, kept));
+                if !keep_old {
+                    kept_updates.push((index, kept));
+                }
                 finalize.push((index, key, ready));
             }
 
@@ -2196,6 +2316,9 @@ impl HostHeap {
     fn needs_remake(&self, index: u32, view: &View, for_draw: bool) -> bool {
         if !for_draw || !(is_texture(view) || is_unordered_texture(view)) {
             return false;
+        }
+        if self.ready[index as usize].load(Ordering::Acquire) == 0 {
+            return true;
         }
         let held = self
             .kept
@@ -2320,7 +2443,8 @@ impl HostHeap {
         // when a draw reads them through a table: a host texture (and a
         // staging copy) for each of the ~20,000 the title has views of
         // ran the host out of memory (run b2).
-        let later = !for_draw && is_placed_texture(&view);
+        let at_once = placed_at_once();
+        let later = !for_draw && defer_placed(&view, at_once);
         if !later {
             // What the view needs (the texture it views, the copy of the
             // memory) is made without the slot lock, which title threads
@@ -2341,6 +2465,7 @@ impl HostHeap {
             }
         }
         {
+            let keep_old = later && at_once == PlacedAtOnce::Keep && self.kept(index);
             self.ready[index as usize].store(0, Ordering::Relaxed);
             self.synced[index as usize].store(0, Ordering::Relaxed);
             self.set_stride(index, Some(&view));
@@ -2356,17 +2481,21 @@ impl HostHeap {
             } else {
                 make_marked(&view, self.cpu(index))
             };
-            self.set_mark(index, mark);
-            if kept.is_none() && !self.sampler {
+            if !keep_old {
+                self.set_mark(index, mark);
+            }
+            if kept.is_none() && !self.sampler && !keep_old {
                 null_for(&view, self.cpu(index));
             }
             if !self.sampler {
                 self.viewed.set(index, Some(&view), kept.is_some());
             }
             let kept = kept.flatten();
-            // A texture's view left null is made again when a draw reads it.
+            // A texture's view left null (or keeping a prior view) is made again when a draw reads it.
             let ready = if is_texture(&view) && kept.is_none() { 0 } else { key };
-            self.keep(index, kept);
+            if !keep_old {
+                self.keep(index, kept);
+            }
             self.synced[index as usize].store(key, Ordering::Release);
             self.ready[index as usize].store(ready, Ordering::Release);
         }
@@ -2563,13 +2692,14 @@ impl HostHeap {
             .collect()
     }
 
-    /// The view of slot `index` if it is a placed texture's left without a
-    /// host view (made when read).
+    /// The view of slot `index` if it is a placed texture's left unmade (either
+    /// nulled or keeping a prior view under `VICTORY_PLACED_AT_ONCE=keep`).
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = *self.made.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
+        let ready = self.ready[index as usize].load(Ordering::Acquire) == key;
         let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
-        (is_placed_texture(&view) && !kept).then(|| (*view).clone())
+        (is_placed_texture(&view) && (!kept || !ready)).then(|| (*view).clone())
     }
 
     /// How `make_read` should handle an unmade slot when `heap_worker::on()`.
@@ -2586,13 +2716,14 @@ impl HostHeap {
         if key == 0 {
             return UnmadeRead::None;
         }
+        let ready = self.ready[index as usize].load(Ordering::Acquire) == key;
         let kept = self
             .kept
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(index as usize)
             .is_some();
-        if kept {
+        if kept && ready {
             return UnmadeRead::None;
         }
         let Some(view) = view_at(key as u32, (key >> 32) as u32) else {
@@ -3807,6 +3938,71 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Set in a test: heap syncs of its thread leave slots of foreign
+        /// bytes as they are, as with `VICTORY_STALE_LEFT=1`.
+        pub(crate) static STALE_LEFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// With `VICTORY_STALE_LEFT=1` a heap sync leaves a made slot the title
+    /// wrote zeros or other bytes of its own to, and the record written back
+    /// costs nothing; a draw reading the slot makes it null, and a record of
+    /// ours naming no view is still made null by the sync. Off, the sync
+    /// makes the slot null. Both the fast and the legacy sync.
+    #[test]
+    fn syncs_leave_slots_the_title_wrote_foreign_bytes_to() {
+        const SLOTS: u32 = 2_048;
+        let srv_desc = [62u32, 1, 0x1688, 0, 0, 0, 256, 0, 0, 0];
+        let buffer = crate::resource::test_buffer(256);
+        let (ptr, len) = crate::resource::buffer_bytes(buffer).expect("buffer bytes");
+        crate::shadow::register(buffer as usize, ptr as u64, len);
+        let mut record = [0u32; 3];
+        let at = record.as_mut_ptr() as u64;
+        crate::descriptor::create_srv(std::ptr::null(), buffer, &srv_desc, at);
+        let write = |mem: &mut [u8], slot: usize, words: [u32; 3]| {
+            for (k, w) in words.iter().enumerate() {
+                mem[slot * 32 + 4 * k..slot * 32 + 4 * k + 4].copy_from_slice(&w.to_le_bytes());
+            }
+        };
+        for fast in [false, true] {
+            let Some(host) = HostHeap::new(false, SLOTS) else {
+                break; // no host GPU here
+            };
+            let mut mem = vec![0u8; SLOTS as usize * 32];
+            for slot in 0..4 {
+                write(&mut mem, slot, record);
+            }
+            let sync = |mem: &[u8]| {
+                let start = mem.as_ptr() as u64;
+                host.sync_slots_bytes_with(0..SLOTS, start, 32, start, mem, fast);
+            };
+            sync(&mem);
+            assert!((0..4).all(|i| host.made(i)), "fast {fast}: made from the records");
+            STALE_LEFT.with(|left| left.set(true));
+            write(&mut mem, 0, [0, 0, 0]);
+            write(&mut mem, 1, [0xdead_beef, 0x1234_5678, 7]);
+            write(&mut mem, 2, [VIEW_TAG, 0, 0]);
+            sync(&mem);
+            assert!(host.made(0), "fast {fast}: zeros are left");
+            assert!(host.made(1), "fast {fast}: other bytes are left");
+            assert!(!host.made(2), "fast {fast}: a record of ours naming no view is made null");
+            assert!(host.made(3), "fast {fast}: an unchanged record stays");
+            // The record written back: the slot is still made from it.
+            write(&mut mem, 0, record);
+            sync(&mem);
+            assert!(host.made(0), "fast {fast}: written back");
+            // A draw reading a left slot makes it null.
+            let handle = mem.as_ptr() as u64 + 32;
+            assert!(host.mirror(1, handle, true).is_none());
+            assert!(!host.made(1), "fast {fast}: a draw makes the left slot null");
+            STALE_LEFT.with(|left| left.set(false));
+            write(&mut mem, 3, [0, 0, 0]);
+            sync(&mem);
+            assert!(!host.made(3), "fast {fast}: off, zeros are made null");
+        }
+        crate::object::release(buffer);
+    }
+
     /// Typed buffer views of integer formats carry their kind in the
     /// view-stride table; float, normalized, raw and structured ones none.
     #[test]
@@ -4045,12 +4241,29 @@ mod tests {
         assert!(crate::resource::made_copy(texture).is_some(), "with a host texture again");
     }
 
-    /// Work to run while a view's texture is prepared, once (tests).
-    pub(crate) static WHILE_PREPARING: std::sync::Mutex<Option<crate::descriptor::tests::Work>> = std::sync::Mutex::new(None);
+    std::thread_local! {
+        /// Work to run while a view's texture is prepared on this thread,
+        /// once (tests). Each test thread has its own: tests run at once,
+        /// and every test's heap syncs and mirrors pass through `prepare`.
+        /// One hook for the process ran a test's work on whichever thread
+        /// prepared a view first (the bench's syncs, thousands a second),
+        /// so the test went on without waiting for it.
+        static WHILE_PREPARING: std::cell::RefCell<Option<crate::descriptor::tests::Work>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Sets the work the next `prepare` on this thread runs.
+    fn when_preparing(work: impl FnOnce() + Send + 'static) {
+        WHILE_PREPARING.set(Some(Box::new(work)));
+    }
+
+    /// Whether this thread's `prepare` ran the work set (or none was set).
+    fn prepared() -> bool {
+        WHILE_PREPARING.with_borrow(Option::is_none)
+    }
 
     pub(crate) fn while_preparing() {
-        let work = WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).take();
-        if let Some(work) = work {
+        if let Some(work) = WHILE_PREPARING.take() {
             work();
         }
     }
@@ -4081,7 +4294,7 @@ mod tests {
             resource,
             0x10,
         );
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             // The title's last reference goes while the view is being made.
             // The call must not wait for the make: this very thread is the
             // one making the view, so a wait would never end.
@@ -4095,10 +4308,10 @@ mod tests {
                 std::thread::yield_now();
             }
             assert_eq!(released.join().unwrap(), 1, "the pin still holds it");
-        }));
+        });
 
         let view = heap.mirror(0, at, false).expect("the current view");
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(prepared(), "the prepare ran");
         assert!(heap.made(0), "the view was made from the live resource");
         assert!(
             crate::descriptor::view(at).is_some(),
@@ -4137,14 +4350,14 @@ mod tests {
         let host = title_heap.host().expect("a host view heap");
         let (done, waited) = std::sync::mpsc::channel();
         let second_view = view_of(second);
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             // The title writes the other record into the slot meanwhile.
             std::thread::spawn(move || {
                 crate::descriptor::create_placed_srv(std::ptr::null(), &words, &second_view, at);
                 done.send(()).unwrap();
             });
             assert!(waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(), "the write waits");
-        }));
+        });
         // A draw reads the slot: its first record is prepared.
         assert!(host.mirror(s, at, true).is_some());
         let second_texture = crate::resource::texture_at(second, &words).expect("its resource");
@@ -4180,7 +4393,7 @@ mod tests {
         let heap_at = title_heap.start;
         let heap = heap as usize;
         let (done, waited) = std::sync::mpsc::channel();
-        *WHILE_PREPARING.lock().unwrap() = Some(Box::new(move || {
+        when_preparing(move || {
             std::thread::spawn(move || {
                 let h = crate::descriptor::heap(heap as crate::object::This);
                 h.host().unwrap().mirror(second, heap_at + u64::from(second) * 32, true);
@@ -4190,9 +4403,9 @@ mod tests {
                 waited.recv_timeout(std::time::Duration::from_secs(5)).is_ok(),
                 "a view bound while another slot's texture is made waits"
             );
-        }));
+        });
         assert!(host.mirror(first, slot(first), true).is_some());
-        assert!(WHILE_PREPARING.lock().unwrap().is_none(), "the prepare ran");
+        assert!(prepared(), "the prepare ran");
         assert!(host.kept(first) && host.kept(second), "both made");
     }
 
@@ -4370,7 +4583,7 @@ mod tests {
         assert_eq!(heap.address_at(first), Some(0), "a root view");
         heap.make_at(first, &view);
         heap.make_at(first + 1, &view);
-        heap.raw_pair_at(first, None, 0);
+        heap.raw_pair_at(first, None, 0, 0);
         assert_eq!(heap.address_at(first), Some(0), "a view pair");
         assert_eq!(heap.address_at(first + 1), Some(0), "a view pair");
         // Slots past the dynamic ones (host copies' view pairs) have no
@@ -4597,6 +4810,35 @@ mod tests {
         let layout = std::alloc::Layout::from_size_align(1 << 16, 1 << 16).unwrap();
         // SAFETY: non-zero size and power-of-two alignment; leaked for the test.
         unsafe { std::alloc::alloc_zeroed(layout) as u64 }
+    }
+
+    /// `len` zeroed bytes that no other test's memory comes near for the
+    /// rest of the run: committed at the start of a reservation of 4 MiB
+    /// windows of its own (the windows `crate::shadow` copies loose memory
+    /// in), never freed. Memory from the process heap is handed to the next
+    /// test at the same address, which finds what the tables keyed by address
+    /// keep of the last one's (its placed textures, its views, the window
+    /// copies of its memory and their guards), and its memory shares those
+    /// windows with the tests running beside it.
+    fn private_memory(len: usize) -> &'static mut [u8] {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const WINDOW: usize = 4 << 20;
+        let span = len.next_multiple_of(WINDOW);
+        // SAFETY: a fresh reservation, never freed: one window more than
+        // `span`, so a whole aligned `span` lies inside it.
+        let base =
+            unsafe { VirtualAlloc(std::ptr::null(), span + WINDOW, MEM_RESERVE, PAGE_READWRITE) }
+                as usize;
+        assert_ne!(base, 0, "address space for the test's memory");
+        let start = base.next_multiple_of(WINDOW);
+        // SAFETY: inside the reservation above.
+        let at =
+            unsafe { VirtualAlloc(start as *const _, len, MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_eq!(at, start, "the test's memory committed");
+        // SAFETY: `len` committed bytes (zeroed), used by the caller alone.
+        unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) }
     }
 
     fn placed_tex_desc(width: u64, height: u32, format: u32, flags: u32) -> [u32; 14] {
@@ -5144,6 +5386,150 @@ mod tests {
         assert!(!fast_heap_sync_value(Some(OsStr::new("0"))));
     }
 
+    struct PlacedAtOnceGuard(Option<PlacedAtOnce>);
+
+    impl PlacedAtOnceGuard {
+        fn set(mode: PlacedAtOnce) -> Self {
+            Self(TEST_PLACED_AT_ONCE.replace(Some(mode)))
+        }
+    }
+
+    impl Drop for PlacedAtOnceGuard {
+        fn drop(&mut self) {
+            TEST_PLACED_AT_ONCE.set(self.0);
+        }
+    }
+
+    #[test]
+    fn placed_at_once_env_parsing() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("true"), Some("2"), Some("Keep")] {
+            assert_eq!(PlacedAtOnce::parse(off), PlacedAtOnce::Off, "{off:?}");
+            assert!(!PlacedAtOnce::parse(off).makes_existing());
+        }
+        assert_eq!(PlacedAtOnce::parse(Some("1")), PlacedAtOnce::Made);
+        assert_eq!(PlacedAtOnce::parse(Some(" 1 ")), PlacedAtOnce::Made);
+        assert_eq!(PlacedAtOnce::parse(Some("keep")), PlacedAtOnce::Keep);
+        assert_eq!(PlacedAtOnce::parse(Some(" keep ")), PlacedAtOnce::Keep);
+        assert_eq!(PlacedAtOnce::parse(Some("all")), PlacedAtOnce::All);
+        assert!(
+            [PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All]
+                .iter()
+                .all(|m| m.makes_existing())
+        );
+        if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
+            assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+        }
+    }
+
+    #[test]
+    fn placed_at_once_keep_preserves_prior_view_until_draw_or_read() {
+        let Some(host_gpu) = host() else {
+            return; // no host GPU here
+        };
+        let Some(heap) = HostHeap::new(false, 128) else {
+            return;
+        };
+        let _guard = PlacedAtOnceGuard::set(PlacedAtOnce::Keep);
+
+        // Four distinct linear RGBA8 4x1 placed textures in separate addresses.
+        let mem = vec![0u8; 4 << 16];
+        let base = mem.as_ptr() as u64;
+        let addr_a = base;
+        let addr_b = base + (1 << 16);
+        let addr_c = base + (2 << 16);
+        let addr_d = base + (3 << 16);
+        let tex_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let make_view = |addr: u64| {
+            let mut v = [0u32; 16];
+            v[..6].copy_from_slice(&[28, 4, 0x1688, 0, 0, 1]);
+            (v[10], v[11]) = (addr as u32, (addr >> 32) as u32);
+            v
+        };
+
+        let mut title_heap = vec![0u8; 128 * 32];
+        let start = title_heap.as_ptr() as u64;
+        let slot_addr = |i: u32| start + u64::from(i) * 32;
+        let write_placed = |i: u32, addr: u64| -> u64 {
+            let view = make_view(addr);
+            crate::descriptor::create_placed_srv(std::ptr::null(), &tex_words, &view, slot_addr(i));
+            crate::descriptor::view_and_key(slot_addr(i)).unwrap().1
+        };
+
+        // Prime slots 0 and 1 with placed texture A (`for_draw = true` creates its host texture).
+        let key_a0 = write_placed(0, addr_a);
+        let key_a1 = write_placed(1, addr_a);
+        assert!(heap.mirror(0, slot_addr(0), true).is_some());
+        assert!(heap.mirror(1, slot_addr(1), true).is_some());
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_a0);
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), key_a1);
+        let tex_a = crate::resource::texture_at(addr_a, &tex_words).expect("texture A");
+        let raw_a = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_a).expect("made A").texture,
+        ) as usize;
+        assert_eq!(heap.textures_at(&[0]), [raw_a]);
+        assert!(crate::resource::placed_made(addr_a, &tex_words));
+        assert!(!crate::resource::placed_made(addr_b, &tex_words));
+
+        // Batched sync path (`mirror_synced_batch`): rewrite slot 0 to unmade placed texture B,
+        // and write fresh empty slot 2 with unmade placed texture D.
+        let key_b = write_placed(0, addr_b);
+        let key_d = write_placed(2, addr_d);
+        heap.sync_slots_bytes_with(0..128, start, 32, start, &title_heap, true);
+        assert!(heap.made(0));
+        assert_eq!(heap.synced[0].load(Ordering::Acquire), key_b);
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), 0);
+        assert!(!heap.slot_ready(0, slot_addr(0)));
+        assert!(heap.kept(0), "slot 0 keeps prior host view instead of null");
+        assert_eq!(heap.textures_at(&[0]), [raw_a], "slot 0 still shows texture A");
+        assert!(heap.unmade_placed(0).is_some(), "make_read sees unmade kept slot");
+        assert_eq!(
+            heap.unmade_read_kind(0),
+            UnmadeRead::Background,
+            "heap_worker sees unmade kept slot"
+        );
+        assert!(!crate::resource::placed_made(addr_b, &tex_words), "B not allocated eagerly");
+        assert!(heap.made(2));
+        assert_eq!(heap.synced[2].load(Ordering::Acquire), key_d);
+        assert!(!heap.kept(2), "empty slot with no prior view stays null");
+
+        // Drawing / shader-read remakes slot 0 to texture B cleanly on demand.
+        assert!(heap.mirror(0, slot_addr(0), true).is_some());
+        let tex_b = crate::resource::texture_at(addr_b, &tex_words).expect("texture B");
+        let raw_b = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_b).expect("made B").texture,
+        ) as usize;
+        assert_ne!(raw_a, raw_b);
+        assert_eq!(heap.textures_at(&[0]), [raw_b], "slot 0 remade to texture B");
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_b);
+        assert!(heap.unmade_placed(0).is_none());
+        assert_eq!(heap.unmade_read_kind(0), UnmadeRead::None);
+
+        // Rewriting slot 0 back to already-made texture A updates immediately on sync (no null frame).
+        let key_a_again = write_placed(0, addr_a);
+        heap.sync_slots_bytes_with(0..128, start, 32, start, &title_heap, true);
+        assert_eq!(heap.textures_at(&[0]), [raw_a], "existing host texture made at once");
+        assert_eq!(heap.ready[0].load(Ordering::Acquire), key_a_again);
+
+        // Direct `mirror(..., false)` path: rewrite slot 1 from A to unmade C -> keeps A until draw.
+        let key_c = write_placed(1, addr_c);
+        assert!(heap.mirror(1, slot_addr(1), false).is_some());
+        assert_eq!(heap.synced[1].load(Ordering::Acquire), key_c);
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), 0);
+        assert_eq!(heap.textures_at(&[1]), [raw_a], "mirror(false) keeps prior view");
+        assert!(heap.mirror(1, slot_addr(1), true).is_some());
+        let tex_c = crate::resource::texture_at(addr_c, &tex_words).expect("texture C");
+        let raw_c = windows::core::Interface::as_raw(
+            &crate::resource::made_copy(tex_c).expect("made C").texture,
+        ) as usize;
+        assert_eq!(heap.textures_at(&[1]), [raw_c], "mirror(true) remakes to texture C");
+        assert_eq!(heap.ready[1].load(Ordering::Acquire), key_c);
+
+        // SAFETY: plain device health check.
+        assert!(unsafe { host_gpu.device.GetDeviceRemovedReason() }.is_ok());
+        let _ = title_heap.as_mut_ptr();
+        let _ = mem.as_ptr();
+    }
+
     #[test]
     fn fast_heap_sync_handles_placed_null_duplicates_forget_and_concurrent_rewrite() {
         let Some(host) = HostHeap::new(false, 512) else {
@@ -5239,16 +5625,16 @@ mod tests {
             expected_c.as_mut_ptr() as u64,
         );
         let expected_c_key = u64::from(expected_c[2]) << 32 | u64::from(expected_c[1]);
-        *WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+        when_preparing(move || {
             crate::descriptor::create_srv(
                 std::ptr::null(),
                 buf_c_addr as crate::object::This,
                 &srv_desc,
                 race_addr,
             );
-        }));
+        });
         host.sync_slots_bytes_with(0..128, start, 32, start, &title_heap[..128 * 32], true);
-        assert!(WHILE_PREPARING.lock().unwrap_or_else(|e| e.into_inner()).is_none());
+        assert!(prepared());
         assert_eq!(
             host.synced[race_slot as usize].load(Ordering::Acquire),
             expected_c_key,
@@ -5293,8 +5679,7 @@ mod tests {
         // Extra resource forgotten after benchmark to verify Views/HostHeap invalidation.
         let ephemeral = make_shadowed_buffer();
 
-        let tex_mem = vec![0u8; 1 << 16];
-        let tex_addr = tex_mem.as_ptr() as u64;
+        let tex_addr = private_memory(1 << 16).as_ptr() as u64;
         let tex_words: [u32; 14] = [3, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
         let mut placed_records: Vec<[u32; 3]> = Vec::with_capacity(40);
         for k in 0..40u64 {
@@ -5339,24 +5724,24 @@ mod tests {
         };
 
         let build_heap = || {
-            let mut mem = vec![0u8; SLOTS as usize * 32];
+            let mem = private_memory(SLOTS as usize * 32);
             // 10,000 steady-state buffer views (real host SRVs), 20,000 steady-state
             // placed-texture-left-null slots (ready == 0, synced == key), 16 ephemeral
             // slots, remainder empty.
             for i in 0..10_000usize {
-                write_rec(&mut mem, i, buf_records[i % 75]);
+                write_rec(mem, i, buf_records[i % 75]);
             }
             for i in 0..20_000usize {
-                write_rec(&mut mem, 12_288 + i, placed_records[i % 20]);
+                write_rec(mem, 12_288 + i, placed_records[i % 20]);
             }
             for i in 0..16usize {
-                write_rec(&mut mem, 34_816 + i, eph_record);
+                write_rec(mem, 34_816 + i, eph_record);
             }
             mem
         };
 
-        let mut mem_legacy = build_heap();
-        let mut mem_fast = build_heap();
+        let mem_legacy = build_heap();
+        let mem_fast = build_heap();
 
         let sync_all_pages = |host: &HostHeap, mem: &[u8], fast: bool| {
             let start = mem.as_ptr() as u64;
@@ -5377,8 +5762,8 @@ mod tests {
         };
 
         // Initial warm sync so steady-state slots (including 20,000 placed-left-null) are populated.
-        sync_all_pages(&host_legacy, &mem_legacy, false);
-        sync_all_pages(&host_fast, &mem_fast, true);
+        sync_all_pages(&host_legacy, mem_legacy, false);
+        sync_all_pages(&host_fast, mem_fast, true);
         assert!(host_fast.kept(0), "benchmark buffer SRVs are real host views");
         assert!(!host_fast.kept(12_288), "placed textures remain null on sync");
 
@@ -5416,24 +5801,38 @@ mod tests {
         // Run legacy across 23 passes (1.5M scanned + ~39k stale) with a mid-run forget() epoch bump.
         let t_legacy = std::time::Instant::now();
         for pass in 0..PASSES {
-            mutate_pass(&mut mem_legacy, pass);
+            mutate_pass(mem_legacy, pass);
             if pass == PASSES / 2 {
                 crate::descriptor::forget(bump_legacy as usize);
             }
-            sync_all_pages(&host_legacy, &mem_legacy, false);
+            sync_all_pages(&host_legacy, mem_legacy, false);
         }
         let legacy_ms = t_legacy.elapsed().as_secs_f64() * 1000.0;
 
         // Run fast across identical 23 passes (1.5M scanned + ~39k stale) with identical forget() epoch bump.
         let t_fast = std::time::Instant::now();
         for pass in 0..PASSES {
-            mutate_pass(&mut mem_fast, pass);
+            mutate_pass(mem_fast, pass);
             if pass == PASSES / 2 {
                 crate::descriptor::forget(bump_fast as usize);
             }
-            sync_all_pages(&host_fast, &mem_fast, true);
+            sync_all_pages(&host_fast, mem_fast, true);
         }
         let fast_ms = t_fast.elapsed().as_secs_f64() * 1000.0;
+
+        // Both heaps' memory took the same writes: records that differ were
+        // written by something else, and the heaps' states differ with them.
+        if let Some(i) = mem_fast
+            .chunks(32)
+            .zip(mem_legacy.chunks(32))
+            .position(|(f, l)| f != l)
+        {
+            panic!(
+                "slot {i}'s record changed behind the bench: {:?} (fast) vs {:?} (legacy)",
+                &mem_fast[i * 32..i * 32 + 12],
+                &mem_legacy[i * 32..i * 32 + 12]
+            );
+        }
 
         // Verify identical final made/kept state across all 65,536 slots.
         for i in 0..SLOTS {
@@ -5443,8 +5842,8 @@ mod tests {
 
         // Now actually forget ephemeral and verify both clear slots 34,816..34,832.
         crate::descriptor::forget(ephemeral as usize);
-        sync_all_pages(&host_legacy, &mem_legacy, false);
-        sync_all_pages(&host_fast, &mem_fast, true);
+        sync_all_pages(&host_legacy, mem_legacy, false);
+        sync_all_pages(&host_fast, mem_fast, true);
         for i in 34_816..34_832u32 {
             assert!(!host_legacy.made(i));
             assert!(!host_fast.made(i));
@@ -5466,7 +5865,6 @@ mod tests {
         for b in buffers {
             crate::object::release(b);
         }
-        let _ = tex_mem.as_ptr();
     }
 
     /// Mismatched descriptor kinds (a sampler record in a CBV/SRV/UAV heap or

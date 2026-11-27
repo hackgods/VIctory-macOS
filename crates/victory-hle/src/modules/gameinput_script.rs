@@ -380,6 +380,15 @@ impl Source for ScriptedSource {
     }
 }
 
+fn parse_replay(
+    bytes: &[u8],
+    register: impl FnOnce(&[u8]) -> String,
+) -> Result<(Script, String), String> {
+    let text = std::str::from_utf8(bytes).map_err(|e| format!("invalid UTF-8: {e}"))?;
+    let script = Script::parse(text)?;
+    Ok((script, register(bytes)))
+}
+
 /// Wraps `source` with input replay and/or recording when `VICTORY_INPUT_REPLAY`
 /// or `VICTORY_INPUT_RECORD` is configured.
 pub(crate) fn wrap(source: Box<dyn Source>) -> Box<dyn Source> {
@@ -395,22 +404,16 @@ pub(crate) fn wrap(source: Box<dyn Source>) -> Box<dyn Source> {
     }
 
     let replay = replay_path.and_then(|path| match std::fs::read(&path) {
-        Ok(bytes) => {
-            let sha = victory_gpu::bench::register_input_script(&bytes);
-            match std::str::from_utf8(&bytes)
-                .map_err(|e| format!("invalid UTF-8: {e}"))
-                .and_then(Script::parse)
-            {
-                Ok(script) => {
-                    tracing::info!(path, sha256 = %sha, "replaying scripted world-frame inputs");
-                    Some(script)
-                }
-                Err(err) => {
-                    tracing::error!(path, error = %err, "failed to parse VICTORY_INPUT_REPLAY");
-                    None
-                }
+        Ok(bytes) => match parse_replay(&bytes, victory_gpu::bench::register_input_script) {
+            Ok((script, sha)) => {
+                tracing::info!(path, sha256 = %sha, "replaying scripted world-frame inputs");
+                Some(script)
             }
-        }
+            Err(err) => {
+                tracing::error!(path, error = %err, "failed to parse VICTORY_INPUT_REPLAY");
+                None
+            }
+        },
         Err(err) => {
             tracing::error!(path, error = %err, "failed to read VICTORY_INPUT_REPLAY");
             None
@@ -706,6 +709,22 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
+
+    #[test]
+    fn rejected_replays_are_not_registered_for_benchmarks() {
+        for bytes in [b"not a replay".as_slice(), &[0xff]] {
+            assert!(parse_replay(bytes, |_| panic!("registered a rejected replay")).is_err());
+        }
+
+        let valid = b"{\"from\":1,\"to\":2,\"buttons\":16}\n";
+        let (script, digest) = parse_replay(valid, |bytes| {
+            assert_eq!(bytes, valid);
+            "digest".to_owned()
+        })
+        .unwrap();
+        assert_eq!(script.pad_at(1, 0).unwrap().buttons, 16);
+        assert_eq!(digest, "digest");
+    }
 
     #[derive(Default)]
     struct MockHost {

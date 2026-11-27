@@ -30,11 +30,22 @@ pub fn world_frame() -> u64 {
     WORLD_FRAME.load(Ordering::Relaxed)
 }
 
-/// Computes and records the BLAKE3 hex digest of the active replay script so
+/// Computes and records the SHA-256 hex digest of the active replay script so
 /// benchmark reports bind timings to exact input bytes.
 pub fn register_input_script(bytes: &[u8]) -> String {
-    let hex = blake3::hash(bytes).to_hex().to_string();
+    let hex = input_script_digest(bytes);
     let _ = INPUT_SCRIPT_HASH.set(hex.clone());
+    hex
+}
+
+fn input_script_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        let _ = write!(hex, "{byte:02x}");
+    }
     hex
 }
 
@@ -642,6 +653,14 @@ pub(crate) fn on_present(drawn: u64, black_frame: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_script_digest_matches_sha256() {
+        assert_eq!(
+            input_script_digest(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 
     #[test]
     fn world_frame_latches_at_500_draws_and_excludes_warmup() {

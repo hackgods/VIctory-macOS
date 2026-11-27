@@ -213,8 +213,10 @@ pub(crate) struct Shadow {
     sums: Mutex<Vec<u64>>,
     has_sums: AtomicBool,
     /// The last presented frame a view or a list asked for it
-    /// ([`Shadow::touch`]), for [`release_idle`].
+    /// ([`Shadow::touch`]), for [`release_idle`], and the time then
+    /// ([`NOW_MS`]), for [`release_stale`].
     used: AtomicU64,
+    used_ms: AtomicU64,
 }
 
 /// A 16-byte-element host copy of a three-channel 32-bit buffer view. D3DMetal
@@ -587,7 +589,13 @@ impl Shadow {
         let frame = crate::queue::presented();
         if self.used.load(Ordering::Relaxed) != frame {
             self.used.store(frame, Ordering::Relaxed);
+            self.used_ms.store(NOW_MS.load(Ordering::Relaxed), Ordering::Relaxed);
         }
+    }
+
+    /// When a view or a list last asked for it.
+    fn asked(&self) -> Stamp {
+        (self.used_ms.load(Ordering::Relaxed), self.used.load(Ordering::Relaxed))
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Arc<Shadow> {
@@ -618,6 +626,7 @@ impl Shadow {
             sums: Mutex::default(),
             has_sums: AtomicBool::new(false),
             used: AtomicU64::new(crate::queue::presented()),
+            used_ms: AtomicU64::new(NOW_MS.load(Ordering::Relaxed)),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -654,6 +663,7 @@ impl Shadow {
             sums: Mutex::default(),
             has_sums: AtomicBool::new(false),
             used: AtomicU64::new(crate::queue::presented()),
+            used_ms: AtomicU64::new(NOW_MS.load(Ordering::Relaxed)),
         });
         if let Some(base) = marks {
             self::marks().owners.insert(base, Arc::downgrade(&shadow));
@@ -1029,142 +1039,211 @@ impl Shadow {
 
     /// At submission: copies what changed of `[address, address + len)`
     /// since it was last copied (all of it if the memory is not
-    /// write-watched). Returns the bytes copied.
+    /// write-watched). Returns the bytes copied. The host copies a range
+    /// list as one batch ([`Shadow::update_ranges`]); one range asks it.
+    #[cfg(test)]
     pub(crate) fn update(&self, address: usize, len: usize) -> usize {
+        let mut copied = [0; 1];
+        self.update_ranges_into(&[(address, address.saturating_add(len))], &mut copied);
+        copied[0]
+    }
+
+    /// [`Shadow::update`] of several ranges at once: the same bytes, in the
+    /// same order, using `[from, to)` endpoints and one copied-byte count per
+    /// range (in order). What a range took a lock for — the widened source,
+    /// and under it the process's
+    /// guard lock — is taken once for all of them.
+    pub(crate) fn update_ranges(&self, ranges: &[(usize, usize)]) -> Vec<usize> {
+        let mut copied = vec![0; ranges.len()];
+        self.update_ranges_into(ranges, &mut copied);
+        copied
+    }
+
+    /// [`Shadow::update_ranges`], the counts left in `copied` (one a range,
+    /// in order) instead of returned: a copy of one range asks with one on
+    /// the stack.
+    fn update_ranges_into(&self, ranges: &[(usize, usize)], copied: &mut [usize]) {
+        if ranges.is_empty() {
+            return;
+        }
         if self.aliased {
             if self.has_widened.load(Ordering::Acquire) {
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                let (from, to) = (address.max(start), address.saturating_add(len).min(end));
-                if from < to {
-                    let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
-                    self.refresh_widened(from, to);
+                let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+                for &(from, to) in ranges {
+                    let (from, to) = (from.max(start), to.min(end));
+                    if from < to {
+                        self.refresh_widened(from, to);
+                    }
                 }
             }
-            return 0;
+            return;
+        }
+        // Most copies are clean; the lock is only for the ones that are not.
+        if self.clean() {
+            return;
         }
         let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
-        if self.clean() {
-            return 0;
-        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-        let (from, to) = (address.max(start), (address + len).min(end));
-        if from >= to {
-            return 0;
-        }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+        let clipped: Vec<(usize, usize)> = ranges
             .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
+            .map(|&(from, to)| (from.max(start), to.min(end)))
             .collect();
         if self.tracked.is_some() {
-            return self.update_tracked(from, to, !busy.is_empty());
+            let busy: Vec<bool> = clipped
+                .iter()
+                .map(|&(from, to)| {
+                    from < to
+                        && self
+                            .pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .iter()
+                            .any(|&(a, e)| a < to && e > from)
+                })
+                .collect();
+            return self.update_tracked_ranges(&clipped, &busy, copied);
         }
-        if !busy.is_empty() {
-            // Around ranges shaders are writing: the gaps, each as below
-            // (in the world most submissions have such ranges; copying the
-            // gaps whole cost ~1 s per frame). Under them, the title's bytes
-            // as well, as nothing says what it wrote since: a submission
-            // waits for the one before it, so none of this submission's
-            // shaders has run yet, and a constant the title wrote there
-            // would stay stale for the whole submission. The same bytes go
-            // into the snapshot `writing` took, so copy-back tells the
-            // shader's write from them.
-            busy.sort_unstable();
-            let (mut at, mut bytes) = (from, 0);
-            for (a, e) in busy {
-                let (a, e) = (a.max(from), e.min(to));
-                if a > at {
-                    bytes += self.update_untracked(at, a);
-                }
-                if e > a.max(at) {
-                    let (a, e) = (a.max(at), e);
-                    bytes += self.update_untracked(a, e);
-                    self.sync_snapshot(a, e);
-                }
-                at = at.max(e);
+        for (i, &(from, to)) in clipped.iter().enumerate() {
+            if from >= to {
+                continue;
             }
-            if at < to {
-                bytes += self.update_untracked(at, to);
-            }
-            return bytes;
+            let busy: Vec<(usize, usize)> = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect();
+            copied[i] = if busy.is_empty() {
+                self.update_untracked(from, to)
+            } else {
+                // Around ranges shaders are writing: the gaps, each as below
+                // (in the world most submissions have such ranges; copying the
+                // gaps whole cost ~1 s per frame). Under them, the title's bytes
+                // as well, as nothing says what it wrote since: a submission
+                // waits for the one before it, so none of this submission's
+                // shaders has run yet, and a constant the title wrote there
+                // would stay stale for the whole submission. The same bytes go
+                // into the snapshot `writing` took, so copy-back tells the
+                // shader's write from them.
+                let mut busy = busy;
+                busy.sort_unstable();
+                let (mut at, mut bytes) = (from, 0);
+                for (a, e) in busy {
+                    let (a, e) = (a.max(from), e.min(to));
+                    if a > at {
+                        bytes += self.update_untracked(at, a);
+                    }
+                    if e > a.max(at) {
+                        let (a, e) = (a.max(at), e);
+                        bytes += self.update_untracked(a, e);
+                        self.sync_snapshot(a, e);
+                    }
+                    at = at.max(e);
+                }
+                if at < to {
+                    bytes += self.update_untracked(at, to);
+                }
+                bytes
+            };
         }
-        self.update_untracked(from, to)
     }
 
-    /// [`Shadow::update`] of `[from, to)` (inside the buffer) where the
-    /// memory is tracked: the pages the title wrote since they were taken,
-    /// in one [`crate::watch::Tracked::take`], so that a page wholly in the
-    /// range is guarded even where shaders write part of it (split at those
-    /// ranges it stayed changed, and [`Shadow::copy_back_marked`] dropped
-    /// what they wrote).
+    /// [`Shadow::update_ranges`] where the memory is tracked: the pages the
+    /// title wrote since they were taken, in one
+    /// [`crate::watch::Tracked::take_split_many`], so that a page wholly in
+    /// a range is guarded even where shaders write part of it (split at
+    /// those ranges it stayed changed, and [`Shadow::copy_back_marked`]
+    /// dropped what they wrote).
     ///
-    /// `busy`: a list submitted earlier declared that shaders write in the
-    /// range. A submission waits for the one before it, so none of this
-    /// submission's shaders has run yet: the pages the title wrote are
-    /// copied as anywhere else. Skipped, the title's constants there stayed
-    /// stale for the whole submission (a dispatch read its sizes as zeros
-    /// and looped until the device was removed). The same bytes go into the
-    /// snapshot `writing` took, so copy-back neither takes them for the
-    /// GPU's nor puts them back over a later title write.
-    fn update_tracked(&self, from: usize, to: usize, busy: bool) -> usize {
+    /// `busy`: per range, whether a list submitted earlier declared that
+    /// shaders write there. A submission waits for the one before it, so
+    /// none of this submission's shaders has run yet: the pages the title
+    /// wrote are copied as anywhere else. Skipped, the title's constants
+    /// there stayed stale for the whole submission (a dispatch read its
+    /// sizes as zeros and looped until the device was removed). The same
+    /// bytes go into the snapshot `writing` took, so copy-back neither takes
+    /// them for the GPU's nor puts them back over a later title write.
+    fn update_tracked_ranges(
+        &self,
+        ranges: &[(usize, usize)],
+        busy: &[bool],
+        copied: &mut [usize],
+    ) {
         let Some(t) = &self.tracked else {
-            return 0;
+            return;
         };
-        for (a, b) in t.take_retaken(from, to) {
-            self.forget_sums(a, b);
+        for &(from, to) in ranges {
+            if from >= to {
+                continue;
+            }
+            for (a, b) in t.take_retaken(from, to) {
+                self.forget_sums(a, b);
+            }
         }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
-        let (runs, unmapped) = t.take_split(from, to);
+        let splits = t.take_split_many(ranges);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::WatchUs, started.elapsed().as_micros() as u64);
         let start = self.start as usize;
-        let mut before = busy.then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut sync_before = |a: usize, b: usize| {
-            if let Some(before) = &mut before {
-                self.sync_snapshot_in(before, a, b);
+        let mut before = busy
+            .iter()
+            .any(|busy| *busy)
+            .then(|| self.before.lock().unwrap_or_else(|e| e.into_inner()));
+        for (i, ((from, to), (runs, unmapped))) in ranges.iter().copied().zip(splits).enumerate() {
+            if from >= to {
+                continue;
             }
-        };
-        let mut copied = 0;
-        for (a, b) in runs {
-            copied += self.copy(a, b);
-            sync_before(a, b);
-        }
-        for (a, b) in unmapped {
-            // SAFETY: inside the mapping (`take_split` cuts to the buffer).
-            unsafe { self.data.add(a - start).write_bytes(0, b - a) };
-            self.forget_sums(a, b);
-            if self.has_widened.load(Ordering::Acquire) {
-                self.refresh_widened(a, b);
+            // Only a range shaders may write in goes into the snapshot, as
+            // one range asked for itself.
+            let busy = busy[i];
+            let mut sync_before = |a: usize, b: usize| {
+                let before = if busy { before.as_mut() } else { None };
+                if let Some(before) = before {
+                    self.sync_snapshot_in(before, a, b);
+                }
+            };
+            let mut bytes = 0;
+            for (a, b) in runs {
+                bytes += self.copy(a, b);
+                sync_before(a, b);
             }
-            sync_before(a, b);
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
-        }
-        // Parts on memory that is not the runtime's: whole, as below.
-        for (a, b) in t.untracked(from, to) {
-            #[cfg(feature = "diagnostics")]
-            let started = std::time::Instant::now();
-            copied += self.copy(a, b);
-            sync_before(a, b);
+            for (a, b) in unmapped {
+                // SAFETY: inside the mapping (`take_split_many` cuts to the buffer).
+                unsafe { self.data.add(a - start).write_bytes(0, b - a) };
+                self.forget_sums(a, b);
+                if self.has_widened.load(Ordering::Acquire) {
+                    self.refresh_widened(a, b);
+                }
+                sync_before(a, b);
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, (b - a) as u64);
+            }
+            // Parts on memory that is not the runtime's: whole, as below.
+            for (a, b) in t.untracked(from, to) {
+                #[cfg(feature = "diagnostics")]
+                let started = std::time::Instant::now();
+                bytes += self.copy(a, b);
+                sync_before(a, b);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::WholeBytes, (b - a) as u64);
+                    add(C::WholeUs, started.elapsed().as_micros() as u64);
+                }
+            }
+            copied[i] = bytes;
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
-                add(C::WholeBytes, (b - a) as u64);
-                add(C::WholeUs, started.elapsed().as_micros() as u64);
+                add(C::Watches, 1);
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(bytes) as u64);
             }
         }
-        #[cfg(feature = "diagnostics")]
-        {
-            use crate::copystat::{C, add};
-            add(C::Watches, 1);
-            add(C::Checked, (to - from) as u64);
-            add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
-        }
-        copied
     }
 
     /// Puts the copy's bytes of `[a, b)` (title addresses), just updated,
@@ -2254,12 +2333,35 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
 fn loose_window_bytes() -> u64 {
     static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
-        if crate::switch::on("VICTORY_SMALL_LOOSE_WINDOWS") {
-            256 << 10
-        } else {
-            4 << 20
-        }
+        let asked = std::env::var_os("VICTORY_SMALL_LOOSE_WINDOWS")
+            .map(|v| crate::switch::value_is_on(Some(&v)));
+        let ram = crate::alias::total_ram_bytes();
+        let bytes = loose_window_size(asked, crate::watch::rosetta(), ram);
+        tracing::debug!(bytes, "loose window size");
+        bytes
     })
+}
+
+/// Loose windows of 256 KiB and of 4 MiB.
+const SMALL_WINDOW: u64 = 256 << 10;
+const LARGE_WINDOW: u64 = 4 << 20;
+
+/// The most memory with which a Mac takes [`SMALL_WINDOW`]s unasked. Where
+/// it was measured, the small windows held far less: 4.0 GB of host copies
+/// instead of 7.1 GB and a working set of 17.9 GB instead of 22.2 GB (#165,
+/// M5 Max), and 2.9 GB of loose windows instead of 5.6 to 6.1 GB, with 20
+/// to 26 % of a 24 GB Mac free instead of 14 % (#454). The frame rate was
+/// within the noise both times; there were about 2.4 times as many copies.
+/// A Mac with this much memory or less runs out of it first.
+const SMALL_WINDOWS_MAX_RAM: u64 = 32 << 30;
+
+/// The loose window size: [`SMALL_WINDOW`] if `asked` (`VICTORY_SMALL_LOOSE_WINDOWS`
+/// set and not `0`), [`LARGE_WINDOW`] if asked not to; unasked, small on a
+/// Mac (`rosetta`) with [`SMALL_WINDOWS_MAX_RAM`] or less, else large.
+fn loose_window_size(asked: Option<bool>, rosetta: bool, total_ram: Option<u64>) -> u64 {
+    let small = asked
+        .unwrap_or_else(|| rosetta && total_ram.is_some_and(|ram| ram <= SMALL_WINDOWS_MAX_RAM));
+    if small { SMALL_WINDOW } else { LARGE_WINDOW }
 }
 
 /// Copies of title memory outside buffers, by (start, length).
@@ -2591,17 +2693,145 @@ fn release_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_COPIES").is_none_or(|v| v != "0"))
 }
 
-/// Whether `copy`, one of the copies of `[start, start + len)`, can go:
-/// nothing but the table that found it and the page tables' own layouts
-/// (`tables` of them) holds it, no submission's writes to it are still to
-/// go back, and no view or list asked for it in [`IDLE_FRAMES`] frames.
-/// A list that holds it, a heap slot made from it, a widened view of it or
-/// a list still reading an older layout all hold it too, so it stays.
-fn idle(copy: &Arc<Shadow>, tables: usize, frame: u64) -> bool {
+/// Whether `copy`, one of the copies of `[start, start + len)`, could go
+/// now: nothing but the table that found it and the page tables' own
+/// layouts (`tables` of them) holds it, and no submission's writes to it
+/// are still to go back. A list that holds it, a heap slot made from it, a
+/// widened view of it or a list still reading an older layout all hold it
+/// too, so it stays.
+fn settled(copy: &Arc<Shadow>, tables: usize) -> bool {
     !copy.aliased
         && Arc::strong_count(copy) <= 1 + tables
-        && frame.saturating_sub(copy.used.load(Ordering::Relaxed)) >= IDLE_FRAMES
         && copy.pending.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+}
+
+/// Whether `copy` can go while memory runs low: [`settled`], and no view
+/// or list asked for it in [`IDLE_FRAMES`] frames.
+fn idle(copy: &Arc<Shadow>, tables: usize, frame: u64) -> bool {
+    frame.saturating_sub(copy.used.load(Ordering::Relaxed)) >= IDLE_FRAMES && settled(copy, tables)
+}
+
+/// When a copy was last asked for, or the time now: milliseconds
+/// ([`crate::resource::now_ms`]) and presented frames.
+type Stamp = (u64, u64);
+
+/// The time of the last [`release_stale`] pass, which copies asked for are
+/// stamped with ([`Shadow::touch`]): read once a frame, not once a copy.
+static NOW_MS: AtomicU64 = AtomicU64::new(0);
+
+/// A copy nothing asked for in this many seconds, and as many presented
+/// frames (never fewer than [`IDLE_FRAMES`]), goes even while memory is
+/// plentiful ([`release_stale`]). Two minutes, as host textures
+/// ([`crate::resource::IDLE_MS`]); frames as well, as there, so that a run
+/// slower than a frame a second does not cycle what a scene comes back to.
+const STALE_S: u64 = 120;
+
+/// The idle time in seconds from `VICTORY_IDLE_RELEASE` (`0`: nothing goes
+/// for its age) and `VICTORY_IDLE_RELEASE_S` (a whole number above zero,
+/// else [`STALE_S`]); none when off.
+fn stale_setting(release: Option<&str>, seconds: Option<&str>) -> Option<u64> {
+    if release.is_some_and(|v| v.trim() == "0") {
+        return None;
+    }
+    let seconds = seconds
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0);
+    Some(seconds.unwrap_or(STALE_S))
+}
+
+/// [`stale_setting`] of the environment, logged once; none in tests, which
+/// give up only the copies they made ([`release_stale_at`]), and none with
+/// `VICTORY_RELEASE_COPIES=0`.
+fn stale_seconds() -> Option<u64> {
+    static SECONDS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *SECONDS.get_or_init(|| {
+        if cfg!(test) || !release_enabled() {
+            return None;
+        }
+        let var = |name: &str| std::env::var(name).ok();
+        let seconds = stale_setting(
+            var("VICTORY_IDLE_RELEASE").as_deref(),
+            var("VICTORY_IDLE_RELEASE_S").as_deref(),
+        );
+        match seconds {
+            Some(seconds) if seconds != STALE_S => tracing::info!(
+                seconds,
+                "host copies of title memory nothing asked for in this many seconds (and frames) are given up"
+            ),
+            Some(_) => {}
+            None => tracing::info!(
+                "host copies of title memory are given up only while memory is low (VICTORY_IDLE_RELEASE=0)"
+            ),
+        }
+        seconds
+    })
+}
+
+/// Whether what was last asked for at `asked` is stale at `now`: for
+/// `seconds` seconds, and as many presented frames but at least
+/// [`IDLE_FRAMES`].
+fn stale(asked: Stamp, now: Stamp, seconds: u64) -> bool {
+    now.0.saturating_sub(asked.0) >= seconds.saturating_mul(1000)
+        && now.1.saturating_sub(asked.1) >= seconds.max(IDLE_FRAMES)
+}
+
+/// Takes the copies `idle` picks, given `tables` page tables, out of the
+/// title buffers' entries and the loose windows, the longest unasked first,
+/// until about `want` bytes went (all of them if fewer). Their tables stop
+/// naming them (the generation changes); the caller drops them.
+fn take_idle(
+    want: u64,
+    tables: usize,
+    idle: impl Fn(&Arc<Shadow>, usize) -> bool,
+) -> Vec<Arc<Shadow>> {
+    let mut gone: Vec<Arc<Shadow>> = Vec::new();
+    let mut map = buffers();
+    let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    /// Where a candidate is kept: a title buffer's entry or a loose window.
+    enum Held {
+        Buffer((u64, usize)),
+        Loose((u64, u64)),
+    }
+    let mut candidates: Vec<(u64, u64, Held)> = map
+        .iter()
+        .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
+        .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
+        .filter(|(_, c)| idle(c, tables))
+        .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
+        .collect();
+    candidates.sort_unstable_by_key(|&(used, ..)| used);
+    let mut taken = 0;
+    for (_, len, held) in candidates {
+        if taken >= want {
+            break;
+        }
+        let copy = match held {
+            Held::Loose(key) => loose.remove(&key),
+            Held::Buffer(key) => map.get_mut(&key).and_then(|e| e.shadow.take()),
+        };
+        if let Some(copy) = copy {
+            taken += len;
+            gone.push(copy);
+        }
+    }
+    if !gone.is_empty() {
+        changed();
+    }
+    gone
+}
+
+/// Remembers where the copies `gone` were, to count those made again, and
+/// returns how many there are and their bytes.
+fn note_released(gone: &[Arc<Shadow>]) -> (usize, u64, u64) {
+    let bytes = gone.iter().map(|c| c.len).sum::<u64>();
+    let mut r = released();
+    if !gone.is_empty() {
+        if r.starts.len() > Released::CAP {
+            r.starts.clear();
+        }
+        r.starts.extend(gone.iter().map(|c| c.start));
+    }
+    (gone.len(), bytes, r.remade)
 }
 
 /// While the computer's memory runs low: gives up copies of title memory
@@ -2616,58 +2846,78 @@ pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
     if want == 0 || !release_enabled() {
         return (0, 0);
     }
-    let tables = crate::memory::tables();
-    let mut gone: Vec<Arc<Shadow>> = Vec::new();
-    {
-        let mut map = buffers();
-        let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-        /// Where a candidate is kept: a title buffer's entry or a loose window.
-        enum Held {
-            Buffer((u64, usize)),
-            Loose((u64, u64)),
-        }
-        let mut candidates: Vec<(u64, u64, Held)> = map
-            .iter()
-            .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
-            .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
-            .filter(|(_, c)| idle(c, tables, frame))
-            .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
-            .collect();
-        candidates.sort_unstable_by_key(|&(used, ..)| used);
-        let mut taken = 0;
-        for (_, len, held) in candidates {
-            if taken >= want {
-                break;
-            }
-            let copy = match held {
-                Held::Loose(key) => loose.remove(&key),
-                Held::Buffer(key) => map.get_mut(&key).and_then(|e| e.shadow.take()),
-            };
-            if let Some(copy) = copy {
-                taken += len;
-                gone.push(copy);
-            }
-        }
-        if !gone.is_empty() {
-            changed();
-        }
-    }
-    let (count, bytes) = (gone.len(), gone.iter().map(|c| c.len).sum::<u64>());
-    if !gone.is_empty() {
-        let mut r = released();
-        if r.starts.len() > Released::CAP {
-            r.starts.clear();
-        }
-        r.starts.extend(gone.iter().map(|c| c.start));
+    let gone = take_idle(want, crate::memory::tables(), |c, tables| {
+        idle(c, tables, frame)
+    });
+    let (count, bytes, remade) = note_released(&gone);
+    if count > 0 {
         tracing::info!(
-            copies = gone.len(),
+            copies = count,
             mb = bytes / (1 << 20),
-            made_again = r.remade,
+            made_again = remade,
             "host copies of title memory given up while memory is low"
         );
     }
     // The copies' buffers go with the last layout naming them, on the
     // thread that rewrites it; these references go now.
+    drop(gone);
+    (count, bytes)
+}
+
+/// Once per presented frame, between submissions (`evict_unused`): the
+/// stamps' time moves on, and once a second the copies nothing asked for in
+/// [`stale_seconds`] (and as many frames) go as [`release_idle`]'s do, with
+/// the same conditions ([`settled`]) but whatever memory is free. The title
+/// keeps most of its memory mapped, so copies of what a scene left were
+/// otherwise kept until memory ran low, and the system compressed and
+/// swapped them first. Returns the copies and bytes.
+pub(crate) fn release_stale(frame: u64) -> (usize, u64) {
+    let Some(seconds) = stale_seconds() else {
+        return (0, 0);
+    };
+    let now = (crate::resource::now_ms(), frame);
+    NOW_MS.store(now.0, Ordering::Relaxed);
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    if now.0.saturating_sub(LAST.load(Ordering::Relaxed)) < 1000 {
+        return (0, 0);
+    }
+    LAST.store(now.0, Ordering::Relaxed);
+    release_stale_at(now, seconds, crate::memory::tables(), |_| true)
+}
+
+/// [`release_stale`] at `now`, with `tables` page tables, of the copies
+/// `within` picks (tests).
+fn release_stale_at(
+    now: Stamp,
+    seconds: u64,
+    tables: usize,
+    within: impl Fn(&Shadow) -> bool,
+) -> (usize, u64) {
+    let pick = |c: &Arc<Shadow>| within(c) && stale(c.asked(), now, seconds);
+    // Most passes find nothing: look under the readers' lock first.
+    let any = buffers_read()
+        .values()
+        .filter_map(|e| e.shadow.as_ref())
+        .any(&pick);
+    let any = any
+        || LOOSE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(&pick);
+    if !any {
+        return (0, 0);
+    }
+    let gone = take_idle(u64::MAX, tables, |c, tables| pick(c) && settled(c, tables));
+    let (count, bytes, remade) = note_released(&gone);
+    if count > 0 {
+        tracing::debug!(
+            copies = count,
+            mb = bytes / (1 << 20),
+            made_again = remade,
+            "host copies of title memory nothing asked for lately given up"
+        );
+    }
     drop(gone);
     (count, bytes)
 }
@@ -2773,6 +3023,29 @@ pub(crate) mod tests {
         assert_eq!(take_count(&mut words), 0, "taken once");
     }
 
+    #[test]
+    fn batched_refresh_uses_endpoints_and_preserves_gaps() {
+        let p = crate::watch::tests::pool(3);
+        let len = 3 * PAGE;
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            return;
+        };
+        copy.update(p, len);
+        // SAFETY: writes within our three-page pool.
+        unsafe { (p as *mut u8).write_bytes(0x5a, len) };
+        assert_eq!(
+            copy.update_ranges(&[(p, p + PAGE), (p + 2 * PAGE, p + len)]),
+            [PAGE, PAGE]
+        );
+        assert_eq!(copy.read_host(p as u64, 1), [0x5a5a5a5a]);
+        assert_eq!(copy.read_host((p + PAGE) as u64, 1), [0], "gap is not refreshed");
+        assert_eq!(copy.read_host((p + 2 * PAGE) as u64, 1), [0x5a5a5a5a]);
+        assert_eq!(copy.update(p + PAGE, PAGE), PAGE, "gap stays dirty");
+        unregister(p, p as u64);
+    }
+
     /// The title writes a constant under a range an earlier list of the
     /// submission declared as written by shaders: the refresh before the
     /// submission runs still brings it to the copy, a shader's write still
@@ -2834,6 +3107,104 @@ pub(crate) mod tests {
         copy.used.store(later, Ordering::Relaxed);
         assert!(!idle(&copy, 1, later), "asked for again");
         unregister(p, p as u64);
+    }
+
+    /// `VICTORY_IDLE_RELEASE=0` turns the age limit off and
+    /// `VICTORY_IDLE_RELEASE_S` sets it; anything else keeps two minutes.
+    #[test]
+    fn the_variables_turn_the_age_limit_off_and_set_it() {
+        assert_eq!(stale_setting(None, None), Some(STALE_S), "on by default");
+        assert_eq!(stale_setting(Some("0"), Some("30")), None);
+        assert_eq!(stale_setting(Some(" 0 "), None), None);
+        assert_eq!(stale_setting(Some("1"), Some(" 45 ")), Some(45));
+        assert_eq!(
+            stale_setting(Some(""), Some("45")),
+            Some(45),
+            "only 0 is off"
+        );
+        assert_eq!(
+            stale_setting(None, Some("0")),
+            Some(STALE_S),
+            "no limit of zero"
+        );
+        assert_eq!(stale_setting(None, Some("-5")), Some(STALE_S));
+        assert_eq!(stale_setting(None, Some("1.5")), Some(STALE_S));
+        assert_eq!(stale_setting(None, Some("soon")), Some(STALE_S));
+    }
+
+    /// Stale only once both the seconds and as many frames (at least
+    /// [`IDLE_FRAMES`]) have passed.
+    #[test]
+    fn stale_takes_the_time_and_the_frames() {
+        let asked = (10_000, 50);
+        assert!(!stale(asked, (129_999, 1_000), 120), "a millisecond short");
+        assert!(
+            !stale(asked, (1 << 40, 169), 120),
+            "a frame short (a slow run)"
+        );
+        assert!(stale(asked, (130_000, 170), 120));
+        assert!(
+            !stale(asked, (40_000, 109), 30),
+            "30 s, but fewer than IDLE_FRAMES frames"
+        );
+        assert!(stale(asked, (40_000, 50 + IDLE_FRAMES), 30));
+        assert!(
+            !stale(asked, (5_000, 20), 30),
+            "asked for after `now` was read"
+        );
+        assert!(stale((0, 0), (u64::MAX, u64::MAX), u64::MAX), "no overflow");
+    }
+
+    /// The age pass gives up a copy unasked past the limit, whatever memory
+    /// is free, and keeps one asked for lately (by time or by frames) and
+    /// one a list still holds.
+    #[test]
+    fn a_copy_unasked_past_the_limit_goes_and_a_recent_one_stays() {
+        let p = crate::watch::tests::pool(4);
+        let at = |i: usize| p + i * PAGE;
+        for i in 0..4 {
+            register(at(i), at(i) as u64, PAGE as u64);
+        }
+        let done = || (0..4).for_each(|i| unregister(at(i), at(i) as u64));
+        let copies: Vec<_> = (0..4)
+            .filter_map(|i| find(at(i) as u64, PAGE as u64))
+            .collect();
+        let Ok([old, lately, few_frames, held]) = <[_; 4]>::try_from(copies) else {
+            done();
+            return; // no host GPU here
+        };
+        let now: Stamp = (1 << 30, 1 << 20);
+        let stamp = |c: &Shadow, ms: u64, frames: u64| {
+            c.used_ms.store(now.0 - ms, Ordering::Relaxed);
+            c.used.store(now.1 - frames, Ordering::Relaxed);
+        };
+        stamp(&old, 30_000, IDLE_FRAMES);
+        stamp(&lately, 29_999, 1_000);
+        stamp(&few_frames, 1_000_000, IDLE_FRAMES - 1);
+        stamp(&held, 1_000_000, 1_000);
+        let mine = |c: &Shadow| (p as u64..at(4) as u64).contains(&c.start);
+        // Nothing but their entries holds the first three (a lookup's cache
+        // holds weak references), and no page table names them.
+        drop((old, lately, few_frames));
+        assert_eq!(
+            release_stale_at(now, 30, 0, mine),
+            (1, PAGE as u64),
+            "only the old one"
+        );
+        let kept = |i: usize| buffers_read()[&(at(i) as u64, at(i))].shadow.is_some();
+        assert_eq!([0, 1, 2, 3].map(kept), [false, true, true, true]);
+        assert_eq!(release_stale_at(now, 30, 0, mine), (0, 0), "the rest stay");
+        drop(held);
+        assert_eq!(
+            release_stale_at(now, 30, 0, mine),
+            (1, PAGE as u64),
+            "a list let go of it"
+        );
+        assert!(!kept(3));
+        // Asked for again: made again from title memory.
+        assert!(find(at(0) as u64, PAGE as u64).is_some());
+        assert!(kept(0));
+        done();
     }
 
     /// The same where title memory is not tracked (what Rosetta gets for
@@ -4054,6 +4425,24 @@ pub(crate) mod tests {
         unregister(1, base);
         assert_eq!(found, Some((base, 1)));
         assert!(buffers().range((base, 0)..=(base + len, usize::MAX)).next().is_none());
+    }
+
+    #[test]
+    fn loose_windows_are_small_on_macs_with_up_to_32_gib_unless_asked() {
+        let gib = 1u64 << 30;
+        // Unasked: by the Mac's memory.
+        for ram in [8, 16, 18, 24, 32] {
+            assert_eq!(loose_window_size(None, true, Some(ram * gib)), SMALL_WINDOW, "{ram} GiB");
+        }
+        for ram in [36, 48, 64, 128] {
+            assert_eq!(loose_window_size(None, true, Some(ram * gib)), LARGE_WINDOW, "{ram} GiB");
+        }
+        assert_eq!(loose_window_size(None, true, None), LARGE_WINDOW, "memory unknown");
+        assert_eq!(loose_window_size(None, false, Some(16 * gib)), LARGE_WINDOW, "not a Mac");
+        // Asked: as asked, whatever the memory.
+        assert_eq!(loose_window_size(Some(false), true, Some(16 * gib)), LARGE_WINDOW);
+        assert_eq!(loose_window_size(Some(true), false, Some(128 * gib)), SMALL_WINDOW);
+        assert_eq!(loose_window_size(Some(true), true, None), SMALL_WINDOW);
     }
 
     #[test]

@@ -232,7 +232,8 @@ mod mach {
 /// Metal out-of-memory errors; `VICTORY_ALIAS_BUFFERS=1` still opts in.
 const DEFAULT_MIN_RAM_BYTES: u64 = 20 << 30;
 
-fn total_ram_bytes() -> Option<u64> {
+/// The computer's memory, as Wine reports it (`ullTotalPhys`).
+pub(crate) fn total_ram_bytes() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: `MEMORYSTATUSEX` is plain-old-data with `dwLength` initialized.
     let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };

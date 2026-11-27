@@ -4530,6 +4530,7 @@ struct BatchBuffers {
     pending: PtrMap<usize>,
     current: PtrMap<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
     extents: victory_formats::extents::Extents,
+    pending_extents: victory_formats::extents::Extents,
 }
 
 static BATCH_POOL: Mutex<Vec<BatchBuffers>> = Mutex::new(Vec::new());
@@ -4552,6 +4553,9 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
+    /// As `extents`, for the copies whose refreshes are still pending: a
+    /// title copy flushes only the ones its bytes can be in.
+    pending_extents: victory_formats::extents::Extents,
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -4566,6 +4570,7 @@ impl Drop for Batch {
         self.pending.clear();
         self.current.clear();
         self.extents.clear();
+        self.pending_extents.clear();
         if self.current.capacity() == 0 && self.pending.capacity() == 0 {
             return;
         }
@@ -4576,6 +4581,7 @@ impl Drop for Batch {
                 pending: std::mem::take(&mut self.pending),
                 current: std::mem::take(&mut self.current),
                 extents: std::mem::take(&mut self.extents),
+                pending_extents: std::mem::take(&mut self.pending_extents),
             });
         }
     }
@@ -4593,6 +4599,7 @@ impl Batch {
             #[cfg(feature = "diagnostics")]
             summary: Default::default(),
             extents: buffers.extents,
+            pending_extents: buffers.pending_extents,
         }
     }
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
@@ -4617,10 +4624,18 @@ impl Batch {
             }
             return;
         }
-        let i = *self.pending.entry(key).or_insert_with(|| {
-            self.refreshes.push((shadow.clone(), Default::default()));
-            self.refreshes.len() - 1
-        });
+        let i = match self.pending.get(&key) {
+            Some(&i) => i,
+            None => {
+                let (start, len) = shadow.range();
+                self.pending_extents
+                    .flushed(key, start as usize, (start + len) as usize);
+                self.refreshes.push((shadow.clone(), Default::default()));
+                let i = self.refreshes.len() - 1;
+                self.pending.insert(key, i);
+                i
+            }
+        };
         for (from, to) in todo {
             self.refreshes[i].1.insert(from, to, JOIN);
         }
@@ -4653,28 +4668,37 @@ impl Batch {
         }
         // Flush only pending refreshes whose ranges overlap the destination
         // window; disjoint copies stay queued so they coalesce across lists.
+        // The index reaches the copies whose memory can hold the window's
+        // bytes; the rest are left queued without a look.
         let mut overlapping = Vec::new();
-        let mut i = 0;
-        while i < self.refreshes.len() {
-            let overlaps = {
-                let (shadow, ranges) = &self.refreshes[i];
-                let (start, slen) = shadow.range();
-                let (s_start, s_end) = (start as usize, start.saturating_add(slen) as usize);
-                s_start < to
-                    && s_end > from
-                    && ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from)
+        let mut stale = 0;
+        for key in self.pending_extents.overlapping(from, to) {
+            let Some(&i) = self.pending.get(&key) else {
+                stale += 1;
+                continue;
             };
-            if overlaps {
-                let (shadow, ranges) = self.refreshes.swap_remove(i);
-                let key = std::sync::Arc::as_ptr(&shadow) as usize;
-                self.pending.remove(&key);
-                if let Some((moved, _)) = self.refreshes.get(i) {
-                    self.pending
-                        .insert(std::sync::Arc::as_ptr(moved) as usize, i);
-                }
-                overlapping.push((shadow, ranges));
-            } else {
-                i += 1;
+            let (_, ranges) = &self.refreshes[i];
+            if !ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from) {
+                continue;
+            }
+            let (shadow, ranges) = self.refreshes.swap_remove(i);
+            self.pending.remove(&key);
+            if let Some((moved, _)) = self.refreshes.get(i) {
+                self.pending
+                    .insert(std::sync::Arc::as_ptr(moved) as usize, i);
+            }
+            overlapping.push((shadow, ranges));
+        }
+        // The entries of the copies flushed above name nothing pending any
+        // more; once they outnumber the live ones, filing the live ones
+        // again costs less than walking past the dead ones.
+        if stale > self.refreshes.len() {
+            self.pending_extents.clear();
+            for (shadow, _) in &self.refreshes {
+                let (start, len) = shadow.range();
+                let key = std::sync::Arc::as_ptr(shadow) as usize;
+                self.pending_extents
+                    .flushed(key, start as usize, (start + len) as usize);
             }
         }
         if !overlapping.is_empty() {
@@ -4693,6 +4717,7 @@ impl Batch {
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
         self.pending.clear();
+        self.pending_extents.clear();
         let work = std::mem::take(&mut self.refreshes);
         self.flush_work(work)
     }
@@ -4725,12 +4750,15 @@ impl Batch {
                 (0..work.len()).map(|_| Mutex::default()).collect();
             crate::texture::in_parallel(work.len(), |i| {
                 let (shadow, ranges) = &work[i];
-                let mut out = Vec::new();
-                for (from, to) in ranges.iter() {
-                    let started = std::time::Instant::now();
-                    let copied = shadow.update(from, to - from);
-                    let us = started.elapsed().as_micros() as u64;
-                    out.push((from, to, copied, us));
+                let collected = ranges.as_slice();
+                let started = std::time::Instant::now();
+                let copied = shadow.update_ranges(collected);
+                // The ranges are copied as one batch, so they are timed as
+                // one: its time is the first range's, the others none.
+                let us = started.elapsed().as_micros() as u64;
+                let mut out = Vec::with_capacity(collected.len());
+                for (n, (&(from, to), copied)) in collected.iter().zip(copied).enumerate() {
+                    out.push((from, to, copied, if n == 0 { us } else { 0 }));
                 }
                 *results[i].lock().unwrap_or_else(|e| e.into_inner()) = out;
             });
@@ -4764,10 +4792,13 @@ impl Batch {
         for (shadow, ranges) in work {
             let key = std::sync::Arc::as_ptr(&shadow) as usize;
             let (start, len) = shadow.range();
-            for (from, to) in ranges.iter() {
-                let started = std::time::Instant::now();
-                let copied = shadow.update(from, to - from);
-                let us = started.elapsed().as_micros() as u64;
+            let collected = ranges.as_slice();
+            let started = std::time::Instant::now();
+            let copied = shadow.update_ranges(collected);
+            // As above: the batch is timed as one, on its first range.
+            let us = started.elapsed().as_micros() as u64;
+            for (n, (&(from, to), copied)) in collected.iter().zip(copied).enumerate() {
+                let us = if n == 0 { us } else { 0 };
                 #[cfg(feature = "diagnostics")]
                 {
                     counted.range(from, to - from, us, 0);

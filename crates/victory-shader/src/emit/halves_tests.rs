@@ -3877,3 +3877,211 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
+
+
+/// A program whose only cross-half operations are first-lane reads goes to
+/// halves for them (#522). Where halves cannot pass the read between them,
+/// here in a loop counted to the console wave's first lane, it is refused,
+/// with or without console lanes asked for as well: each 32-lane host wave
+/// reading its own first lane would count the upper half's loop to thread
+/// 32 and store 32 there, where the console stores 0
+/// ([`a_first_lane_read_in_a_loop_matches_the_console_on_every_gpu`]).
+#[test]
+fn first_lane_reads_halves_cannot_pass_are_refused() {
+    let words = first_lane_in_a_counted_loop();
+    let with_mbcnt = in_a_loop(&[0x7E18_0500], 12, Count::FirstLane);
+    for threads in [64, 128, 256] {
+        for program in [&words, &with_mbcnt] {
+            let why = refusal(program, threads, 0);
+            assert!(
+                why.contains("a first-lane read of a value that may differ between 32-lane halves"),
+                "{threads} threads: {why}"
+            );
+        }
+    }
+}
+
+/// [`in_a_loop`] of `v_readfirstlane_b32 s12, v0` counted to the first
+/// lane, without its `v_mbcnt`: a program whose only cross-half operations
+/// are first-lane reads, one of them in a loop.
+fn first_lane_in_a_counted_loop() -> Vec<u32> {
+    let mbcnt = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
+    let first = [0x7E18_0500]; // v_readfirstlane_b32 s12, v0
+    let with_mbcnt = in_a_loop(&first, 12, Count::FirstLane);
+    let at = with_mbcnt
+        .windows(2)
+        .position(|w| w == mbcnt)
+        .expect("in_a_loop's v_mbcnt");
+    [&with_mbcnt[..at], &with_mbcnt[at + 2..]].concat()
+}
+
+/// A first-lane read the halves cannot pass between them is refused, never
+/// made by each 32-lane host wave from its own first lane: on the console
+/// every lane of a wave64 reads the wave's first lane, thread `l & !63`,
+/// where the upper host wave's own first lane is thread `l & !31`.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_in_a_loop_matches_the_console_on_every_gpu() {
+    let words = first_lane_in_a_counted_loop();
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        match lowered(&native(&words, true, threads, 0), true) {
+            Err(e) => {
+                let why = e.to_string();
+                let across = "a first-lane read of a value that may differ between 32-lane halves";
+                assert!(why.contains(across), "{threads} threads: {why}");
+            }
+            Ok(_) => {
+                let want: Vec<u32> = (0..threads).map(|l| l & !63).collect();
+                failed.extend(differences(&words, threads, 1, &want));
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// `v_readfirstlane_b32 s12, v4` inside an `s_and_saveexec_b64` region
+/// whose EXEC is `mask_words`'s, of `v4 = f32(s14) + 1.0` made there, with
+/// `s14` the first dword of the SRV buffer at table dword 8 (a scalar load,
+/// as in GTA VI's reciprocals of constant-buffer divisors): the same in
+/// every lane EXEC has. `inside`: `v2 = s12` under the region's EXEC (only
+/// lanes that ran the read see it), else after EXEC is restored (every
+/// lane).
+fn readfirstlane_of_a_scalar_in_branch(
+    mask_words: &[u32],
+    with_mbcnt: bool,
+    inside: bool,
+) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0xF420_0396,
+        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ]);
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    w.extend(mask_words);
+    w.push(0xBE80_246A); // s_and_saveexec_b64 s[0:1], vcc
+    let region = [
+        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
+        0x0608_08F2, // v_add_f32 v4, 1.0, v4
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+    ];
+    let skip = region.len() as u32 + u32::from(inside);
+    w.push(0xBF88_0000 | skip); // s_cbranch_execz (past the region)
+    w.extend(region);
+    if inside {
+        w.push(0x7E04_020C); // v_mov_b32 v2, s12
+    }
+    w.push(0xBEFE_0400); // s_mov_b64 exec, s[0:1]
+    if !inside {
+        w.push(0x7E04_020C); // v_mov_b32 v2, s12
+    }
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_scalar_readfirstlane_programs_are_what_their_comments_say() {
+    for inside in [false, true] {
+        let words = readfirstlane_of_a_scalar_in_branch(&MASK_LANES_40_41, true, inside);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "s_load_dwordx4 s[44:47], s[4:5], 0x000020",
+            "s_buffer_load_dword s14, s[44:47]",
+            "v_cmp_eq_u32 vcc, 20, v3",
+            "s_and_saveexec_b64 s[0:1], vcc",
+            "s_cbranch_execz",
+            "v_cvt_f32_u32 v4, s14",
+            "v_add_f32 v4, 1.0, v4",
+            "v_readfirstlane_b32 s12, v4",
+            "v_mov_b32 v2, s12",
+        ] {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A first-lane read of a value every lane EXEC has computed alike, whose
+/// result only those lanes see, is made by each host half by itself: its
+/// own first active lane, with no value passed between the halves (none of
+/// an exchange's group barriers), so it translates also where the halves
+/// cannot meet (#522 refused it there). Seen by lanes outside the read's
+/// EXEC, it still passes the halves' first lanes and ballots between them.
+#[test]
+fn a_first_lane_read_only_active_lanes_see_is_made_in_each_half() {
+    for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
+        let inside = readfirstlane_of_a_scalar_in_branch(mask, true, true);
+        let alone = lowered(&native(&inside, true, 64, 0), true).expect("read alone in halves");
+        assert_eq!(alone.wave_size, Some(32));
+        let outside = readfirstlane_of_a_scalar_in_branch(mask, true, false);
+        let across = lowered(&native(&outside, true, 64, 0), true).expect("read across in halves");
+        // At least two exchanges (the value, the ballot) of two barriers.
+        assert!(
+            across.barriers >= alone.barriers + 4,
+            "{} {}",
+            across.barriers,
+            alone.barriers
+        );
+    }
+}
+
+/// [`readfirstlane_of_a_scalar_in_branch`] read inside its region gives the
+/// console's lanes on every hardware adapter: `f32(41) + 1.0` in the lanes
+/// EXEC has, 0 elsewhere, with the active lanes in the lower half only, in
+/// the upper half only (the lower host wave has none), in both, or none (the
+/// region is skipped); with console lanes needed elsewhere (halves) and not.
+#[test]
+#[cfg(windows)]
+fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
+    let value = (41.0f32 + 1.0).to_bits();
+    let lower: fn(u32) -> bool = |l| l >> 1 == 4;
+    let upper: fn(u32) -> bool = |l| l >> 1 == 20;
+    let both: fn(u32) -> bool = |l| l & 31 == 12;
+    let none: fn(u32) -> bool = |_| false;
+    let mut failed = Vec::new();
+    for (label, mask, active) in [
+        ("lower_8_9", &MASK_LANES_8_9, lower),
+        ("upper_40_41", &MASK_LANES_40_41, upper),
+        ("both_12_44", &MASK_LANES_12_44, both),
+        ("empty", &MASK_EMPTY, none),
+    ] {
+        for with_mbcnt in [false, true] {
+            let words = readfirstlane_of_a_scalar_in_branch(mask, with_mbcnt, true);
+            let want: Vec<u32> = (0..64).map(|l| if active(l) { value } else { 0 }).collect();
+            let found = differences_with_buffer(
+                true,
+                &words,
+                64,
+                1,
+                &want,
+                0,
+                false,
+                false,
+                &[41, 0, 0, 0],
+            );
+            failed.extend(
+                found
+                    .into_iter()
+                    .map(|msg| format!("{label}(mbcnt={with_mbcnt}): {msg}")),
+            );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

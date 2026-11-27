@@ -19,6 +19,11 @@ impl Ranges {
         self.0.iter().copied()
     }
 
+    /// The ranges as a slice, for a caller that hands them to one call.
+    pub(crate) fn as_slice(&self) -> &[(usize, usize)] {
+        &self.0
+    }
+
     /// Adds `[from, to)`, joined with the ranges that overlap it or lie
     /// within `gap` bytes of it (the bytes between are then in the set).
     pub(crate) fn insert(&mut self, from: usize, to: usize, gap: usize) {

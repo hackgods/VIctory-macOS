@@ -244,4 +244,137 @@ fn main() {
         println!("bench_title_copied_{name}_us {median:.0} us (all: {all})");
         black_box(&samples);
     }
+
+    pending(&world, &mut lcg);
+}
+
+/// A submission's pending refreshes: the copies not brought up to date
+/// yet, each with the ranges of it still due. A title copy flushes the
+/// ones its bytes can be in; the rest stay queued.
+#[derive(Default)]
+struct Pending {
+    /// Each copy's memory `[start, end)` and the ranges still due.
+    copies: Vec<(usize, usize, Ranges)>,
+    /// Where each copy is in `copies`, by its address.
+    index: HashMap<usize, usize>,
+    /// Where each copy's memory sits, by its address.
+    extents: Extents,
+}
+
+impl Pending {
+    /// Files a copy not brought up to date yet, its memory `[start, start +
+    /// len)` naming it (as the copy's address does in `host`).
+    fn add(&mut self, start: usize, len: usize) {
+        if self.index.contains_key(&start) {
+            return;
+        }
+        self.extents.flushed(start, start, start + len);
+        self.copies
+            .push((start, start + len, Ranges::whole(start, start + len)));
+        self.index.insert(start, self.copies.len() - 1);
+    }
+
+    /// Takes the copies a window `[from, to)` can be in out of the queue,
+    /// returning how many it flushed. `indexed` reaches them by the
+    /// extent index; otherwise every copy is walked.
+    fn take(&mut self, from: usize, to: usize, indexed: bool) -> usize {
+        let mut taken = 0;
+        let mut stale = 0;
+        if indexed {
+            for key in self.extents.overlapping(from, to) {
+                let Some(&i) = self.index.get(&key) else {
+                    stale += 1;
+                    continue;
+                };
+                if !self.copies[i].2.0.iter().any(|&(f, t)| f < to && t > from) {
+                    continue;
+                }
+                self.copies.swap_remove(i);
+                self.index.remove(&key);
+                if let Some((next, _, _)) = self.copies.get(i) {
+                    self.index.insert(*next, i);
+                }
+                taken += 1;
+            }
+            // The entries of the copies flushed above name nothing pending
+            // any more; once they outnumber the live ones, refile the live.
+            if stale > self.copies.len() {
+                self.extents.clear();
+                for (start, end, _) in &self.copies {
+                    self.extents.flushed(*start, *start, *end);
+                }
+            }
+        } else {
+            let mut i = 0;
+            while i < self.copies.len() {
+                let overlaps = {
+                    let (start, end, ranges) = &self.copies[i];
+                    *start < to && *end > from && ranges.0.iter().any(|(r_from, r_to)| *r_from < to && *r_to > from)
+                };
+                if overlaps {
+                    let (start, _, _) = self.copies.swap_remove(i);
+                    self.index.remove(&start);
+                    if let Some((next, _, _)) = self.copies.get(i) {
+                        self.index.insert(*next, i);
+                    }
+                    taken += 1;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        taken
+    }
+}
+
+/// One submission's title copies against the pending queue, both ways.
+fn pending(world: &[(u64, u64)], lcg: &mut Lcg) {
+    let build = || {
+        let mut pending = Pending::default();
+        for &(start, len) in world.iter() {
+            pending.add(start as usize, len as usize);
+        }
+        pending
+    };
+    let checked = windows(lcg);
+    let mut scan = build();
+    let mut indexed = build();
+    let (mut scan_visits, mut index_visits) = (0, 0);
+    for &(from, to) in &checked {
+        scan_visits += scan.take(from, to, false);
+        index_visits += indexed.take(from, to, true);
+    }
+    let mut left_scan = scan.copies.clone();
+    let mut left_index = indexed.copies.clone();
+    left_scan.sort_unstable_by_key(|&(start, ..)| start);
+    left_index.sort_unstable_by_key(|&(start, ..)| start);
+    assert_eq!(left_scan, left_index, "the same copies left pending");
+    println!("bench_title_pending_visits_scan {scan_visits}");
+    println!("bench_title_pending_visits_index {index_visits}");
+
+    for (name, indexed) in [("scan", false), ("index", true)] {
+        let mut samples = Vec::with_capacity(9);
+        for _ in 0..9 {
+            let mut took = 0u128;
+            for _ in 0..BATCH {
+                let mut pending = build();
+                let windows = windows(lcg);
+                let started = Instant::now();
+                for &(from, to) in &windows {
+                    pending.take(from, to, indexed);
+                }
+                took += started.elapsed().as_micros();
+            }
+            samples.push(took as f64 / f64::from(BATCH));
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let median = samples[samples.len() / 2];
+        let all = samples
+            .iter()
+            .map(|s| format!("{s:.0}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("bench_title_pending_{name}_us {median:.0} us (all: {all})");
+        black_box(&samples);
+    }
 }

@@ -1868,13 +1868,54 @@ pub(crate) mod tests {
         };
         assert_eq!(create(desc, placement, &mut h), S_OK);
         if let Some(host) = heap(h).host() {
+            use crate::backend::{HostGpu, HostMemory};
+            use crate::compute::{Param, srv};
             let cbv = [constants as u32, (constants >> 32) as u32, 256, 0];
             create_cbv(std::ptr::null(), &cbv, memory as u64 + 3 * 32);
-            let held = host.held_copy(3).expect("the slot reads the buffer");
-            assert!(held.is_aliased(), "made from memory in place");
+            assert!(
+                crate::alias::is_in_place(constants, 256),
+                "the slot's view in place"
+            );
+            // A compute pass reads the slot through a table, as the title's
+            // shaders do, and copies its 256 bytes out; submitted as the
+            // title's lists are (the remake runs in `prepare_submission`).
+            const READ: &str = "ByteAddressBuffer t : register(t0);\n\
+                RWByteAddressBuffer u : register(u0);\n\
+                [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
+                    u.Store(id.x * 4, t.Load(id.x * 4));\n\
+                }\n";
+            let (root, pso) = crate::compute::pipeline(
+                READ,
+                windows::core::s!("read slot"),
+                0,
+                &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
+            )
+            .expect("a pipeline reading the slot");
+            let gpu = crate::host::host().expect("a host GPU");
+            let (out, _) = gpu.shared_buffer(1 << 16).expect("an output buffer");
+            let read = || {
+                let list = gpu.new_list().expect("a list");
+                // SAFETY: our heap, pipeline and buffer outlive the waited
+                // submission.
+                unsafe {
+                    list.list.SetDescriptorHeaps(&[Some(host.heap.clone())]);
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetComputeRootDescriptorTable(0, host.gpu(3));
+                    list.list
+                        .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                    list.list.SetPipelineState(&pso);
+                    list.list.Dispatch(1, 1, 1);
+                }
+                // What a table draw reading the slot defers.
+                list.defer_slot(&host.viewed, 3);
+                list.close();
+                gpu.execute(&[&list]);
+                gpu_bytes(&out, 0, 256)
+            };
             assert_eq!(
-                gpu_bytes(&held.buffer, held.offset(constants), 256),
-                vec![0x11; 256]
+                read(),
+                vec![0x11; 256],
+                "the slot reads the section's pages"
             );
 
             // The title maps other pages there.
@@ -1891,14 +1932,13 @@ pub(crate) mod tests {
             unsafe { std::ptr::write_bytes(view.add(PAGE + 256), 0x22, 256) };
             crate::alias::TEST_RESOLVER.with(|c| c.set(None));
             crate::watch::title_memory_remapped(view as usize, SECTION);
-            // Before the next submission's heap sync.
-            assert!(crate::alias::remake_let_go() >= 1, "the slot made again");
-            let held = host.held_copy(3).expect("the slot reads the buffer");
-            assert!(!held.is_aliased(), "made from a copy of the new pages");
-            held.update(constants as usize, 256);
+            assert!(!crate::alias::is_in_place(constants, 256), "let go");
+            // The same slot, unchanged by the title, read by the next
+            // submission: the new pages' bytes.
             assert_eq!(
-                gpu_bytes(&held.buffer, held.offset(constants), 256),
-                vec![0x22; 256]
+                read(),
+                vec![0x22; 256],
+                "the slot reads the pages mapped there now"
             );
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);

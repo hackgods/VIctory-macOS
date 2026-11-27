@@ -2967,16 +2967,35 @@ fn scalar_buffer_loads_read_four_dwords_a_load() {
     for (op, n, mask) in [(13, 2, 3), (15, 3, 7), (14, 4, 15)] {
         assert_eq!(root_view_load(op, n).raw_load_args, [(None, Some(mask))]);
     }
-    // From title memory: the page table's entry (two dwords) and the
-    // constants, then a dword a load again in a block of their own, which
-    // only lanes whose run wraps (it starts before its copy) run.
+    // From title memory: the page table's entry (two dwords) for the run's
+    // first byte and, in a block that only lanes whose run crosses onto the
+    // next page run, for its last; the constants four dwords a load, each
+    // dword also read through the next page's copy (a load each); then a
+    // dword a load again, the same way, in a block of their own, which only
+    // lanes whose run wraps (it starts before its copy) run.
     let memory = memory_constants(4);
-    assert_eq!(wide_loads(&memory)[1..], [(None, Some(15)); 4]);
-    assert_eq!(memory.raw_load_args[7..], [(None, Some(1)); 16]);
-    let [blocks, _] = &memory.raw_loads;
-    let wraps = blocks[7];
-    assert!(blocks[..7].iter().all(|&b| b != wraps), "{blocks:?}");
-    assert!(blocks[7..].iter().all(|&b| b == wraps), "{blocks:?}");
+    assert_eq!(
+        wide_loads(&memory),
+        [
+            (None, Some(3)),
+            (None, Some(3)),
+            (None, Some(15)),
+            (None, Some(15)),
+            (None, Some(15)),
+            (None, Some(15)),
+        ]
+    );
+    let [blocks, table] = &memory.raw_loads;
+    let (first, crossing) = (table[1], table[3]);
+    assert!(first == table[2] && crossing == table[4] && crossing != first, "{table:?}");
+    let run = blocks.iter().position(|&b| b != first && b != crossing).expect("the run's loads");
+    let wraps = *blocks.last().expect("loads");
+    assert!(wraps != blocks[run], "{blocks:?}");
+    // Four loads of four with four of one each, then sixteen pairs of one.
+    assert_eq!(blocks.iter().filter(|&&b| b == blocks[run]).count(), 4 * 5, "{blocks:?}");
+    assert_eq!(blocks.iter().filter(|&&b| b == wraps).count(), 16 * 2, "{blocks:?}");
+    let at_wraps = blocks.len() - 32;
+    assert_eq!(memory.raw_load_args[at_wraps..], [(None, Some(1)); 32]);
 }
 
 /// Constants at a computed offset of a constant buffer view load each row

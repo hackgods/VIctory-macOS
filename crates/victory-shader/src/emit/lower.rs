@@ -22,6 +22,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod atomics;
 mod back_edges;
+mod pages;
 mod barriers;
 mod bvh;
 mod f64;
@@ -479,6 +480,11 @@ struct Lower<'a> {
     memory_null: Option<V>,
     /// The offsets [`Lower::memory`] returned ([`Lower::raw_run`]).
     memory_offsets: HashSet<V>,
+    /// Reads of title memory that may cross onto the next page, by handle
+    /// ([`Lower::page_tail`]).
+    tails: Map<V, pages::Tail>,
+    /// The read being looked up lies in one page, as its caller knows.
+    one_page: bool,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
@@ -991,6 +997,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             memory_null: None,
             memory_offsets: HashSet::new(),
+            tails: Map::default(),
+            one_page: false,
             counters: HashMap::new(),
             abort: None,
             round16: round16(p),
@@ -2674,14 +2682,14 @@ impl<'a> Lower<'a> {
     /// `dx.op.rawBufferLoad.f32` of the handle, index, offset, mask and
     /// alignment in `args`, in `block`.
     fn raw_buffer_load(&mut self, block: usize, args: &[V]) -> V {
-        self.s.op(
-            block,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            args,
-        )
+        match self.tails.get(&args[0]) {
+            Some(&tail) => self.tail_load(block, args, tail),
+            None => self.raw_op(block, args),
+        }
+    }
+
+    fn raw_op(&mut self, block: usize, args: &[V]) -> V {
+        self.s.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, args)
     }
 
     /// `dx.op.atomicBinOp.i32` of the handle, operation, coordinates and
@@ -5353,8 +5361,11 @@ impl<'a> Lower<'a> {
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
-    // shortcut: one lookup per access, so its bytes are taken to lie in one
-    // host copy of title memory (any access within a 64 KiB page does).
+    // A read of more than a dword that crosses onto the next 64 KiB page
+    // looks that page up too and takes its dwords there from that page's
+    // copy (`pages`); a BVH node's reads see to that themselves (`bvh`).
+    // shortcut: one lookup for an access of a dword or less, which lies in
+    // one page unless its address is not 4-byte aligned.
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -5407,6 +5418,9 @@ impl<'a> Lower<'a> {
             let second = self.memory_mark_index(entry2, block2, l1_2);
             self.mark_memory_bit(bitmap, second);
             self.end_guarded(at, &[]);
+        }
+        if !write && bytes > 4 && !self.one_page {
+            self.page_tail(lo, hi, bytes, e.handle, e.offset, active);
         }
         self.memory_offsets.insert(e.offset);
         (e.handle, e.offset)

@@ -4085,3 +4085,139 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// A `while` loop as the console compiler lays one out: the entry jumps to
+/// the test, which branches back to the body while lanes stay; the body
+/// falls into the test. The body reads the first lane's thread id
+/// (`v_readfirstlane_b32 s6, v0`) into an accumulator `v2`, and counts its
+/// passes in `v1`. `narrow`: a lane stays while `v1 < (tid & 7)`, and the
+/// test drops the lanes done from EXEC (`s_and_b64 exec, exec, vcc;
+/// s_cbranch_execnz`). Else every lane stays while `v1 < 7`, a test the
+/// same in every lane, and EXEC stays (`s_and_b64 vcc, exec, vcc;
+/// s_cbranch_vccnz`, as GTA VI's loops test). Every lane stores `v2`.
+fn while_loop_first_lane(narrow: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        if narrow {
+            0x360A_0087 // v_and_b32 v5, 7, v0
+        } else {
+            0x7E0A_0287 // v_mov_b32 v5, 7
+        },
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+        0xBF82_0003, // s_branch (the test)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
+    ]);
+    if narrow {
+        w.extend([
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFA, // s_cbranch_execnz (the body)
+        ]);
+    } else {
+        w.extend([
+            0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+            0xBF87_FFFA, // s_cbranch_vccnz (the body)
+        ]);
+    }
+    w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What every lane of [`while_loop_first_lane`] stores on the console: the
+/// first lane still in the loop in each pass is the console wave's thread
+/// `64 * wave + pass + 1` (narrow), or its first, `64 * wave`, in all 7
+/// passes.
+fn console_while_loop_first_lane(narrow: bool, t: u32) -> u32 {
+    let base = t & !63;
+    if narrow {
+        let n = t & 7;
+        n * base + n * (n + 1) / 2
+    } else {
+        7 * base
+    }
+}
+
+#[test]
+fn the_while_loop_programs_are_what_their_comments_say() {
+    for narrow in [false, true] {
+        let words = while_loop_first_lane(narrow);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let tail: &[&str] = if narrow {
+            &["s_and_b64 exec, exec, vcc", "s_cbranch_execnz"]
+        } else {
+            &["s_and_b64 vcc, exec, vcc", "s_cbranch_vccnz"]
+        };
+        let bound = if narrow {
+            "v_and_b32 v5, 7, v0"
+        } else {
+            "v_mov_b32 v5, 7"
+        };
+        for want in [
+            bound,
+            "s_mov_b64 s[36:37], exec",
+            "s_branch",
+            "v_readfirstlane_b32 s6, v0",
+            "v_add_nc_u32 v2, s6, v2",
+            "v_add_nc_u32 v1, 1, v1",
+            "v_cmp_lt_u32 vcc, v1, v5",
+            "s_mov_b64 exec, s[36:37]",
+        ]
+        .iter()
+        .chain(tail)
+        {
+            assert!(all.contains(want), "{want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A first-lane read in a `while` loop (its exit test before the latch's
+/// work, as GTA VI's `23d507cbb6a22e86` and `b0095eb50222e808` have) runs in
+/// halves with the loop in lockstep: the group stays while any lane stays,
+/// so the halves meet in every pass and pass the console wave's first lane
+/// between them. Before, the read was refused there.
+#[test]
+fn a_first_lane_read_in_a_while_loop_translates_in_halves() {
+    for narrow in [false, true] {
+        for threads in [64, 128, 256] {
+            let words = while_loop_first_lane(narrow);
+            let l = lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("narrow={narrow} {threads} threads: {e}"));
+            assert_eq!(l.wave_size, Some(32));
+            assert!(l.barriers > 0, "the halves meet in the loop");
+        }
+    }
+}
+
+/// The read in a `while` loop gives the console's lanes on every GPU.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_in_a_while_loop_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for narrow in [false, true] {
+        for threads in [64, 128] {
+            let words = while_loop_first_lane(narrow);
+            let want: Vec<u32> = (0..threads)
+                .map(|t| console_while_loop_first_lane(narrow, t))
+                .collect();
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("narrow={narrow} {threads} threads: {m}")),
+            );
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

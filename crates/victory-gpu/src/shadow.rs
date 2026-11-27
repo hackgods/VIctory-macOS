@@ -627,6 +627,20 @@ impl Shadow {
         start: u64,
         len: u64,
     ) -> Arc<Shadow> {
+        Self::new_aliased_at(buffer, data, gpu, start, len, 0)
+    }
+
+    /// [`Shadow::new_aliased`] for a range that starts `base` bytes into
+    /// `buffer` (a heap's buffer holding more than this range: views and
+    /// copies count their offsets in `buffer` from there).
+    pub(crate) fn new_aliased_at(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        base: u64,
+    ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -641,7 +655,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),

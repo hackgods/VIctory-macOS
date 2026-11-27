@@ -683,6 +683,83 @@ pub(super) struct FlightState {
     landing_signals: Vec<(usize, u64)>,
     /// Whether the background `victory-flight` finisher thread has been spawned.
     worker_started: bool,
+    /// When the host GPU last finished our work (a landed flight's fence, or
+    /// a synchronous submission's end) and nothing has been launched since:
+    /// the start of the GPU's idle time before the next flight.
+    free_since: Option<std::time::Instant>,
+}
+
+/// Microseconds the flights launched since the last frame report spent in
+/// each step ([`take_flight_times`], in [`Phase`]'s order).
+static FLIGHT_US: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Flights launched since the last frame report.
+static FLIGHTS: AtomicU64 = AtomicU64::new(0);
+
+/// What [`FLIGHT_US`] counts, per flight.
+#[derive(Clone, Copy)]
+enum Phase {
+    /// From asking to launch to the flight before it having landed (its GPU
+    /// time left and its copy-back, under Wait-Before-Prep).
+    Landing,
+    /// Preparing: refreshing host copies and textures, heaps, preludes.
+    Preparing,
+    /// The host `ExecuteCommandLists` and `Signal` calls.
+    Launching,
+    /// The GPU's idle time before the flight while no work was there to run.
+    IdleUnasked,
+    /// The GPU's idle time before the flight while it was being prepared.
+    IdlePreparing,
+}
+
+fn add_step(step: Phase, d: std::time::Duration) {
+    FLIGHT_US[step as usize].fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// The GPU's idle time before a flight launched at `launched`, split at
+/// when its work was there: from `free` (the GPU finished our last work)
+/// to `asked` (the submit worker began this flight) nothing waited to run;
+/// from then (or from `free`, if the worker was already waiting for the
+/// last flight to land) to `launched` the flight was being prepared.
+fn idle_split(
+    free: std::time::Instant,
+    asked: std::time::Instant,
+    launched: std::time::Instant,
+) -> (std::time::Duration, std::time::Duration) {
+    let ready = asked.max(free);
+    (
+        ready.saturating_duration_since(free),
+        launched.saturating_duration_since(ready),
+    )
+}
+
+/// The flights launched since the last call, and per [`Phase`] their
+/// microseconds, cleared (the frame report).
+pub(crate) fn take_flight_times() -> (u64, [u64; 5]) {
+    (
+        FLIGHTS.swap(0, Ordering::Relaxed),
+        FLIGHT_US.each_ref().map(|a| a.swap(0, Ordering::Relaxed)),
+    )
+}
+
+/// The frame report's line for asynchronous submission, per frame over
+/// `frames` frames: nothing unless a flight was launched.
+pub(crate) fn log_frame(frames: f64) {
+    let (flights, us) = take_flight_times();
+    let worker = crate::queue::take_worker_us();
+    if flights == 0 {
+        return;
+    }
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    let [landing, preparing, launching, unasked, idle_preparing] = us.map(ms);
+    tracing::info!(
+        "host submissions in flight per frame: {:.1}; ms per frame: submit worker busy {:.1} (waiting for the last \
+         to land {landing:.1}, preparing {preparing:.1}, launching {launching:.1}); host GPU idle before them \
+         {:.1} (nothing to run {unasked:.1}, preparing {idle_preparing:.1})",
+        flights as f64 / frames,
+        ms(worker),
+        unasked + idle_preparing,
+    );
 }
 
 impl FlightState {
@@ -784,6 +861,7 @@ impl Host {
             }
             self.finish_flight_locked(&mut submitted, None, None);
         }
+        let landed = Instant::now();
         let mut beside = self.in_air() > 0;
 
         let prep = {
@@ -898,6 +976,11 @@ impl Host {
             }
         };
         drop(split_pool);
+        let sent = std::time::Instant::now();
+        add_step(Phase::Landing, landed - asked);
+        add_step(Phase::Preparing, launched - landed);
+        add_step(Phase::Launching, sent - launched);
+        FLIGHTS.fetch_add(1, Ordering::Relaxed);
 
         let split_count = native_boundaries.len();
         let memory = segments.iter().any(|l| {
@@ -928,6 +1011,11 @@ impl Host {
         {
             let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
             debug_assert!(state.in_flight.len() < flights_limit() && state.landing == 0);
+            if let Some(free) = state.free_since.take() {
+                let (unasked, preparing) = idle_split(free, asked, launched);
+                add_step(Phase::IdleUnasked, unasked);
+                add_step(Phase::IdlePreparing, preparing);
+            }
             state.in_flight.push_back(flight);
             if !state.worker_started {
                 state.worker_started = true;
@@ -972,6 +1060,12 @@ impl Host {
             None => state.landing_signals.push((fence as usize, value)),
         }
         true
+    }
+
+    /// Notes that a synchronous submission left the host GPU free at `at`,
+    /// for the next flight's idle time.
+    pub(super) fn note_gpu_free(&self, at: std::time::Instant) {
+        self.flight.lock().unwrap_or_else(|e| e.into_inner()).free_since = Some(at);
     }
 
     /// Whether a flight is currently in the air or landing.
@@ -1193,6 +1287,14 @@ impl Host {
         ran_for(gpu_duration, waited, true);
         #[cfg(test)]
         super::tests::native_call_group(flight.waited);
+        // The host GPU is free from here unless another flight is in the
+        // air behind this one (`VICTORY_FLIGHTS=2`).
+        {
+            let mut state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            if state.in_flight.is_empty() {
+                state.free_since = Some(gpu_done);
+            }
+        }
 
         let mark = self.mark_for(flight.slot);
         let split_failed = if flight.split_count > 0 {
@@ -2133,6 +2235,129 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::object::release_ref(heap);
         crate::object::release_ref(dst);
         crate::watch::tests::free(pool);
+    }
+
+    /// The GPU's idle time before a flight is split at when its work was
+    /// there: a worker that came to a free GPU had nothing to run until it
+    /// came; one already waiting for the last flight to land prepared all
+    /// the idle time.
+    #[test]
+    fn idle_time_is_split_at_when_the_work_was_there() {
+        let free = Instant::now();
+        let ms = Duration::from_millis;
+        assert_eq!(idle_split(free, free + ms(5), free + ms(8)), (ms(5), ms(3)));
+        assert_eq!(idle_split(free + ms(4), free, free + ms(10)), (ms(0), ms(6)));
+        assert_eq!(idle_split(free, free, free), (ms(0), ms(0)));
+    }
+
+    /// Under `VICTORY_ASYNC_SUBMIT=1` the title's `ExecuteCommandLists` and
+    /// `Signal` only queue: the title's thread is back while the work waits
+    /// for a memory value, may reset the list at once, and never runs host
+    /// work itself. The fence moves only once the work ran, after its
+    /// bottom-of-pipe write.
+    #[test]
+    fn async_submit_runs_host_work_off_the_title_thread_and_signals_after_it() {
+        let Some(_) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, true);
+        const GREATER_EQUAL: u32 = 7;
+
+        let (q, f) = make_queue_and_fence();
+        let (alloc, list) = make_title_list();
+        let flag = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let flag_addr = std::ptr::from_ref(&*flag) as u64;
+        let ran_on = Arc::new(std::sync::Mutex::new(None));
+        let mut word: u64 = 0;
+
+        crate::list::wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
+        let seg = crate::list::host_list(list).expect("host list");
+        let r = ran_on.clone();
+        seg.defer_after(move || {
+            *r.lock().unwrap() = Some(std::thread::current().id());
+        });
+        seg.defer_write((&raw mut word).cast(), Written::Value(0x5eed), 8);
+        close_title_list(list);
+        queue_execute(q, &[list]);
+        queue_signal(q, f, 1);
+
+        assert_eq!(crate::fence::value(f), 0, "the fence moved before the work ran");
+        assert!(ran_on.lock().unwrap().is_none(), "the held work ran");
+        // D3D12 lets a submitted list be reset at once.
+        reset_title_list(list, alloc);
+        close_title_list(list);
+
+        flag.store(1, Ordering::Release);
+        assert!(
+            wait_fence(f, 1, Duration::from_secs(5)),
+            "the submit worker did not run the work once its wait held"
+        );
+        // SAFETY: the fence reached 1, so the write landed before it.
+        assert_eq!(unsafe { (&raw const word).read_volatile() }, 0x5eed);
+        let thread = ran_on.lock().unwrap().expect("the work ran");
+        assert_ne!(thread, std::thread::current().id(), "host work ran on the title's thread");
+        let (flights, _) = take_flight_times();
+        assert!(flights >= 1, "the flight was not counted");
+    }
+
+    /// Under `VICTORY_ASYNC_SUBMIT=1` a queue that waits for another
+    /// queue's fence completes only after that queue's work: whenever the
+    /// title reads the waiting queue's fence as reached, the other fence and
+    /// the other queue's bottom-of-pipe write show too, and neither fence
+    /// moves before the first queue's work could run. (The worker may join
+    /// both queues' work into one host submission; the title sees its
+    /// effects only when it has landed.)
+    #[test]
+    fn async_submit_queue_wait_completes_after_the_signalling_queue_work() {
+        let Some(_) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, true);
+        const GREATER_EQUAL: u32 = 7;
+
+        let (qa, fa) = make_queue_and_fence();
+        let (qb, fb) = make_queue_and_fence();
+        let (_alloc_a, la) = make_title_list();
+        let (_alloc_b, lb) = make_title_list();
+        let flag = Box::new(std::sync::atomic::AtomicU64::new(0));
+        let flag_addr = std::ptr::from_ref(&*flag) as u64;
+        let mut a_word: u64 = 0;
+        let mut b_word: u64 = 0;
+
+        crate::list::wait64(la, flag_addr, GREATER_EQUAL, 1, 0);
+        crate::list::host_list(la)
+            .expect("host list a")
+            .defer_write((&raw mut a_word).cast(), Written::Value(1), 8);
+        close_title_list(la);
+        queue_execute(qa, &[la]);
+        queue_signal(qa, fa, 1);
+
+        assert_eq!(crate::queue::wait_for_test(qb, fa, 1), S_OK);
+        crate::list::host_list(lb)
+            .expect("host list b")
+            .defer_write((&raw mut b_word).cast(), Written::Value(2), 8);
+        close_title_list(lb);
+        queue_execute(qb, &[lb]);
+        queue_signal(qb, fb, 1);
+
+        assert_eq!((crate::fence::value(fa), crate::fence::value(fb)), (0, 0));
+        // SAFETY: plain reads of words the landings write.
+        let words = || unsafe { ((&raw const a_word).read_volatile(), (&raw const b_word).read_volatile()) };
+        assert_eq!(words(), (0, 0), "held work wrote before its wait held");
+        flag.store(1, Ordering::Release);
+        let start = Instant::now();
+        loop {
+            // B's fence first: anything it shows must already show A's.
+            let b = crate::fence::value(fb);
+            let a = crate::fence::value(fa);
+            if b >= 1 {
+                assert_eq!(a, 1, "queue b completed before the fence it waited for");
+                assert_eq!(words(), (1, 2), "a fence moved before its queue's writes");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "the waiting queue's work did not run");
+            std::thread::yield_now();
+        }
     }
 
     /// Under `VICTORY_ASYNC_SUBMIT=1` + `VICTORY_FLIGHT1=1`, submits

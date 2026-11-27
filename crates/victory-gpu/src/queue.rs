@@ -141,6 +141,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held_for(Why::Submission);
+        let entered = std::time::Instant::now();
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
@@ -152,8 +153,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             drop(held);
             ensure_submit_worker();
             wake_submit();
+            add_run(Why::Submission, entered);
         } else if crate::host::flight1_enabled() {
             drop(held);
+            add_run(Why::Submission, entered);
             pump_unlocked(Why::Submission);
         } else {
             pump(&mut held, Why::Submission);
@@ -190,8 +193,16 @@ pub(crate) fn signal_for_test(this: This, fence: This, value: u64) -> HRESULT {
     signal(this, fence, value)
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn wait_for_test(this: This, fence: This, value: u64) -> HRESULT {
+    wait(this, fence, value)
+}
+
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
-/// CPU fence call, PresentX, our timer, or a completed Flight-1 landing.
+/// CPU fence call, PresentX, host work of ours that runs synchronously
+/// behind the queued work (`VICTORY_ASYNC_SUBMIT=1` or `VICTORY_FLIGHT1=1`:
+/// read-backs, captures, page mappings), our timer, or a completed Flight-1
+/// landing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Why {
     Submission,
@@ -199,6 +210,7 @@ pub(crate) enum Why {
     Wait,
     Fence,
     Present,
+    Sync,
     Timer,
     #[cfg(windows)]
     Flight,
@@ -273,8 +285,26 @@ fn submit_worker() {
             }
             *work = false;
         }
-        pump_unlocked(Why::Submission);
+        let started = std::time::Instant::now();
+        {
+            let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+            let _on = OnSubmit::enter();
+            pump_ready_under_drain(Why::Submission);
+        }
+        WORKER_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
+}
+
+/// Microseconds `victory-submit` spent running queued work since the last
+/// [`take_worker_us`]: host work that, without `VICTORY_ASYNC_SUBMIT=1`,
+/// holds the title's threads.
+#[cfg(windows)]
+static WORKER_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`WORKER_US`] since the last call, cleared (the frame report).
+#[cfg(windows)]
+pub(crate) fn take_worker_us() -> u64 {
+    WORKER_US.swap(0, Ordering::Relaxed)
 }
 
 #[cfg(windows)]
@@ -418,11 +448,16 @@ fn pump_ready_under_drain(why: Why) -> bool {
     moved_any
 }
 
+/// Runs what may run now on the calling thread (`VICTORY_FLIGHT1=1` without
+/// the submit worker), its wait for [`SUBMIT_DRAIN`] and its run counted in
+/// [`BLOCKED_US`] as `why`'s.
 #[cfg(windows)]
 fn pump_unlocked(why: Why) {
-    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);
     let _on = OnSubmit::enter();
+    let entered = std::time::Instant::now();
     pump_ready_under_drain(why);
+    add_run(why, entered);
 }
 
 /// Drains all runnable queued work on `victory-submit` and waits for any
@@ -437,8 +472,11 @@ pub(crate) fn drain_submit(why: Why) {
         host.finish_flight_now();
         return;
     }
-    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    // The calling thread waits here for the submit worker's turn and the
+    // flight in the air, then runs what is left: counted as `why`'s.
+    let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);
     let _on = OnSubmit::enter();
+    let entered = std::time::Instant::now();
     loop {
         let moved = pump_ready_under_drain(why);
         let landed = host.finish_flight_now();
@@ -446,6 +484,7 @@ pub(crate) fn drain_submit(why: Why) {
             break;
         }
     }
+    add_run(why, entered);
 }
 
 /// Called by synchronous `Host::execute` callers (`present`, `resource.rs`,
@@ -456,7 +495,7 @@ pub(crate) fn before_sync() {
     if (crate::host::async_submit_enabled() || crate::host::flight1_enabled())
         && !ON_SUBMIT_THREAD.with(std::cell::Cell::get)
     {
-        drain_submit(Why::Submission);
+        drain_submit(Why::Sync);
     }
 }
 
@@ -486,8 +525,22 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 /// the pump, the host submissions included. The thread that called is held
 /// for both: a title thread for all but [`Why::Timer`], which is ours. The
 /// frame report divides them by its frames ([`take_blocked`]).
+///
+/// With `VICTORY_ASYNC_SUBMIT=1` a title's call only queues its work, and
+/// `[1]` is that; the threads that wait for the submit worker to drain
+/// (PresentX, our synchronous host work) count the lock they wait for in
+/// `[0]` and what they then wait for and run in `[1]`. The worker's own
+/// time is [`WORKER_US`].
 #[cfg(windows)]
-static BLOCKED_US: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
+static BLOCKED_US: [[AtomicU64; 2]; WHY_NAMES.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; WHY_NAMES.len()];
+
+/// Adds the microseconds since `entered` to `why`'s time in the pump
+/// ([`BLOCKED_US`]`[why][1]`).
+#[cfg(windows)]
+fn add_run(why: Why, entered: std::time::Instant) {
+    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
 
 /// [`held`] for a caller that runs held work for `why`, its wait for the
 /// lock counted in [`BLOCKED_US`].
@@ -510,14 +563,16 @@ fn lock_timed<'a, T>(
 
 /// [`Why`]'s variants in their order, as the frame report names them: the
 /// title's submissions, its queues' Signals and Waits, its CPU fence calls,
-/// its presents, and our timer thread.
+/// its presents, our synchronous host work behind queued work, and our
+/// timer thread.
 #[cfg(windows)]
-pub(crate) const WHY_NAMES: [&str; 6] = [
+pub(crate) const WHY_NAMES: [&str; 7] = [
     "title submissions",
     "queue signals",
     "queue waits",
     "fence calls",
     "presents",
+    "our syncs",
     "our timer",
 ];
 #[cfg(windows)]
@@ -526,7 +581,7 @@ const _: () = assert!(Why::Timer as usize + 1 == WHY_NAMES.len());
 /// [`BLOCKED_US`] since the last call, cleared: for each [`Why`], the
 /// microseconds waiting for the queues' lock and in the pump.
 #[cfg(windows)]
-pub(crate) fn take_blocked() -> [[u64; 2]; 6] {
+pub(crate) fn take_blocked() -> [[u64; 2]; WHY_NAMES.len()] {
     BLOCKED_US
         .each_ref()
         .map(|w| w.each_ref().map(|a| a.swap(0, Ordering::Relaxed)))
@@ -562,7 +617,9 @@ pub(crate) fn pump_held_if_free(why: Why) {
         } else if crate::host::flight1_enabled() {
             if let Ok(_drain) = SUBMIT_DRAIN.try_lock() {
                 let _on = OnSubmit::enter();
+                let entered = std::time::Instant::now();
                 pump_ready_under_drain(why);
+                add_run(why, entered);
             }
         } else if let Ok(mut held) = HELD.try_lock() {
             pump(&mut held, why);
@@ -614,7 +671,7 @@ fn join_lists() -> usize {
 fn pump(held: &mut Holding, why: Why) {
     let entered = std::time::Instant::now();
     pump_work(held, why);
-    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+    add_run(why, entered);
 }
 
 #[cfg(windows)]
@@ -743,7 +800,7 @@ fn account_frame(frame: u64) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
-    let mut by = [0u32; 7];
+    let mut by = [0u32; 8];
     for r in &a.released {
         by[r.2 as usize] += 1;
     }
@@ -763,7 +820,7 @@ fn account_frame(frame: u64) {
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; coalesced BoP waits and hazard splits; time in the pump \
+         submission/signal/wait/fence/present/sync/timer/flight {by:?}; coalesced BoP waits and hazard splits; time in the pump \
          outside host submissions; events the title waited on for fence values and their summed waits); held at the \
          present: {}",
         blocked.len()
@@ -1282,7 +1339,7 @@ extern "system" fn copy_page_mappings(
     #[cfg(windows)]
     {
         if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
-            drain_submit(Why::Submission);
+            drain_submit(Why::Sync);
         }
         if held().holds_work(this as usize) {
             account().mappings += 1;

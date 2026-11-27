@@ -2274,6 +2274,9 @@ impl Host {
             let _ = (i, started);
         }
         drop(split_pool);
+        if flight1_enabled() {
+            self.note_gpu_free(std::time::Instant::now());
+        }
         let done = *submitted;
         SUBMISSIONS_DONE.store(done, Ordering::Release);
         // The GPU fence has completed: return worker-owned staging chunks now.
@@ -5636,6 +5639,9 @@ impl Meter {
                  running it: {}",
                 held.join(", ")
             );
+            // With VICTORY_ASYNC_SUBMIT=1 / VICTORY_FLIGHT1=1: what the
+            // submit worker did instead, and how long the host GPU waited.
+            flight::log_frame(report_frames);
             #[cfg(feature = "diagnostics")]
             {
                 if let Some([(local, budget), (system, system_budget)]) = video_memory() {

@@ -668,7 +668,8 @@ impl Shadow {
         shadow
     }
 
-    #[cfg(test)]
+    /// Whether this is title memory itself (aliased onto `buffer`'s pages),
+    /// not a copy of it.
     pub(crate) fn is_aliased(&self) -> bool {
         self.aliased
     }

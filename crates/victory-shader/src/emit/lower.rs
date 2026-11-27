@@ -488,8 +488,7 @@ struct Lower<'a> {
     memory_null: Option<V>,
     /// The offsets [`Lower::memory`] returned ([`Lower::raw_run`]).
     memory_offsets: HashSet<V>,
-    /// Reads of title memory that may cross onto the next page, by handle
-    /// ([`Lower::page_tail`]).
+    /// Reads that may cross onto the next page, by handle ([`Lower::page_tail`]).
     tails: Map<V, pages::Tail>,
     /// The read being looked up lies in one page, as its caller knows.
     one_page: bool,
@@ -503,7 +502,7 @@ struct Lower<'a> {
     /// Loop exit tests lanes outside the loop's entry predicate may take
     /// at once, if the loop allows (`entry_exit`).
     entry_exits: Vec<entry_exit::Candidate>,
-    /// Loop exit tests rewritten so (`entry_exit`).
+    /// Loop exit tests rewritten (`entry_exit`).
     loop_entry_exits: usize,
     /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
     /// the one in force at the instruction being lowered (see [`round16`]).
@@ -5385,11 +5384,9 @@ impl<'a> Lower<'a> {
     /// [`super::shader::MEMORY_SPACE`]; the root UAV `u0` there takes a bit
     /// per page written and per page or 256 MiB region missed. May end in a
     /// new block: callers take [`Lower::cur`] afresh.
-    // A read of more than a dword that crosses onto the next 64 KiB page
-    // looks that page up too and takes its dwords there from that page's
-    // copy (`pages`); a BVH node's reads see to that themselves (`bvh`).
-    // shortcut: one lookup for an access of a dword or less, which lies in
-    // one page unless its address is not 4-byte aligned.
+    // A read over a dword that crosses a 64 KiB page also looks up the
+    // next page (`pages`; BVH reads do it in `bvh`). Shortcut: one lookup
+    // for a dword or less.
     pub(crate) fn memory(
         &mut self,
         lo: V,
@@ -7662,10 +7659,8 @@ impl<'a> Lower<'a> {
                 // for a value the same in both halves, or where the group is
                 // one host wave.
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
-                // Alike in the lanes that made it: in a block predication
-                // runs in every lane the others hold an old value, and a
-                // half may have none of the first. There it is read as any
-                // other: from a lane of the predicate, between the halves.
+                // Alike in the lanes that made it; in a predicated block
+                // the others hold old values, so read it as any other.
                 let is_alike = self.pred_active(self.cur_ir).is_none()
                     && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
                         if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
@@ -9666,10 +9661,7 @@ impl<'a> Lower<'a> {
                 // taken where the guard is live — inside, a ballot of the
                 // branch's own condition is not exact under D3DMetal. A
                 // glc-set umax reads its old value, so it cannot reduce.
-                // What these write involves only the lanes of `guard`: the
-                // reduction reads lanes of the guard's ballot and others
-                // offer 0, the identity of `umax`; the lock runs inside
-                // the guarded region (`entry_exit`).
+                // Only the lanes of `guard` take part (`entry_exit`).
                 let quiet = u32::from(guard.is_some());
                 self.s.quiet += quiet;
                 let (value, not_rep) = if self.x.atomic_umax

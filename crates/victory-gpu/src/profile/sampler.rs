@@ -1866,6 +1866,113 @@ mod tests {
         }
     }
 
+    /// mac: "alone" is not zero where one real thread runs: a spinner
+    /// beside threads that wait, read a file or fault all the time (left
+    /// out of looks) is alone in nearly all its running samples, and the
+    /// faulting thread's left-out looks are never running.
+    #[test]
+    fn a_thread_running_beside_waiting_reading_and_faulting_ones_is_alone() {
+        use windows_sys::Win32::System::Diagnostics::Debug::{
+            AddVectoredExceptionHandler, RemoveVectoredExceptionHandler,
+        };
+        use windows_sys::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, PAGE_READONLY, VirtualProtect};
+        // SAFETY: our handler, removed below.
+        let handler = unsafe { AddVectoredExceptionHandler(1, Some(on_fault)) };
+        assert!(!handler.is_null());
+        // SAFETY: a fresh page of ours.
+        let guarded = unsafe { VirtualAlloc(null(), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(guarded, 0);
+        GUARDED.store(guarded, Relaxed);
+        let (mut read_end, mut write_end): (HANDLE, HANDLE) = (null_mut(), null_mut());
+        // SAFETY: out pointers to two handles.
+        assert_ne!(unsafe { CreatePipe(&mut read_end, &mut write_end, null(), 0) }, 0);
+        let read_at = read_end as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel::<(usize, u32)>();
+        // 0 spins, 1 sleeps, 2 reads a pipe, 3 faults on a guarded page.
+        let workers: Vec<_> = (0..4)
+            .map(|kind| {
+                let (stop, tx) = (stop.clone(), tx.clone());
+                std::thread::spawn(move || {
+                    // SAFETY: a plain query.
+                    tx.send((kind, unsafe { GetCurrentThreadId() })).unwrap();
+                    let mut n = 0u64;
+                    match kind {
+                        0 => n = calls_spin(&stop),
+                        1 => {
+                            while !stop.load(Relaxed) {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                        }
+                        2 => {
+                            let (mut byte, mut got) = (0u8, 0u32);
+                            // SAFETY: the pipe lives until after the join.
+                            unsafe { ReadFile(read_at as HANDLE, &mut byte, 1, &mut got, null_mut()) };
+                        }
+                        _ => {
+                            while !stop.load(Relaxed) {
+                                let mut old: PAGE_PROTECTION_FLAGS = 0;
+                                // SAFETY: our page; the handler gives it back.
+                                unsafe {
+                                    VirtualProtect(guarded as *const c_void, 4096, PAGE_READONLY, &mut old);
+                                    (guarded as *mut u64).write_volatile(n);
+                                }
+                                n += 1;
+                            }
+                        }
+                    }
+                    n
+                })
+            })
+            .collect();
+        let mut ids = [0u32; 4];
+        for _ in 0..4 {
+            let (kind, id) = rx.recv().unwrap();
+            ids[kind] = id;
+        }
+        let filter = ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
+        let mut s = Sampler::new(config(&filter, "NUL"), Vec::new()).unwrap();
+        run_for(&mut s, Duration::from_millis(1500));
+        stop.store(true, Relaxed);
+        // SAFETY: our pipe.
+        unsafe {
+            let mut written = 0;
+            WriteFile(write_end, [1u8].as_ptr(), 1, &mut written, null_mut());
+        }
+        for w in workers {
+            w.join().unwrap();
+        }
+        GUARDED.store(0, Relaxed);
+        // SAFETY: ours, not used again.
+        unsafe {
+            RemoveVectoredExceptionHandler(handler);
+            VirtualFree(guarded as *mut c_void, 0, MEM_RELEASE);
+            CloseHandle(read_end);
+            CloseHandle(write_end);
+        }
+        eprintln!("spinner beside waiting, reading and faulting threads: {}", stats(&s));
+        let acc_of = |id: u32| s.threads.iter().find(|t| t.id == id).unwrap().totals.acc;
+        for (kind, &id) in ids.iter().enumerate() {
+            eprintln!("  kind {kind}, thread {id}: {:?}", acc_of(id));
+        }
+        let spinner = acc_of(ids[0]);
+        assert!(spinner.running.samples >= 200, "{spinner:?}");
+        assert!(
+            spinner.alone.samples * 10 >= spinner.running.samples * 8,
+            "the spinner is seldom alone: {spinner:?}"
+        );
+        let faulting = acc_of(ids[3]);
+        assert!(s.skipped > 0, "no look was left out: {}", stats(&s));
+        assert!(faulting.unseen.samples > 0, "{faulting:?}");
+        assert!(acc_of(ids[1]).running.samples * 10 <= acc_of(ids[1]).all.samples);
+        assert!(acc_of(ids[2]).io.samples * 10 >= acc_of(ids[2]).all.samples * 9);
+        // The whole report: alone time is there, the left-out mark is not
+        // in a running table.
+        let text = s.render(true);
+        assert!(!text.contains("not looked at (an exception)"), "{text}");
+        assert!(s.all.acc.alone.samples > 0);
+    }
+
     #[test]
     fn threads_that_fault_and_call_the_system_survive_sampling() {
         let kinds: Vec<u32> = std::env::var("PROFILE_KINDS").map_or(vec![0, 1, 2, 3], |v| {

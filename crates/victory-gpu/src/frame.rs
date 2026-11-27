@@ -8,6 +8,13 @@
 //!
 //! shortcut: event offsets are ignored (every event is at the tick); tie
 //! the clock to presentation if a title paces by them.
+//!
+//! `VICTORY_LOADING_HZ=<hz>` (any build, off unless set) paces frames at
+//! that rate until the world's first frame (`bench::world_frame`), then at
+//! the title's own interval: Grand Theft Auto VI streams the world by its
+//! own frames, so its menus and loading screens, capped at its 30 Hz,
+//! load faster when their frames come sooner; the world, its cinematics
+//! included, is paced as without it.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::sync::Mutex;
@@ -30,6 +37,9 @@ struct Clock {
     interval: Duration,
     /// The tick number at `start` (ticks go on across interval changes).
     first: u64,
+    /// While the clock runs at `VICTORY_LOADING_HZ`'s interval: the
+    /// title's, which it changes to at the world's first frame.
+    after_loading: Option<Duration>,
 }
 
 static CLOCK: Mutex<Option<Clock>> = Mutex::new(None);
@@ -39,12 +49,35 @@ fn clock() -> std::sync::MutexGuard<'static, Option<Clock>> {
     CLOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The interval of `hz` frames a second, if that is a whole number above 0
+/// and at most 10^9.
+fn hz_interval(hz: &str) -> Option<Duration> {
+    let hz = hz.trim().parse::<u32>().ok()?;
+    Duration::from_secs(1)
+        .checked_div(hz)
+        .filter(|interval| !interval.is_zero())
+}
+
 #[cfg(any(feature = "diagnostics", test))]
 fn test_interval(requested: Duration, hz: Option<&str>) -> Duration {
-    hz.and_then(|hz| hz.parse::<u32>().ok())
-        .and_then(|hz| Duration::from_secs(1).checked_div(hz))
-        .filter(|interval| !interval.is_zero())
-        .unwrap_or(requested)
+    hz.and_then(hz_interval).unwrap_or(requested)
+}
+
+/// `VICTORY_LOADING_HZ`'s interval, read once.
+fn loading_interval() -> Option<Duration> {
+    static LOADING: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *LOADING.get_or_init(|| {
+        let hz = std::env::var("VICTORY_LOADING_HZ").ok()?;
+        let interval = hz_interval(&hz);
+        match interval {
+            Some(interval) => tracing::info!(
+                ?interval,
+                "VICTORY_LOADING_HZ: frames paced at this interval until the world's first frame"
+            ),
+            None => tracing::warn!(hz, "VICTORY_LOADING_HZ: not a frame rate; ignored"),
+        }
+        interval
+    })
 }
 
 /// Device method: a frame every `length` microseconds. The period is how
@@ -70,8 +103,25 @@ pub(crate) extern "system" fn set_interval(
     } else {
         tracing::info!(?interval, "frame interval");
     }
-    install_clock(interval, Instant::now());
+    let loading = loading_interval().filter(|_| crate::bench::world_frame() == 0);
+    install_title_clock(interval, Instant::now(), loading);
     S_OK
+}
+
+/// The title's clock: at `loading`'s interval until the world's first
+/// frame if there is one (then at `interval`), else at `interval`.
+fn install_title_clock(
+    interval: Duration,
+    start: Instant,
+    loading: Option<Duration>,
+) -> (Instant, u64) {
+    let installed = install_clock(loading.unwrap_or(interval), start);
+    if loading.is_some()
+        && let Some(c) = clock().as_mut()
+    {
+        c.after_loading = Some(interval);
+    }
+    installed
 }
 
 /// Start a clock ticking once per `interval` from `start`, its first tick
@@ -87,6 +137,7 @@ fn install_clock(interval: Duration, start: Instant) -> (Instant, u64) {
         start,
         interval,
         first,
+        after_loading: None,
     });
     (start, first)
 }
@@ -128,13 +179,43 @@ fn last(kind: u32) -> &'static AtomicU64 {
 /// threads waiting for one kind never take the same tick. `now` is sampled
 /// after taking the lock, so a paused caller does not act on a stale clock.
 fn next_tick(kind: u32, limit: Duration, now: impl FnOnce() -> Instant) -> (u64, Duration) {
+    next_tick_in(kind, limit, now, crate::bench::world_frame() >= 1)
+}
+
+/// [`next_tick`], `in_world` saying whether the world's first frame has
+/// come: a clock at `VICTORY_LOADING_HZ`'s interval then starts again at
+/// the title's, its first tick after the last one handed out.
+fn next_tick_in(
+    kind: u32,
+    limit: Duration,
+    now: impl FnOnce() -> Instant,
+    in_world: bool,
+) -> (u64, Duration) {
     let mut clock = clock();
     let now = now();
     let c = clock.get_or_insert_with(|| Clock {
         start: now,
         interval: SIXTIETH,
         first: 0,
+        after_loading: None,
     });
+    if in_world && let Some(interval) = c.after_loading {
+        let first = LAST
+            .iter()
+            .map(|t| t.load(Ordering::Relaxed))
+            .max()
+            .unwrap_or(0);
+        *c = Clock {
+            start: now,
+            interval,
+            first,
+            after_loading: None,
+        };
+        tracing::info!(
+            ?interval,
+            "the world's first frame: frames paced at the title's interval"
+        );
+    }
     let elapsed = now.saturating_duration_since(c.start).as_nanos();
     let interval = c.interval.as_nanos().max(1);
     let tick = (c.first + (elapsed / interval) as u64).max(last(kind).load(Ordering::Relaxed) + 1);
@@ -391,6 +472,69 @@ mod tests {
         let (succ, succ_wait) = next_tick(FLIP, Duration::MAX, || late_now);
         assert_eq!(succ, late + 1);
         assert!(succ_wait > Duration::ZERO);
+    }
+
+    #[test]
+    fn a_loading_rate_is_a_whole_frame_rate() {
+        assert_eq!(hz_interval("120"), Some(Duration::from_nanos(8_333_333)));
+        assert_eq!(hz_interval(" 60 "), Some(Duration::from_nanos(16_666_666)));
+        for value in ["0", "", "fast", "-30", "29.97", "1000000001"] {
+            assert_eq!(hz_interval(value), None, "{value:?}");
+        }
+    }
+
+    /// With `VICTORY_LOADING_HZ`, frames come at its interval until the
+    /// world's first frame, then at the title's, from then on.
+    #[test]
+    fn a_loading_clock_runs_until_the_world_then_the_titles_does() {
+        let _fixture = Fixture::new();
+        const FLIP: u32 = 2;
+        let title = Duration::from_millis(50);
+        let ms = Duration::from_millis;
+        // Fixed clock samples: a scheduler pause cannot move the ticks.
+        let start = Instant::now();
+        let (_, first) = install_title_clock(title, start, Some(ms(5)));
+        let at = start + ms(7);
+        // Loading: 5 ms ticks. The tick passed is taken at once, the next
+        // one is 5 ms after it.
+        assert_eq!(
+            next_tick_in(FLIP, Duration::MAX, || at, false),
+            (first + 1, Duration::ZERO)
+        );
+        assert_eq!(
+            next_tick_in(FLIP, Duration::MAX, || at, false),
+            (first + 2, ms(3))
+        );
+        // The world: the clock starts again at the title's interval, its
+        // first tick after the last one handed out.
+        assert_eq!(
+            next_tick_in(FLIP, Duration::MAX, || at, true),
+            (first + 3, title)
+        );
+        assert!(
+            clock()
+                .as_ref()
+                .is_some_and(|c| c.interval == title && c.after_loading.is_none())
+        );
+        assert_eq!(
+            next_tick_in(FLIP, Duration::MAX, || at, false),
+            (first + 4, title * 2)
+        );
+    }
+
+    #[test]
+    fn without_a_loading_rate_the_clock_is_the_titles() {
+        let _fixture = Fixture::new();
+        let title = Duration::from_millis(50);
+        install_title_clock(title, Instant::now(), None);
+        assert!(
+            clock()
+                .as_ref()
+                .is_some_and(|c| c.interval == title && c.after_loading.is_none())
+        );
+        // A world frame changes nothing then.
+        let _ = next_tick_in(2, Duration::ZERO, Instant::now, true);
+        assert!(clock().as_ref().is_some_and(|c| c.interval == title));
     }
 
     /// Two waits for one kind that begin together (two threads) take two

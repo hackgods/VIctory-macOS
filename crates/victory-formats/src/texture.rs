@@ -663,6 +663,28 @@ impl Layout {
         slice: u32,
         ranges: &[(usize, usize)],
     ) -> Option<(std::ops::Range<u32>, std::ops::Range<usize>)> {
+        if self.desc.swizzle != Swizzle::LINEAR {
+            return self.tiled_touched_rows(mip, slice, ranges);
+        }
+        let m = self.mips.get(mip as usize)?;
+        let first = if self.desc.dimension == Dimension::Tex3d {
+            (slice == 0).then_some(0)?
+        } else {
+            slice
+        };
+        if first >= self.slices || !self.addressable() {
+            return None;
+        }
+        Some(self.linear_touched_rows(m, first, ranges))
+    }
+
+    #[inline(never)]
+    fn tiled_touched_rows(
+        &self,
+        mip: u32,
+        slice: u32,
+        ranges: &[(usize, usize)],
+    ) -> Option<(std::ops::Range<u32>, std::ops::Range<usize>)> {
         let m = self.mips.get(mip as usize)?;
         let first = if self.desc.dimension == Dimension::Tex3d {
             (slice == 0).then_some(0)?
@@ -723,6 +745,45 @@ impl Layout {
             }
         }
         Some((y0..y1, a..b))
+    }
+
+    // Keep the interval arithmetic out of the tiled row walk.
+    #[inline(never)]
+    fn linear_touched_rows(
+        &self,
+        m: &Mip,
+        first: u32,
+        ranges: &[(usize, usize)],
+    ) -> (std::ops::Range<u32>, std::ops::Range<usize>) {
+        let pitch = m.pitch as usize * self.desc.element_bytes as usize;
+        let bytes = m.width as usize * self.desc.element_bytes as usize;
+        let base = |z: u32| (u64::from(first + z) * self.slice_size + m.offset) as usize;
+        let (mut y0, mut y1) = (m.height, 0);
+        for z in 0..m.depth {
+            let at = base(z);
+            for &(a, b) in ranges {
+                if b <= at {
+                    continue;
+                }
+                let from = if a < at + bytes {
+                    0
+                } else {
+                    (a - at - bytes) / pitch + 1
+                };
+                let to = (b - at).div_ceil(pitch).min(m.height as usize);
+                if from < to {
+                    y0 = y0.min(from as u32);
+                    y1 = y1.max(to as u32);
+                }
+            }
+        }
+        if y0 >= y1 {
+            return (0..0, 0..0);
+        }
+        (
+            y0..y1,
+            base(0) + y0 as usize * pitch..base(m.depth - 1) + (y1 - 1) as usize * pitch + bytes,
+        )
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -1216,6 +1277,68 @@ mod tests {
             walk_changed(37, &mut expected, &fresh, &mut reference);
             assert_eq!(runs, reference);
             assert_eq!(kept, fresh);
+        }
+    }
+
+    #[test]
+    fn linear_row_bounds_match_a_row_scan() {
+        let mut seed = 7u64;
+        for dimension in [Dimension::Tex2d, Dimension::Tex3d] {
+            for width in [1, 17, 64, 257] {
+                let l = Layout::new(&Desc {
+                    dimension,
+                    width,
+                    height: 67,
+                    depth: 3,
+                    mips: 4,
+                    element_bytes: 4,
+                    block: 1,
+                    samples: 1,
+                    swizzle: Swizzle::LINEAR,
+                })
+                .unwrap();
+                for mip in 0..4 {
+                    let m = &l.mips[mip as usize];
+                    for slice in 0..if dimension == Dimension::Tex2d { 3 } else { 1 } {
+                        for _ in 0..100 {
+                            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                            let a = seed as usize % (l.size as usize + 4096);
+                            let len = (seed >> 32) as usize % 8192;
+                            let ranges = match seed & 7 {
+                                0 => vec![],
+                                1 => vec![(a, a)],
+                                _ => vec![(a, a + len), (a + len + 100, a + len + 301)],
+                            };
+                            let mut rows = Vec::new();
+                            for z in 0..m.depth {
+                                for y in 0..m.height {
+                                    let at = l.offset(mip, 0, y, z + slice).unwrap() as usize;
+                                    if ranges
+                                        .iter()
+                                        .any(|&(a, b)| b > at && a < at + m.width as usize * 4)
+                                    {
+                                        rows.push(y);
+                                    }
+                                }
+                            }
+                            let expected = if rows.is_empty() {
+                                (0..0, 0..0)
+                            } else {
+                                let from = *rows.iter().min().unwrap();
+                                let to = *rows.iter().max().unwrap() + 1;
+                                (
+                                    from..to,
+                                    l.offset(mip, 0, from, slice).unwrap() as usize
+                                        ..l.offset(mip, 0, to - 1, m.depth - 1 + slice).unwrap()
+                                            as usize
+                                            + m.width as usize * 4,
+                                )
+                            };
+                            assert_eq!(l.touched_rows(mip, slice, &ranges), Some(expected));
+                        }
+                    }
+                }
+            }
         }
     }
 

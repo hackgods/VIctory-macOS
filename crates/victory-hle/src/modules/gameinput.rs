@@ -1154,9 +1154,22 @@ struct Scripted {
     from: Duration,
     to: Duration,
     every: Option<Duration>,
-    /// How long each repeated press is held (`+<hold>`; [`PRESS`] by default).
+    /// How long each repeated press is held (`+<hold>` or `~<hold>`;
+    /// [`PRESS`] by default).
     hold: Duration,
     vk: u8,
+}
+
+#[cfg(any(test, windows))]
+impl Scripted {
+    /// The same entry `by` later; an unbounded end stays unbounded.
+    fn after(self, by: Duration) -> Scripted {
+        Scripted {
+            from: self.from.saturating_add(by),
+            to: self.to.saturating_add(by),
+            ..self
+        }
+    }
 }
 
 /// The virtual key a script names: a letter, a digit, or `Enter`, `Esc`,
@@ -1239,12 +1252,19 @@ fn take_time<'a>(s: &'a str, delims: &str) -> Option<(Duration, &'a str)> {
 /// `<span>` is `<from>-<to>` (bounds; empty parts default to the start, 0,
 /// or no end), and `/<every>[+<hold>]` presses the key again each `<every>`
 /// seconds, each press `<hold>` long (0.2 s by default). A plain
-/// `<seconds>:<key>` is one 0.2 s press at that time.
+/// `<seconds>:<key>` is one 0.2 s press at that time; `<key>~<hold>` holds
+/// each press `<hold>` seconds instead (`5:W~2.5` holds W from 5 to 7.5 s,
+/// `/3:Enter~2.5` is `/3+2.5:Enter`). A range without a repeat already
+/// says how long its key is held, so it takes no `~<hold>`.
 #[cfg(any(test, windows))]
 fn parse_script(list: &str) -> Vec<Scripted> {
     list.split(',')
         .filter_map(|entry| {
             let (at, key) = entry.split_once(':')?;
+            let (key, held) = match key.split_once('~') {
+                Some((key, held)) => (key, Some(take_time(held, "")?.0)),
+                None => (key, None),
+            };
             let vk = key_named(key)?;
             // `<from>-<to>/<every>[+<hold>]`: the `/<every>` part is optional,
             // and `+<hold>` (shorter than `<every>`) lengthens each press,
@@ -1252,17 +1272,22 @@ fn parse_script(list: &str) -> Vec<Scripted> {
             let (span, every, hold) = match at.split_once('/') {
                 Some((span, rest)) => {
                     let (every, rest) = take_time(rest, "+")?;
-                    let hold = match rest.strip_prefix('+') {
-                        Some(hold) => take_time(hold, "")?.0,
-                        None => PRESS,
+                    let hold = match (rest.strip_prefix('+'), held) {
+                        // One hold, not two.
+                        (Some(_), Some(_)) => return None,
+                        (Some(hold), None) => take_time(hold, "")?.0,
+                        (None, held) => held.unwrap_or(PRESS),
                     };
                     if hold.is_zero() || every <= hold {
                         return None;
                     }
                     (span, Some(every), hold)
                 }
-                None => (at, None, PRESS),
+                None => (at, None, held.unwrap_or(PRESS)),
             };
+            if hold.is_zero() {
+                return None;
+            }
             let (from, rest) = if span.trim().is_empty() {
                 every?;
                 (Duration::ZERO, span)
@@ -1270,10 +1295,12 @@ fn parse_script(list: &str) -> Vec<Scripted> {
                 take_time(span, "-")?
             };
             let to = match rest.trim_start().strip_prefix('-') {
+                // A range is held throughout: a `~<hold>` would contradict it.
+                Some(_) if every.is_none() && held.is_some() => return None,
                 Some(to) => take_time(to, "")?.0,
                 None => match every {
-                    // `<seconds>:<key>`: one press, held the default time.
-                    None => from.checked_add(PRESS)?,
+                    // `<seconds>:<key>[~<hold>]`: one press, held `hold`.
+                    None => from.checked_add(hold)?,
                     // A repeat with no end bound runs for as long as input does.
                     Some(_) => Duration::MAX,
                 },
@@ -1327,7 +1354,8 @@ fn complete_lines(bytes: &[u8]) -> (u64, Vec<&[u8]>) {
 }
 
 /// `VICTORY_KEYS_FILE` state: how far into the file we have consumed, the
-/// keys of complete lines waiting to be pressed, and the press in progress.
+/// keys of complete lines waiting to be pressed, the press in progress, and
+/// the timed entries of `VICTORY_KEYS`-style lines.
 #[cfg(any(test, windows))]
 #[derive(Default)]
 struct FileKeys {
@@ -1344,6 +1372,9 @@ struct FileKeys {
     looked: Duration,
     /// The press in progress: when it started, which key.
     held: Option<(Duration, u8)>,
+    /// Entries of lines in the `VICTORY_KEYS` syntax, their times moved on
+    /// to when their line was read; dropped once over.
+    timed: Vec<Scripted>,
 }
 
 #[cfg(any(test, windows))]
@@ -1357,6 +1388,11 @@ impl FileKeys {
     /// in place (even to the same or a longer length) starts parsing over
     /// from byte 0, so no press is dropped or read from mid-line. A UTF-8
     /// BOM at byte 0 is skipped, not matched as part of the first key name.
+    ///
+    /// A line with a `:` is a `VICTORY_KEYS` list whose times count from
+    /// this look, so a steering script can append `0:W~2.5` (hold W 2.5 s
+    /// from now) or `0.5-1.5:J` while it watches the frames; `Stop` lets
+    /// go of every key, timed or queued.
     fn poll(&mut self, path: &std::path::Path, now: Duration) {
         if now.saturating_sub(self.looked) < FILE_POLL {
             return;
@@ -1382,11 +1418,47 @@ impl FileKeys {
         self.offset = start as u64 + used;
         for line in lines {
             let name = String::from_utf8_lossy(line);
-            tracing::info!(key = %name, "a key was asked for (VICTORY_KEYS_FILE)");
-            if let Some(vk) = key_named(name.trim()) {
-                self.pending.push_back(vk);
+            let name = name.trim();
+            if name == "Stop" {
+                tracing::info!("every key let go (VICTORY_KEYS_FILE)");
+                self.pending.clear();
+                self.held = None;
+                self.timed.clear();
+            } else if name.contains(':') {
+                // `VICTORY_KEYS` entries, their times counted from now.
+                let entries = parse_script(name);
+                if entries.is_empty() {
+                    tracing::warn!(keys = name, "no key in this line (VICTORY_KEYS_FILE)");
+                }
+                tracing::info!(
+                    keys = name,
+                    at = now.as_secs_f64(),
+                    "keys were asked for (VICTORY_KEYS_FILE)"
+                );
+                self.timed.extend(entries.into_iter().map(|k| k.after(now)));
+            } else {
+                tracing::info!(key = name, "a key was asked for (VICTORY_KEYS_FILE)");
+                if let Some(vk) = key_named(name) {
+                    self.pending.push_back(vk);
+                }
             }
         }
+    }
+
+    /// The keys to hold at `now`, each once: those of timed entries, and
+    /// the queued press (see [`FileKeys::take_held`]).
+    fn keys_at(&mut self, now: Duration) -> Vec<u8> {
+        self.timed.retain(|k| now < k.to);
+        let mut down = Vec::new();
+        for vk in held_at(&self.timed, now)
+            .into_iter()
+            .chain(self.take_held(now))
+        {
+            if !down.contains(&vk) {
+                down.push(vk);
+            }
+        }
+        down
     }
 
     /// The key to hold at `now`: each queued key is pressed for [`PRESS`],
@@ -1654,6 +1726,108 @@ mod script_tests {
     }
 
     #[test]
+    fn a_tilde_holds_each_press_that_long() {
+        let script = parse_script("5:W~2.5,/3:Enter~2.5,2-20/1:A~0.5,1e-1:X~1e-1");
+        assert_eq!(script.len(), 4);
+        assert_eq!(
+            script[0],
+            Scripted {
+                from: s(5.0),
+                to: s(7.5),
+                every: None,
+                hold: s(2.5),
+                vk: b'W'
+            }
+        );
+        assert_eq!(script[1], parse_script("/3+2.5:Enter")[0]);
+        assert_eq!((script[2].every, script[2].hold), (Some(s(1.0)), s(0.5)));
+        assert_eq!((script[3].from, script[3].to), (s(0.1), s(0.2)));
+        assert_eq!(held_at(&script[..1], s(4.9)), Vec::<u8>::new());
+        assert_eq!(held_at(&script[..1], s(7.4)), [b'W']);
+        assert_eq!(held_at(&script[..1], s(7.5)), Vec::<u8>::new());
+        // What a steering script appends: keys held together, a tap long
+        // enough for a 2-3 fps frame to see.
+        let both = parse_script("0:W~2,0:L~2");
+        assert_eq!(held_at(&both, s(1.9)), [b'W', b'L']);
+        assert_eq!(held_at(&both, s(2.0)), Vec::<u8>::new());
+        assert_eq!(parse_script("0:Enter~0.5")[0].to, s(0.5));
+        for bad in [
+            "2-5:W~1",          // a range is held throughout already
+            "/1+0.5:Enter~0.5", // two holds
+            "/1:Enter~1",       // as long as the period
+            "5:W~0",
+            "5:W~",
+            "5:W~x",
+            "5:W~-1",
+            "5:Nope~1",
+        ] {
+            assert!(parse_script(bad).is_empty(), "{bad} parsed");
+        }
+    }
+
+    #[test]
+    fn keys_file_timed_lines_count_from_when_they_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live");
+        std::fs::write(&path, b"").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(10.0));
+        assert_eq!(keys.keys_at(s(10.0)), Vec::<u8>::new());
+        // Appended while the title runs: held 2.5 s from the look that
+        // reads it, not from when input started.
+        append(&path, b"0:W~2.5\n");
+        keys.poll(&path, s(20.0));
+        assert_eq!(keys.keys_at(s(20.0)), [b'W']);
+        assert_eq!(keys.keys_at(s(22.4)), [b'W']);
+        assert_eq!(keys.keys_at(s(22.5)), Vec::<u8>::new());
+        assert!(keys.timed.is_empty(), "an entry that is over is dropped");
+        // Several entries in a line, one of them later; a partial line
+        // waits for its newline.
+        append(&path, b"0.5:J~1,0-1:A\n0:Ent");
+        keys.poll(&path, s(30.0));
+        assert_eq!(keys.keys_at(s(30.2)), [b'A']);
+        assert_eq!(keys.keys_at(s(30.6)), [b'J', b'A']);
+        assert_eq!(keys.keys_at(s(31.2)), [b'J']);
+        assert_eq!(keys.keys_at(s(31.5)), Vec::<u8>::new());
+        // Consumed lines do not run again; the completed line runs from
+        // the look that completes it.
+        append(&path, b"er\n");
+        keys.poll(&path, s(40.0));
+        assert_eq!(keys.keys_at(s(40.1)), [0x0D]);
+        assert_eq!(keys.keys_at(s(40.2)), Vec::<u8>::new());
+        // Plain key names still queue, pressed alongside timed keys.
+        append(&path, b"0-1:W\nEsc\n");
+        keys.poll(&path, s(50.0));
+        assert_eq!(keys.keys_at(s(50.0)), [b'W', 0x1B]);
+        assert_eq!(keys.keys_at(s(50.3)), [b'W']);
+        // A line without a key it knows schedules nothing.
+        append(&path, b"0:Nope\n");
+        keys.poll(&path, s(60.0));
+        assert_eq!(keys.keys_at(s(60.0)), Vec::<u8>::new());
+        assert!(keys.timed.is_empty());
+        assert_eq!(keys.offset, 47);
+    }
+
+    #[test]
+    fn keys_file_stop_lets_go_of_every_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live");
+        std::fs::write(&path, b"0-30:W\n/1:Enter\nEsc\nTab\n").unwrap();
+        let mut keys = FileKeys::default();
+        keys.poll(&path, s(1.0));
+        assert_eq!(keys.keys_at(s(1.0)), [b'W', 0x0D, 0x1B]);
+        assert_eq!(keys.keys_at(s(1.3)), [b'W']);
+        append(&path, b"Stop\n0:J~1\n");
+        keys.poll(&path, s(1.5));
+        // W, the unbounded repeat, the press in progress and the queued Tab
+        // are let go; the line after `Stop` still runs.
+        assert_eq!(keys.keys_at(s(1.5)), [b'J']);
+        assert!(keys.pending.is_empty());
+        assert_eq!(keys.keys_at(s(2.5)), Vec::<u8>::new());
+        assert_eq!(keys.keys_at(s(3.05)), Vec::<u8>::new());
+    }
+
+    #[test]
     fn invalid_times_schedule_nothing() {
         // No falling back to a shorter number, and no unconsumed trailing
         // characters: each of these entries is refused whole.
@@ -1822,15 +1996,20 @@ mod host {
     /// every `<every>` seconds, each press `<hold>` long (0.2 s by default),
     /// e.g. `2-120/1:Enter` to get through menus a second after they are
     /// ready, not up to a period late, or `2-200/3+2.5:Enter` to hold long
-    /// enough to skip a hold-to-skip cutscene. A key is a letter, a digit, or
-    /// `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right` (the
-    /// stand-in pad's table maps them to buttons).
+    /// enough to skip a hold-to-skip cutscene. `<key>~<hold>` holds a press
+    /// that long (`30:W~2.5`: W from 30 to 32.5 s). A key is a letter, a
+    /// digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`,
+    /// `Right` (the stand-in pad's table maps them to buttons).
     ///
     /// `VICTORY_KEYS_FILE=<path>`: one key name per line (as above), each
     /// pressed for 0.2 s once its line is complete (newline-terminated), in
     /// order, so a script watching the log can press a key exactly when a
     /// screen is ready (`Add-Content <path> Enter`); a line still being
-    /// written is left for the next look.
+    /// written is left for the next look. The file is looked at every
+    /// 0.1 s while the title runs. A line with a `:` is a `VICTORY_KEYS`
+    /// list timed from when it is read (`0:W~2.5` holds W for 2.5 s from
+    /// then, `0.5:J~1` holds J for 1 s from half a second on), to steer
+    /// while watching the frames; `Stop` lets go of every key.
     ///
     /// In every build, so that unattended runs can get past the title's
     /// prompts; unset, it holds nothing.
@@ -1849,10 +2028,10 @@ mod host {
         if let Some(file) = FILE.as_ref() {
             let mut asked = lock(&KEYS_FILE);
             asked.poll(std::path::Path::new(file), now);
-            if let Some(vk) = asked.take_held(now)
-                && !down.contains(&vk)
-            {
-                down.push(vk);
+            for vk in asked.keys_at(now) {
+                if !down.contains(&vk) {
+                    down.push(vk);
+                }
             }
         }
         down

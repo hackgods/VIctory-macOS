@@ -114,7 +114,10 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The pages a tracker has not taken since they changed, what it saves of
 /// pages it armed, its bit in [`DIRTY`] (none: always taken as dirty), and
 /// whether it is a host buffer copy's (the only trackers [`retake`] marks).
-struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool);
+/// The changed pages, the saved bytes, the dirty bit, whether a host buffer
+/// copy holds it ([`track_copy`]), and whether it is a descriptor heap's
+/// ([`track_heap`]).
+struct Changed(Mutex<BTreeSet<usize>>, Mutex<Saved>, Option<u32>, bool, bool);
 
 /// A bit per tracker, set while it holds changed pages: set and cleared
 /// under the tracker's lock, read without one ([`Tracked::clean`]). Dense,
@@ -653,16 +656,24 @@ fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
 /// Only the pages of the range that are such memory are tracked; the rest is
 /// never guarded and is copied whole at each use, as memory with no tracker.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    track_as(start, len, views, false)
+    track_as(start, len, views, false, false)
+}
+
+/// [`track`] for a descriptor heap: its pages are never left open as hot
+/// ([`left_open`]), since a heap page left changed has all its slots synced
+/// again at every take (prison cell: heap slots the title copied 13.5 ->
+/// 28.7 ms a frame, 0.5 -> 1.1 million slots, with heap pages hot).
+pub(crate) fn track_heap(start: usize, len: usize, views: bool) -> Option<Tracked> {
+    track_as(start, len, views, false, true)
 }
 
 /// [`track`] for a host buffer copy: what shaders write lands in it, so a
 /// [`retake`] of its memory marks it.
 pub(crate) fn track_copy(start: usize, len: usize, views: bool) -> Option<Tracked> {
-    track_as(start, len, views, true)
+    track_as(start, len, views, true, false)
 }
 
-fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked> {
+fn track_as(start: usize, len: usize, views: bool, copy: bool, heap: bool) -> Option<Tracked> {
     if len == 0 || !fault_tracking() {
         return None;
     }
@@ -685,7 +696,7 @@ fn track_as(start: usize, len: usize, views: bool, copy: bool) -> Option<Tracked
     // A tracker with untracked parts is never clean: no bit.
     let bit = if untracked.is_empty() { dirty_bit() } else { None };
     set_dirty(bit, true);
-    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy));
+    let changed = Arc::new(Changed(Mutex::new(pages.iter().copied().collect()), Mutex::default(), bit, copy, heap));
     let mut g = guards();
     for &page in &pages {
         g.holders.entry(page).or_default().push(changed.clone());
@@ -1281,12 +1292,14 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
 
 /// Whether a take leaves page `page` open and changed instead of guarding
 /// it: it is hot ([`crate::hot_pages`]) and no host buffer copy holds it,
-/// since a buffer copy's copy-back needs the bytes its guard's fault saves.
+/// since a buffer copy's copy-back needs the bytes its guard's fault saves,
+/// nor a descriptor heap ([`track_heap`]): a changed heap page is synced
+/// slot by slot at every take.
 fn left_open(g: &Guards, page: usize) -> bool {
     if !crate::hot_pages::enabled() || !g.hot.is_hot(page) {
         return false;
     }
-    let open = g.holders.get(&page).is_some_and(|holders| holders.iter().all(|c| !c.3));
+    let open = g.holders.get(&page).is_some_and(|holders| holders.iter().all(|c| !c.3 && !c.4));
     #[cfg(feature = "diagnostics")]
     if open {
         crate::copystat::add(crate::copystat::C::HotKept, 1);
@@ -1754,12 +1767,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pages_written_every_frame_are_left_open_unless_a_buffer_copy_holds_them() {
+    fn pages_written_every_frame_are_left_open_unless_a_buffer_copy_or_heap_holds_them() {
         use crate::hot_pages::{HOLD, STREAK};
         crate::hot_pages::force_on_this_thread();
         let p = pool(2);
         let tex = track(p, 2 * PAGE, true).expect("pool memory is tracked");
         let copy = track_copy(p + PAGE, PAGE, true).expect("tracked");
+        // A descriptor heap's page, written every frame too.
+        let h = pool(1);
+        let heap = track_heap(h, PAGE, true).expect("tracked");
+        assert_eq!(heap.take(h, h + PAGE), [(h, h + PAGE)]);
         assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
         assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
         for _ in 0..STREAK {
@@ -1771,8 +1788,13 @@ pub(crate) mod tests {
             }
             assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
             assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+            // SAFETY: committed page of ours, opened by the guard's fault.
+            unsafe { (h as *mut u8).write_volatile(1) };
+            assert_eq!(heap.take(h, h + PAGE), [(h, h + PAGE)]);
             frame_presented();
         }
+        assert!(read_only(h), "a descriptor heap's page stays guarded");
+        assert!(heap.clean());
         // The first page, held by the texture's tracker alone, is hot: left
         // open and changed, so every take copies it. The second, which a
         // buffer copy holds, is guarded as before.
@@ -1796,8 +1818,9 @@ pub(crate) mod tests {
         assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + PAGE)]);
         assert!(read_only(p), "guarded again after the hold");
         assert!(tex.take(p, p + 2 * PAGE).is_empty());
-        drop((tex, copy));
+        drop((tex, copy, heap));
         free(p);
+        free(h);
     }
 
     #[test]

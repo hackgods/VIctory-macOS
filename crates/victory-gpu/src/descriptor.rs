@@ -1104,7 +1104,7 @@ pub(crate) extern "system" fn create_heap(
         pending: Default::default(),
         #[cfg(windows)]
         written: (placed && visible)
-            .then(|| crate::watch::track(start as usize, size as usize, true))
+            .then(|| crate::watch::track_heap(start as usize, size as usize, true))
             .flatten(),
     });
     // mac: the title's own stores tell this heap's slots

@@ -1289,10 +1289,10 @@ impl<'a> Lower<'a> {
             args.resize(3 + 4, iu);
             args.push(self.s.m.i8((1u8 << n) - 1));
             args.push(self.s.m.i32(4));
-            let changes = self.store_changes(&args, u32::from(n));
+            let bytes = self.s.m.i32(4 * u32::from(n));
+            let changes = self.store_changes(&args, u32::from(n), off, bytes);
             self.s
                 .op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
-            let bytes = self.s.m.i32(4 * u32::from(n));
             self.mark_view_write(h, off, bytes, changes);
             self.end_guarded(at, &[]);
             return Ok(());
@@ -10879,7 +10879,7 @@ impl<'a> Lower<'a> {
             }
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
-            let changes = if typed { None } else { self.store_changes(&args, count) };
+            let changes = if typed { None } else { self.store_changes(&args, count, byte, bytes) };
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
             self.mark_view_write(args[0], byte, bytes, changes);
             self.end_guarded(at, &[]);

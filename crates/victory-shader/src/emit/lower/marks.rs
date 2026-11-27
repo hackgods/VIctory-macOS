@@ -20,6 +20,16 @@
 //!
 //! Atomics, the byte and half stores made of two atomics, and stores
 //! through typed views mark as before, whatever they write.
+//!
+//! The load sees the host's copy, which holds the title's bytes at
+//! submission (every view a shader can store through is brought up to
+//! date then) but for one case: bytes shaders wrote that the host kept
+//! from title memory because their list's writes were withheld. A store of
+//! the same bytes by a later list would find nothing changed, and the
+//! title would never get them. The host keeps a bit per such page (the
+//! kept pages, after the written pages' buffer:
+//! [`crate::emit::VIEW_KEPT_AT`]); a store to a kept page marks whatever
+//! it stores, as every store did.
 
 use super::*;
 
@@ -35,12 +45,17 @@ impl Lower<'_> {
     /// arguments `args` (handle, two coordinates, the dwords, mask and
     /// alignment, as `rawBufferStore` takes them) changes a dword of what
     /// is there, loaded in the current block (call it before the store):
-    /// the lanes to mark in. `None` to mark as before: without precise
-    /// marks, or through a handle whose writes are not marked.
-    pub(super) fn store_changes(&mut self, args: &[V], count: u32) -> Option<V> {
-        if !PRECISE_MARKS.get() || !self.x.view_marks || !self.s.view_index.contains_key(&args[0]) {
+    /// the lanes to mark in. `x` and `bytes` are the store's first byte
+    /// in the view and its length: a store to a page the host keeps
+    /// shaders' bytes of marks whatever it stores. `None` to mark as
+    /// before: without precise marks, or through a handle whose writes are
+    /// not marked.
+    pub(super) fn store_changes(&mut self, args: &[V], count: u32, x: V, bytes: V) -> Option<V> {
+        if !PRECISE_MARKS.get() || !self.x.view_marks {
             return None;
         }
+        let &index = self.s.view_index.get(&args[0])?;
+        let kept = self.kept_page(index, x, bytes);
         let c = self.cur;
         let count = count.min(4);
         let (mask, align) = (self.s.m.i8((1u8 << count) - 1), self.s.m.i32(4));
@@ -55,7 +70,54 @@ impl Lower<'_> {
                 None => differs,
             });
         }
-        changes
+        changes.map(|any| self.s.m.bin(c, Bin::Or, any, kept))
+    }
+
+    /// Whether the page of the first or the last byte of a store of `bytes`
+    /// bytes at byte `x` of the view at heap index `index` is one whose
+    /// copy keeps bytes of shaders that title memory lacks: its bit among
+    /// the kept pages, numbered as the written pages are (the view's base
+    /// bit and phase from the mark table, as [`Lower::mark_view_write`]
+    /// reads them). False for a view without marks.
+    fn kept_page(&mut self, index: V, x: V, bytes: V) -> V {
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let table = self.s.view_marks_handle();
+        let c = self.cur;
+        let eight = k(self, 8);
+        let at = self.s.m.bin(c, Bin::Mul, index, eight);
+        let (base, phase) = self.raw_pair(table, at);
+        let none = k(self, crate::emit::VIEW_MARK_NONE);
+        let valid = self.s.m.cmp(c, pred::NE, base, none);
+        let first = self.s.m.bin(c, Bin::Add, phase, x);
+        let (zero, one) = (k(self, 0), k(self, 1));
+        let nonempty = self.s.m.cmp(c, pred::NE, bytes, zero);
+        let span = self.s.m.bin(c, Bin::Sub, bytes, one);
+        let span = self.s.m.select(c, nonempty, span, zero);
+        let last = self.s.m.bin(c, Bin::Add, first, span);
+        let (k16, cap) = (k(self, 16), k(self, crate::emit::VIEW_WRITE_BITS - 1));
+        let (k5, k2, k31, kept_at) = (k(self, 5), k(self, 2), k(self, 31), k(self, crate::emit::VIEW_KEPT_AT));
+        let bitmap = self.s.view_writes_handle();
+        let mut any = None;
+        for byte in [first, last] {
+            let page = self.s.m.bin(c, Bin::LShr, byte, k16);
+            let n = self.s.m.bin(c, Bin::Add, base, page);
+            let over = self.s.m.cmp(c, pred::IUGT, n, cap);
+            let n = self.s.m.select(c, over, cap, n);
+            let word = self.s.m.bin(c, Bin::LShr, n, k5);
+            let word = self.s.m.bin(c, Bin::Shl, word, k2);
+            let word = self.s.m.bin(c, Bin::Add, word, kept_at);
+            let bit = self.s.m.bin(c, Bin::And, n, k31);
+            let bits = self.raw_dword(bitmap, word);
+            let bits = self.s.m.bin(c, Bin::LShr, bits, bit);
+            let bits = self.s.m.bin(c, Bin::And, bits, one);
+            let set = self.s.m.cmp(c, pred::NE, bits, zero);
+            any = Some(match any {
+                Some(other) => self.s.m.bin(c, Bin::Or, other, set),
+                None => set,
+            });
+        }
+        let any = any.expect("two bytes");
+        self.s.m.bin(c, Bin::And, any, valid)
     }
 
     /// `dx.op.rawBufferLoad.f32` of `args`, in `block`.

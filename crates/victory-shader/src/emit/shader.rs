@@ -98,6 +98,16 @@ pub const ATOMIC_LOCKS_GAVE_UP_AT: u32 = ATOMIC_LOCKS_AT + 4 * ATOMIC_LOCKS;
 /// The bytes of the buffer bound at `u`[`VIEW_WRITES`]: the written pages,
 /// the read marks, the lock words, then the count of lanes that gave up.
 pub const VIEW_WRITES_BYTES: u32 = ATOMIC_LOCKS_GAVE_UP_AT + 4;
+/// The byte in that buffer of the kept pages' bits, one per written-pages
+/// bit ([`VIEW_WRITE_BITS`] of them), for stores that mark only what they
+/// change ([`super::Options::precise_marks`]): the host sets a page's bit
+/// while its copy holds bytes shaders wrote that did not go back to title
+/// memory (their list's writes were withheld), and a store to such a page
+/// marks whatever it stores. The buffer is then
+/// [`VIEW_WRITES_BYTES_KEPT`] long.
+pub const VIEW_KEPT_AT: u32 = VIEW_WRITES_BYTES;
+/// [`VIEW_WRITES_BYTES`] with the kept pages' bits after it.
+pub const VIEW_WRITES_BYTES_KEPT: u32 = VIEW_KEPT_AT + VIEW_WRITE_BITS / 8;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {

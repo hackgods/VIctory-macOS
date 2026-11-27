@@ -1584,7 +1584,8 @@ fn bitmap(memory: bool) -> Option<&'static Bitmap> {
         .get_or_init(|| {
             // Written pages, then one read mark per heap index, then the lock
             // words of emulated 64-bit atomics.
-            let bytes = u64::from(victory_shader::emit::VIEW_WRITES_BYTES);
+            // Then the kept pages (stores that mark only what they change).
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITES_BYTES_KEPT);
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages and read slots".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
@@ -1806,6 +1807,60 @@ thread_local! {
     static MARKED_COPY_BACK_PARALLEL: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Sets or clears page bit `n` among the kept pages of both bitmaps
+/// (`victory_shader::emit::VIEW_KEPT_AT`), between submissions.
+fn set_kept(n: u32, kept: bool) {
+    let at = (victory_shader::emit::VIEW_KEPT_AT / 4 + n / 32) as usize;
+    for memory in [false, true] {
+        // Only a bitmap that was made: making one for this would bind it nowhere.
+        let Some(Some(b)) = BITMAPS[usize::from(memory)].get() else {
+            continue;
+        };
+        // SAFETY: inside the mapped bitmap (`n` is a written-pages bit); the
+        // GPU is done with it (one submission runs at a time).
+        unsafe {
+            let word = (b.data as *mut u32).add(at);
+            let bits = word.read_volatile();
+            let bit = 1u32 << (n % 32);
+            let new = if kept { bits | bit } else { bits & !bit };
+            if new != bits {
+                word.write_volatile(new);
+            }
+        }
+    }
+}
+
+/// For tests: the written-pages bit of the 64 KiB page at `page` of the
+/// copy holding it; `None` if the copy has no marks.
+#[cfg(test)]
+fn page_bit_for_test(page: usize) -> Option<u32> {
+    let copy = find(page as u64, 1)?;
+    let m = marks();
+    m.owners
+        .iter()
+        .find(|(_, c)| c.upgrade().is_some_and(|c| Arc::ptr_eq(&c, &copy)))
+        .map(|(&base, _)| base + ((page as u64 >> 16) - (copy.start >> 16)) as u32)
+}
+
+/// For tests: makes the page at `page` a kept page, as a withheld write
+/// would. False if its copy has no marks.
+#[cfg(test)]
+pub(crate) fn keep_page_for_test(page: usize) -> bool {
+    page_bit_for_test(page).map(|n| set_kept(n, true)).is_some()
+}
+
+/// For tests: whether the page at `page` is a kept page (in the bitmap of
+/// shaders that do not use title memory).
+#[cfg(test)]
+pub(crate) fn page_kept_for_test(page: usize) -> bool {
+    let (Some(n), Some(Some(b))) = (page_bit_for_test(page), BITMAPS[0].get()) else {
+        return false;
+    };
+    let at = (victory_shader::emit::VIEW_KEPT_AT / 4 + n / 32) as usize;
+    // SAFETY: inside the mapped bitmap, between submissions.
+    unsafe { (b.data as *const u32).add(at).read_volatile() >> (n % 32) & 1 != 0 }
+}
+
 /// Pages shaders marked as written through views that were compared with
 /// title memory (`[0]`), and those of them that differed and went back
 /// (`[1]`), since the last [`marks_line`].
@@ -1877,17 +1932,25 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
     if marked.is_empty() {
         return;
     }
-    let pages: Vec<(Arc<Shadow>, usize)> = {
+    let pages: Vec<(u32, Arc<Shadow>, usize)> = {
         let m = marks();
-        marked.iter().filter_map(|&n| page_of(&m, n)).collect()
+        marked
+            .iter()
+            .filter_map(|&n| page_of(&m, n).map(|(copy, page)| (n, copy, page)))
+            .collect()
     };
     // Per copy, in page order, so its pages go back together.
     let mut by_copy: Vec<(Arc<Shadow>, Vec<usize>)> = Vec::new();
-    for (copy, page) in pages {
-        if withheld
+    for (n, copy, page) in pages {
+        // A page whose writes stay in the copy (its list's are withheld) is
+        // a kept page until it is next compared with title memory: stores
+        // that mark only what they change then mark it whatever they store
+        // (the copy is ahead of title memory there).
+        let kept = withheld
             .iter()
-            .any(|(c, a, n)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + n)
-        {
+            .any(|(c, a, len)| Arc::ptr_eq(c, &copy) && *a < page + PAGE && page < a + len);
+        set_kept(n, kept);
+        if kept {
             continue;
         }
         match by_copy.iter_mut().find(|(c, _)| Arc::ptr_eq(c, &copy)) {

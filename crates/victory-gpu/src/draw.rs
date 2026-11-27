@@ -6784,8 +6784,16 @@ void main() {
     /// data, byte offset), with write marks, precise or not. The buffer
     /// starts as `start`. Returns the buffer's first dword in title memory
     /// after the submission, and the marked pages the copy-back compared,
-    /// each with whether it differed.
-    fn marked_store(precise: bool, start: u32, values: [u32; 2], ops: &[(u32, u8, u16)]) -> Option<(u32, Vec<bool>)> {
+    /// each with whether it differed. With `keep`, the buffer's page is a
+    /// kept page when the submission runs (as after a withheld write), and
+    /// must not be one after it.
+    fn marked_store(
+        precise: bool,
+        keep: bool,
+        start: u32,
+        values: [u32; 2],
+        ops: &[(u32, u8, u16)],
+    ) -> Option<(u32, Vec<bool>)> {
         use crate::pipeline::{Shader, Translated, host::HostPipeline};
         use victory_shader::native::{ComputeIo, StageIo};
         use victory_shader::{
@@ -6922,13 +6930,19 @@ void main() {
         state.set_constants(true, 0, &[values[0], values[1], 0, 0], 0);
         state.set_table(true, 1, title_heap.start);
         assert!(state.bind(&list, &hp, true), "the dispatch is bound");
+        let page = out_bytes as usize & !(crate::watch::PAGE - 1);
+        if keep {
+            assert!(crate::shadow::keep_page_for_test(page), "the copy's pages have marks");
+        }
         // SAFETY: an open list with everything bound.
         unsafe { list.list.Dispatch(1, 1, 1) };
         list.close();
         host.execute(&[&list]);
         // SAFETY: inside the title buffer.
         let after = unsafe { (out_bytes as *const u32).read_volatile() };
-        let page = out_bytes as usize & !(crate::watch::PAGE - 1);
+        if keep {
+            assert!(!crate::shadow::page_kept_for_test(page), "compared: no longer kept");
+        }
         let seen: Vec<bool> = crate::shadow::MARKED_SEEN.with(|seen| {
             seen.borrow_mut()
                 .drain(..)
@@ -6962,12 +6976,13 @@ void main() {
         const UNMARKED: &[bool] = &[];
         const SAME: &[bool] = &[false];
         const CHANGED: &[bool] = &[true];
-        let Some(first) = marked_store(false, OLD, [OLD, 0], &[(STORE, 0, 0)]) else {
+        let Some(first) = marked_store(false, false, OLD, [OLD, 0], &[(STORE, 0, 0)]) else {
             return; // no host GPU with SM 6.6 here
         };
         // Without the switch every store marks: compared, found the same.
         assert_eq!(first, (OLD, SAME.to_vec()), "as before: a store of the same value");
-        let run = |precise, values, ops: &[(u32, u8, u16)]| marked_store(precise, OLD, values, ops).expect("the same host");
+        let run =
+            |precise, values, ops: &[(u32, u8, u16)]| marked_store(precise, false, OLD, values, ops).expect("the same host");
         for precise in [false, true] {
             // A store that changes the dword marks and lands.
             assert_eq!(run(precise, [NEW, 0], &[(STORE, 0, 0)]), (NEW, CHANGED.to_vec()), "{precise}");
@@ -6991,6 +7006,13 @@ void main() {
         }
         // With the switch, a store of what is there marks nothing.
         assert_eq!(run(true, [OLD, 0], &[(STORE, 0, 0)]), (OLD, UNMARKED.to_vec()));
+        // Unless the page is one whose copy keeps shaders' bytes that title
+        // memory lacks (a withheld write): then it marks, as every store
+        // did, and the page is compared and no longer kept.
+        assert_eq!(
+            marked_store(true, true, OLD, [OLD, 0], &[(STORE, 0, 0)]).expect("the same host"),
+            (OLD, SAME.to_vec())
+        );
         // The store after it, which changes the dword, still marks.
         assert_eq!(
             run(true, [OLD, NEW], &[(STORE, 0, 0), (STORE, 1, 0)]),

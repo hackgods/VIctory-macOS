@@ -412,6 +412,76 @@ fn sync_fast_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_FAST").as_deref() != Some(std::ffi::OsStr::new("0")))
 }
 
+/// `VICTORY_SYNC_REREAD=slot`: a heap sync re-reads each stale slot's
+/// record in a kernel call of its own, as before [`live_records`] read them
+/// together (for timing).
+fn reread_by_slot() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_SYNC_REREAD").as_deref() == Some(std::ffi::OsStr::new("slot"))
+    })
+}
+
+/// Most bytes [`live_records`] reads in one kernel call: a page.
+const REREAD_SPAN: u64 = 64 << 10;
+
+/// The records of `stale` slots (ascending, the record of slot `i` at
+/// `at(i)`) as title memory holds them now, `None` where it cannot be read.
+/// Slots within [`REREAD_SPAN`] bytes are read in one kernel call (or each
+/// in its own with `by_slot`, and where that call fails): a call costs about
+/// 0.5 us under Wine, whether it reads 12 bytes or 4 KiB, and a world frame
+/// re-reads some 30,000 slots.
+fn live_records(
+    stale: &[(u32, [u32; 3])],
+    at: &impl Fn(u32) -> u64,
+    by_slot: bool,
+) -> Vec<Option<[u32; 3]>> {
+    fn record(raw: &[u8]) -> [u32; 3] {
+        let word = |i: usize| u32::from_le_bytes([raw[i], raw[i + 1], raw[i + 2], raw[i + 3]]);
+        [word(0), word(4), word(8)]
+    }
+    let one = |index: u32| {
+        let mut raw = [0u8; 12];
+        crate::host::read_into(at(index) as *const u8, &mut raw).then(|| record(&raw))
+    };
+    let mut live = Vec::with_capacity(stale.len());
+    let mut bytes = Vec::new();
+    let mut i = 0;
+    while i < stale.len() {
+        let first = at(stale[i].0);
+        let mut end = first.saturating_add(12);
+        let mut j = i + 1;
+        while !by_slot && j < stale.len() {
+            let next = at(stale[j].0);
+            if next < end || next.saturating_add(12) - first > REREAD_SPAN {
+                break;
+            }
+            end = next.saturating_add(12);
+            j += 1;
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::SyncRereads, 1);
+        if j == i + 1 {
+            live.push(one(stale[i].0));
+            i = j;
+            continue;
+        }
+        bytes.resize((end - first) as usize, 0);
+        // A run with an unreadable page is read slot by slot, as alone.
+        let whole = crate::host::read_into(first as *const u8, &mut bytes);
+        for &(index, _) in &stale[i..j] {
+            let off = (at(index) - first) as usize;
+            live.push(if whole {
+                Some(record(&bytes[off..off + 12]))
+            } else {
+                one(index)
+            });
+        }
+        i = j;
+    }
+    live
+}
+
 /// Monotonic identity for each [`HostHeap`] so stale dynamic-slot releases
 /// targeting a released heap's recycled address never free a newer heap's slots.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -1509,6 +1579,13 @@ impl HostHeap {
                 }
             }
             if !stale.is_empty() {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::SyncStale, stale.len() as u64);
+                #[cfg(feature = "diagnostics")]
+                let _timed = crate::watch::Timed(
+                    std::time::Instant::now(),
+                    crate::copystat::C::SyncMirrorUs,
+                );
                 self.mirror_synced_batch(&stale, at);
             }
         } else {
@@ -1677,21 +1754,15 @@ impl HostHeap {
                 .map(|&(_, data, _)| data);
             let addr_slots = self.address_slots();
 
+            // Re-read live title memory under `self.made`, before any slot is
+            // made: a slot a title thread overwrote since the page snapshot
+            // (including during `prepare`) is deferred to `mirror` after
+            // dropping locks.
+            let live = live_records(stale, &at, reread_by_slot());
             for (entry_idx, &(index, snapshot)) in stale.iter().enumerate() {
-                let addr = at(index);
-                // Re-read live title memory under `self.made`: if a title
-                // thread overwrote the slot since the page snapshot (including
-                // during `prepare`), defer to `mirror` after dropping locks.
-                // SAFETY: the caller holds the heap alive until the sync completes.
-                let mut raw = [0u8; 12];
-                if !crate::host::read_into(addr as *const u8, &mut raw) {
+                let Some(live) = live[entry_idx] else {
                     continue;
-                }
-                let live = [
-                    u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]),
-                    u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
-                    u32::from_le_bytes([raw[8], raw[9], raw[10], raw[11]]),
-                ];
+                };
                 if live != snapshot {
                     again.push(index);
                     continue;
@@ -1844,6 +1915,8 @@ impl HostHeap {
                 }
             }
 
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::SyncMade, finalize.len() as u64);
             self.keep_batch(kept_updates, &mut retired);
             if !self.sampler {
                 self.viewed.set_batch(&viewed_updates);
@@ -4777,6 +4850,61 @@ mod tests {
         assert_ne!(key1, key2);
         assert!(!heap.publish(1, handle, key1));
         crate::watch::tests::free(mem);
+    }
+
+    /// A heap sync re-reads its stale slots' records together, a run of
+    /// them per page, and gets what reading each alone gets: the live
+    /// record, `None` on a page with nothing mapped.
+    #[test]
+    fn stale_records_are_read_again_together_as_each_alone() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // Three 64 KiB pages, the middle one reserved only.
+        let page = REREAD_SPAN as usize;
+        // SAFETY: fresh memory of our own, committed around a reserved page.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * page, MEM_RESERVE, PAGE_READWRITE) }
+            .cast::<u8>();
+        assert!(!base.is_null());
+        for p in [0, 2] {
+            // SAFETY: inside the reservation above.
+            let at = unsafe {
+                VirtualAlloc(base.add(p * page).cast(), page, MEM_COMMIT, PAGE_READWRITE)
+            };
+            assert!(!at.is_null());
+        }
+        let start = base as u64;
+        let at = |i: u32| start + u64::from(i) * 32;
+        let slots_per_page = (page / 32) as u32;
+        let write = |i: u32, record: [u32; 3]| {
+            // SAFETY: a committed slot of the memory above.
+            unsafe { (at(i) as *mut [u32; 3]).write_unaligned(record) };
+        };
+        // Stale slots on the first page (one written since its snapshot),
+        // on the reserved page, and on the last page.
+        let mut stale = Vec::new();
+        for i in [0, 1, 7, slots_per_page - 1] {
+            write(i, [VIEW_TAG, i, 1]);
+            stale.push((i, [VIEW_TAG, i, 1]));
+        }
+        write(7, [VIEW_TAG, 70, 2]);
+        stale.push((slots_per_page + 3, [VIEW_TAG, 0, 1]));
+        for i in [2 * slots_per_page, 2 * slots_per_page + 5] {
+            write(i, [VIEW_TAG, i, 1]);
+            stale.push((i, [VIEW_TAG, i, 1]));
+        }
+        let together = live_records(&stale, &at, false);
+        assert_eq!(together, live_records(&stale, &at, true));
+        assert_eq!(together.len(), stale.len());
+        for (&(i, snapshot), live) in stale.iter().zip(&together) {
+            match i {
+                7 => assert_eq!(*live, Some([VIEW_TAG, 70, 2]), "written since the snapshot"),
+                i if i / slots_per_page == 1 => assert_eq!(*live, None, "nothing mapped"),
+                _ => assert_eq!(*live, Some(snapshot)),
+            }
+        }
+        // SAFETY: the reservation made above, no longer used.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
     #[test]

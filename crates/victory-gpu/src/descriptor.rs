@@ -1589,6 +1589,18 @@ pub(crate) mod tests {
 
     /// A record the title copies into its shader-visible heap as bytes (no
     /// call) is made on the host at the next sync, and only then.
+    /// Waits (a few seconds at most) for `made` to hold. The ranges a title
+    /// wrote are taken by whichever thread calls `sync_heaps` first, so a
+    /// test's heap may be made by another test's call that is still running
+    /// when this test's own call finds nothing left to do.
+    #[cfg(windows)]
+    fn made_by_the_sync(made: impl Fn() -> bool) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !made() && std::time::Instant::now() < until {
+            std::thread::yield_now();
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn records_copied_as_bytes_are_made_at_the_next_sync() {
@@ -1616,6 +1628,7 @@ pub(crate) mod tests {
             unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot as *mut u8, 16) };
             assert!(!host.made(5));
             sync_heaps();
+            made_by_the_sync(|| host.made(5));
             assert!(host.made(5), "made at the sync");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
@@ -1663,6 +1676,7 @@ pub(crate) mod tests {
             unsafe { std::ptr::copy_nonoverlapping(at as *const u8, slot1 as *mut u8, 16) };
             assert!(!host.made(1));
             sync_heaps();
+            made_by_the_sync(|| host.made(1));
             assert!(host.made(1), "partial 64 KiB page / small heap must still sync");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);

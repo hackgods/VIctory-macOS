@@ -3987,7 +3987,9 @@ impl HostList {
                     if batch.rewritten(dst, src, len) {
                         continue;
                     }
+                    batch.in_title_copy = true;
                     batch.title_copied(dst, len);
+                    batch.in_title_copy = false;
                     crate::alias::title_copy(dst, len, std::mem::take(&mut batch.cut));
                     if matches!(step, Step::Move(..)) {
                         move_mapped(dst as *mut u8, src as *const u8, len);
@@ -4178,6 +4180,9 @@ struct Batch {
     /// copy not into memory shown twice flushes only the pending refreshes
     /// its window can change ([`Batch::title_copied`]).
     overlap_only: bool,
+    /// mac: a title copy's step is running: its refresh batches count
+    /// inside it ([`REFRESH_CLOCK`]).
+    in_title_copy: bool,
 }
 
 /// For the frame line, since the last one: title copies (not into memory
@@ -4201,6 +4206,31 @@ fn flush_line(frames: f64) -> String {
         other_bytes / 1e6,
         other_us / 1e3,
         if crate::mac_switches::flush_overlapping() { " (VICTORY_FLUSH_OVERLAPPING)" } else { "" }
+    )
+}
+
+/// mac: the refresh batches by the clock, since the last frame line:
+/// [`Batch::flush_work`]'s wall microseconds on the submitting thread
+/// outside a title copy's step and inside one ([`Batch::in_title_copy`]),
+/// and the refreshes' own microseconds summed over the threads that made
+/// them (what the line's "copies" ms holds of them).
+static REFRESH_CLOCK: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The frame line's part for [`REFRESH_CLOCK`] (`frames` since the last
+/// one), always, at the end of the line. `copies_ms`, the line's "copies"
+/// ms a frame, is thread time: the refreshes' microseconds on every worker
+/// of a parallel batch ([`Batch::flush_made`]) plus each title copy step's
+/// own time, which holds the wall time of the batch made before the copy.
+/// So the copies' wall time on the submitting thread is `copies_ms` less
+/// the refreshes' thread time, plus the batches made outside title copies.
+fn refresh_clock_line(frames: f64, copies_ms: f64) -> String {
+    let [outside, inside, thread] =
+        REFRESH_CLOCK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames.max(1.0));
+    format!(
+        "; copies by the clock: {:.1} ms on the submitting thread, {:.1} ms of it in refresh batches ({inside:.1} ms \
+         of those inside title copies), whose refreshes took {thread:.1} ms of thread time",
+        (copies_ms - thread + outside).max(0.0),
+        outside + inside,
     )
 }
 
@@ -4396,6 +4426,7 @@ impl Batch {
         let total = self.flush_made(work);
         FLUSHES[counted_at + 2].fetch_add(total as u64, Ordering::Relaxed);
         FLUSHES[counted_at + 3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        REFRESH_CLOCK[usize::from(self.in_title_copy)].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         total
     }
 
@@ -4442,6 +4473,7 @@ impl Batch {
                     }
                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    REFRESH_CLOCK[2].fetch_add(us, Ordering::Relaxed);
                     total += copied;
                     let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                     let (_, have) = match self.current.entry(key) {
@@ -4481,6 +4513,7 @@ impl Batch {
                 }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                REFRESH_CLOCK[2].fetch_add(us, Ordering::Relaxed);
                 total += copied;
                 let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                 // The copy's memory joins the index as its first range
@@ -5239,6 +5272,8 @@ impl Meter {
             // mac: where the refreshes were made (`VICTORY_FLUSH_OVERLAPPING`,
             // from VIctory-macOS #452), always.
             let flushes = flush_line(report_frames);
+            // mac: the copies' wall time against their thread time, always.
+            let refresh_clock = refresh_clock_line(report_frames, copy_ms);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5263,7 +5298,7 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}",
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{refresh_clock}",
                 making = crate::pipeline::making()
             );
             unwaited::log(report_frames);

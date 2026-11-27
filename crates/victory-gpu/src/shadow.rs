@@ -1024,10 +1024,11 @@ impl Shadow {
             }
             return 0;
         }
-        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
+        // Most copies are clean; the lock is only for the ones that are not.
         if self.clean() {
             return 0;
         }
+        let _source = self.widened_source.lock().unwrap_or_else(|e| e.into_inner());
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {

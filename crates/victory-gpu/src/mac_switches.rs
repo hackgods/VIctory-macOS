@@ -1061,45 +1061,6 @@ pub(crate) fn heap_sync_threads(value: Option<&str>, split: bool, most: usize) -
     if split { asked.clamp(1, most.max(1)) } else { 1 }
 }
 
-/// mac: what `VICTORY_ALIAS_PHYSICAL` asks of the title's physical pages
-/// (stage 2, `notes/alias-physical-design.md`; `crate::alias::physical_heap`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AliasPhysical {
-    /// Unset, empty or `0`: each section is a pagefile section, as before.
-    Off,
-    /// `cpu`: each section is backed by a CPU-visible D3D12 heap and every
-    /// title view of its pages is remapped onto it (VIctory-macOS #275's
-    /// section heap): the heap backing alone, the GPU still reads the pages
-    /// through host copies.
-    Cpu,
-}
-
-/// [`AliasPhysical`], read once (at the title's first physical allocation).
-/// `1`, the GPU side too, is not built yet: it and any other value leave
-/// the switch off, with a warning.
-pub(crate) fn alias_physical() -> AliasPhysical {
-    static RULE: OnceLock<AliasPhysical> = OnceLock::new();
-    *RULE.get_or_init(|| {
-        let value = std::env::var("VICTORY_ALIAS_PHYSICAL").ok();
-        alias_physical_rule(value.as_deref()).unwrap_or_else(|| {
-            tracing::warn!(
-                "VICTORY_ALIAS_PHYSICAL={}: only =cpu (the heap backing) is built so far; left off",
-                value.as_deref().unwrap_or_default()
-            );
-            AliasPhysical::Off
-        })
-    })
-}
-
-/// [`alias_physical`]'s rule: `None` for a value that names nothing built.
-fn alias_physical_rule(value: Option<&str>) -> Option<AliasPhysical> {
-    match value.map(str::trim) {
-        None | Some("" | "0") => Some(AliasPhysical::Off),
-        Some("cpu") => Some(AliasPhysical::Cpu),
-        Some(_) => None,
-    }
-}
-
 /// A switch's state: `0` off, `1` on, anything else (and unset) `default`.
 fn setting(value: Option<&str>, default: bool) -> bool {
     match value {
@@ -1185,27 +1146,9 @@ pub(crate) fn key(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::{
-        AliasPhysical, alias_physical_rule, copy_order, epoch, heap_locks, heap_sync_pause,
-        heap_sync_threads, key, overlapping_rule, quick, setting, spans_rule, texture_workers,
-        uav_size, writers,
+        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
+        spans_rule, texture_workers, uav_size, writers,
     };
-
-    #[test]
-    fn alias_physical_is_off_unless_cpu() {
-        assert_eq!(alias_physical_rule(Some("cpu")), Some(AliasPhysical::Cpu));
-        assert_eq!(alias_physical_rule(Some(" cpu ")), Some(AliasPhysical::Cpu));
-        for off in [None, Some(""), Some("0")] {
-            assert_eq!(
-                alias_physical_rule(off),
-                Some(AliasPhysical::Off),
-                "{off:?}"
-            );
-        }
-        // The GPU side (`=1`) is not built: refused, as anything else.
-        for refused in [Some("1"), Some("gpu"), Some("CPU"), Some("yes")] {
-            assert_eq!(alias_physical_rule(refused), None, "{refused:?}");
-        }
-    }
 
     thread_local! {
         /// `snapshot_spans` is on for this thread's snapshots ([`SpansHere`]).

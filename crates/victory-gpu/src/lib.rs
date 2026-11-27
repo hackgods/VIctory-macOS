@@ -127,10 +127,6 @@ mod tdr;
 mod texback;
 #[cfg(windows)]
 mod texture;
-// mac: stage 2's tile plan (`VICTORY_ALIAS_PHYSICAL`); plain std, so its
-// tests run everywhere.
-#[cfg(any(windows, test))]
-mod tile_plan;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
@@ -160,21 +156,12 @@ pub use alias::{
     alias_region, committed as alias_committed, enabled as alias_buffers, unalias_region,
     uncommitted as alias_uncommitted,
 };
-// mac: in every build (`VICTORY_ALIAS_PHYSICAL=cpu`).
-#[cfg(windows)]
+#[cfg(all(windows, feature = "diagnostics"))]
 pub use alias::{PhysicalHeap, physical_heap};
 #[cfg(windows)]
 pub use host::{MeshSupport, host_mesh_support, on_failure};
 #[cfg(windows)]
 pub use physical_runs::{mapped as physical_mapped, unmapped as physical_unmapped};
-// mac: stage 2's counts (`notes/alias-physical-design.md`, I0).
-#[cfg(windows)]
-pub use physical_runs::{
-    pages_changed as physical_pages_changed, reserved as physical_reserved,
-    section as physical_section, shown_changed as physical_shown_changed,
-    shown_delta as physical_shown_delta, tally as physical_tally,
-    view_remap_retried as physical_view_remap_retried,
-};
 #[cfg(windows)]
 pub use watch::{
     Writing as KernelWrite, fault_tracking, rosetta, stores_need_patching, title_memory_aliased,

@@ -672,7 +672,6 @@ impl<'a> Lower<'a> {
         bad: &'a HashMap<Value, Why>,
         keep: Option<&KeptOutputs>,
         per_vertex_center: bool,
-        first_lane_halves: bool,
         meet_plan: &'a Set<MeetSite>,
         meet_found: &'a std::cell::RefCell<Set<MeetSite>>,
     ) -> Self {
@@ -746,7 +745,7 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            } || (first_lane_halves && halves::needs_first_lane(x, &mut alike_cache));
+            } || halves::needs_first_lane(x, &mut alike_cache);
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;

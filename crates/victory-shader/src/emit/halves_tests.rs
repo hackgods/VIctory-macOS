@@ -3881,11 +3881,30 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
 
 /// A program whose only cross-half operations are first-lane reads goes to
 /// halves for them (#522). Where halves cannot pass the read between them,
-/// here in a loop counted to the host wave's first lane, it is translated as
-/// before #522, each host wave reading its own first lane, rather than
-/// refused (its draws dropped).
+/// here in a loop counted to the console wave's first lane, it is refused,
+/// with or without console lanes asked for as well: each 32-lane host wave
+/// reading its own first lane would count the upper half's loop to thread
+/// 32 and store 32 there, where the console stores 0
+/// ([`a_first_lane_read_in_a_loop_matches_the_console_on_every_gpu`]).
 #[test]
-fn first_lane_reads_halves_refuse_fall_back_to_the_host_waves() {
+fn first_lane_reads_halves_cannot_pass_are_refused() {
+    let words = first_lane_in_a_counted_loop();
+    let with_mbcnt = in_a_loop(&[0x7E18_0500], 12, Count::FirstLane);
+    for threads in [64, 128, 256] {
+        for program in [&words, &with_mbcnt] {
+            let why = refusal(program, threads, 0);
+            assert!(
+                why.contains("a first-lane read of a value that may differ between 32-lane halves"),
+                "{threads} threads: {why}"
+            );
+        }
+    }
+}
+
+/// [`in_a_loop`] of `v_readfirstlane_b32 s12, v0` counted to the first
+/// lane, without its `v_mbcnt`: a program whose only cross-half operations
+/// are first-lane reads, one of them in a loop.
+fn first_lane_in_a_counted_loop() -> Vec<u32> {
     let mbcnt = [0xD765_0001, 0x0001_00C1]; // v_mbcnt_lo_u32_b32 v1, -1, 0
     let first = [0x7E18_0500]; // v_readfirstlane_b32 s12, v0
     let with_mbcnt = in_a_loop(&first, 12, Count::FirstLane);
@@ -3893,15 +3912,30 @@ fn first_lane_reads_halves_refuse_fall_back_to_the_host_waves() {
         .windows(2)
         .position(|w| w == mbcnt)
         .expect("in_a_loop's v_mbcnt");
-    let words = [&with_mbcnt[..at], &with_mbcnt[at + 2..]].concat();
-    for threads in [64, 128, 256] {
-        assert_eq!(refusal(&words, threads, 0), "translated", "{threads} threads");
-        // With console lanes asked for as well, the program stays in halves,
-        // and the read is still refused there.
-        let why = refusal(&with_mbcnt, threads, 0);
-        assert!(
-            why.contains("a first-lane read of a value that may differ between 32-lane halves"),
-            "{threads} threads: {why}"
-        );
+    [&with_mbcnt[..at], &with_mbcnt[at + 2..]].concat()
+}
+
+/// A first-lane read the halves cannot pass between them is refused, never
+/// made by each 32-lane host wave from its own first lane: on the console
+/// every lane of a wave64 reads the wave's first lane, thread `l & !63`,
+/// where the upper host wave's own first lane is thread `l & !31`.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_in_a_loop_matches_the_console_on_every_gpu() {
+    let words = first_lane_in_a_counted_loop();
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        match lowered(&native(&words, true, threads, 0), true) {
+            Err(e) => {
+                let why = e.to_string();
+                let across = "a first-lane read of a value that may differ between 32-lane halves";
+                assert!(why.contains(across), "{threads} threads: {why}");
+            }
+            Ok(_) => {
+                let want: Vec<u32> = (0..threads).map(|l| l & !63).collect();
+                failed.extend(differences(&words, threads, 1, &want));
+            }
+        }
     }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

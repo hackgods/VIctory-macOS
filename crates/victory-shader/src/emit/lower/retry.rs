@@ -29,35 +29,8 @@ pub(crate) fn lower_limited(
     literal_halves: bool,
     limits: bool,
 ) -> Result<Lowered, ShaderError> {
-    let lowered = lower_with_literal_retry(parts, keep, per_vertex_center, literal_halves, limits);
-    // A program whose only cross-half operation is a first lane read goes to
-    // halves for it (#522). Where halves cannot read that first lane, the
-    // per-lane form reads each host wave's own first lane, as before: closer
-    // to the console than dropping the program's draws.
-    if matches!(
-        &lowered,
-        Err(ShaderError::Unsupported {
-            what: halves::FIRST_ACROSS,
-            ..
-        })
-    ) && let Ok(l) = lower_with_structure(parts, keep, per_vertex_center, limits, false)
-    {
-        return Ok(l);
-    }
-    lowered
-}
-
-/// The per-lane form, and a 64-thread wave64 program it refuses at a
-/// cross-half gate again in literal halves ([`lower_literal`]).
-fn lower_with_literal_retry(
-    parts: &Parts,
-    keep: Option<&KeptOutputs>,
-    per_vertex_center: bool,
-    literal_halves: bool,
-    limits: bool,
-) -> Result<Lowered, ShaderError> {
     // Retry refusals from the legacy cross-half gates with whole-wave control flow.
-    let original = lower_with_structure(parts, keep, per_vertex_center, limits, true);
+    let original = lower_with_structure(parts, keep, per_vertex_center, limits);
     if !literal_halves
         || !parts.host_wave32
         || !parts.native.wave64
@@ -116,7 +89,6 @@ pub(crate) fn lower_literal(
         // A group in literal halves takes one path: its lanes never leave
         // past a count of threads (`Lower::can_leave_past_a_count`).
         false,
-        true,
     )
 }
 
@@ -125,7 +97,6 @@ fn lower_with_structure(
     keep: Option<&KeptOutputs>,
     per_vertex_center: bool,
     limits: bool,
-    first_lane_halves: bool,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     // Divergent sites where the halves meet (`lower::meet`): a pass that
@@ -133,8 +104,7 @@ fn lower_with_structure(
     let mut plan: Set<MeetSite> = Set::default();
     loop {
         let found = std::cell::RefCell::new(Set::default());
-        let r = Lower::new(parts, &bad, keep, per_vertex_center, first_lane_halves, &plan, &found)
-            .run(limits);
+        let r = Lower::new(parts, &bad, keep, per_vertex_center, &plan, &found).run(limits);
         let found = found.into_inner();
         if !found.is_empty() {
             plan.extend(found);

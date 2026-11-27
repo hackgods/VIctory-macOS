@@ -273,8 +273,10 @@ pub fn enabled() -> bool {
         // With flights the next submission is prepared while the one left
         // on the GPU still writes: its texture uploads can read aliased
         // memory those shaders are writing, which host copies only see when
-        // the copy-back lands (`crate::host::unwaited::flights`).
-        let flights = crate::host::unwaited::flights::on();
+        // the copy-back lands (`crate::host::unwaited::flights`). mac:
+        // unless `VICTORY_FLIGHTS_WITH=alias` checks the uploads against
+        // what that one may write first (`Host::beside_texture_reads`).
+        let flights = crate::host::unwaited::flights::on() && !crate::host::unwaited::flights::with_alias();
         let on = decide_enabled(asked, rosetta, warp) && split.is_some() && !flights;
         if on {
             tracing::info!(
@@ -300,7 +302,8 @@ pub fn enabled() -> bool {
                     "WARP draws in software, its buffers are not the GPU's memory"
                 } else if flights {
                     "VICTORY_FLIGHTS is on: the next submission is prepared while the one on the GPU still writes \
-                     aliased memory, and its texture uploads could read those writes half done"
+                     aliased memory, and its texture uploads could read those writes half done \
+                     (VICTORY_FLIGHTS_WITH=alias checks them)"
                 } else {
                     "VICTORY_COPY_ORDER is not split: without its cuts every command of a submission would read the \
                      bytes of the submission's last title copy into aliased memory, also the commands before the copy"

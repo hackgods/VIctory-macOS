@@ -40,6 +40,13 @@
 //! knows the list ran). The heap sync writes slots the running lists may
 //! read, as the rounds ahead do. A view heap made meanwhile (`Host::quiet`,
 //! VIctory-macOS #31) waits for the GPU first.
+//!
+//! `VICTORY_FLIGHTS_WITH=alias` (E2 of `notes/overlap-stages-design.md`)
+//! keeps title buffers zero-copy (`crate::alias`), where the shaders of the
+//! submission left write title memory itself while the next is prepared.
+//! The next one's texture uploads then finish it first when a texture's
+//! memory could meet what it writes or lands ([`Host::beside_texture_reads`]);
+//! a fill and a step of ours that read title memory follow the same rule.
 
 use super::*;
 
@@ -68,6 +75,60 @@ pub(crate) fn on() -> bool {
             }
             on
         })
+}
+
+/// Turns `alias` on for the tests (with [`FORCED`]).
+#[cfg(test)]
+pub(in crate::host) static FORCED_ALIAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The names of `VICTORY_FLIGHTS_WITH` this build has (bits of
+/// `crate::flights::WITH`): `alias`.
+const BUILT: u32 = 1;
+
+/// mac: `VICTORY_FLIGHTS_WITH=<list>` (`notes/overlap-stages-design.md` §6),
+/// read once: the overlap line's increments taken, as bits of
+/// `crate::flights::WITH`. Nothing without the switch on; each name needs
+/// the ones before it; one line for what is taken and one for each refusal.
+/// `VICTORY_AB` cannot flip it (they carry state across submissions).
+fn with() -> u32 {
+    static WITH: OnceLock<u32> = OnceLock::new();
+    *WITH.get_or_init(|| {
+        let value = std::env::var("VICTORY_FLIGHTS_WITH").unwrap_or_default();
+        if value.trim().is_empty() {
+            return 0;
+        }
+        if !on() {
+            tracing::warn!("VICTORY_FLIGHTS_WITH={value} does nothing without VICTORY_FLIGHTS=1 and VICTORY_ASYNC_SUBMIT=1");
+            return 0;
+        }
+        let (taken, refused) = crate::flights::with_names(&value, BUILT, |i| {
+            (i == 0 && crate::heap_worker::on()).then_some(
+                "the background heap worker (VICTORY_HEAP_WORKER=1) reads texture memory at any time, where the \
+                 check before the uploads cannot see it",
+            )
+        });
+        for why in refused {
+            tracing::warn!("VICTORY_FLIGHTS_WITH refused {why}");
+        }
+        if taken & 1 != 0 {
+            tracing::info!(
+                "VICTORY_FLIGHTS_WITH=alias: title buffers stay aliased with flights (VICTORY_ALIAS_BUFFERS); the \
+                 texture uploads of a submission prepared while the one before runs finish that one first where a \
+                 texture's memory, or the memory a fill or a step of ours reads, is in what it may write or (if it \
+                 writes anything) is shown at another address too"
+            );
+        }
+        taken
+    })
+}
+
+/// Whether flights take zero-copy title buffers (`VICTORY_FLIGHTS_WITH=alias`).
+pub(crate) fn with_alias() -> bool {
+    #[cfg(test)]
+    if FORCED_ALIAS.load(Relaxed) {
+        return on();
+    }
+    on() && with() & 1 != 0
 }
 
 /// The GPU is asked whether it has run the submission left every this many
@@ -124,6 +185,10 @@ static REFUSED: AtomicU64 = AtomicU64::new(0);
 static SPLIT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static LANDING: AtomicU64 = AtomicU64::new(0);
 static ON_ALIASED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// With `VICTORY_FLIGHTS_WITH=alias`: texture uploads made while it ran;
+/// of them, those that finished it first as a texture's memory is in what it
+/// may write, and as one is shown at another address too.
+static UPLOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
@@ -173,6 +238,22 @@ impl Footprint {
     /// Whether title memory `[at, at + len)` may change when it is finished.
     fn reaches(&self, at: usize, len: usize) -> bool {
         self.every || self.spans.touches(at, len)
+    }
+
+    /// Whether a read of title memory `[at, at + len)` while it runs could
+    /// meet what it writes or lands: 1 if the memory is in what it may write
+    /// ([`Footprint::reaches`]); with `VICTORY_FLIGHTS_WITH=alias`, 2 if it
+    /// writes anything at all and a page of the memory is shown at another
+    /// address too (`crate::watch::aliased`), where its writes are not
+    /// named by the addresses here.
+    fn meets(&self, at: usize, len: usize) -> Option<usize> {
+        if self.reaches(at, len) {
+            Some(1)
+        } else if len > 0 && with_alias() && !self.spans.is_empty() && crate::watch::aliased(at, len) {
+            Some(2)
+        } else {
+            None
+        }
     }
 
     /// Whether `copy` may not be refreshed before it is finished (the
@@ -316,10 +397,10 @@ impl Host {
         let why = match step {
             Step::Copy(..) | Step::Move(..) => Some(Why::Copy),
             Step::Host(_) => Some(Why::Host),
-            &Step::Own(_, at, len) => (len > 0 && b.footprint().reaches(at, len)).then_some(Why::Host),
+            &Step::Own(_, at, len) => (len > 0 && b.footprint().meets(at, len).is_some()).then_some(Why::Host),
             Step::GpuWrite(..) => Some(Why::Write),
             Step::Memory(_) => Some(Why::Memory),
-            &Step::Fill(_, src, len) => b.footprint().reaches(src, len).then_some(Why::Fill),
+            &Step::Fill(_, src, len) => b.footprint().meets(src, len).is_some().then_some(Why::Fill),
             Step::Refresh(..) | Step::Slot(..) | Step::Heap(_) | Step::Texture(..) => None,
         };
         match why {
@@ -377,7 +458,7 @@ impl Host {
 
     /// Whether the texture uploads would reset what the submission left
     /// runs: its upload list, and the staging pool its uploads read from
-    /// (`crate::bindless::uploads`, `crate::texture::recycle`).
+    /// (`crate::bindless::uploads_after`, `crate::texture::recycle`).
     pub(in crate::host) fn beside_uploads(&self, beside: &Option<Beside>) -> bool {
         beside.as_ref().is_some_and(Beside::running)
             && LEFT
@@ -385,6 +466,35 @@ impl Host {
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .is_none_or(|l| l.uploads)
+    }
+
+    /// mac: with `VICTORY_FLIGHTS_WITH=alias`, before the texture uploads
+    /// read title memory (`work`: what they bring up, whether it changed or
+    /// not): the submission left is finished first if one of the textures'
+    /// memory could meet what it writes or lands ([`Footprint::meets`]).
+    /// Their reads then never meet its shaders' writes in aliased memory,
+    /// and a texture its copy-back tells is told before they look, as when
+    /// it is finished before the next is prepared.
+    pub(in crate::host) fn beside_texture_reads(
+        &self,
+        submitted: &mut u64,
+        beside: &mut Option<Beside>,
+        work: &[(std::sync::Arc<crate::texture::Staging>, std::sync::Arc<crate::resource::HostTexture>)],
+    ) {
+        if !with_alias() || work.is_empty() {
+            return;
+        }
+        let Some(b) = beside.as_mut().filter(|b| b.running()) else { return };
+        UPLOADS[0].fetch_add(1, Relaxed);
+        let footprint = b.footprint();
+        let met = work.iter().find_map(|(staging, _)| {
+            let (at, len) = staging.title_range();
+            footprint.meets(at, len)
+        });
+        if let Some(k) = met {
+            UPLOADS[k].fetch_add(1, Relaxed);
+            self.finish_beside(submitted, beside, Why::Uploads);
+        }
     }
 }
 
@@ -419,8 +529,22 @@ pub(super) fn log(frames: f64) {
          later parts of a copy-order split finished it before they were prepared, after waiting {split_ms:.1} \
          ms/frame (only under the title's next submission above); landing it after its wait took {landing:.1} \
          ms/frame of these finishes; of them, shader-write declarations on aliased copies {write:.1}/frame \
-         ({write_ms:.1} ms waited) and title copies between aliased buffers {copy:.1}/frame ({copy_ms:.1} ms)"
+         ({write_ms:.1} ms waited) and title copies between aliased buffers {copy:.1}/frame ({copy_ms:.1} ms){}",
+        uploads_line(frames)
     );
+}
+
+/// The flights line's part for `VICTORY_FLIGHTS_WITH=alias` (empty without).
+fn uploads_line(frames: f64) -> String {
+    if !with_alias() {
+        return String::new();
+    }
+    let [made, reached, twice] = UPLOADS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    format!(
+        "; VICTORY_FLIGHTS_WITH=alias: {made:.1}/frame texture uploads made while it ran, {reached:.1} of them \
+         finished it first as a texture's memory is in what it may write, {twice:.1} as a texture's memory is shown \
+         at another address too"
+    )
 }
 
 /// Finishes so far by every [`Why`] (tests; the frame line takes them).

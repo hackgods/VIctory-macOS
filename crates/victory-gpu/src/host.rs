@@ -1974,8 +1974,14 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        // mac: with flights' `alias`, the one left is finished first where
+        // their memory could meet what it writes.
         let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
+            .then(|| {
+                crate::bindless::uploads_after(&heaps, &textures, &mut |work| {
+                    self.beside_texture_reads(&mut submitted, &mut beside, work)
+                })
+            })
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);

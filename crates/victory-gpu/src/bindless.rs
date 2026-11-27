@@ -499,9 +499,13 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn uploads(
+///
+/// mac: `before` is told what is to be brought up before any of its title
+/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`).
+pub(crate) fn uploads_after(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]),
 ) -> Option<Uploads> {
     static LIST: Mutex<Holder> = Mutex::new(Holder(None));
     let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
@@ -571,6 +575,8 @@ pub(crate) fn uploads(
             }
         }
     }
+    // mac: before their title memory is read.
+    before(&work);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
@@ -645,6 +651,15 @@ pub(crate) fn uploads(
         list: guard,
         worker: Mutex::new(ready),
     })
+}
+
+/// [`uploads_after`] with nothing told first (tests).
+#[cfg(test)]
+pub(crate) fn uploads(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> Option<Uploads> {
+    uploads_after(heaps, textures, &mut |_| {})
 }
 
 /// The upload list, used under its lock only.

@@ -1226,6 +1226,92 @@ mod tests {
         drop(take_done());
     }
 
+    /// mac: with flights and `VICTORY_FLIGHTS_WITH=alias` (E2 of
+    /// `notes/overlap-stages-design.md`): the next submission's texture
+    /// upload from memory the one left writes (here on the GPU, through an
+    /// aliased buffer, a range it declared) finishes that one first and
+    /// uploads what it wrote; a texture elsewhere is uploaded beside it.
+    /// Needs Rosetta (the aliasing) and the heap sync ahead
+    /// (`VICTORY_ASYNC_HEAP_SYNC=1`, as the launcher sets it): without it
+    /// every flight is finished at the heap sync, before the uploads.
+    #[test]
+    fn with_flights_an_upload_from_memory_the_one_left_writes_waits() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let flights = Flights::on();
+        flights::FORCED_ALIAS.store(true, Relaxed);
+        if !crate::watch::rosetta() || !crate::descriptor::ahead::on() {
+            flights::FORCED_ALIAS.store(false, Relaxed);
+            eprintln!("skipped: needs Rosetta and VICTORY_ASYNC_HEAP_SYNC=1");
+            return;
+        }
+        settle(By::Signal);
+        let page = crate::watch::PAGE;
+        // A page of aliased memory, and one elsewhere: an RGBA8 128x128
+        // linear texture over each.
+        let aliased = crate::watch::tests::pool(1);
+        assert!(crate::alias::alias_region(aliased, page, false));
+        let shadow = crate::shadow::find_aliased(aliased as u64, (aliased + page) as u64).expect("an aliased copy");
+        let elsewhere = crate::watch::tests::pool(1);
+        let iid = crate::object::guid(0x696442be, 0xa72e, 0x4059, [0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad]);
+        let texture = |at: usize| {
+            // SAFETY: the texture's own page.
+            unsafe { std::ptr::write_bytes(at as *mut u8, 0x11, page) };
+            let words: [u32; 14] = [3, 0, 0, 0, 128, 0, 128, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+            let mut object = std::ptr::null();
+            let made = crate::resource::create_at_address(std::ptr::null(), at as u64, words.as_ptr().cast(), 0, std::ptr::null(), &iid, &mut object);
+            assert_eq!(made, 0);
+            let copy = crate::resource::host_copy(object).expect("a host texture");
+            let staging = crate::texture::staging(object, &copy.texture).expect("staging");
+            // Uploaded once (0x11), so that only a change uploads again.
+            let _one = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = crate::bindless::uploads(&[], &[(staging, copy.clone())]);
+            (object, copy)
+        };
+        for (at, of_the_one_left) in [(elsewhere, false), (aliased, true)] {
+            let (object, copy) = texture(at);
+            let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+            // The first writes 0x22 over the aliased page on the GPU, as it
+            // declares; the second samples the texture.
+            let (up, data) = host.upload_buffer(page as u64).expect("an upload buffer");
+            // SAFETY: the upload buffer's own mapping, `page` bytes.
+            unsafe { std::ptr::write_bytes(data, 0x22, page) };
+            // SAFETY: an open list; both buffers hold `page` bytes there.
+            unsafe { lists[0].list.CopyBufferRegion(&shadow.buffer, shadow.offset(aliased as u64), &up, 0, page as u64) };
+            lists[0].keep(&up);
+            shadow.gpu_writes(&lists[0], aliased as u64, page as u64, false);
+            crate::texture::upload(&lists[1], object, &copy.texture);
+            lists.iter().for_each(|l| l.close());
+            let (finishes, uploads) = (flights::finished_for(flights::Why::Uploads), crate::texture::uploads(object));
+            let mut back = host.execute_title(1, vec![lists[0].clone()]);
+            let left = VALUE.load(Acquire) != 0;
+            if !of_the_one_left {
+                // A change the title made itself, which the second uploads.
+                // SAFETY: the texture's own page.
+                unsafe { std::ptr::write_bytes(at as *mut u8, 0x33, page) };
+            }
+            back.extend(host.execute_title(1, vec![lists[1].clone()]));
+            settle(By::Signal);
+            // SAFETY: the texture's own page.
+            let byte = unsafe { (at as *const u8).read_volatile() };
+            assert_eq!(byte, if of_the_one_left { 0x22 } else { 0x33 });
+            assert_eq!(crate::texture::uploads(object), uploads + 1, "uploaded again, the new bytes (the one left's: {of_the_one_left})");
+            // (Left unless a diagnostics build captures.)
+            if left {
+                assert_eq!(
+                    flights::finished_for(flights::Why::Uploads),
+                    finishes + u64::from(of_the_one_left),
+                    "finished for the upload only where it writes the texture's memory"
+                );
+            }
+            drop(back);
+            drop(take_done());
+        }
+        flights::FORCED_ALIAS.store(false, Relaxed);
+        drop(flights);
+    }
+
     /// A title submission left to the host GPU owes its bottom-of-pipe
     /// write until something waits for it; then the write is there, the
     /// mark shows it ran, and its list comes back.

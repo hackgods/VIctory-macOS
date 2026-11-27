@@ -687,6 +687,11 @@ impl Staging {
         self.size
     }
 
+    /// mac: the title memory a refresh may read (start, bytes).
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
     /// Marks that real readable title memory reached a submitted GPU upload.
     pub(crate) fn mark_uploaded_once(&self) {
         self.uploaded_once

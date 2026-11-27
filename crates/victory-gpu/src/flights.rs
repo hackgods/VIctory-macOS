@@ -38,6 +38,11 @@ impl Spans {
         self.0.get(at).is_some_and(|r| r.0 < to)
     }
 
+    /// Whether they hold nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
     #[cfg(test)]
     fn ranges(&self) -> &[(usize, usize)] {
         &self.0
@@ -76,6 +81,40 @@ pub(crate) fn after_writes(writes: &[(usize, Option<u64>, usize)], address: usiz
         });
     }
     seen
+}
+
+/// mac: the names `VICTORY_FLIGHTS_WITH=<list>` takes, each building on the
+/// ones before it (`notes/overlap-stages-design.md` §6).
+pub(crate) const WITH: [&str; 6] = ["alias", "writes", "copies", "ring", "relay", "present"];
+
+/// `VICTORY_FLIGHTS_WITH`'s rule: of the comma list `value`, the names taken
+/// (bit `i` for [`WITH`]`[i]`), and a line for each one refused: unknown, not
+/// in this build (`built`, the bits it has), asked without every name before
+/// it, or refused by `refuse(i)` for a reason of its own.
+pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Option<&'static str>) -> (u32, Vec<String>) {
+    let mut asked = 0u32;
+    let mut refused = Vec::new();
+    for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        match WITH.iter().position(|w| w.eq_ignore_ascii_case(name)) {
+            Some(i) => asked |= 1 << i,
+            None => refused.push(format!("{name}: not a name it takes ({})", WITH.join(","))),
+        }
+    }
+    let mut taken = 0u32;
+    for (i, name) in WITH.iter().enumerate().filter(|&(i, _)| asked & 1 << i != 0) {
+        let why = if built & 1 << i == 0 {
+            Some("not in this build".to_owned())
+        } else if taken != (1 << i) - 1 {
+            Some(format!("it needs {} first", WITH[..i].join(",")))
+        } else {
+            refuse(i).map(str::to_owned)
+        };
+        match why {
+            Some(why) => refused.push(format!("{name}: {why}")),
+            None => taken |= 1 << i,
+        }
+    }
+    (taken, refused)
 }
 
 /// mac: E1 of `notes/overlap-stages-design.md` (lines only): per thread that
@@ -172,6 +211,32 @@ pub(crate) mod threads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `VICTORY_FLIGHTS_WITH`: names in their order, each needing those
+    /// before it; unknown, unbuilt and otherwise refused names named.
+    #[test]
+    fn flights_with_takes_each_name_after_the_ones_before_it() {
+        let none = |_: usize| None;
+        assert_eq!(with_names("", 1, none), (0, vec![]));
+        assert_eq!(with_names(" alias , ", 1, none), (1, vec![]));
+        assert_eq!(with_names("ALIAS", 1, none).0, 1);
+        let (taken, refused) = with_names("alias,writes", 1, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["writes: not in this build"]);
+        let (taken, refused) = with_names("writes", 0b11, none);
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["writes: it needs alias first"]);
+        assert_eq!(with_names("writes,alias", 0b11, none), (0b11, vec![]));
+        let (taken, refused) = with_names("alias,copies", 0b111, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["copies: it needs alias,writes first"]);
+        let (taken, refused) = with_names("alias,bogus", 1, none);
+        assert_eq!(taken, 1);
+        assert!(refused[0].starts_with("bogus: not a name"), "{refused:?}");
+        let (taken, refused) = with_names("alias,writes", 0b11, |i| (i == 0).then_some("the heap worker"));
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["alias: the heap worker", "writes: it needs alias first"]);
+    }
 
     /// E1's table: each thread its own slot, only the outermost call timed,
     /// the waits added as they come, zero after a take.

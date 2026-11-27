@@ -678,6 +678,36 @@ fn loops_sharing_a_latch() -> Vec<u32> {
     w
 }
 
+/// A console wave32 waterfall loop over the low two bits of the thread id
+/// (`s_andn2_wrexec_b32` takes each value's lanes out of the pending mask
+/// and sets SCC to whether lanes remain), then the compiler's select on
+/// that SCC after the loop: `s_cselect_b32` of EXEC or 0, OR-ed with the
+/// lanes below 20. The loop leaves when no lanes remain, so SCC is 0 there
+/// and the mask is the compare's. Per thread, one dword at `l * 32`: 9
+/// below 20, else 7.
+fn mask_selected_after_a_waterfall() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x360A_0083, // v_and_b32 v5, 3, v0
+        0xBE83_037E, // s_mov_b32 s3, exec_lo
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7DA4_0A07, // v_cmpx_eq_u32 s7, v5
+        0xBE86_4706, // s_andn2_wrexec_b32 s6, s6
+        0xBF89_FFFC, // s_cbranch_execnz (back to the v_readfirstlane)
+        0xBEFE_0303, // s_mov_b32 exec_lo, s3
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0x8504_807E, // s_cselect_b32 s4, exec_lo, 0
+        0x8804_046A, // s_or_b32 s4, vcc_lo, s4
+        0xD501_0001,
+        0x0011_1287, // v_cndmask_b32 v1, 7, 9, s4
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// The console's low-half f16 whole-wave64 sum of `v0`: DPP within rows,
 /// `v_permlanex16` across rows, then lanes 31 and 63 (each 32-lane half's
 /// sum) read and added. Its high half is kept from lane 31, as the
@@ -1043,6 +1073,50 @@ fn a_branch_back_to_two_loops_runs_in_whole_wave_halves() {
 fn a_branch_back_to_two_loops_matches_the_console_on_every_gpu() {
     let words = loops_sharing_a_latch();
     let failed = differences_in(true, &words, 64, 1, &[6; 64], 0, false, true);
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`mask_selected_after_a_waterfall`]: the SCC the waterfall loop's exit
+/// shows is 0, so the select is the compare's mask and no lane mask is
+/// read as data.
+#[test]
+fn a_mask_selected_on_a_waterfall_exits_scc_translates() {
+    let words = mask_selected_after_a_waterfall();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(false))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_and_b32 v5, 3, v0",
+        "s_mov_b32 s3, exec_lo",
+        "s_mov_b32 s6, exec_lo",
+        "v_readfirstlane_b32 s7, v5",
+        "v_cmpx_eq_u32 exec_lo, s7, v5",
+        "s_andn2_wrexec_b32 s6, s6",
+        "s_cbranch_execnz",
+        "s_mov_b32 exec_lo, s3",
+        "v_cmp_gt_u32 vcc_lo, 20, v0",
+        "s_cselect_b32 s4, exec_lo, 0",
+        "s_or_b32 s4, vcc_lo, s4",
+        "v_cndmask_b32 v1, 7, 9, s4",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let n = native(&words, false, 32, 0);
+    lowered(&n, false).expect("wave32");
+}
+
+/// [`mask_selected_after_a_waterfall`] on every hardware adapter gives the
+/// console's values.
+#[test]
+#[cfg(windows)]
+fn a_mask_selected_on_a_waterfall_exits_scc_matches_the_console_on_every_gpu() {
+    let want: Vec<u32> = (0..32).map(|l| if l < 20 { 9 } else { 7 }).collect();
+    let words = mask_selected_after_a_waterfall();
+    let failed = differences_in(false, &words, 32, 1, &want, 0, false, false);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 

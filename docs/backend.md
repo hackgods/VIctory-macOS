@@ -47,4 +47,18 @@ What this says for the Metal host:
 
 - Calls are cheap enough to make one per command: a frame's 50,000 or so would take under 1 ms. (D3DMetal's list calls cost about the same to record: 10,000 in 0.15 ms.) A command stream in memory both sides see, with one call per list or submission, still keeps the Windows side free of Metal's objects and lets recording run on the title's threads.
 - Metal's own recording runs as fast under Rosetta as natively, so the unixlib can stay in the Wine process: a helper process of its own would gain nothing there and would need title memory shared across processes.
-- For simple compute work D3DMetal adds little: 0.1–0.5 µs a dispatch and 30 µs a submission. Its cost in a title's frame, if it is in D3DMetal at all, is elsewhere: draws, render passes, barriers or indirect calls, which are next to measure the same way.
+- For simple compute work D3DMetal adds little: 0.1–0.5 µs a dispatch and 30 µs a submission. What costs is compute and render work taking turns across a barrier, the pattern VIctory's inline argument clamps make (below).
+
+### Compute and render work taking turns
+
+`crates/victory-metal/tests/encoder_breaks.rs` runs a title frame's pattern: a dispatch of one thread writes an indirect draw's 20 bytes of arguments, a barrier, the draw through `ExecuteIndirect` into a render target, again and again in one list; against the same work batched (all dispatches, one barrier, all draws), and the same turns in Metal itself through the bridge. Each turn is one more encoder on Metal. Per turn, on the same M5 Pro, over 1,000 to 3,500 pairs in one list (medians of five):
+
+| | Recording (CPU) | Submission to completion |
+| --- | --- | --- |
+| D3D12/D3DMetal, transition barriers and indirect draws | 12–38 µs, growing with the turns already in the list | 16–20 µs |
+| D3D12/D3DMetal, UAV barriers and plain draws | 11–29 µs, growing the same way | 12.5–14.7 µs |
+| D3D12/D3DMetal, the same turns with no barrier | 0.03 µs | 0.2 µs |
+| Metal through the bridge, an encoder each | 6.4–7.2 µs | 9.9–10.7 µs, nearly all of it GPU time |
+| Batched, either way | under 0.5 µs a pair | under 1.3 µs a pair |
+
+So the cost is the barrier between compute and render work, not the switch itself: without one, D3DMetal keeps the work together. With one, recording a list in D3DMetal takes time that grows with the square of its turns (25, 96 and 263 ms for 1,000, 2,000 and 3,500 pairs), and even Metal itself needs about 10 µs of GPU time a turn to finish the one encoder before the next starts. A Metal host would halve the cost of each turn; batching the dispatches ahead of the draws removes nearly all of it on either host.

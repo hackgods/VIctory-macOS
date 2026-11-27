@@ -19,6 +19,9 @@ enum vm_call {
     /* Empty command buffers, each committed and waited for alone.
      * struct vm_submit. */
     VM_SUBMIT_EMPTY = 3,
+    /* Compute and render work taking turns, or batched, in one command
+     * buffer. struct vm_turns. */
+    VM_TURNS = 4,
     VM_CALLS
 };
 
@@ -63,7 +66,26 @@ struct vm_submit {
     char error[VM_ERROR_LEN];
 };
 
+/* `pairs` times: one compute dispatch of one thread writes a draw's
+ * arguments (20 bytes, MTLDrawIndexedPrimitivesIndirectArguments), then an
+ * indirect indexed draw reads them into a 64 x 64 render target. With
+ * `batched` 0 each dispatch has a compute encoder of its own and each draw
+ * a render encoder of its own (the target loaded and stored each time);
+ * with 1, one compute encoder holds all dispatches and one render encoder
+ * all draws. The unixlib checks every record and the target. */
+struct vm_turns {
+    uint32_t size;
+    uint32_t pairs;
+    uint32_t batched;
+    uint32_t reserved;
+    uint64_t encode_ns;
+    uint64_t wait_ns;
+    uint64_t gpu_ns;
+    char error[VM_ERROR_LEN];
+};
+
 _Static_assert(sizeof(struct vm_device) == 296, "vm_device layout");
+_Static_assert(sizeof(struct vm_turns) == 232, "vm_turns layout");
 _Static_assert(sizeof(struct vm_fill) == 256, "vm_fill layout");
 _Static_assert(sizeof(struct vm_submit) == 208, "vm_submit layout");
 

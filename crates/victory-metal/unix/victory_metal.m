@@ -194,12 +194,170 @@ static NTSTATUS vm_submit_empty(void *args) {
     }
 }
 
+/* What VM_TURNS draws with, made the first time. Holds `lock`. */
+static id<MTLComputePipelineState> args_pipeline;
+static id<MTLRenderPipelineState> draw_pipeline;
+static id<MTLBuffer> draw_indices;
+static id<MTLTexture> draw_target;
+#define TURNS_SIZE 64
+
+static NSString *const turns_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "kernel void args(device uint *a [[buffer(0)]], constant uint &record [[buffer(1)]]) {\n"
+     "    device uint *r = a + record * 5;\n"
+     "    r[0] = 3; r[1] = 1; r[2] = 0; r[3] = 0; r[4] = 0;\n"
+     "}\n"
+     "vertex float4 corner(uint id [[vertex_id]]) {\n"
+     "    float2 p = float2((id << 1) & 2, id & 2);\n"
+     "    return float4(p * 2 - 1, 0, 1);\n"
+     "}\n"
+     "fragment float4 white() { return float4(1); }\n";
+
+static BOOL ensure_turns(char *error) {
+    if (draw_target) return YES;
+    if (!ensure_open(error)) return NO;
+    NSError *failure = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:turns_source options:nil error:&failure];
+    if (!library) {
+        set_error(error, [NSString stringWithFormat:@"turns library: %@", failure]);
+        return NO;
+    }
+    args_pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"args"]
+                                                          error:&failure];
+    MTLRenderPipelineDescriptor *draw = [MTLRenderPipelineDescriptor new];
+    draw.vertexFunction = [library newFunctionWithName:@"corner"];
+    draw.fragmentFunction = [library newFunctionWithName:@"white"];
+    draw.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+    if (args_pipeline)
+        draw_pipeline = [device newRenderPipelineStateWithDescriptor:draw error:&failure];
+    if (!args_pipeline || !draw_pipeline) {
+        set_error(error, [NSString stringWithFormat:@"turns pipelines: %@", failure]);
+        return NO;
+    }
+    static const uint16_t indices[3] = {0, 1, 2};
+    draw_indices = [device newBufferWithBytes:indices length:sizeof(indices) options:MTLResourceStorageModeShared];
+    MTLTextureDescriptor *target =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                           width:TURNS_SIZE
+                                                          height:TURNS_SIZE
+                                                       mipmapped:NO];
+    target.usage = MTLTextureUsageRenderTarget;
+    target.storageMode = MTLStorageModeShared;
+    draw_target = [device newTextureWithDescriptor:target];
+    if (!draw_indices || !draw_target) {
+        set_error(error, @"turns resources");
+        return NO;
+    }
+    return YES;
+}
+
+static NTSTATUS vm_turns(void *args) {
+    struct vm_turns *t = args;
+    if (!t || t->size != sizeof(*t)) return STATUS_INVALID_PARAMETER;
+    if (!t->pairs) {
+        set_error(t->error, @"no pairs");
+        return STATUS_INVALID_PARAMETER;
+    }
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        if (!ensure_turns(t->error)) {
+            pthread_mutex_unlock(&lock);
+            return STATUS_UNSUCCESSFUL;
+        }
+        /* Fresh, zeroed arguments: what the draws find is what this
+         * command buffer's dispatches wrote. Tracked, as D3D12's barriers
+         * order the dispatches before the draws. */
+        id<MTLBuffer> records = [device newBufferWithLength:(NSUInteger)t->pairs * 20
+                                                    options:MTLResourceStorageModeShared];
+        memset(records.contents, 0, records.length);
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = draw_target;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+        uint64_t t0 = now_ns();
+        id<MTLCommandBuffer> commands = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> compute = nil;
+        id<MTLRenderCommandEncoder> render = nil;
+        for (uint32_t i = 0; i < t->pairs; i++) {
+            if (!compute) {
+                compute = [commands computeCommandEncoder];
+                [compute setComputePipelineState:args_pipeline];
+                [compute setBuffer:records offset:0 atIndex:0];
+            }
+            [compute setBytes:&i length:sizeof(i) atIndex:1];
+            [compute dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            if (!t->batched) {
+                [compute endEncoding];
+                compute = nil;
+                pass.colorAttachments[0].loadAction = i ? MTLLoadActionLoad : MTLLoadActionClear;
+                render = [commands renderCommandEncoderWithDescriptor:pass];
+                [render setRenderPipelineState:draw_pipeline];
+                [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexType:MTLIndexTypeUInt16
+                                  indexBuffer:draw_indices
+                            indexBufferOffset:0
+                               indirectBuffer:records
+                         indirectBufferOffset:(NSUInteger)i * 20];
+                [render endEncoding];
+                render = nil;
+            }
+        }
+        if (t->batched) {
+            [compute endEncoding];
+            pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+            render = [commands renderCommandEncoderWithDescriptor:pass];
+            [render setRenderPipelineState:draw_pipeline];
+            for (uint32_t i = 0; i < t->pairs; i++)
+                [render drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                    indexType:MTLIndexTypeUInt16
+                                  indexBuffer:draw_indices
+                            indexBufferOffset:0
+                               indirectBuffer:records
+                         indirectBufferOffset:(NSUInteger)i * 20];
+            [render endEncoding];
+        }
+        uint64_t t1 = now_ns();
+        [commands commit];
+        [commands waitUntilCompleted];
+        uint64_t t2 = now_ns();
+        t->encode_ns = t1 - t0;
+        t->wait_ns = t2 - t1;
+        t->gpu_ns = (uint64_t)((commands.GPUEndTime - commands.GPUStartTime) * 1e9);
+        NTSTATUS status = STATUS_SUCCESS;
+        if (commands.status != MTLCommandBufferStatusCompleted) {
+            set_error(t->error, [NSString stringWithFormat:@"command buffer: %@", commands.error]);
+            status = STATUS_UNSUCCESSFUL;
+        }
+        const uint32_t *words = records.contents;
+        for (uint32_t i = 0; status == STATUS_SUCCESS && i < t->pairs; i++) {
+            const uint32_t *r = words + i * 5;
+            if (r[0] != 3 || r[1] != 1 || r[2] || r[3] || r[4]) {
+                set_error(t->error, [NSString stringWithFormat:@"record %u not as written", i]);
+                status = STATUS_UNSUCCESSFUL;
+            }
+        }
+        uint32_t pixel = 0;
+        [draw_target getBytes:&pixel
+                  bytesPerRow:TURNS_SIZE * 4
+                   fromRegion:MTLRegionMake2D(TURNS_SIZE / 2, TURNS_SIZE / 2, 1, 1)
+                  mipmapLevel:0];
+        if (status == STATUS_SUCCESS && pixel != 0xffffffffu) {
+            set_error(t->error, [NSString stringWithFormat:@"the target holds %08x, not white", pixel]);
+            status = STATUS_UNSUCCESSFUL;
+        }
+        pthread_mutex_unlock(&lock);
+        return status;
+    }
+}
+
 /* Wine looks this table up by name; the order is enum vm_call's. */
 __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {
     vm_noop,
     vm_open,
     vm_fill,
     vm_submit_empty,
+    vm_turns,
 };
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == VM_CALLS,
                "one entry per call");

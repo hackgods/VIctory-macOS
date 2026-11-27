@@ -1071,7 +1071,7 @@ impl Lower<'_> {
                         None => x,
                         Some(prev) if prev == x => prev,
                         Some(prev) => {
-                            let cond = if scalar {
+                            let cond = if scalar && crate::emit::diag_522_cs() {
                                 match wave_any_edge.get(&q).copied() {
                                     Some(v) => v,
                                     None => {
@@ -1232,7 +1232,7 @@ impl Lower<'_> {
                     let sel = if vb == vd {
                         vb
                     } else {
-                        let cond = if scalar {
+                        let cond = if scalar && crate::emit::diag_522_cs() {
                             match wave_any_body {
                                 Some(v) => v,
                                 None => {

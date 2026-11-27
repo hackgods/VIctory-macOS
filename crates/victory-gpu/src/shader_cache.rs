@@ -279,6 +279,8 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
+    let diag_ps = !victory_shader::emit::diag_522_ps();
+    let diag_cs = !victory_shader::emit::diag_522_cs();
     if !locks
         && !bias
         && !narrow
@@ -287,10 +289,12 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         && !apart
         && !cap_barriers
         && !limits
+        && !diag_ps
+        && !diag_cs
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,7 +304,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | usize::from(diag_ps) << 10
+        | usize::from(diag_cs) << 11;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
@@ -333,6 +339,12 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         }
         if limits {
             h.update(b"thread limits");
+        }
+        if diag_ps {
+            h.update(b"diag 522 ps off");
+        }
+        if diag_cs {
+            h.update(b"diag 522 cs off");
         }
         *h.finalize().as_bytes()
     })

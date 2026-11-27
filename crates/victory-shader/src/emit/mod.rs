@@ -512,6 +512,21 @@ pub fn cap_barriers_refused() -> bool {
     }
 }
 
+/// DIAGNOSTIC ONLY (never upstream): `VICTORY_DIAG_522_PS=0` reads a
+/// first lane outside halves as before #522 (the host wave's first lane,
+/// no guard ballot); `VICTORY_DIAG_522_CS=0` makes #522's compute side as
+/// before it (no halves for first-lane reads, joins of scalars by lane).
+pub fn diag_522_ps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DIAG_522_PS").ok().as_deref() != Some("0"))
+}
+
+/// See [`diag_522_ps`].
+pub fn diag_522_cs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DIAG_522_CS").ok().as_deref() != Some("0"))
+}
+
 /// `VICTORY_CAP_BARRIERS`'s value as a switch: only `1` turns the refusal on.
 #[cfg_attr(test, allow(dead_code))]
 fn cap_barriers_from(value: Option<&str>) -> bool {

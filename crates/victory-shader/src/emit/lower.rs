@@ -746,7 +746,9 @@ impl<'a> Lower<'a> {
                         .iter()
                         .any(|a| matches!(a, Atom::Opaque(_) | Atom::Constant(_)))
                 })
-            } || (first_lane_halves && halves::needs_first_lane(x, &mut alike_cache));
+            } || (first_lane_halves
+                && crate::emit::diag_522_cs()
+                && halves::needs_first_lane(x, &mut alike_cache));
             let wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -7620,7 +7622,13 @@ impl<'a> Lower<'a> {
                     return self.write_i(inst, r, None);
                 }
                 let a = s(self, 0)?;
-                let r = self.first_lane_in_wave(a, (!is_alike).then_some(guard).flatten());
+                let r = if !self.halves && !crate::emit::diag_522_ps() {
+                    self.s.flags |= flags::WAVE_OPS;
+                    self.s
+                        .op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, self.s.t.i32, 118, &[a])
+                } else {
+                    self.first_lane_in_wave(a, (!is_alike).then_some(guard).flatten())
+                };
                 let r = self.helper_reads_own(a, r);
                 self.write_i(inst, r, None)
             }

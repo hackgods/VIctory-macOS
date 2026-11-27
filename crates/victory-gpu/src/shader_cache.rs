@@ -437,6 +437,21 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     kept
 }
 
+/// How the BVH builder's own forms are translated under
+/// `VICTORY_BVH_BUILDER=1` (`crate::pipeline::builder`): as this run's
+/// settings say, but with no half of a console wave answering on its own
+/// (`VICTORY_HALVES_LOCAL` and `VICTORY_HALVES_SHARED_LDS` off), so that a
+/// read across the halves is handed over exactly or the program is refused;
+/// `thread_counts` for the form of dispatches counted in threads.
+pub(crate) fn exact_options(thread_counts: bool) -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        halves_local: false,
+        halves_shared_lds: false,
+        thread_counts,
+        ..runtime_options()
+    }
+}
+
 pub(crate) fn runtime_options() -> victory_shader::emit::Options {
     // Writes through views mark their pages: copy-backs compare only those
     // (`crate::shadow::copy_back_marks`).
@@ -481,7 +496,16 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let mut options = runtime_options();
+    host_shader_with(container, runtime_options())
+}
+
+/// [`host_shader`] made from `options` instead of this run's (cached under
+/// their own key): the BVH builder's own forms (`crate::pipeline::builder`).
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+) -> (Result<HostShader, String>, bool) {
+    let mut options = options;
     // One program at a time, if the switch lists hashes (mac).
     options.uav_size_level0 = crate::mac_switches::uav_size_level0_for(container);
     let translate =

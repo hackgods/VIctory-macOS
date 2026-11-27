@@ -507,6 +507,7 @@ mod tests {
                 container: Mutex::new(Vec::new()),
                 translated: OnceLock::new(),
                 spilled: OnceLock::new(),
+                options: None,
             })
         };
         let mut state = GraphicsState::default();
@@ -532,6 +533,7 @@ mod tests {
             container: Mutex::new(Vec::new()),
             translated: OnceLock::new(),
             spilled: OnceLock::new(),
+            options: None,
         });
         let cold = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));
         let warm = Arc::new(Pending::new(vec![shader.clone()], None, &hashes));

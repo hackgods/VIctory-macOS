@@ -55,6 +55,9 @@ pub(crate) struct IndexView {
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// The thread counts of the dispatch being bound, while a form for
+    /// dispatches counted in threads is (`dispatch_x`); else zeros.
+    thread_counts: [u32; 3],
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -579,6 +582,11 @@ impl State {
     /// view's address (title memory).
     fn user_value(&self, compute: bool, slot: u8, root: RootType, dword: u32) -> u32 {
         match (self.roots_ref(compute).get(usize::from(slot)), root) {
+            // A thread count of the dispatch being bound (`dispatch_x`);
+            // 0, every lane, for any other.
+            (_, RootType::Other(victory_shader::emit::USER_DISPATCH_THREADS)) => {
+                self.thread_counts.get(dword as usize).copied().unwrap_or(0)
+            }
             (Some(Root::View(address)), RootType::Descriptor) if dword < 2 => {
                 (address >> (32 * dword)) as u32
             }
@@ -1266,6 +1274,18 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        self.dispatch_x(list, x, y, z, 0);
+    }
+
+    /// Runs a dispatch with the console's dispatch flags (`DispatchX`). Of
+    /// them the host follows [`THREAD_COUNTS`] where the pipeline has a form
+    /// for it (the BVH builder's under `VICTORY_BVH_BUILDER=1`,
+    /// `crate::pipeline::counted`): the counts are then threads, run as the
+    /// groups that hold them by that form, whose lanes past the counts start
+    /// with EXEC off. A builder pipeline whose form is refused does not run
+    /// such a dispatch, and stops the builder for the rest of the run. Any
+    /// other pipeline runs the counts as groups, as before.
+    pub(crate) fn dispatch_x(&mut self, list: &HostList, mut x: u32, mut y: u32, mut z: u32, flags: u32) {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1293,7 +1313,29 @@ impl State {
             });
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let asked = [x, y, z];
+        let (mut form, mut counts) = (None, [0; 3]);
+        if flags & THREAD_COUNTS != 0 {
+            match crate::pipeline::counted(self.pipeline as This) {
+                crate::pipeline::Counted::Groups => {
+                    once!(flags = format_args!("{flags:#x}"), "a DispatchX counted in threads runs its counts as groups");
+                }
+                crate::pipeline::Counted::Form(p, group) => {
+                    form = Some(p);
+                    counts = asked;
+                    note_counted(&p.name, asked, group);
+                    [x, y, z] = std::array::from_fn(|i| asked[i].div_ceil(group[i]));
+                }
+                crate::pipeline::Counted::Missing(why) => {
+                    crate::pipeline::stop_builder(why);
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = asked;
+        let Some(p) = form.or_else(|| crate::pipeline::host_pipeline(self.pipeline as This)) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -1307,14 +1349,25 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // The counts the thread form's lanes read (`user_value`), for this
+        // bind only.
+        self.thread_counts = counts;
+        let bound = self.bind(list, p, true);
+        self.thread_counts = [0; 3];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(list, self.pipeline, "dispatch");
             return;
         }
         #[cfg(feature = "diagnostics")]
-        list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.note_op(|| {
+            if form.is_some() {
+                format!("{} (threads {asked:?})", self.op_text(format!("dispatch {x}x{y}x{z}"), true))
+            } else {
+                self.op_text(format!("dispatch {x}x{y}x{z}"), true)
+            }
+        });
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
         #[cfg(feature = "diagnostics")]
@@ -2483,6 +2536,32 @@ fn has_root_views(t: &victory_shader::emit::HostShader) -> bool {
 }
 
 /// The console's own primitive topologies.
+/// `DispatchX`'s flag that the counts are threads, not groups: the console's
+/// dispatch initiator bit `USE_THREAD_DIMENSIONS` (DexNom/VIctory bc3cd4b0,
+/// VIctory-macOS #527, LakshanSivakumar/Native-Victory-macOS 0ae6cfcd,
+/// where it was measured on the BVH builder's box unpackers).
+const THREAD_COUNTS: u32 = 0x20;
+
+/// Logs each pipeline's first dispatch counted in threads that runs from
+/// its form for them: what it asked for and its group size.
+fn note_counted(name: &str, threads: [u32; 3], group: [u32; 3]) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
+    COUNTED.fetch_add(1, Ordering::Relaxed);
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.get_or_insert_with(Default::default).insert(name.to_owned()) {
+        tracing::info!(pipeline = name, ?threads, ?group, "a dispatch counted in threads, first of this pipeline");
+    }
+}
+
+/// Dispatches counted in threads run from a form for them.
+static COUNTED: AtomicU64 = AtomicU64::new(0);
+
+/// Dispatches counted in threads run so far.
+#[cfg(test)]
+pub(crate) fn counted_dispatches() -> u64 {
+    COUNTED.load(Ordering::Relaxed)
+}
+
 const TRIANGLE_FAN: u32 = 6;
 const RECTANGLES: u32 = 17;
 

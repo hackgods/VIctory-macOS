@@ -261,6 +261,16 @@ static LOST: [std::sync::atomic::AtomicU64; 2] = [
 /// (`crate::shadow::take_gave_up`).
 static GAVE_UP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Draws recorded after compute work in the same host list since the last
+/// frame-rate line ([`HostList::note_work`]): the render passes compute
+/// splits.
+static WORK_SWITCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`WORK_SWITCHES`] since the last call.
+pub(crate) fn take_work_switches() -> u64 {
+    WORK_SWITCHES.swap(0, Ordering::Relaxed)
+}
+
 /// Time spent in submissions since the last frame-rate line, in
 /// microseconds: preparing them on the CPU (title memory copies, texture
 /// detiling), then waiting for the GPU.
@@ -1512,6 +1522,9 @@ pub(crate) struct HostList {
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
     budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    /// What the last draw or dispatch recorded was ([`HostList::note_work`]):
+    /// 0 nothing yet, 1 a draw, 2 compute.
+    work: std::sync::atomic::AtomicU8,
     /// Clamped indirect arguments (`crate::indirect`), reused by each
     /// inline execution in turn; replaced by a bigger one when too small.
     arguments: Mutex<Option<ID3D12Resource>>,
@@ -1682,6 +1695,20 @@ pub(crate) struct WriteHazard {
     inline_used: bool,
 }
 
+/// Why an indirect execution's clamp cannot go into its list's prelude.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Blocker {
+    /// An inline clamp came first: later clamps keep the budget's order.
+    Inline,
+    /// An earlier command may write any title buffer (heap views, memory).
+    Unknown,
+    /// An earlier command wrote the arguments' or the count's bytes.
+    Written,
+    /// The GPU reads them in place in title memory: clamped inline
+    /// ([`crate::indirect::clamped_in_place`]).
+    InPlace,
+}
+
 impl WriteHazard {
     pub(crate) fn note_write(&mut self, start: u64, len: u64) {
         if self.unknown || len == 0 {
@@ -1736,19 +1763,22 @@ impl WriteHazard {
         pos < self.ranges.len() && self.ranges[pos].0 < end
     }
 
+    #[cfg(test)]
     pub(crate) fn can_hoist(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
-        if self.inline_used || self.unknown {
-            return false;
+        self.blocker(arguments, len, count).is_none()
+    }
+
+    /// What keeps a clamp of `[arguments, arguments + len)` (and the 4-byte
+    /// `count`) out of the prelude, if anything.
+    pub(crate) fn blocker(&self, arguments: u64, len: u64, count: Option<u64>) -> Option<Blocker> {
+        if self.inline_used {
+            return Some(Blocker::Inline);
         }
-        if self.overlaps(arguments, len) {
-            return false;
+        if self.unknown {
+            return Some(Blocker::Unknown);
         }
-        if let Some(at) = count
-            && self.overlaps(at, 4)
-        {
-            return false;
-        }
-        true
+        let written = self.overlaps(arguments, len) || count.is_some_and(|at| self.overlaps(at, 4));
+        written.then_some(Blocker::Written)
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1768,6 +1798,56 @@ struct HoistedClamps {
     pending: Vec<crate::indirect::PendingClamp>,
     budget_gpu: u64,
     hazard: WriteHazard,
+    /// The clamp group open in the list, if any (`crate::indirect` group
+    /// passes): the last pass recorded, which may still take executions.
+    group: Option<ClampGroup>,
+    /// The group passes' output buffers, kept from recording to recording,
+    /// the one in use and the bytes of it the passes of this recording took.
+    group_chunks: Vec<GroupChunk>,
+    group_current: usize,
+    group_used: u64,
+    /// Group passes recorded since the list was made.
+    group_passes: u64,
+}
+
+/// The bytes of one group pass's output: a slot for each of its jobs.
+const GROUP_OUT: u64 = crate::indirect::GROUP_JOBS as u64 * crate::indirect::GROUP_SLOT as u64;
+
+/// The bytes of a buffer of group passes' outputs: eight passes.
+const GROUP_CHUNK: u64 = 8 * GROUP_OUT;
+
+/// A buffer of group passes' outputs, and whether a pass of this recording
+/// left it readable as arguments (else it is common).
+struct GroupChunk {
+    buffer: ID3D12Resource,
+    readable: bool,
+}
+
+/// A group pass recorded in a list, which executions recorded after it
+/// join until it cannot take the next one ([`HostList::clamp_group_seat`]).
+struct ClampGroup {
+    /// Which pass of the list it is ([`HostList::clamp_group_join`]).
+    pass: u64,
+    /// Its table of jobs, in the list's upload memory.
+    table: usize,
+    jobs: u32,
+    /// The host addresses of the buffers it reads records from.
+    sources: [u64; crate::indirect::GROUP_SOURCES],
+    /// Where its output is: a buffer of [`HoistedClamps::group_chunks`], the
+    /// byte its first slot is at.
+    chunk: usize,
+    base: u64,
+    /// What commands recorded after the pass wrote: an execution reading
+    /// any of it cannot join.
+    since: WriteHazard,
+}
+
+/// A place in a list's clamp group for an indirect execution about to be
+/// recorded ([`HostList::clamp_group_seat`]): the pass, and which of its
+/// sources the record is read from.
+pub(crate) struct GroupSeat {
+    pass: u64,
+    source: usize,
 }
 
 impl HoistedClamps {
@@ -1776,6 +1856,22 @@ impl HoistedClamps {
         out.extend(self.chunks.iter().take(self.touched).map(|c| c.buffer.clone()));
         out.extend(self.oversized.iter().cloned());
         out
+    }
+
+    /// A command of the list writes `[start, start + len)` of a title buffer.
+    fn note_write(&mut self, start: u64, len: u64) {
+        self.hazard.note_write(start, len);
+        if let Some(group) = &mut self.group {
+            group.since.note_write(start, len);
+        }
+    }
+
+    /// A command of the list may write any title buffer.
+    fn note_unknown(&mut self) {
+        self.hazard.note_unknown();
+        if let Some(group) = &mut self.group {
+            group.since.note_unknown();
+        }
     }
 }
 
@@ -2030,6 +2126,7 @@ impl HostGpu for Host {
                 pipelines: Mutex::default(),
                 id,
                 budget: OnceLock::new(),
+                work: 0.into(),
                 arguments: Mutex::new(None),
                 clamps: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -2320,6 +2417,13 @@ impl Host {
         // submission: unordered views left null are made again first.
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
+        }
+        // Views of title memory in place where the title has since mapped
+        // other pages: made again from their records before they are read.
+        // Lists recorded with that memory before then are counted.
+        crate::alias::remake_let_go();
+        for run in runs {
+            run.reads_let_go();
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
@@ -3251,6 +3355,7 @@ impl HostList {
         self.targets.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.trim_scratch();
         self.reset_hoisted_clamps();
+        self.work.store(0, Ordering::Relaxed);
         // SAFETY: the list is not executing.
         let reset = unsafe {
             self.allocator
@@ -3754,6 +3859,7 @@ impl HostList {
                         clamp_budget,
                         &clamp_buffers,
                         &pending_clamps,
+                        &mut |len| self.scratch(len),
                     );
                 }
                 list.Close()
@@ -3841,6 +3947,18 @@ impl HostList {
 
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the list reads or writes title memory in place that the title
+    /// mapped other pages over after it was recorded (`crate::alias`), by
+    /// the copies its submission steps name: those are every one its draws
+    /// and copies refresh or write.
+    fn reads_let_go(&self) -> bool {
+        let deferred = self.deferred();
+        crate::alias::stale_list(deferred.copies.iter().filter_map(|step| match step {
+            Step::Refresh(shadow, ..) | Step::GpuWrite(shadow, ..) => Some(shadow),
+            _ => None,
+        }))
     }
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
@@ -3935,7 +4053,6 @@ impl HostList {
         self.clamps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .hazard
             .note_write(address as u64, len as u64);
     }
 
@@ -3945,23 +4062,22 @@ impl HostList {
         self.clamps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .hazard
             .note_unknown();
     }
 
     /// Notes that an inline indirect clamp was recorded in this list so later
-    /// clamps stay inline and charge the list budget in recorded order.
+    /// clamps stay inline and charge the list budget in recorded order (and
+    /// none joins a clamp group recorded before it).
     pub(crate) fn note_inline_clamp(&self) {
-        self.clamps
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .hazard
-            .note_inline();
+        let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        clamps.hazard.note_inline();
+        clamps.group = None;
     }
 
     /// Whether an indirect execution reading `[arguments, arguments + len)`
     /// (and optional 4-byte `count`) has no earlier conflicting GPU write or
     /// inline clamp in this list and may be clamped in `prelude`.
+    #[cfg(test)]
     pub(crate) fn can_hoist_clamp(&self, arguments: u64, len: u64, count: Option<u64>) -> bool {
         self.clamps
             .lock()
@@ -4029,11 +4145,18 @@ impl HostList {
     /// end of `list.list` so the list can be re-submitted or reset cleanly.
     fn hoisted_clamps_close(&self) {
         let buffers = {
-            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
-            if clamps.pending.is_empty() {
-                return;
+            let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            clamps.group = None;
+            // The group passes' outputs too, left readable by their passes.
+            let mut buffers: Vec<ID3D12Resource> = clamps
+                .group_chunks
+                .iter_mut()
+                .filter_map(|c| std::mem::take(&mut c.readable).then(|| c.buffer.clone()))
+                .collect();
+            if !clamps.pending.is_empty() {
+                buffers.extend(clamps.touched_buffers());
             }
-            clamps.touched_buffers()
+            buffers
         };
         if buffers.is_empty() {
             return;
@@ -4049,10 +4172,11 @@ impl HostList {
             })
             .collect();
         // SAFETY: an open list and live argument buffers left in
-        // `INDIRECT_ARGUMENT` by `prelude`.
+        // `INDIRECT_ARGUMENT` by `prelude` or by group passes.
         unsafe {
             self.list.ResourceBarrier(&barriers);
         }
+        crate::indirect::note_barriers(barriers.len());
     }
 
     /// Resets hoisted clamp tracking after the list finishes running, keeping
@@ -4069,6 +4193,16 @@ impl HostList {
             clamps.current = 0;
             clamps.used = 0;
             clamps.touched = 0;
+            // A list reset unclosed ran none of its passes: all common.
+            clamps.group = None;
+            clamps.group_chunks.iter_mut().for_each(|c| c.readable = false);
+            let kept = (clamps.group_current + 2).min(clamps.group_chunks.len());
+            let spent_groups: Vec<ID3D12Resource> =
+                clamps.group_chunks.split_off(kept).into_iter().map(|c| c.buffer).collect();
+            if !spent_groups.is_empty() {
+                release_later(Box::new(spent_groups));
+            }
+            (clamps.group_current, clamps.group_used) = (0, 0);
             (spent_chunks, spent_oversized)
         };
         if !spent_chunks.is_empty() {
@@ -4323,6 +4457,186 @@ impl HostList {
         }
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
+    }
+
+    /// A draw (`compute` false) or compute work was recorded: a draw after
+    /// compute in one host list is counted ([`take_work_switches`]), as the
+    /// host ends a render pass for the compute and starts another after it
+    /// (D3DMetal does, one Metal encoder each).
+    pub(crate) fn note_work(&self, compute: bool) {
+        let now = if compute { 2 } else { 1 };
+        if self.work.swap(now, Ordering::Relaxed) == 2 && !compute {
+            WORK_SWITCHES.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// What keeps the clamp of an indirect execution reading `[arguments,
+    /// arguments + len)` (and the 4-byte `count`) out of this list's
+    /// prelude, if anything.
+    pub(crate) fn clamp_blocker(
+        &self,
+        arguments: u64,
+        len: u64,
+        count: Option<u64>,
+    ) -> Option<Blocker> {
+        self.clamps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hazard
+            .blocker(arguments, len, count)
+    }
+
+    /// For an indirect execution about to be recorded whose clamp the
+    /// prelude cannot take, reading `[arguments, arguments + len)` of a title
+    /// buffer whose host copy is in `source` (at host address `record`): a
+    /// seat in the list's open clamp group (`crate::indirect` group passes)
+    /// if its pass reads `source` and nothing recorded since the pass writes
+    /// what the execution reads, else in a group whose pass is recorded now,
+    /// reading `source` and the first of `recent` (the buffers other
+    /// executions read lately), and whether it was. `None` if no pass can be
+    /// recorded or the record is not where one can read it.
+    ///
+    /// Only the group recorded last takes executions, and none after an
+    /// inline clamp ([`HostList::note_inline_clamp`]) or once a pass is
+    /// recorded hoists ([`WriteHazard::note_inline`]): every clamp of the
+    /// list charges the budget in recorded order. The execution's job goes
+    /// in once it has been recorded ([`HostList::clamp_group_join`]).
+    pub(crate) fn clamp_group_seat(
+        &self,
+        (source, record): (&ID3D12Resource, u64),
+        (arguments, len): (u64, u64),
+        recent: impl FnOnce() -> Vec<ID3D12Resource>,
+    ) -> Option<(GroupSeat, bool)> {
+        use crate::indirect::{GROUP_JOBS, GROUP_SOURCES, GROUP_TABLE};
+        // SAFETY: live buffers.
+        let gpu = |b: &ID3D12Resource| unsafe { b.GetGPUVirtualAddress() };
+        let at = gpu(source);
+        // The pass reads the record as a word of the buffer's (32-bit index).
+        // SAFETY: a plain query on a live buffer.
+        let end = at.saturating_add(unsafe { source.GetDesc() }.Width);
+        let inside = record >= at
+            && record.saturating_add(len) <= end
+            && (record - at).is_multiple_of(4)
+            && (record - at) / 4 <= u64::from(u32::MAX);
+        if !inside {
+            return None;
+        }
+        {
+            let clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(g) = &clamps.group
+                && g.jobs < GROUP_JOBS
+                && g.since.blocker(arguments, len, None).is_none()
+                && let Some(source) = g.sources.iter().position(|&s| s == at)
+            {
+                return Some((GroupSeat { pass: g.pass, source }, false));
+            }
+        }
+        if !at.is_multiple_of(4) || !crate::indirect::group_available() {
+            return None;
+        }
+        let budget = self.budget()?;
+        let (table_gpu, table) = self.scratch(GROUP_TABLE)?;
+        // SAFETY: the list's upload memory, until it is reset; no job yet.
+        unsafe { table.cast::<u32>().write_volatile(0) };
+        let mut sources = [at; GROUP_SOURCES];
+        let mut bound = 1;
+        self.keep(source);
+        for buffer in recent() {
+            let other = gpu(&buffer);
+            if bound == GROUP_SOURCES {
+                break;
+            }
+            if other.is_multiple_of(4) && !sources[..bound].contains(&other) {
+                // Read only if a job names it; kept as the copies draws read.
+                self.keep(&buffer);
+                sources[bound] = other;
+                bound += 1;
+            }
+        }
+        let host = host()?;
+        let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        if clamps.group_current < clamps.group_chunks.len()
+            && clamps.group_used + GROUP_OUT > GROUP_CHUNK
+        {
+            (clamps.group_current, clamps.group_used) = (clamps.group_current + 1, 0);
+        }
+        if clamps.group_current == clamps.group_chunks.len() {
+            let (buffer, _) = host.shared_buffer(GROUP_CHUNK)?;
+            name(&buffer, || format!("indirect clamp groups {GROUP_CHUNK:#x}"));
+            clamps.group_chunks.push(GroupChunk { buffer, readable: false });
+            clamps.group_used = 0;
+        }
+        let chunk = clamps.group_current;
+        let out = &mut clamps.group_chunks[chunk];
+        let before = if out.readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        let pass = (&out.buffer, before);
+        if !crate::indirect::record_group(&self.list, pass, budget, table_gpu, &sources) {
+            return None;
+        }
+        out.readable = true;
+        let base = clamps.group_used;
+        clamps.group_used += GROUP_OUT;
+        clamps.group_passes += 1;
+        let pass = clamps.group_passes;
+        // Later clamps stay out of the prelude, where they would be charged
+        // before this pass's.
+        clamps.hazard.note_inline();
+        clamps.group = Some(ClampGroup {
+            pass,
+            table: table as usize,
+            jobs: 0,
+            sources,
+            chunk,
+            base,
+            since: WriteHazard::default(),
+        });
+        drop(clamps);
+        self.note_work(true);
+        Some((GroupSeat { pass, source: 0 }, true))
+    }
+
+    /// The execution `seat` was for has been recorded, reading a record of
+    /// `kind` and `stride` bytes at host address `record`: its job goes into
+    /// the group's table, and the place of its clamped record (a buffer
+    /// readable as arguments, the offset in it). `None` if the group is gone
+    /// or full, or the record is not where the pass can read it.
+    pub(crate) fn clamp_group_join(
+        &self,
+        seat: &GroupSeat,
+        record: u64,
+        (kind, stride): (u32, u32),
+    ) -> Option<(ID3D12Resource, u64)> {
+        use crate::indirect::{GROUP_JOBS, GROUP_SLOT};
+        let mut clamps = self.clamps.lock().unwrap_or_else(|e| e.into_inner());
+        let group = clamps.group.as_mut().filter(|g| g.pass == seat.pass && g.jobs < GROUP_JOBS)?;
+        let from = record
+            .checked_sub(group.sources[seat.source])
+            .filter(|b| b.is_multiple_of(4))?
+            / 4;
+        let from = u32::try_from(from).ok()?;
+        let i = group.jobs;
+        let to = group.base + u64::from(i * GROUP_SLOT);
+        let job = crate::indirect::group_job(seat.source as u32, kind, stride, from, to as u32);
+        // SAFETY: the table's own words ([`HostList::clamp_group_seat`]):
+        // fewer than `GROUP_JOBS` jobs before this one; the list has not run.
+        unsafe {
+            let table = group.table as *mut u32;
+            let at = table.add(4 + 4 * i as usize);
+            for (k, word) in job.into_iter().enumerate() {
+                at.add(k).write_volatile(word);
+            }
+            table.write_volatile(i + 1);
+        }
+        group.jobs += 1;
+        let chunk = group.chunk;
+        let out = clamps.group_chunks[chunk].buffer.clone();
+        drop(clamps);
+        crate::indirect::note_grouped();
+        Some((out, to))
     }
 
     /// The list's argument buffer, at least `bytes` long, common between
@@ -5606,6 +5920,19 @@ impl Meter {
                 crate::indirect::take_records().map(|n| n as f64 / report_frames);
             let [hoisted, inline] =
                 crate::indirect::take_clamps().map(|n| n as f64 / report_frames);
+            let [
+                passes,
+                grouped,
+                after_clamp,
+                after_unknown,
+                over_written,
+                in_place,
+                prelude_passes,
+                prelude_grouped,
+            ] = crate::indirect::take_groups().map(|n| n as f64 / report_frames);
+            let [barrier_calls, barriers] =
+                crate::indirect::take_barriers().map(|n| n as f64 / report_frames);
+            let switches = take_work_switches() as f64 / report_frames;
             tracing::info!(
                 "{fps:.1} fps, {ms:.1} ms/frame ({cpu:.1} preparing: copies {copy_ms:.1} ms \
                  {copy_mb:.1} MB, textures {texture_ms:.1} ms {texture_mb:.1} MB; {gpu:.1} on the \
@@ -5613,7 +5940,12 @@ impl Meter {
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame; indirect \
                  max records {records:.0}/frame ({counted:.0} under a count; clamps \
-                 {hoisted:.0} hoisted, {inline:.0} inline)",
+                 {hoisted:.0} hoisted ({prelude_grouped:.0} in {prelude_passes:.0} prelude group \
+                 passes), {inline:.0} inline, {grouped:.0} in {passes:.0} group passes; out of \
+                 the prelude {after_clamp:.0} after a clamp of the list not in \
+                 it, {after_unknown:.0} after a write anywhere, {over_written:.0} over written \
+                 bytes, {in_place:.0} read in place; {barrier_calls:.0} barrier calls of \
+                 {barriers:.0} barriers); {switches:.0} draws after compute/frame",
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);

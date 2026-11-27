@@ -482,6 +482,26 @@ pub(crate) fn remake_unordered() {
     tracing::info!(made, "shaders write through heaps: unordered texture views made again");
 }
 
+/// Makes again, in every shader-visible view heap, the slots whose view is
+/// one of `copies` (title memory in place the title has since mapped other
+/// pages over, `crate::alias::remake_let_go`), from their records. Returns
+/// the slots made again.
+#[cfg(windows)]
+pub(crate) fn remake_holding(copies: &[std::sync::Arc<crate::shadow::Shadow>]) -> usize {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let mut made = 0;
+    for &(start, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let (Some(Some(host)), Some(step), VIEWS_KIND) =
+            (heap.host.get(), increment(heap.desc.kind), heap.desc.kind)
+        {
+            made += host.remake_holding(start, u64::from(step), copies);
+        }
+    }
+    made
+}
+
 /// The host textures (raw pointers) that slots `slots` of the
 /// shader-visible view heaps view.
 #[cfg(windows)]
@@ -1905,6 +1925,249 @@ pub(crate) mod tests {
         drop(second);
         assert!(freed(address), "the last pin freed it");
         assert!(view(at).is_none(), "stale after the last pin");
+    }
+
+    /// The section view the test resolver below answers for, and its heap.
+    #[cfg(windows)]
+    static IN_PLACE_VIEW: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    #[cfg(windows)]
+    static IN_PLACE_HEAP: std::sync::Mutex<Option<std::sync::Arc<crate::alias::PhysicalHeap>>> =
+        std::sync::Mutex::new(None);
+
+    /// As victory-hle's resolver for one section of four 64 KiB pages shown
+    /// whole, in order, at `IN_PLACE_VIEW`.
+    #[cfg(windows)]
+    fn in_place_resolve(
+        start: u64,
+        len: u64,
+    ) -> Option<(std::sync::Arc<crate::alias::PhysicalHeap>, usize)> {
+        let base = IN_PLACE_VIEW.load(std::sync::atomic::Ordering::Relaxed) as u64;
+        let heap = IN_PLACE_HEAP.lock().unwrap().clone()?;
+        (start >= base && start + len <= base + (4 << 16)).then(|| (heap, (start - base) as usize))
+    }
+
+    /// `len` bytes of `buffer` from `offset`, copied out by the GPU.
+    #[cfg(windows)]
+    fn gpu_bytes(
+        buffer: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        offset: u64,
+        len: usize,
+    ) -> Vec<u8> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+        let host = crate::host::host().expect("a host GPU");
+        let device = &host.device;
+        let mut back: Option<ID3D12Resource> = None;
+        // SAFETY: a readback buffer, a list, a queue and a fence of our own,
+        // waited for before the buffer is read.
+        unsafe {
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_READBACK,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: len as u64,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC {
+                            Count: 1,
+                            Quality: 0,
+                        },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+            let back = back.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let alloc: ID3D12CommandAllocator = device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+                .unwrap();
+            let list: ID3D12GraphicsCommandList = device
+                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                .unwrap();
+            list.CopyBufferRegion(&back, 0, buffer, offset, len as u64);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(windows::core::Interface::cast(&list).unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            while fence.GetCompletedValue() < 1 {
+                std::thread::yield_now();
+            }
+            let mut p = std::ptr::null_mut();
+            back.Map(0, None, Some(&mut p)).unwrap();
+            let bytes = std::slice::from_raw_parts(p.cast::<u8>(), len).to_vec();
+            back.Unmap(0, None);
+            bytes
+        }
+    }
+
+    /// A slot made from a title buffer in place on a section's heap reads
+    /// what the title maps there after it maps other pages: before the next
+    /// submission the slot is made again, here from a copy of the new pages,
+    /// as a slot made from a copy would show them once refreshed.
+    #[cfg(windows)]
+    #[test]
+    fn slots_of_memory_in_place_show_the_pages_mapped_over_it() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            MapViewOfFileEx, PAGE_READWRITE, UnmapViewOfFile,
+        };
+        const PAGE: usize = 64 << 10;
+        const SECTION: usize = 4 * PAGE;
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        if !crate::alias::in_place_sections() {
+            crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+            return; // not Rosetta with D3DMetal
+        }
+        let heap_of_section = crate::alias::in_place_heap(SECTION).expect("a heap for the section");
+        let section = |bytes: usize| {
+            // SAFETY: a fresh pagefile section.
+            let s = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    bytes as u32,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!s.is_null());
+            s
+        };
+        let (old, new) = (section(SECTION), section(SECTION));
+        // SAFETY: a view of our section, shown on the heap's pages.
+        let view = unsafe { MapViewOfFile(old, FILE_MAP_WRITE, 0, 0, SECTION) }
+            .Value
+            .cast::<u8>();
+        assert!(!view.is_null());
+        // SAFETY: as victory-hle shows every view of a section on a heap.
+        assert!(unsafe { heap_of_section.alias_view(view as usize, 0, SECTION) });
+        crate::alias::clear_remapped(view as u64, view as u64 + SECTION as u64);
+        IN_PLACE_VIEW.store(view as usize, std::sync::atomic::Ordering::Relaxed);
+        *IN_PLACE_HEAP.lock().unwrap() = Some(heap_of_section);
+        crate::alias::TEST_RESOLVER.with(|c| c.set(Some(in_place_resolve)));
+        // A title buffer in the section, and constants in it the slot views.
+        let start = view as u64 + PAGE as u64;
+        let resource = 0x7e57_2000usize;
+        crate::shadow::register(resource, start, 2 * PAGE as u64);
+        let constants = start + 256;
+        // SAFETY: inside the view.
+        unsafe { std::ptr::write_bytes(view.add(PAGE + 256), 0x11, 256) };
+
+        let memory = crate::watch::tests::pool(1);
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 16,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let mut h = std::ptr::null();
+        let placement = Placement {
+            address: memory as u64,
+            size: 16 * 32,
+        };
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            use crate::backend::{HostGpu, HostMemory};
+            use crate::compute::{Param, srv};
+            let cbv = [constants as u32, (constants >> 32) as u32, 256, 0];
+            create_cbv(std::ptr::null(), &cbv, memory as u64 + 3 * 32);
+            assert!(
+                crate::alias::is_in_place(constants, 256),
+                "the slot's view in place"
+            );
+            // A compute pass reads the slot through a table, as the title's
+            // shaders do, and copies its 256 bytes out; submitted as the
+            // title's lists are (the remake runs in `prepare_submission`).
+            const READ: &str = "ByteAddressBuffer t : register(t0);\n\
+                RWByteAddressBuffer u : register(u0);\n\
+                [numthreads(64, 1, 1)] void main(uint3 id : SV_DispatchThreadID) {\n\
+                    u.Store(id.x * 4, t.Load(id.x * 4));\n\
+                }\n";
+            let (root, pso) = crate::compute::pipeline(
+                READ,
+                windows::core::s!("read slot"),
+                0,
+                &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
+            )
+            .expect("a pipeline reading the slot");
+            let gpu = crate::host::host().expect("a host GPU");
+            let (out, _) = gpu.shared_buffer(1 << 16).expect("an output buffer");
+            let read = || {
+                let list = gpu.new_list().expect("a list");
+                // SAFETY: our heap, pipeline and buffer outlive the waited
+                // submission.
+                unsafe {
+                    list.list.SetDescriptorHeaps(&[Some(host.heap.clone())]);
+                    list.list.SetComputeRootSignature(&root);
+                    list.list.SetComputeRootDescriptorTable(0, host.gpu(3));
+                    list.list
+                        .SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+                    list.list.SetPipelineState(&pso);
+                    list.list.Dispatch(1, 1, 1);
+                }
+                // What a table draw reading the slot defers.
+                list.defer_slot(&host.viewed, 3);
+                list.close();
+                gpu.execute(&[&list]);
+                gpu_bytes(&out, 0, 256)
+            };
+            assert_eq!(
+                read(),
+                vec![0x11; 256],
+                "the slot reads the section's pages"
+            );
+
+            // The title maps other pages there.
+            // SAFETY: our view goes; the new section's view takes its
+            // address (nothing else maps there meanwhile in this test).
+            let remapped = unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+                MapViewOfFileEx(new, FILE_MAP_WRITE, 0, 0, SECTION, view.cast())
+                    .Value
+                    .cast::<u8>()
+            };
+            assert_eq!(remapped, view, "the new pages at the same address");
+            // SAFETY: inside the new view.
+            unsafe { std::ptr::write_bytes(view.add(PAGE + 256), 0x22, 256) };
+            crate::alias::TEST_RESOLVER.with(|c| c.set(None));
+            crate::watch::title_memory_remapped(view as usize, SECTION);
+            assert!(!crate::alias::is_in_place(constants, 256), "let go");
+            // The same slot, unchanged by the title, read by the next
+            // submission: the new pages' bytes.
+            assert_eq!(
+                read(),
+                vec![0x22; 256],
+                "the slot reads the pages mapped there now"
+            );
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        crate::watch::tests::free(memory);
+        crate::shadow::unregister(resource, start);
+        crate::alias::TEST_IN_PLACE.with(|c| c.set(None));
+        *IN_PLACE_HEAP.lock().unwrap() = None;
+        // SAFETY: our view and sections, no longer used.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+            CloseHandle(old);
+            CloseHandle(new);
+        }
     }
 
     /// A record the title copies into its shader-visible heap as bytes (no

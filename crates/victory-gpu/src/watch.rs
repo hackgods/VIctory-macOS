@@ -1656,6 +1656,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new, and read-write.
 pub fn title_memory_remapped(at: usize, len: usize) {
+    crate::alias::forget_in_place(at as u64, len as u64);
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -1689,6 +1690,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
 /// around its unmappings and the title's frees, and a tracker taking the
 /// pages meanwhile leaves them changed, as during a kernel write.
 pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
+    crate::alias::forget_in_place(at as u64, len as u64);
     if !fault_tracking() || at == 0 {
         return Writing { first: 0, last: 0 };
     }

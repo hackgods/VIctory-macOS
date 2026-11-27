@@ -643,6 +643,20 @@ impl Shadow {
         start: u64,
         len: u64,
     ) -> Arc<Shadow> {
+        Self::new_aliased_at(buffer, data, gpu, start, len, 0)
+    }
+
+    /// [`Shadow::new_aliased`] for a range that starts `base` bytes into
+    /// `buffer` (a heap's buffer holding more than this range: views and
+    /// copies count their offsets in `buffer` from there).
+    pub(crate) fn new_aliased_at(
+        buffer: ID3D12Resource,
+        data: *mut u8,
+        gpu: u64,
+        start: u64,
+        len: u64,
+        base: u64,
+    ) -> Arc<Shadow> {
         let marks = marks().take(pages(start, len));
         let shadow = Arc::new(Shadow {
             buffer,
@@ -657,7 +671,7 @@ impl Shadow {
             widened: Mutex::default(),
             widened_source: Mutex::default(),
             has_widened: AtomicBool::new(false),
-            base: 0,
+            base,
             slice: None,
             aliased: true,
             sums: Mutex::default(),
@@ -2300,6 +2314,13 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        // On XMem physical pages on a heap, the buffer is that heap's own
+        // memory (`VICTORY_INPLACE_SECTIONS`): no copy.
+        if let Some(shadow) = crate::alias::in_place_shadow(key.0, len) {
+            entry.shadow = Some(shadow);
+            changed();
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -2324,6 +2345,25 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         changed();
     }
     entry.shadow.clone()
+}
+
+/// Title buffers in place on XMem physical pages (`crate::alias`) that
+/// overlap `[from, to)`, where the title mapped other pages or none: let go,
+/// so that the next lookup finds them again, in place or copied. Returns
+/// them, for the host views made from them to be made again.
+pub(crate) fn forget_in_place(from: u64, to: u64) -> Vec<Arc<Shadow>> {
+    let mut map = buffers();
+    let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+    let mut gone = Vec::new();
+    for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
+        if entry.end > from && entry.shadow.as_ref().is_some_and(|s| s.aliased) {
+            gone.extend(entry.shadow.take());
+        }
+    }
+    if !gone.is_empty() {
+        changed();
+    }
+    gone
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -2796,7 +2836,8 @@ fn take_idle(
         .iter()
         .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
         .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
-        .filter(|(_, c)| idle(c, tables))
+        // Memory in place frees nothing when given up.
+        .filter(|(_, c)| !c.aliased && idle(c, tables))
         .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
         .collect();
     candidates.sort_unstable_by_key(|&(used, ..)| used);

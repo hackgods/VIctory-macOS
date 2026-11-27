@@ -2392,6 +2392,8 @@ impl Host {
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
+            // mac: `VICTORY_PLACED_AT_ONCE=read` keeps when slots were read.
+            crate::placed_read::note_reads(&read);
             crate::descriptor::make_read(&read);
         }
         // Lanes that gave up waiting for a 64-bit atomic's lock: their
@@ -5356,6 +5358,8 @@ impl Meter {
             crate::widened::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
+            // mac: `VICTORY_PLACED_AT_ONCE=read`'s counts.
+            crate::placed_read::log(report_frames);
             // mac: the view table and its lock (`VICTORY_VIEW_INLINE`), always.
             crate::descriptor::log_views(report_frames);
             crate::bindless::log_held(report_frames);

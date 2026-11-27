@@ -2034,7 +2034,10 @@ fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    let slots = crate::shadow::reads_since();
+    // mac: the slots read, for `VICTORY_PLACED_AT_ONCE=read`.
+    crate::placed_read::note_reads(&slots);
+    let read = crate::descriptor::read_textures(&slots);
     evict_among(&candidates(), &read, frame, now, over)
 }
 

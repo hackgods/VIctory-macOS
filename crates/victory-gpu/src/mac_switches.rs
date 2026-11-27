@@ -717,12 +717,22 @@ pub(crate) enum PlacedAtOnce {
     /// `all`: every such slot is made at once, its texture made if it is
     /// not yet (the host textures the null rule spares: memory).
     All,
+    /// `read`: as `keep`, and a slot a shader read through the heap in the
+    /// last `VICTORY_PLACED_READ_FRAMES` frames is made at once as with
+    /// `all` (`crate::placed_read`).
+    Read,
 }
 
 impl PlacedAtOnce {
     /// Whether a view whose host texture is made is made at once.
     pub(crate) fn made(self) -> bool {
         self != PlacedAtOnce::Off
+    }
+
+    /// Whether a slot left for later keeps the host view it held (`keep`,
+    /// and `read` for the slots it does not make at once).
+    pub(crate) fn keeps(self) -> bool {
+        matches!(self, PlacedAtOnce::Keep | PlacedAtOnce::Read)
     }
 }
 
@@ -732,6 +742,7 @@ fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
         Some("1") => PlacedAtOnce::Made,
         Some("keep") => PlacedAtOnce::Keep,
         Some("all") => PlacedAtOnce::All,
+        Some("read") => PlacedAtOnce::Read,
         _ => PlacedAtOnce::Off,
     }
 }
@@ -758,6 +769,8 @@ pub(crate) fn placed_at_once() -> PlacedAtOnce {
             PlacedAtOnce::All => tracing::info!(
                 "VICTORY_PLACED_AT_ONCE=all: every heap slot rewritten with a view of a placed texture is made at once, its texture made if need be"
             ),
+            // Its line is `crate::placed_read`'s, with the window.
+            PlacedAtOnce::Read => {}
         }
         mode
     });
@@ -860,7 +873,16 @@ mod census_tests {
         assert_eq!(placed_rule(Some(" 1 ")), PlacedAtOnce::Made);
         assert_eq!(placed_rule(Some("keep")), PlacedAtOnce::Keep);
         assert_eq!(placed_rule(Some("all")), PlacedAtOnce::All);
-        assert!([PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All].iter().all(|m| m.made()));
+        assert_eq!(placed_rule(Some(" read ")), PlacedAtOnce::Read);
+        assert!(
+            [PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All, PlacedAtOnce::Read].iter().all(|m| m.made())
+        );
+        // `read` keeps a slot's old view where it does not make it at once.
+        assert_eq!(
+            [PlacedAtOnce::Off, PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All, PlacedAtOnce::Read]
+                .map(PlacedAtOnce::keeps),
+            [false, false, true, false, true]
+        );
         // Read once; the tests never set it.
         if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
             assert_eq!(super::placed_at_once(), PlacedAtOnce::Off);
@@ -956,6 +978,7 @@ mod ab_tests {
         assert_eq!(placed_at_once(), PlacedAtOnce::Off);
         with("VICTORY_PLACED_AT_ONCE:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::All));
         with("VICTORY_PLACED_AT_ONCE=keep:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Keep));
+        with("VICTORY_PLACED_AT_ONCE=read:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Read));
     }
 
     #[test]

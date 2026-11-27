@@ -477,6 +477,8 @@ pub(crate) fn make_read(slots: &[u32]) {
             })
             .unzip()
     };
+    // mac: `VICTORY_PLACED_AT_ONCE=read`'s count of them.
+    crate::placed_read::null_reads(placed.len());
     // mac: `VICTORY_FLICKER_WATCH=1`: the slots read while null, before
     // their textures are made.
     if crate::flicker::on() {

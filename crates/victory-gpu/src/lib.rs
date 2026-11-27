@@ -70,6 +70,9 @@ mod flights;
 // mac: `VICTORY_FLICKER_WATCH`; plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod flicker;
+// mac: `VICTORY_PLACED_AT_ONCE=read`; plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod placed_read;
 pub mod frame;
 mod hold;
 #[cfg(windows)]

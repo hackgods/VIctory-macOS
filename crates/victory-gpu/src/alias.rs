@@ -722,6 +722,7 @@ pub(crate) fn in_place_shadow(
     }
     IN_PLACE_SPAN.fetch_max(len, Ordering::Relaxed);
     drop(map);
+    note_coverage(true, len);
     if len >= 16 << 20 {
         tracing::info!(
             start = format_args!("{start:#x}"),
@@ -736,6 +737,35 @@ pub(crate) fn in_place_shadow(
         );
     }
     Some(shadow)
+}
+
+/// Bytes of title memory found in place (`[0]`) and copied to the host
+/// (`[1]`) while sections may hold it in place, and how many ranges each.
+static COVERAGE: [std::sync::atomic::AtomicU64; 4] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Counts `bytes` of title memory found in place, or copied to the host
+/// although [`in_place_sections`]: logged each time either total doubles
+/// (from 64 MiB), so a run shows how much of its memory the heaps cover.
+pub(crate) fn note_coverage(in_place: bool, bytes: u64) {
+    if !in_place && !in_place_sections() {
+        return;
+    }
+    let k = usize::from(!in_place);
+    let before = COVERAGE[k].fetch_add(bytes, Ordering::Relaxed);
+    COVERAGE[k + 2].fetch_add(1, Ordering::Relaxed);
+    let after = before + bytes;
+    if after >= 64 << 20 && after.leading_zeros() != before.max(1).leading_zeros() {
+        let [placed, copied, placed_ranges, copied_ranges] =
+            [0, 1, 2, 3].map(|i| COVERAGE[i].load(Ordering::Relaxed));
+        tracing::info!(
+            in_place_mb = placed >> 20,
+            in_place_ranges = placed_ranges,
+            copied_mb = copied >> 20,
+            copied_ranges,
+            "title memory in place against copied to the host, so far"
+        );
+    }
 }
 
 /// Whether any of `[address, address + len)` is title memory in place.

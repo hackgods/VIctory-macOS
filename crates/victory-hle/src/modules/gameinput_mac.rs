@@ -29,7 +29,9 @@
 //! key is down, one log line (`input watch`) with what the host reports: each
 //! such pad's sticks, triggers and buttons, how long its value has been
 //! exactly the same and how long XInput's packet number has (a pad whose
-//! reports stopped keeps both still), and the keys down. Changes nothing.
+//! reports stopped keeps both still), and the keys down; also the rumble the
+//! title set on each slot (calls since the last line, the last speeds), with a
+//! line for rumble calls alone. Changes nothing.
 //!
 //! `VICTORY_PAD_REARM=1`: a watchdog for a host pad whose reading stopped
 //! while off rest (27 November: right trigger at 1.00 and packet 78 for 56 s
@@ -197,6 +199,17 @@ struct Watched {
     packet_changed: u64,
 }
 
+/// Rumble the title set on one host slot, for `VICTORY_INPUT_WATCH`.
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug)]
+struct WatchedRumble {
+    low: u16,
+    high: u16,
+    /// Calls since the last line, and the last one (µs).
+    calls: u32,
+    last: u64,
+}
+
 /// The input watch; see the module notes.
 #[cfg(any(windows, test))]
 #[derive(Debug, Default)]
@@ -204,6 +217,7 @@ pub(super) struct Watch {
     /// `None` until the environment was read.
     on: Option<bool>,
     pads: [Option<Watched>; PADS],
+    rumble: [Option<WatchedRumble>; PADS],
     /// The last line (µs).
     logged: u64,
 }
@@ -251,6 +265,22 @@ impl Watch {
         });
     }
 
+    /// The title set host slot `slot`'s rumble (whether or not it was sent).
+    pub(super) fn rumble(&mut self, slot: usize, low: u16, high: u16, now: u64) {
+        if !self.on() {
+            return;
+        }
+        if let Some(r) = self.rumble.get_mut(slot) {
+            let calls = r.map_or(0, |r| r.calls) + 1;
+            *r = Some(WatchedRumble {
+                low,
+                high,
+                calls,
+                last: now,
+            });
+        }
+    }
+
     /// The keys down (virtual keys) after the pads of one poll; the line
     /// logged, if one is due.
     pub(super) fn keys(&mut self, keys: &[u8], now: u64) -> Option<String> {
@@ -273,8 +303,15 @@ impl Watch {
         };
         let secs = |since: u64| now.saturating_sub(since) as f64 / 1e6;
         let mut line = String::new();
-        for (slot, w) in self.pads.iter().enumerate() {
-            let Some(w) = w.filter(|w| off_rest(&w.pad)) else {
+        for slot in 0..PADS {
+            let shown = self.pads[slot].filter(|w| off_rest(&w.pad));
+            // Rumble: calls since the last line, or set while a pad shows.
+            let rumble = self.rumble[slot]
+                .filter(|r| r.calls > 0 || (shown.is_some() && (r.low | r.high) != 0));
+            let Some(w) = shown else {
+                if let Some(r) = rumble {
+                    let _ = write!(line, "{}", rumble_part(slot, r, secs(r.last)));
+                }
                 continue;
             };
             let p = w.pad;
@@ -292,12 +329,18 @@ impl Watch {
                 w.packet,
                 secs(w.packet_changed),
             );
+            if let Some(r) = rumble {
+                let _ = write!(line, "{}", rumble_part(slot, r, secs(r.last)));
+            }
         }
         if !keys.is_empty() {
             let _ = write!(line, "keys {keys:02x?}");
         }
         if line.is_empty() {
             return None;
+        }
+        for r in self.rumble.iter_mut().flatten() {
+            r.calls = 0;
         }
         self.logged = now;
         tracing::info!("input watch: {line}");
@@ -822,6 +865,17 @@ mod helper {
     }
 }
 
+/// The watch line's rumble part for one slot.
+#[cfg(any(windows, test))]
+fn rumble_part(slot: usize, r: WatchedRumble, ago: f64) -> String {
+    format!(
+        "rumble {slot}: {:.2} {:.2}, {} calls since the last line, last {ago:.1} s ago; ",
+        f32::from(r.low) / 65535.0,
+        f32::from(r.high) / 65535.0,
+        r.calls
+    )
+}
+
 /// The switches and what they keep; `Default` is all off.
 #[derive(Debug, Default)]
 pub(super) struct Mac {
@@ -1026,6 +1080,30 @@ mod tests {
         assert!(line.ends_with("keys [57]"), "{line}");
         // At most a line a second.
         assert_eq!(watch.keys(&[0x57], 5_000_000), None);
+    }
+
+    #[test]
+    fn the_watch_shows_rumble_calls() {
+        let mut watch = Watch {
+            on: Some(true),
+            ..Watch::default()
+        };
+        // At rest: a line only for the calls.
+        watch.rumble(0, 0x8000, 0, 500_000);
+        watch.rumble(0, 0xFFFF, 0, 900_000);
+        let line = watch.keys(&[], 1_000_000).unwrap();
+        assert_eq!(
+            line,
+            "rumble 0: 1.00 0.00, 2 calls since the last line, last 0.1 s ago; "
+        );
+        assert_eq!(watch.keys(&[], 2_000_000), None, "no calls since");
+        // A pad off rest shows rumble still set, with no calls.
+        watch.pad(0, Some((pad(0, 1.0).unwrap(), 9)), 2_500_000);
+        let line = watch.keys(&[], 3_000_000).unwrap();
+        assert!(
+            line.ends_with("rumble 0: 1.00 0.00, 0 calls since the last line, last 2.1 s ago; "),
+            "{line}"
+        );
     }
 
     #[test]

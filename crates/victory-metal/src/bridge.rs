@@ -85,6 +85,17 @@ pub struct Device {
     pub page_size: u64,
 }
 
+/// Where the time of a [`Bridge::turns`] went, by the unixlib's clock.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnsTimes {
+    /// Recording the command buffer.
+    pub encode: Duration,
+    /// From the commit to the end of the wait for completion.
+    pub wait: Duration,
+    /// What the GPU reports between the command buffer's start and end.
+    pub gpu: Duration,
+}
+
 /// Where the time of a [`Bridge::fill`] went, by the unixlib's clock.
 #[derive(Debug, Clone, Copy)]
 pub struct FillTimes {
@@ -247,6 +258,29 @@ impl Bridge {
             return Err(failed(status, &s.error));
         }
         Ok(Duration::from_nanos(s.total_ns))
+    }
+
+    /// `pairs` times a dispatch of one thread that writes an indirect
+    /// draw's 20 bytes of arguments, then that draw into a 64 x 64 target,
+    /// in one command buffer, waited for. With `batched` false each
+    /// dispatch and each draw get an encoder of their own, as compute and
+    /// render work taking turns do; with `true`, one compute encoder holds
+    /// all dispatches and one render encoder all draws. The unixlib checks
+    /// every record and the target.
+    pub fn turns(&self, pairs: u32, batched: bool) -> Result<TurnsTimes, CallError> {
+        let mut t: abi::Turns = abi::block(|t: &mut abi::Turns, n| t.size = n);
+        t.pairs = pairs;
+        t.batched = batched.into();
+        // SAFETY: a block of the call's own layout, with its size set.
+        let status = unsafe { self.call(abi::TURNS, (&raw mut t).cast()) };
+        if status != 0 {
+            return Err(failed(status, &t.error));
+        }
+        Ok(TurnsTimes {
+            encode: Duration::from_nanos(t.encode_ns),
+            wait: Duration::from_nanos(t.wait_ns),
+            gpu: Duration::from_nanos(t.gpu_ns),
+        })
     }
 }
 

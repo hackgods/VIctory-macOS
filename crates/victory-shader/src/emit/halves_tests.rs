@@ -1579,7 +1579,7 @@ fn same_row_permlane16_native(threads: u32) -> NativeProgram {
 #[test]
 fn same_row_permlane16_uses_host_lanes_without_an_exchange() {
     let n = same_row_permlane16_native(64);
-    let l = super::with_thread_ticket(false, || lowered(&n, true))
+    let l = lowered(&n, true)
         .expect("a live same-row permute lowers in wave64 halves");
     assert_eq!(l.wave_size, Some(32));
     assert!(l.uses_lane_index);

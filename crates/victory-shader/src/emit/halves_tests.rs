@@ -4085,3 +4085,139 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
+
+/// A first-lane read of a value a multiply-accumulate made, in an
+/// `s_and_saveexec_b64` region whose EXEC is `mask_words`'s, its result
+/// used in the region only (as GTA VI's `ef154ebc9e03d1b1` reads a function
+/// of a constant-buffer value): `v4 = f32(s14)`, `s14` the first dword of
+/// the SRV buffer at table dword 8, then `v_mac_f32 v4, v7, v8` with
+/// `v7 = 2.0`, so `v4 += 2.0 * v8`. `v8` is 2.0 (the same in every lane of
+/// the region), or with `per_lane` the lane's thread id. The region's lanes
+/// store the read; the others 0.
+fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0xF420_0396,
+        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ]);
+    w.extend(mask_words);
+    w.extend([
+        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+        0xBF88_0006, // s_cbranch_execz (past the region)
+        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
+        0x7E0E_02F4, // v_mov_b32 v7, 2.0
+        if per_lane {
+            0x7E10_0D00 // v_cvt_f32_u32 v8, v0
+        } else {
+            0x7E10_02F4 // v_mov_b32 v8, 2.0
+        },
+        0x3E08_1107, // v_mac_f32 v4, v7, v8
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_mac_read_programs_are_what_their_comments_say() {
+    for per_lane in [false, true] {
+        let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "s_buffer_load_dword s14, s[44:47]",
+            "s_and_saveexec_b64 s[0:1], vcc",
+            "s_cbranch_execz",
+            "v_cvt_f32_u32 v4, s14",
+            "v_mov_b32 v7, 2.0",
+            if per_lane {
+                "v_cvt_f32_u32 v8, v0"
+            } else {
+                "v_mov_b32 v8, 2.0"
+            },
+            "v_mac_f32 v4, v7, v8",
+            "v_readfirstlane_b32 s12, v4",
+            "v_mov_b32 v2, s12",
+            "s_mov_b64 exec, s[0:1]",
+        ] {
+            assert!(all.contains(want), "per_lane={per_lane}: {want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A multiply-accumulate adds to its old destination. Where that, like its
+/// operands, is the same in every lane of the read's EXEC, so is its
+/// result, and each half makes the read by itself: no halves for it, no
+/// exchange. Before, any multiply-accumulate in the value's chain sent the
+/// read to the halves. With a per-lane operand the read still takes them.
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_is_made_in_each_half() {
+    for threads in [64, 128] {
+        let of = |per_lane: bool| {
+            let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+            lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("per_lane={per_lane} {threads} threads: {e}"))
+        };
+        let alike = of(false);
+        assert_eq!(alike.barriers, 0, "{threads} threads: no exchange");
+        let per_lane = of(true);
+        assert_eq!(per_lane.wave_size, Some(32));
+        assert!(per_lane.barriers > 0, "{threads} threads: the halves pass the first lane");
+    }
+}
+
+/// Both give the console's lanes on every GPU: the region's lanes store
+/// `41.0 + 2.0 * 2.0`, or with a per-lane operand `41.0 + 2.0 *` the thread
+/// id of the console wave's first lane in the region.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu() {
+    type InRegion = fn(u32) -> bool;
+    let masks: [(&str, &[u32; 2], InRegion, &[u32]); 3] = [
+        ("lower_8_9", &MASK_LANES_8_9, |t| t >> 1 == 4, &[64]),
+        ("upper_40_41", &MASK_LANES_40_41, |t| t >> 1 == 20, &[64]),
+        ("both_12_44", &MASK_LANES_12_44, |t| t & 31 == 12, &[64, 128]),
+    ];
+    let mut failed = Vec::new();
+    for (label, mask, in_region, groups) in masks {
+        for &threads in groups {
+            for per_lane in [false, true] {
+                let words = mac_read_in_a_region(mask, per_lane);
+                let want: Vec<u32> = (0..threads)
+                    .map(|t| {
+                        if !in_region(t) {
+                            return 0;
+                        }
+                        let base = t & !63;
+                        let first = (base..base + 64).find(|&l| in_region(l)).expect("in it");
+                        let operand = if per_lane { first as f32 } else { 2.0 };
+                        (41.0 + 2.0 * operand).to_bits()
+                    })
+                    .collect();
+                let found = differences_with_buffer(
+                    true, &words, threads, 1, &want, 0, false, false, &[41, 0, 0, 0],
+                );
+                failed.extend(
+                    found
+                        .into_iter()
+                        .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}

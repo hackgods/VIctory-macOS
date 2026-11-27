@@ -40,7 +40,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 
 /// Whether title writes may fault into a tracker: the guards here and the
 /// write watch of the runtime's pools (`victory_hle`'s `XMemVirtualAlloc`,
@@ -226,9 +226,17 @@ impl Saved {
 }
 
 impl Changed {
-    /// Page `page` was taken: what it saved of it is stale.
-    fn taken(&self, page: usize) {
-        self.1.lock().unwrap_or_else(|e| e.into_inner()).bytes.remove(&page);
+    /// `pages` were taken: anything saved of them is stale.
+    fn taken_many(&self, pages: &[usize]) {
+        if pages.is_empty() {
+            return;
+        }
+        let mut saved = self.1.lock().unwrap_or_else(|e| e.into_inner());
+        if !saved.bytes.is_empty() {
+            for &page in pages {
+                saved.bytes.remove(&page);
+            }
+        }
     }
 
     /// Page `page` is about to change for the first time since it was
@@ -260,9 +268,34 @@ pub(crate) struct Tracked {
     untracked: Vec<(usize, usize)>,
 }
 
+/// State of a page currently being transitioned to `PAGE_READONLY` outside
+/// [`GUARDS`].
+#[derive(Clone, Copy)]
+struct GuardOp {
+    /// Identifies the owning `protect_with_aliases` batch.
+    op_id: u64,
+    /// A concurrent write fault, kernel write, remap, or tracker drop raced
+    /// with this transition: do not commit the page as taken, and reopen it to
+    /// `PAGE_READWRITE` if `VirtualProtect(PAGE_READONLY)` succeeded.
+    reopen: bool,
+    /// A concurrent alias write or `retake` raced with this transition: keep
+    /// the page read-only if `VirtualProtect(PAGE_READONLY)` succeeded, but do
+    /// not clear the page from the caller's dirty set.
+    skip_commit: bool,
+}
+
 struct Guards {
     /// Blocks (pages) we made read-only.
     protected: BTreeSet<usize>,
+    /// Blocks currently being transitioned to `PAGE_READONLY` outside
+    /// [`GUARDS`]. Removed only by the owning batch once it re-acquires
+    /// [`GUARDS`]; any cancelled page is moved atomically into `opening`
+    /// before releasing [`GUARDS`] to reopen it.
+    guarding: BTreeMap<usize, GuardOp>,
+    next_guard_op: u64,
+    /// Page runs `[first, last)` currently being transitioned to
+    /// `PAGE_READWRITE` outside [`GUARDS`].
+    opening: Vec<(usize, usize)>,
     /// The trackers holding each page.
     holders: BTreeMap<usize, Vec<Arc<Changed>>>,
     /// Pages `[first, last)` of writes the guards do not see that are under
@@ -282,6 +315,9 @@ struct Guards {
 
 static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
+    guarding: BTreeMap::new(),
+    next_guard_op: 1,
+    opening: Vec::new(),
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
@@ -290,6 +326,19 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     #[cfg(feature = "diagnostics")]
     written_before: BTreeSet::new(),
 });
+
+/// Wakes threads waiting for an unlocked `VirtualProtect(..., PAGE_READONLY)`
+/// transition (and any cancellation reopen) to finish on a page.
+static GUARDING_CV: Condvar = Condvar::new();
+/// Wakes threads waiting for an unlocked `VirtualProtect(..., PAGE_READWRITE)`
+/// transition to finish on a page.
+static OPENING_CV: Condvar = Condvar::new();
+/// Serializes unlocked `VirtualProtect(..., PAGE_READONLY)` / `VirtualQuery`
+/// batches across parallel refresh workers so they do not stampede Wine's
+/// `virtual_mutex` while write-fault handlers remain completely independent of
+/// it. Never acquired while holding [`GUARDS`], and [`GUARDS`] is never
+/// acquired while holding this lock.
+static PROTECT_SYSCALL: Mutex<()> = Mutex::new(());
 
 thread_local! {
     /// Whether this thread holds the guard lock. A guarded block it faults
@@ -309,23 +358,30 @@ static OPENED_UNDER_LOCK: [std::sync::atomic::AtomicUsize; 64] =
 /// touched while the lock is held, so a clear scan leaves no block behind.
 static OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A fault on the block `page` by the thread holding the guard lock: write
-/// access back now, marked changed by the lock's next holder.
-// shortcut: assumes a read-only block this thread writes while
-// holding the lock is one of ours; with all 64 slots taken the block stays
-// open without being marked (counted); a bigger table if that shows up.
-fn open_under_lock(page: usize) {
+/// Records `page` in [`OPENED_UNDER_LOCK`] for the current or next holder of
+/// [`GUARDS`] to mark changed. Lock-free and allocation-free.
+// shortcut: with all 64 slots taken the block stays open without being marked
+// (counted); a bigger table if that shows up.
+fn note_opened_under_lock(page: usize) {
     use std::sync::atomic::Ordering::{AcqRel, Relaxed, Release};
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let mut old = 0;
-    // SAFETY: a block of this process; fails harmlessly if it is gone.
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
     if OPENED_UNDER_LOCK.iter().any(|s| s.compare_exchange(0, page, AcqRel, Relaxed).is_ok()) {
         OPENED.store(true, Release);
     } else {
         static LOST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         LOST.fetch_add(1, Relaxed);
     }
+}
+
+/// A fault on the block `page` by the thread holding the guard lock: write
+/// access back now, marked changed before the lock is released.
+// shortcut: assumes a read-only block this thread writes while holding the
+// lock is one of ours.
+fn open_under_lock(page: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    let mut old = 0;
+    // SAFETY: a block of this process; fails harmlessly if it is gone.
+    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+    note_opened_under_lock(page);
 }
 
 /// The guard lock, held while this lives. With diagnostics, timed for the
@@ -340,7 +396,6 @@ struct Held {
 
 #[track_caller]
 fn guards() -> Held {
-    use std::sync::atomic::Ordering::AcqRel;
     let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
     HOLDING.with(|h| h.set(true));
     let mut held = Held {
@@ -350,15 +405,93 @@ fn guards() -> Held {
         #[cfg(feature = "diagnostics")]
         line: std::panic::Location::caller().line(),
     };
-    if OPENED.swap(false, AcqRel) {
-        for slot in &OPENED_UNDER_LOCK {
-            let page = slot.swap(0, AcqRel);
-            if page != 0 {
-                changed(&mut held, page, page + 1, false);
+    held.drain_opened_under_lock();
+    held
+}
+
+impl Held {
+    fn record_hold_segment(&mut self) {
+        #[cfg(feature = "diagnostics")]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let us = self.since.elapsed().as_micros() as u64;
+            let line = u64::from(self.line);
+            if let Some(slot) = HELD
+                .iter()
+                .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
+            {
+                slot[1].fetch_add(us, Relaxed);
+                slot[2].fetch_max(us, Relaxed);
             }
         }
     }
-    held
+
+    /// Reconciles any pages opened by re-entrant faults while [`GUARDS`] was
+    /// held, without calling `VirtualProtect` or releasing [`GUARDS`].
+    fn drain_opened_under_lock(&mut self) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        while OPENED.load(Acquire) && OPENED.swap(false, AcqRel) {
+            for slot in &OPENED_UNDER_LOCK {
+                let page = slot.swap(0, AcqRel);
+                if page != 0 {
+                    self.protected.remove(&page);
+                    if let Some(op) = self.guarding.get_mut(&page) {
+                        op.reopen = true;
+                        op.skip_commit = true;
+                    }
+                    let others: Vec<usize> = self
+                        .alias_of
+                        .get(&page)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .collect();
+                    cancel_guarding_aliases(self, &others);
+                    mark_changed(self, page, page + 1, false);
+                    for alias in others {
+                        mark_changed(self, alias, alias + 1, false);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Releases [`GUARDS`] for the duration of `f` (used around `VirtualProtect`,
+    /// `VirtualQuery`, and `GetWriteWatch` syscalls) and re-acquires it
+    /// afterwards.
+    fn unlock_for<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.drain_opened_under_lock();
+        self.record_hold_segment();
+        drop(self.guard.take());
+        HOLDING.with(|h| h.set(false));
+        let out = f();
+        let guard = GUARDS.lock().unwrap_or_else(|e| e.into_inner());
+        HOLDING.with(|h| h.set(true));
+        self.guard = Some(guard);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.since = std::time::Instant::now();
+        }
+        self.drain_opened_under_lock();
+        out
+    }
+
+    /// Waits on `cv`, clearing [`HOLDING`] and hold-time accounting while
+    /// [`GUARDS`] is released.
+    fn wait(&mut self, cv: &'static Condvar) {
+        self.drain_opened_under_lock();
+        self.record_hold_segment();
+        let guard = self.guard.take().expect("held until dropped");
+        HOLDING.with(|h| h.set(false));
+        let guard = cv.wait(guard).unwrap_or_else(|e| e.into_inner());
+        HOLDING.with(|h| h.set(true));
+        self.guard = Some(guard);
+        #[cfg(feature = "diagnostics")]
+        {
+            self.since = std::time::Instant::now();
+        }
+        self.drain_opened_under_lock();
+    }
 }
 
 impl std::ops::Deref for Held {
@@ -382,20 +515,11 @@ static HELD: [[std::sync::atomic::AtomicU64; 3]; 16] =
 
 impl Drop for Held {
     fn drop(&mut self) {
-        drop(self.guard.take());
-        HOLDING.with(|h| h.set(false));
-        #[cfg(feature = "diagnostics")]
-        {
-            use std::sync::atomic::Ordering::Relaxed;
-            let us = self.since.elapsed().as_micros() as u64;
-            let line = u64::from(self.line);
-            if let Some(slot) = HELD
-                .iter()
-                .find(|s| s[0].load(Relaxed) == line || s[0].compare_exchange(0, line, Relaxed, Relaxed).is_ok())
-            {
-                slot[1].fetch_add(us, Relaxed);
-                slot[2].fetch_max(us, Relaxed);
-            }
+        if self.guard.is_some() {
+            self.drain_opened_under_lock();
+            self.record_hold_segment();
+            drop(self.guard.take());
+            HOLDING.with(|h| h.set(false));
         }
     }
 }
@@ -414,27 +538,45 @@ pub(crate) fn held_times() -> Vec<(u64, f64, f64)> {
     out
 }
 
+fn is_busy(g: &Guards, page: usize) -> bool {
+    g.busy.iter().any(|&(a, b)| (a..b).contains(&page))
+}
+
+fn is_opening(g: &Guards, page: usize) -> bool {
+    g.opening.iter().any(|&(a, b)| (a..b).contains(&page))
+}
+
+fn overlaps_opening(g: &Guards, first: usize, last: usize) -> bool {
+    first < last && g.opening.iter().any(|&(a, b)| a < last && first < b)
+}
+
+/// Prevents any in-flight `protect_with_aliases` on `others` (or their
+/// aliases) from clearing tracker dirty state when it re-acquires [`GUARDS`],
+/// without reopening their read-only guards.
+fn cancel_guarding_aliases(g: &mut Guards, others: &[usize]) {
+    if g.guarding.is_empty() || others.is_empty() {
+        return;
+    }
+    for &alias in others {
+        if let Some(op) = g.guarding.get_mut(&alias) {
+            op.skip_commit = true;
+        }
+        if let Some(hop) = g.alias_of.get(&alias) {
+            for &p in hop {
+                if let Some(op) = g.guarding.get_mut(&p) {
+                    op.skip_commit = true;
+                }
+            }
+        }
+    }
+}
+
 /// (page, other page) for the pages (page numbers) showing the same memory
 /// as `pages` elsewhere.
 fn aliases(g: &Guards, pages: &[usize]) -> Vec<(usize, usize)> {
     pages
         .iter()
         .flat_map(|&p| g.alias_of.get(&p).into_iter().flatten().map(move |&a| (p, a)))
-        .collect()
-}
-
-/// Guards the other mappings of taken pages, returning those that still
-/// have an unguarded mapping (cannot be taken yet).
-fn guard_aliases(g: &mut Guards, pairs: &[(usize, usize)]) -> BTreeSet<usize> {
-    if pairs.is_empty() {
-        return BTreeSet::new();
-    }
-    let others: Vec<usize> = pairs.iter().map(|&(_, a)| a).collect();
-    let guarded: BTreeSet<usize> = protect(g, &others).into_iter().collect();
-    pairs
-        .iter()
-        .filter(|(_, a)| !guarded.contains(a))
-        .map(|&(p, _)| p)
         .collect()
 }
 
@@ -582,49 +724,97 @@ impl Drop for Tracked {
                 }
             }
         }
+        let mut to_open = Vec::new();
+        let mut wait_guarding = Vec::new();
+        let mut wait_opening = Vec::new();
         for page in free {
-            let watched_elsewhere = g.alias_of.get(&page).is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
+            let watched_elsewhere = g
+                .alias_of
+                .get(&page)
+                .is_some_and(|o| o.iter().any(|p| g.holders.contains_key(p)));
             if !watched_elsewhere {
-                open(&mut g, page);
+                if g.protected.remove(&page) {
+                    to_open.push(page);
+                }
+                if let Some(op) = g.guarding.get_mut(&page) {
+                    op.reopen = true;
+                    op.skip_commit = true;
+                    wait_guarding.push(page);
+                } else if is_opening(&g, page) {
+                    wait_opening.push(page);
+                }
             }
         }
-    }
-}
-
-/// Gives write access back to page `page` if we guarded it.
-fn open(g: &mut Guards, page: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if !g.protected.remove(&page) {
-        return false;
-    }
-    let mut old = 0;
-    // SAFETY: a block we made read-only (failing harmlessly if it is gone).
-    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
-    #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, 1);
-    true
-}
-
-/// [`open`] of the guarded pages `[first, last)`, all in `protected`.
-fn open_run(g: &mut Guards, first: usize, last: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    if last - first == 1 {
-        open(g, first);
-        return;
-    }
-    let mut old = 0;
-    // SAFETY: blocks we made read-only.
-    if unsafe { VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old) } == 0 {
-        for page in first..last {
-            open(g, page);
+        open_sorted_pages(&mut g, &to_open);
+        while wait_guarding.iter().any(|p| g.guarding.contains_key(p)) {
+            g.wait(&GUARDING_CV);
         }
+        while wait_guarding.iter().chain(&wait_opening).any(|&p| is_opening(&g, p)) {
+            g.wait(&OPENING_CV);
+        }
+    }
+}
+
+/// Coalesces sorted `pages` (already removed from `g.protected`/`g.guarding`)
+/// into contiguous runs and calls `VirtualProtect(..., PAGE_READWRITE)`
+/// outside [`GUARDS`], holding [`Guards::opening`] across the syscalls so
+/// concurrent takes and faults serialize cleanly on only those pages.
+fn open_sorted_pages(g: &mut Held, pages: &[usize]) {
+    if pages.is_empty() {
         return;
     }
-    for page in first..last {
-        g.protected.remove(&page);
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < pages.len() {
+        let mut j = i + 1;
+        while j < pages.len() && pages[j] == pages[j - 1] + 1 {
+            j += 1;
+        }
+        runs.push((pages[i], pages[j - 1] + 1));
+        i = j;
     }
+    g.opening.extend(runs.iter().copied());
+    let opened = g.unlock_for(|| {
+        use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+        debug_assert!(
+            !HOLDING.with(std::cell::Cell::get),
+            "VirtualProtect(PAGE_READWRITE) must not run while holding GUARDS"
+        );
+        let mut count = 0u64;
+        for &(first, last) in &runs {
+            let mut old = 0;
+            if last - first == 1 {
+                // SAFETY: a block we made read-only (fails harmlessly if gone).
+                unsafe { VirtualProtect((first * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+                count += 1;
+                continue;
+            }
+            // SAFETY: blocks we made read-only.
+            if unsafe {
+                VirtualProtect((first * PAGE) as *const _, (last - first) * PAGE, PAGE_READWRITE, &mut old)
+            } != 0
+            {
+                count += (last - first) as u64;
+            } else {
+                for page in first..last {
+                    // SAFETY: as above.
+                    unsafe { VirtualProtect((page * PAGE) as *const _, PAGE, PAGE_READWRITE, &mut old) };
+                    count += 1;
+                }
+            }
+        }
+        count
+    });
+    for run in &runs {
+        if let Some(pos) = g.opening.iter().position(|r| r == run) {
+            g.opening.swap_remove(pos);
+        }
+    }
+    OPENING_CV.notify_all();
     #[cfg(feature = "diagnostics")]
-    crate::copystat::add(crate::copystat::C::OpenPages, (last - first) as u64);
+    crate::copystat::add(crate::copystat::C::OpenPages, opened);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = opened;
 }
 
 impl Tracked {
@@ -705,35 +895,38 @@ impl Tracked {
         if pages.is_empty() {
             return (Vec::new(), Vec::new());
         }
-        let mut whole: Vec<usize> = pages
+        let whole: Vec<usize> = pages
             .iter()
             .copied()
             .filter(|&p| (p * PAGE).max(self.start) >= from && ((p + 1) * PAGE).min(self.end) <= to)
             .collect();
-        // Every address showing the same pages is guarded too. A write in
-        // between marks them changed again; the copy, made after, has it.
-        #[cfg(feature = "diagnostics")]
-        let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
-        let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(feature = "diagnostics")]
-        drop(waited);
-        #[cfg(feature = "diagnostics")]
-        let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
-        let others = aliases(&g, &whole);
-        let unguarded = guard_aliases(&mut g, &others);
-        #[cfg(feature = "diagnostics")]
-        drop(asked);
-        whole.retain(|p| !unguarded.contains(p));
         let mut unmapped = Vec::new();
-        for page in protect_noting(&mut g, &whole, &mut unmapped) {
-            changed.remove(&page);
-            self.changed.taken(page);
+        if !whole.is_empty() {
+            // Every address showing the same pages is guarded too. A write in
+            // between marks them changed again; the copy, made after, has it.
+            #[cfg(feature = "diagnostics")]
+            let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
+            let mut g = guards();
+            #[cfg(feature = "diagnostics")]
+            drop(waited);
+            #[cfg(feature = "diagnostics")]
+            let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
+            let others = aliases(&g, &whole);
+            #[cfg(feature = "diagnostics")]
+            drop(asked);
+            protect_with_aliases(&mut g, &whole, &others, true, Some(&mut unmapped), |taken| {
+                {
+                    let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                    for &page in taken {
+                        changed.remove(&page);
+                    }
+                    set_dirty(self.changed.2, !changed.is_empty());
+                }
+                self.changed.taken_many(taken);
+            });
+            drop(g);
+            unmapped.sort_unstable();
         }
-        set_dirty(self.changed.2, !changed.is_empty());
-        drop(changed);
-        drop(g);
-        unmapped.sort_unstable();
         let (mut copy, mut zero): (Runs, Runs) = (Vec::new(), Vec::new());
         for p in pages {
             let (a, b) = ((p * PAGE).max(from), ((p + 1) * PAGE).min(to));
@@ -768,18 +961,17 @@ impl Tracked {
             return;
         }
         let mut g = guards();
-        let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         let others = aliases(&g, &tracked_pages);
-        let unguarded = guard_aliases(&mut g, &others);
-        let pages: Vec<usize> = tracked_pages
-            .into_iter()
-            .filter(|p| !unguarded.contains(p))
-            .collect();
-        for page in protect(&mut g, &pages) {
-            changed.remove(&page);
-            self.changed.taken(page);
-        }
-        set_dirty(self.changed.2, !changed.is_empty());
+        protect_with_aliases(&mut g, &tracked_pages, &others, true, None, |taken| {
+            {
+                let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
+                for &page in taken {
+                    changed.remove(&page);
+                }
+                set_dirty(self.changed.2, !changed.is_empty());
+            }
+            self.changed.taken_many(taken);
+        });
     }
 
     /// Whether any byte of page `page` (a page number) lies in the tracker's
@@ -871,97 +1063,274 @@ impl Tracked {
     }
 }
 
-/// Makes `pages` read-only where not already (in runs), and returns those
-/// now guarded or with nothing mapped (taken either way); a page that is
-/// mapped but cannot be guarded is left out (it stays changed).
-fn protect(g: &mut Guards, pages: &[usize]) -> Vec<usize> {
-    protect_noting(g, pages, &mut Vec::new())
+/// Makes `pages` read-only where not already (in runs, with [`GUARDS`]
+/// released across syscalls), and returns those now guarded or with nothing
+/// mapped (taken either way); a page that is mapped but cannot be guarded or
+/// was concurrently opened/cancelled is left out (it stays changed).
+fn protect(g: &mut Held, pages: &[usize]) -> Vec<usize> {
+    protect_with_aliases(g, pages, &[], false, None, |_| {})
 }
 
-/// [`protect`], also listing in `unmapped` the pages taken because nothing
-/// is mapped there.
-fn protect_noting(g: &mut Guards, pages: &[usize], unmapped_pages: &mut Vec<usize>) -> Vec<usize> {
-    #[cfg(feature = "diagnostics")]
-    let counted = |calls: u64, pages: u64| {
-        crate::copystat::add(crate::copystat::C::ProtectCalls, calls);
-        crate::copystat::add(crate::copystat::C::ProtectPages, pages);
-    };
+/// Guards `primary` (and, when `check_aliases` is true, every alias mapping of
+/// each primary page) in a single unlocked `VirtualProtect` / `VirtualQuery` /
+/// `GetWriteWatch` pass, committing tracker dirty-set clears atomically under
+/// [`GUARDS`] via `on_commit` before releasing [`GUARDS`] to reopen any
+/// concurrently cancelled pages.
+fn protect_with_aliases(
+    g: &mut Held,
+    primary: &[usize],
+    alias_pairs: &[(usize, usize)],
+    check_aliases: bool,
+    mut unmapped_pages: Option<&mut Vec<usize>>,
+    mut on_commit: impl FnMut(&[usize]),
+) -> Vec<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualProtect, VirtualQuery,
     };
-    #[cfg(feature = "diagnostics")]
-    let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
-    let set = |from: usize, to: usize| {
-        #[cfg(feature = "diagnostics")]
-        counted(1, (to - from) as u64);
-        #[cfg(test)]
-        tests::PROTECTS.with(|n| n.set(n.get() + 1));
-        let mut old = 0;
-        // SAFETY: title memory; only its protection changes.
-        unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
-    };
-    let unmapped_region = |page: usize| -> Option<usize> {
-        // SAFETY: plain data filled in by the query.
-        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
-        if n == 0 {
-            return Some(page + 1);
-        }
-        if info.State != MEM_COMMIT {
-            let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE)
-                .max(page + 1);
-            return Some(end);
-        }
-        None
-    };
-    let mut taken = Vec::with_capacity(pages.len());
-    let busy = |page: usize| g.busy.iter().any(|&(a, b)| (a..b).contains(&page));
-    let pages: Vec<usize> = pages.iter().copied().filter(|&p| !busy(p)).collect();
-    // Only the runtime's GPU memory is guarded. A tracked range can start
-    // in free or reserved memory and run on into the host's own pages: in
-    // #50 that guarded the process heap's header, and a thread holding the
-    // heap lock then faulted while another held `Guards` and allocated,
-    // a deadlock. Pages left out stay changed, so they are copied whole.
-    // Pages guarded already passed this check when they were guarded.
-    // With each page, where its region is known to end: `VirtualProtect`
-    // takes one view at a time under Wine, so a run that crossed two views
-    // (the runtime's page mappings make one per page) failed and was then
-    // guarded page by page, one call more than needed.
-    let (pages, ends) = filter_runtime_pages(
-        &pages,
-        &g.protected,
-        |first, count| write_watched_range(first * PAGE, count * PAGE),
-        query_runtime_region,
-    );
-    let mut i = 0;
-    while i < pages.len() {
-        if g.protected.contains(&pages[i]) {
-            taken.push(pages[i]);
-            i += 1;
+    if primary.is_empty() {
+        return Vec::new();
+    }
+
+    let mut prim: Vec<usize> = primary.to_vec();
+    prim.sort_unstable();
+    prim.dedup();
+
+    // Partition into pages already fully guarded (which we commit immediately
+    // under `GUARDS` before unlocking, so a concurrent fault while unlocked is
+    // never lost) and pages that need at least one unlocked `VirtualProtect`.
+    let mut already_ready = Vec::new();
+    let mut pending_prim = Vec::new();
+    let mut candidates = Vec::new();
+
+    for &p in &prim {
+        if is_busy(g, p) || is_opening(g, p) || g.guarding.contains_key(&p) {
             continue;
         }
-        // A run of consecutive pages not guarded yet, in one region.
-        let first = i;
-        while i + 1 < pages.len()
-            && pages[i + 1] == pages[i] + 1
-            && pages[i + 1] < ends[first]
-            && !g.protected.contains(&pages[i + 1])
-        {
-            i += 1;
+        let mut alias_blocked = false;
+        let mut all_aliases_protected = true;
+        if check_aliases && let Some(links) = g.alias_of.get(&p) {
+            for &a in links {
+                if is_busy(g, a) || is_opening(g, a) || g.guarding.contains_key(&a) {
+                    alias_blocked = true;
+                    break;
+                }
+                if !g.protected.contains(&a) {
+                    all_aliases_protected = false;
+                }
+            }
         }
-        let run = &pages[first..=i];
-        i += 1;
-        protect_run_pages(
-            run,
-            &mut g.protected,
-            &mut taken,
-            unmapped_pages,
-            set,
-            unmapped_region,
+        if alias_blocked {
+            continue;
+        }
+        if g.protected.contains(&p) && all_aliases_protected {
+            already_ready.push(p);
+            continue;
+        }
+        pending_prim.push(p);
+        if !g.protected.contains(&p) {
+            candidates.push(p);
+        }
+        if check_aliases && let Some(links) = g.alias_of.get(&p) {
+            for &a in links {
+                if !g.protected.contains(&a) {
+                    candidates.push(a);
+                }
+            }
+        }
+    }
+    if check_aliases {
+        for &(p, a) in alias_pairs {
+            if pending_prim.binary_search(&p).is_ok()
+                && !g.protected.contains(&a)
+                && !is_busy(g, a)
+                && !is_opening(g, a)
+                && !g.guarding.contains_key(&a)
+            {
+                candidates.push(a);
+            }
+        }
+    }
+
+    if !already_ready.is_empty() {
+        on_commit(&already_ready);
+    }
+    let mut all_taken = already_ready;
+
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return all_taken;
+    }
+
+    let op_id = g.next_guard_op;
+    g.next_guard_op = g.next_guard_op.wrapping_add(1).max(1);
+    for &page in &candidates {
+        g.guarding.insert(
+            page,
+            GuardOp {
+                op_id,
+                reopen: false,
+                skip_commit: false,
+            },
         );
     }
-    taken
+
+    // Only the runtime's GPU memory is guarded. A tracked range can start in
+    // free or reserved memory and run on into the host's own pages (#50).
+    // Filter and `VirtualProtect` run completely outside `GUARDS`, preserving
+    // contiguous `GetWriteWatch` batching (#510) and uncommitted-region skips
+    // (#523).
+    let (succeeded, unmapped_found) = g.unlock_for(|| {
+        let _syscall = PROTECT_SYSCALL.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        let _timed = Timed(std::time::Instant::now(), crate::copystat::C::ProtectUs);
+        debug_assert!(
+            !HOLDING.with(std::cell::Cell::get),
+            "VirtualProtect(PAGE_READONLY) must not run while holding GUARDS"
+        );
+        let set = |from: usize, to: usize| {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::ProtectCalls, 1);
+                crate::copystat::add(crate::copystat::C::ProtectPages, (to - from) as u64);
+            }
+            #[cfg(test)]
+            tests::PROTECTS.with(|n| n.set(n.get() + 1));
+            let mut old = 0;
+            // SAFETY: title memory; only its protection changes.
+            unsafe { VirtualProtect((from * PAGE) as *const _, (to - from) * PAGE, PAGE_READONLY, &mut old) != 0 }
+        };
+        let unmapped_region = |page: usize| -> Option<usize> {
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery((page * PAGE) as *const _, &mut info, size_of_val(&info)) };
+            if n == 0 {
+                return Some(page + 1);
+            }
+            if info.State != MEM_COMMIT {
+                let end = ((info.BaseAddress as usize).saturating_add(info.RegionSize) / PAGE)
+                    .max(page + 1);
+                return Some(end);
+            }
+            None
+        };
+
+        let empty = BTreeSet::new();
+        let (filtered, ends) = filter_runtime_pages(
+            &candidates,
+            &empty,
+            |first, count| write_watched_range(first * PAGE, count * PAGE),
+            query_runtime_region,
+        );
+
+        let mut ok = BTreeSet::new();
+        let mut unmapped_out = Vec::new();
+        let mut run_taken = Vec::with_capacity(filtered.len());
+        let mut i = 0;
+        while i < filtered.len() {
+            let first = i;
+            while i + 1 < filtered.len()
+                && filtered[i + 1] == filtered[i] + 1
+                && filtered[i + 1] < ends[first]
+            {
+                i += 1;
+            }
+            let run = &filtered[first..=i];
+            i += 1;
+            protect_run_pages(
+                run,
+                &mut ok,
+                &mut run_taken,
+                &mut unmapped_out,
+                set,
+                unmapped_region,
+            );
+        }
+        (ok, unmapped_out)
+    });
+
+    // Reconcile under `GUARDS`: any candidate marked `reopen` (or now
+    // busy/opening) was concurrently faulted, written, remapped, or dropped
+    // while unlocked and must be reopened to `PAGE_READWRITE` before waking
+    // `GUARDING_CV`. Any candidate marked `skip_commit` stays dirty.
+    let mut reopen_set = BTreeSet::new();
+    let mut skip_commit_set = BTreeSet::new();
+    for &page in &candidates {
+        if let Some(&op) = g.guarding.get(&page)
+            && op.op_id == op_id
+        {
+            g.guarding.remove(&page);
+            if op.reopen || is_busy(g, page) || is_opening(g, page) {
+                reopen_set.insert(page);
+                skip_commit_set.insert(page);
+            } else if op.skip_commit {
+                skip_commit_set.insert(page);
+            }
+        } else {
+            reopen_set.insert(page);
+            skip_commit_set.insert(page);
+        }
+    }
+
+    let mut reopen_cancelled = Vec::new();
+    for &page in &succeeded {
+        if reopen_set.contains(&page) {
+            reopen_cancelled.push(page);
+        } else {
+            g.protected.insert(page);
+        }
+    }
+    let unmapped_ok: BTreeSet<usize> = unmapped_found
+        .into_iter()
+        .filter(|p| !skip_commit_set.contains(p))
+        .collect();
+
+    let mut newly_taken = Vec::with_capacity(pending_prim.len());
+    for &p in &pending_prim {
+        if skip_commit_set.contains(&p)
+            || is_busy(g, p)
+            || is_opening(g, p)
+            || g.guarding.contains_key(&p)
+        {
+            continue;
+        }
+        let p_unmapped = unmapped_ok.contains(&p);
+        if !g.protected.contains(&p) && !p_unmapped {
+            continue;
+        }
+        if check_aliases
+            && let Some(links) = g.alias_of.get(&p)
+            && links.iter().any(|a| {
+                skip_commit_set.contains(a)
+                    || is_busy(g, *a)
+                    || is_opening(g, *a)
+                    || g.guarding.contains_key(a)
+                    || (!g.protected.contains(a) && !unmapped_ok.contains(a))
+            })
+        {
+            continue;
+        }
+        newly_taken.push(p);
+        if p_unmapped && let Some(out) = unmapped_pages.as_deref_mut() {
+            out.push(p);
+        }
+    }
+
+    // Commit tracker state atomically under `GUARDS` before `open_sorted_pages`
+    // unlocks `GUARDS` to reopen cancelled pages: otherwise a newly guarded
+    // page in `newly_taken` could fault and reopen while unlocked, only for
+    // the caller to clear its dirty flag afterwards.
+    if !newly_taken.is_empty() {
+        on_commit(&newly_taken);
+        all_taken.extend(newly_taken);
+    }
+
+    if !reopen_cancelled.is_empty() {
+        open_sorted_pages(g, &reopen_cancelled);
+    }
+    GUARDING_CV.notify_all();
+    all_taken
 }
 
 /// Guards a contiguous run of unprotected pages, falling back to per-page
@@ -1119,12 +1488,21 @@ fn filter_runtime_pages(
 }
 
 /// Pages `[first, last)` changed, and so the pages showing the same memory
-/// elsewhere: gives write access back where we guarded them and marks them
-/// in every tracker holding them. True if one of `[first, last)` was
-/// guarded.
-fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
-    let guarded = g.protected.range(first..last).next().is_some();
+/// elsewhere: gives write access back where we guarded them (outside
+/// [`GUARDS`]) and marks them in every tracker holding them. True if one of
+/// `[first, last)` was guarded.
+fn changed(g: &mut Held, first: usize, last: usize, save: bool) -> bool {
+    let to_open: Vec<usize> = g.protected.range(first..last).copied().collect();
+    for &page in &to_open {
+        g.protected.remove(&page);
+    }
+    for (_, op) in g.guarding.range_mut(first..last) {
+        op.reopen = true;
+        op.skip_commit = true;
+    }
+    let guarded = !to_open.is_empty();
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    cancel_guarding_aliases(g, &others);
     #[cfg(feature = "diagnostics")]
     {
         let held = others.iter().filter(|p| g.holders.contains_key(p)).count();
@@ -1141,24 +1519,8 @@ fn changed(g: &mut Guards, first: usize, last: usize, save: bool) -> bool {
     for page in others {
         mark_changed(g, page, page + 1, save);
     }
-    open_guarded(g, first, last);
+    open_sorted_pages(g, &to_open);
     guarded
-}
-
-/// Gives write access back to the pages of `[first, last)` we guarded.
-fn open_guarded(g: &mut Guards, first: usize, last: usize) {
-    let guarded: Vec<usize> = g.protected.range(first..last).copied().collect();
-    // In runs: one protection change for consecutive pages (a run across
-    // two views fails, and goes page by page).
-    let mut i = 0;
-    while i < guarded.len() {
-        let mut j = i + 1;
-        while j < guarded.len() && guarded[j] == guarded[j - 1] + 1 {
-            j += 1;
-        }
-        open_run(g, guarded[i], guarded[j - 1] + 1);
-        i = j;
-    }
 }
 
 /// Marks pages `[first, last)` changed in every tracker holding them,
@@ -1228,7 +1590,18 @@ pub fn writing(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    changed(&mut g, first, last, true);
+    loop {
+        changed(&mut g, first, last, true);
+        if g.guarding.range(first..last).next().is_some() {
+            g.wait(&GUARDING_CV);
+            continue;
+        }
+        if overlaps_opening(&g, first, last) {
+            g.wait(&OPENING_CV);
+            continue;
+        }
+        break;
+    }
     Writing { first, last }
 }
 
@@ -1237,7 +1610,21 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    remapped(&mut guards(), first, last);
+    let mut g = guards();
+    remapped(&mut g, first, last);
+    let cancelled_ops: Vec<(usize, u64)> = g
+        .guarding
+        .range(first..last)
+        .filter(|(_, op)| op.reopen)
+        .map(|(&p, op)| (p, op.op_id))
+        .collect();
+    while cancelled_ops
+        .iter()
+        .any(|&(p, id)| g.guarding.get(&p).is_some_and(|op| op.op_id == id))
+    {
+        g.wait(&GUARDING_CV);
+    }
+    drop(g);
     crate::shadow::forget_range(at, len);
 }
 
@@ -1261,7 +1648,18 @@ pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     g.busy.push((first, last));
-    remapped(&mut g, first, last);
+    loop {
+        remapped(&mut g, first, last);
+        if g.guarding.range(first..last).next().is_some() {
+            g.wait(&GUARDING_CV);
+            continue;
+        }
+        if overlaps_opening(&g, first, last) {
+            g.wait(&OPENING_CV);
+            continue;
+        }
+        break;
+    }
     drop(g);
     crate::shadow::forget_range(at, len);
     Writing { first, last }
@@ -1286,7 +1684,7 @@ fn allocation_len(at: usize) -> usize {
 }
 
 /// [`title_memory_remapped`] of pages `[first, last)`, under the guard lock.
-fn remapped(g: &mut Guards, first: usize, last: usize) {
+fn remapped(g: &mut Held, first: usize, last: usize) {
     // What it showed is gone already: nothing to keep.
     changed(g, first, last, false);
     mark_retaken(g, first, last);
@@ -1332,8 +1730,12 @@ pub(crate) fn notify_written(at: usize, len: usize) {
 /// were uploaded again for nothing: 19 % of the uploads, run evict3).
 pub(crate) fn retake(at: usize, len: usize) {
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
-    let g = guards();
+    let mut g = guards();
+    for (_, op) in g.guarding.range_mut(first..last) {
+        op.skip_commit = true;
+    }
     let others: Vec<usize> = g.alias_of.range(first..last).flat_map(|(_, o)| o.iter().copied()).collect();
+    cancel_guarding_aliases(&mut g, &others);
     mark_copies(&g, first, last);
     for &page in &others {
         mark_copies(&g, page, page + 1);
@@ -1378,6 +1780,9 @@ fn mark_copies(g: &Guards, first: usize, last: usize) {
 /// too (a write through the new mapping must not go unseen by the trackers
 /// there).
 pub fn title_memory_aliased(at: usize, others: &[usize]) {
+    if others.is_empty() {
+        return;
+    }
     let mut g = guards();
     let page = at / PAGE;
     for &other in others {
@@ -1391,9 +1796,11 @@ pub fn title_memory_aliased(at: usize, others: &[usize]) {
     // If the new mapping cannot be guarded (a write the guards do not see is
     // under way through it), the page is changed; its bytes now may hold that
     // write already, so nothing is saved of them.
-    if others.iter().any(|&o| g.protected.contains(&(o / PAGE)))
-        && protect(&mut g, &[page]).is_empty()
-    {
+    let need_guard = others.iter().any(|&o| {
+        let op = o / PAGE;
+        g.protected.contains(&op) || g.guarding.contains_key(&op)
+    });
+    if need_guard && protect(&mut g, &[page]).is_empty() {
         changed(&mut g, page, page + 1, false);
     }
 }
@@ -1421,6 +1828,80 @@ pub(crate) fn alias_pages(at: usize, len: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Handles a write access violation at `at`. Returns `true` when execution
+/// should resume (`EXCEPTION_CONTINUE_EXECUTION`), `false` when the fault does
+/// not belong to our guards (`EXCEPTION_CONTINUE_SEARCH`).
+fn handle_write_fault(at: usize) -> bool {
+    let page = at / PAGE;
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
+    if HOLDING.with(|h| h.get()) {
+        if read_only(at) {
+            open_under_lock(page);
+            return true;
+        }
+        // Another thread's `open_sorted_pages` can concurrently restore
+        // `PAGE_READWRITE` outside `GUARDS` before `read_only(at)` runs.
+        if writable(at) {
+            note_opened_under_lock(page);
+            return true;
+        }
+        return false;
+    }
+    let mut g = guards();
+    let mut waited_opening = false;
+    let mut cancelled_guard = false;
+    while is_opening(&g, page) || g.guarding.contains_key(&page) {
+        if is_opening(&g, page) {
+            waited_opening = true;
+            g.wait(&OPENING_CV);
+        } else {
+            mark_changed(&mut g, page, page + 1, true);
+            let others: Vec<usize> = g
+                .alias_of
+                .get(&page)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect();
+            cancel_guarding_aliases(&mut g, &others);
+            for alias in others {
+                mark_changed(&mut g, alias, alias + 1, true);
+            }
+            if let Some(op) = g.guarding.get_mut(&page) {
+                op.reopen = true;
+                op.skip_commit = true;
+                cancelled_guard = true;
+            }
+            g.wait(&GUARDING_CV);
+        }
+    }
+    if changed(&mut g, page, page + 1, true) {
+        drop(g);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+        return true;
+    }
+    if waited_opening {
+        drop(g);
+        return true;
+    }
+    // Check `writable(at)` while still holding `GUARDS` so a concurrent
+    // `protect_with_aliases` cannot flip `page` back to `PAGE_READONLY`
+    // between dropping `GUARDS` and querying the page's protection, which
+    // would otherwise turn a stale fault on an already-opened guarded page
+    // into an unhandled access violation.
+    let handled = writable(at);
+    drop(g);
+    #[cfg(feature = "diagnostics")]
+    if cancelled_guard && handled {
+        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = cancelled_guard;
+    handled
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {
@@ -1439,26 +1920,7 @@ fn install() {
         {
             return EXCEPTION_CONTINUE_SEARCH;
         }
-        let at = r.ExceptionInformation[1];
-        #[cfg(feature = "diagnostics")]
-        let _timed = Timed(std::time::Instant::now(), crate::copystat::C::HandlerUs);
-        // Held across both checks: another thread may have opened the block
-        // since this one faulted, and a copy may have guarded it again since
-        // (then it is ours again, not read-only for some other reason).
-        if HOLDING.with(|h| h.get()) {
-            if read_only(at) {
-                open_under_lock(at / PAGE);
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        let mut g = guards();
-        if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
-            #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        if writable(at) {
+        if handle_write_fault(r.ExceptionInformation[1]) {
             EXCEPTION_CONTINUE_EXECUTION
         } else {
             EXCEPTION_CONTINUE_SEARCH
@@ -1472,28 +1934,36 @@ fn install() {
 }
 
 /// Whether `at` is committed memory that is read-only, as our guards make
-/// it.
+/// it (ignoring cache-modifier flags, rejecting `PAGE_GUARD`).
 fn read_only(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READONLY, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READONLY, VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READONLY
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && info.Protect & 0xff == PAGE_READONLY
 }
 
-/// Whether `at` is committed read-write memory now.
+/// Whether `at` is committed read-write memory now (ignoring cache-modifier
+/// flags, rejecting `PAGE_GUARD`).
 fn writable(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_READWRITE,
+        VirtualQuery,
     };
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect & PAGE_GUARD == 0
+        && matches!(info.Protect & 0xff, PAGE_READWRITE | PAGE_EXECUTE_READWRITE)
 }
 
 /// Adds the time since it was made to a counter when dropped (diagnostics).
@@ -1622,6 +2092,8 @@ pub(crate) mod tests {
         let (first, last) = (p / PAGE, (p + len).div_ceil(PAGE));
         let g = guards();
         g.protected.range(first..last).next().is_some()
+            || g.guarding.range(first..last).next().is_some()
+            || overlaps_opening(&g, first, last)
             || g.holders.range(first..last).next().is_some()
     }
 
@@ -2439,5 +2911,385 @@ pub(crate) mod tests {
         assert_eq!(taken, run);
         assert_eq!(protected, (100..110).collect::<BTreeSet<_>>());
         assert_eq!(unmapped_pages, (110..164).collect::<Vec<_>>());
+    }
+
+    /// Stale write faults (where another thread already restored `PAGE_READWRITE`
+    /// before the fault handler ran, both outside and inside `HOLDING`) must
+    /// resume execution and mark tracked pages dirty, while genuinely
+    /// non-writable or `PAGE_GUARD` pages must remain unhandled.
+    #[test]
+    fn stale_write_fault_and_protection_flags_handled_cleanly() {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_EXECUTE_READWRITE, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_READONLY,
+            VirtualProtect,
+        };
+        let p = pool(1);
+        let t = track(p, PAGE, true).expect("pool memory is tracked");
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        assert!(read_only(p));
+        assert!(!t.changed(p / PAGE));
+
+        // Simulate another thread opening the page before a racing thread
+        // enters the fault handler.
+        {
+            let mut g = guards();
+            assert!(g.protected.remove(&(p / PAGE)));
+            open_sorted_pages(&mut g, &[p / PAGE]);
+        }
+        assert!(writable(p));
+        assert!(
+            handle_write_fault(p + 0x488),
+            "stale fault on opened tracked page must resume execution"
+        );
+        assert!(
+            t.changed(p / PAGE),
+            "stale fault on tracked page must mark tracker dirty"
+        );
+
+        // Stale fault while `HOLDING == true` on an already-writable page must
+        // also resume execution and queue the page for marking on lock release.
+        assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
+        {
+            let mut g = guards();
+            assert!(g.protected.remove(&(p / PAGE)));
+            open_sorted_pages(&mut g, &[p / PAGE]);
+            assert!(
+                handle_write_fault(p + 0x488),
+                "stale fault under HOLDING on writable page must resume"
+            );
+        }
+        assert!(
+            t.changed(p / PAGE),
+            "re-entrant stale fault must drain and mark tracker dirty on lock drop"
+        );
+
+        // Negative controls: genuinely non-writable pages must stay unhandled.
+        // SAFETY: fresh reserved page owned by this test, freed below.
+        let unmapped =
+            unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(unmapped, 0);
+        assert!(!handle_write_fault(unmapped + 16));
+        {
+            let _g = guards();
+            assert!(!handle_write_fault(unmapped + 16));
+        }
+        // SAFETY: reservation allocated above.
+        assert_ne!(unsafe { VirtualFree(unmapped as *mut _, 0, MEM_RELEASE) }, 0);
+
+        // Protection-flag matrix on a private scratch page.
+        // SAFETY: fresh private page owned by this test, freed below.
+        let scratch = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(scratch, 0);
+        let set_prot = |prot: u32| {
+            let mut old = 0;
+            // SAFETY: `scratch` is a live committed private page.
+            unsafe { VirtualProtect(scratch as *const _, PAGE, prot, &mut old) != 0 }
+        };
+        assert!(set_prot(PAGE_NOACCESS));
+        assert!(!writable(scratch) && !read_only(scratch));
+        assert!(!handle_write_fault(scratch + 8));
+
+        assert!(set_prot(PAGE_READONLY));
+        assert!(read_only(scratch) && !writable(scratch));
+        assert!(!handle_write_fault(scratch + 8));
+
+        if set_prot(PAGE_READWRITE | PAGE_NOCACHE) {
+            assert!(writable(scratch));
+        }
+        assert!(set_prot(PAGE_EXECUTE_READWRITE));
+        assert!(writable(scratch));
+        assert!(set_prot(PAGE_READWRITE | PAGE_GUARD));
+        assert!(!writable(scratch) && !read_only(scratch));
+        assert!(set_prot(PAGE_READWRITE));
+        // SAFETY: private page allocated above.
+        assert_ne!(unsafe { VirtualFree(scratch as *mut _, 0, MEM_RELEASE) }, 0);
+
+        drop(t);
+        free(p);
+    }
+
+    /// Concurrent writers hammering real hardware faults, `Tracked::take_split`,
+    /// and `watch::writing` must never lose a CPU write or re-protect a busy
+    /// page while `Writing` is held.
+    #[test]
+    fn concurrent_writers_take_and_writing_never_lose_updates() {
+        use std::sync::atomic::AtomicBool;
+
+        const PAGES: usize = 6;
+        let p = pool(PAGES);
+        let t = track(p, PAGES * PAGE, true).expect("pool memory is tracked");
+        let _ = t.take(p, p + PAGES * PAGE);
+        let shadow = Mutex::new(vec![0u8; PAGES * PAGE]);
+        let done = AtomicBool::new(false);
+
+        let sync_into_shadow = |shadow: &Mutex<Vec<u8>>| {
+            let (copy, zero) = t.take_split(p, p + PAGES * PAGE);
+            assert!(zero.is_empty(), "all pool pages are committed");
+            if copy.is_empty() {
+                return;
+            }
+            let mut dst = shadow.lock().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in copy {
+                // SAFETY: `[from, to)` lies inside our live committed pool `p`.
+                let src = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+                dst[from - p..to - p].copy_from_slice(src);
+            }
+        };
+
+        std::thread::scope(|s| {
+            // Taker continuously re-guards and refreshes the shadow copy.
+            let shadow_ref = &shadow;
+            let done_ref = &done;
+            s.spawn(move || {
+                while !done_ref.load(Ordering::Acquire) {
+                    sync_into_shadow(shadow_ref);
+                    std::thread::yield_now();
+                }
+            });
+
+            // Kernel-writer continuously opens the last page via `writing` and
+            // asserts it stays writable across concurrent `take_split` calls.
+            s.spawn(move || {
+                let busy_addr = p + (PAGES - 1) * PAGE;
+                for iter in 0..80usize {
+                    let guard = writing(busy_addr, PAGE);
+                    assert!(
+                        writable(busy_addr),
+                        "busy page must stay writable while Writing is held"
+                    );
+                    // SAFETY: inside our committed pool; `guard` holds it open.
+                    unsafe { ((busy_addr + (iter % 1024)) as *mut u8).write_volatile(iter as u8) };
+                    assert!(
+                        writable(busy_addr),
+                        "concurrent take_split must not re-protect a busy page"
+                    );
+                    drop(guard);
+                    std::thread::yield_now();
+                }
+            });
+
+            // Three writer threads fault across pages 0..PAGES-1.
+            let writers: Vec<_> = (0..3usize)
+                .map(|worker| {
+                    s.spawn(move || {
+                        for iter in 0..150usize {
+                            let page_idx = (iter + worker) % (PAGES - 1);
+                            let off = (worker * 16 + (iter % 64) * 64) % (PAGE - 8);
+                            let addr = p + page_idx * PAGE + off;
+                            let val = ((worker as u64 + 1) << 32) | (iter as u64 + 1);
+                            // SAFETY: aligned 8-byte slot inside our live pool;
+                            // each worker owns disjoint offsets (`worker * 16`).
+                            unsafe { (addr as *mut u64).write_volatile(val) };
+                        }
+                    })
+                })
+                .collect();
+
+            for w in writers {
+                w.join().expect("writer thread panicked");
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        // Final take must observe every write made while concurrent takes ran.
+        sync_into_shadow(&shadow);
+        let dst = shadow.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `p` is our live committed pool and no writer is running now.
+        let live = unsafe { std::slice::from_raw_parts(p as *const u8, PAGES * PAGE) };
+        assert_eq!(
+            &dst[..],
+            live,
+            "shadow copy missed at least one concurrent CPU write"
+        );
+
+        drop(t);
+        free(p);
+    }
+
+    /// Stale write faults racing with continuous unlocked re-protection must
+    /// never return unhandled.
+    #[test]
+    fn concurrent_stale_faults_and_reprotect_never_go_unhandled() {
+        use std::sync::atomic::AtomicBool;
+
+        let p = pool(2);
+        let t = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        let _ = t.take(p, p + 2 * PAGE);
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            let t_ref = &t;
+            let done_ref = &done;
+            s.spawn(move || {
+                while !done_ref.load(Ordering::Acquire) {
+                    let _ = t_ref.take(p, p + 2 * PAGE);
+                    std::thread::yield_now();
+                }
+            });
+            let writers: Vec<_> = (0..3usize)
+                .map(|worker| {
+                    s.spawn(move || {
+                        for iter in 0..150usize {
+                            let off = (iter * 64 + worker * 8) % PAGE;
+                            // SAFETY: live 2-page pool owned by this test.
+                            unsafe { ((p + off) as *mut u8).write_volatile(iter as u8) };
+                            assert!(
+                                handle_write_fault(p + PAGE + off),
+                                "concurrent fault handler on tracked page must never return unhandled"
+                            );
+                        }
+                    })
+                })
+                .collect();
+            for w in writers {
+                w.join().expect("writer thread panicked");
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        drop(t);
+        free(p);
+    }
+
+    /// Copy-back preservation under unlocked guards:
+    /// - an armed page written by CPU keeps exact pre-write bytes in `saved()`,
+    /// - an unarmed page written by CPU stays `changed()` with no `saved()`,
+    /// - `taken()` racing with concurrent CPU writes never leaves a writable
+    ///   page invisible (`!changed()`).
+    #[test]
+    fn concurrent_armed_copy_back_preserves_cpu_writes_and_saved_baselines() {
+        use std::sync::atomic::AtomicBool;
+
+        let p = pool(3);
+        let t = track_copy(p, 3 * PAGE, true).expect("pool memory is tracked");
+
+        // Seed distinct pre-write bytes on pages 0 and 1, then guard them.
+        // SAFETY: live pool pages owned by this test.
+        unsafe {
+            ((p + 16) as *mut u32).write_volatile(0xAAAA_1111);
+            ((p + PAGE + 16) as *mut u32).write_volatile(0xBBBB_2222);
+        }
+        assert_eq!(t.take(p, p + 3 * PAGE), [(p, p + 3 * PAGE)]);
+
+        // Arm pages 0 and 1, then unarm page 1 (simulating copy-back setup).
+        t.arm(p, p + 2 * PAGE);
+        t.unarm(p / PAGE + 1);
+
+        // CPU writes both pages while armed/unarmed.
+        // SAFETY: live pool pages; handler saves page 0 before opening it.
+        unsafe {
+            ((p + 16) as *mut u32).write_volatile(0xDEAD_BEEF);
+            ((p + PAGE + 16) as *mut u32).write_volatile(0xCAFE_BABE);
+        }
+        let saved0 = t.saved(p / PAGE).expect("armed page must save pre-write bytes");
+        assert_eq!(
+            u32::from_le_bytes(saved0[16..20].try_into().unwrap()),
+            0xAAAA_1111,
+            "saved baseline must capture pre-write bytes before PAGE_READWRITE"
+        );
+        assert!(t.changed(p / PAGE));
+        assert!(t.saved(p / PAGE + 1).is_none(), "unarmed page saves nothing");
+        assert!(
+            t.changed(p / PAGE + 1),
+            "unarmed page written by CPU must stay changed so copy-back keeps CPU bytes"
+        );
+
+        // Race `taken()` against a concurrent CPU writer on page 2: a writable
+        // page must NEVER be left invisible (`!t.changed()`).
+        let page2 = p / PAGE + 2;
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let done_ref = &done;
+            s.spawn(move || {
+                let mut v = 1u32;
+                while !done_ref.load(Ordering::Acquire) {
+                    // SAFETY: live pool page owned by this test.
+                    unsafe { ((p + 2 * PAGE + 32) as *mut u32).write_volatile(v) };
+                    v = v.wrapping_add(1);
+                }
+            });
+            for _ in 0..120 {
+                t.taken(&[page2]);
+                // Under `GUARDS`, check the fundamental invariant: if page 2 is
+                // not guarded (not in `protected`), it MUST be marked changed.
+                let g = guards();
+                let guarded = g.protected.contains(&page2);
+                let dirty = t.changed(page2);
+                drop(g);
+                assert!(
+                    guarded || dirty,
+                    "a writable page must never be invisible to Tracked::changed"
+                );
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        drop(t);
+        free(p);
+    }
+
+    /// Concurrent writes through an alias mapping racing with unlocked
+    /// `protect_with_aliases` on the primary tracker must never miss an update.
+    #[test]
+    fn concurrent_alias_writes_and_take_never_miss_updates() {
+        use std::sync::atomic::AtomicBool;
+
+        let (a, b) = twin_views(2);
+        let t = track(a, 2 * PAGE, true).expect("views are tracked");
+        let _ = t.take(a, a + 2 * PAGE);
+        let shadow = Mutex::new(vec![0u8; 2 * PAGE]);
+        let done = AtomicBool::new(false);
+
+        let sync = |shadow: &Mutex<Vec<u8>>| {
+            let runs = t.take(a, a + 2 * PAGE);
+            if runs.is_empty() {
+                return;
+            }
+            let mut dst = shadow.lock().unwrap_or_else(|e| e.into_inner());
+            for (from, to) in runs {
+                // SAFETY: `[from, to)` lies inside our mapped view `a`.
+                let src = unsafe { std::slice::from_raw_parts(from as *const u8, to - from) };
+                dst[from - a..to - a].copy_from_slice(src);
+            }
+        };
+
+        std::thread::scope(|s| {
+            let shadow_ref = &shadow;
+            let done_ref = &done;
+            s.spawn(move || {
+                while !done_ref.load(Ordering::Acquire) {
+                    sync(shadow_ref);
+                    std::thread::yield_now();
+                }
+            });
+            for iter in 0..150usize {
+                let page_idx = iter % 2;
+                let off = (iter * 16) % (PAGE - 8);
+                // SAFETY: write through alias view `b`; backed by same section as `a`.
+                unsafe { ((b + page_idx * PAGE + off) as *mut u64).write_volatile(iter as u64 + 1) };
+            }
+            done.store(true, Ordering::Release);
+        });
+
+        sync(&shadow);
+        let dst = shadow.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: `a` is our live mapped view and no writer is running now.
+        let live = unsafe { std::slice::from_raw_parts(a as *const u8, 2 * PAGE) };
+        assert_eq!(
+            &dst[..],
+            live,
+            "shadow copy missed at least one concurrent write through alias view"
+        );
+
+        drop(t);
+        title_memory_remapped(a, 2 * PAGE);
+        title_memory_remapped(b, 2 * PAGE);
     }
 }

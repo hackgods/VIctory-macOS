@@ -1193,7 +1193,9 @@ fn windows() -> &'static [Vec<f32>; 3] {
 fn window_overlap(block: &mut [f32], window: &[f32]) {
     let len = block.len() / 2;
     let (left, right) = block[..2 * len].split_at_mut(len);
-    let lanes = left.iter_mut().zip(right.iter_mut().rev())
+    let lanes = left
+        .iter_mut()
+        .zip(right.iter_mut().rev())
         .zip(window[..len].iter().zip(window[len..2 * len].iter().rev()));
     for ((a, b), (&wi, &wj)) in lanes {
         let (s0, s1) = (*a, *b);

@@ -130,6 +130,10 @@ mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
+// mac: whether a reserved buffer tiled from CPU-visible memory is that
+// memory, and the nearest alternatives (ignored by default).
+#[cfg(all(windows, test))]
+mod tile_probe;
 
 /// mac: the title's descriptor stores report the slots they write
 /// (`VICTORY_HEAP_REPORTS`, `descriptor::reports`): what the launcher and

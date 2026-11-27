@@ -3491,6 +3491,84 @@ mod tests {
         }
     }
 
+    /// macOS port, level 8. A clip distance the program writes as 0 only
+    /// under a narrowed EXEC keeps its old value in the other lanes (an
+    /// old-value read, `ir`): where those lanes export a computed value, it
+    /// can clip and is not left out; where the exports run under that EXEC
+    /// or one narrowed from it, or the other lanes keep a register nothing
+    /// set, it is. The two written as 1.0 for every lane are left out each
+    /// time.
+    #[test]
+    fn idle_clip_keeps_a_distance_zeroed_under_a_narrowed_exec() {
+        const CVT_V6: u32 = 0x7E0C_0D01; // v_cvt_f32_u32 v6, v1
+        const ONE_LANE: u32 = 0xBEFE_0381; // s_mov_b32 exec_lo, 1
+        const ZERO_V6: u32 = 0x7E0C_0280; // v_mov_b32 v6, 0
+        const ALL_LANES: u32 = 0xBEFE_03C1; // s_mov_b32 exec_lo, -1
+        const SAVE: u32 = 0xBE82_037E; // s_mov_b32 s2, exec_lo
+        const NARROW: u32 = 0x7C22_0880; // v_cmpx_lt_f32 0, v4
+        const RESTORE: u32 = 0xBEFE_0302; // s_mov_b32 exec_lo, s2
+        let idle_clip = |body: &[u32]| {
+            let mut words: Vec<u32> = vec![
+                0xD765_0001, // v_mbcnt_lo_u32_b32 v1, -1, 0
+                0x0001_00C1,
+                0x7E08_0D01, // v_cvt_f32_u32 v4, v1
+                0x7E0E_02F2, // v_mov_b32 v7, 1.0
+            ];
+            words.extend(body);
+            words.extend([
+                0xF800_00DF, // exp pos1 v4, v6, v7, v7
+                0x0707_0604,
+                0xF800_08CF, // exp pos0 v4, v4, v7, v7 done
+                0x0707_0404,
+                0xBF81_0000, // s_endpgm
+            ]);
+            let ms_native = NativeProgram {
+                stage: HwStage::Ms,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ms(crate::native::MeshIo {
+                    outputs: vec![],
+                    clip_cntl: 0x0040_000F,
+                    threads: 32,
+                    max_vertices: 128,
+                    max_primitives: 128,
+                    topology: 2,
+                    lds_bytes: 0,
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let element = |name: &str, kind: u8, row: u32| SigElement {
+                name: name.into(),
+                index: 0,
+                kind,
+                comp: 9,
+                interp: 0,
+                row: Some(row),
+                col: 0,
+                cols: 4,
+                usage: 0xF,
+                half: false,
+            };
+            let outputs = vec![element("SV_Position", 3, 0), element("SV_ClipDistance", 6, 1)];
+            let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
+            let mio = io::raise(&mp, &ms_native).unwrap();
+            lower::idle_clip(&mp, &mio, &outputs)
+        };
+        let (live, trimmed) = (vec![(1, 0b0011)], vec![(1, 0b0001)]);
+        // Every lane exports, all but one the computed value.
+        assert_eq!(idle_clip(&[CVT_V6, ONE_LANE, ZERO_V6, ALL_LANES]), live);
+        // The same with EXEC saved and set back.
+        assert_eq!(idle_clip(&[CVT_V6, SAVE, NARROW, ZERO_V6, RESTORE]), live);
+        // The exports run under the zeroing write's EXEC, or fewer lanes.
+        assert_eq!(idle_clip(&[CVT_V6, ONE_LANE, ZERO_V6]), trimmed);
+        assert_eq!(idle_clip(&[CVT_V6, ONE_LANE, ZERO_V6, NARROW]), trimmed);
+        // Computed and zeroed under one EXEC: the other lanes keep v6 as
+        // nothing set it.
+        assert_eq!(idle_clip(&[SAVE, NARROW, CVT_V6, ZERO_V6, RESTORE]), trimmed);
+    }
+
     /// macOS port, level 7 of a linked pair end to end. A mesh shader whose
     /// first clip distance is its vertex's x, so the clipper cuts the
     /// triangle at the middle of the target: made with the clipper (level

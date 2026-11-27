@@ -13,6 +13,7 @@
 //! keeps the host copies. The probe at start-up ([`supported`]) still falls
 //! back to the copies where the remap does not work.
 
+use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::System::Memory::{
@@ -23,7 +24,6 @@ use crate::backend::HostMemory;
 use crate::host::host;
 use crate::watch::PAGE;
 
-#[cfg(any(test, feature = "diagnostics"))]
 use windows::Win32::Graphics::Direct3D12::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -344,16 +344,16 @@ fn supported() -> Option<bool> {
 
 /// CPU-visible backing for XMem physical pages. The placed buffer keeps a
 /// CPU mapping of the heap from which reserved resources can take tiles.
-#[cfg(any(test, feature = "diagnostics"))]
 pub struct PhysicalHeap {
     backing: ID3D12Resource,
     // A placed buffer must keep its heap alive.
     pub(crate) _heap: ID3D12Heap,
     address: usize,
     len: usize,
+    /// Counted in [`IN_PLACE_BYTES`] ([`in_place_heap`]).
+    counted: bool,
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl PhysicalHeap {
     pub(crate) fn new(device: &ID3D12Device, len: usize) -> windows::core::Result<Self> {
         let desc = D3D12_HEAP_DESC {
@@ -408,7 +408,24 @@ impl PhysicalHeap {
             _heap: heap,
             address: address as usize,
             len,
+            counted: false,
         })
+    }
+
+    /// The GPU's address of the heap's first byte.
+    pub fn gpu_address(&self) -> u64 {
+        // SAFETY: a live placed buffer.
+        unsafe { self.backing.GetGPUVirtualAddress() }
+    }
+
+    /// The heap's bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the heap has no bytes (never, for one that was made).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// The CPU view, valid for the lifetime of this heap.
@@ -443,11 +460,13 @@ impl PhysicalHeap {
     }
 }
 
-#[cfg(any(test, feature = "diagnostics"))]
 impl Drop for PhysicalHeap {
     fn drop(&mut self) {
         // SAFETY: unmapped once, while the placed buffer still owns the view.
         unsafe { self.backing.Unmap(0, None) };
+        if self.counted {
+            IN_PLACE_BYTES.fetch_sub(self.len, Ordering::Relaxed);
+        }
     }
 }
 
@@ -469,6 +488,273 @@ pub fn physical_heap(len: usize) -> Option<PhysicalHeap> {
             None
         }
     }
+}
+
+// Title memory in place on XMem physical pages (`VICTORY_INPLACE_SECTIONS=1`).
+//
+// `alias_region` covers memory the title commits with `XMemVirtualAlloc`.
+// Its physical pages (`XMemAllocatePhysicalPages`, mapped with
+// `XMemMapPhysicalPages`) are sections instead, and every view of them had a
+// host copy: Grand Theft Auto VI's 174 MB buffer of constants among them,
+// refreshed nine times a frame. With the switch, a section of at most
+// `MOST_SECTION` gets a D3DMetal heap ([`PhysicalHeap`]) when it is made, and
+// victory-hle points every view of it at the heap's pages
+// ([`PhysicalHeap::alias_view`]): all views and the GPU then see the same
+// memory. A title buffer that lies in one run of views showing consecutive
+// pages of such a section is that heap's own buffer at the run's offset
+// ([`in_place_shadow`]): nothing is copied, refreshed, guarded or copied
+// back for it. One GPU address per physical page, whatever the addresses
+// the title maps it at (#221's rule for coherence within a submission).
+
+/// The most bytes of one section in place: its pages are the GPU's, wired.
+const MOST_SECTION: usize = 512 << 20;
+
+/// Bytes of heaps made by [`in_place_heap`] that are still alive.
+static IN_PLACE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides `VICTORY_INPLACE_SECTIONS` on this thread.
+    pub(crate) static TEST_IN_PLACE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// The resolver this thread's lookups use in place of the runtime's.
+    pub(crate) static TEST_RESOLVER: std::cell::Cell<Option<InPlaceResolver>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether XMem sections may hold title memory in place: the switch, on a
+/// host where views can be pointed at D3DMetal's pages.
+pub fn in_place_sections() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_IN_PLACE.with(std::cell::Cell::get) {
+        return on && supported().is_some();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_INPLACE_SECTIONS") && supported().is_some();
+        if on {
+            tracing::info!(
+                budget_mb = in_place_budget() >> 20,
+                "title memory in place on XMem physical pages (VICTORY_INPLACE_SECTIONS)"
+            );
+        }
+        on
+    })
+}
+
+/// The bytes all in-place heaps may take together:
+/// `VICTORY_INPLACE_SECTIONS_MB`, 1024 MiB by default.
+fn in_place_budget() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_SECTIONS_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1024)
+            << 20
+    })
+}
+
+/// A heap for a new section of `len` bytes, if its pages are to hold title
+/// memory in place ([`in_place_sections`], at most `MOST_SECTION`, within
+/// the budget).
+pub fn in_place_heap(len: usize) -> Option<std::sync::Arc<PhysicalHeap>> {
+    if !in_place_sections() || len == 0 || !len.is_multiple_of(PAGE) || len > MOST_SECTION {
+        return None;
+    }
+    let before = IN_PLACE_BYTES.fetch_add(len, Ordering::Relaxed);
+    if before + len > in_place_budget() {
+        IN_PLACE_BYTES.fetch_sub(len, Ordering::Relaxed);
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                len,
+                budget_mb = in_place_budget() >> 20,
+                "XMem section not in place: the budget is taken (VICTORY_INPLACE_SECTIONS_MB)"
+            );
+        }
+        return None;
+    }
+    let made = host().map(|h| PhysicalHeap::new(&h.device, len));
+    match made {
+        Some(Ok(mut heap)) => {
+            heap.counted = true;
+            let total = before + len;
+            if len >= 16 << 20 {
+                tracing::info!(
+                    len,
+                    total,
+                    "XMem section on a D3DMetal heap, for title memory in place"
+                );
+            } else {
+                tracing::debug!(
+                    len,
+                    total,
+                    "XMem section on a D3DMetal heap, for title memory in place"
+                );
+            }
+            Some(std::sync::Arc::new(heap))
+        }
+        made => {
+            IN_PLACE_BYTES.fetch_sub(len, Ordering::Relaxed);
+            if let Some(Err(error)) = made {
+                tracing::warn!(len, %error, "XMem section not in place: no heap");
+            }
+            None
+        }
+    }
+}
+
+/// Where title memory `[start, start + len)` lies in a section on a heap,
+/// if it lies in one run of views showing consecutive pages of it: the heap
+/// and the run's offset into it at `start`.
+pub type InPlaceResolver = fn(u64, u64) -> Option<(std::sync::Arc<PhysicalHeap>, usize)>;
+
+static RESOLVER: OnceLock<InPlaceResolver> = OnceLock::new();
+
+/// Installs the runtime's [`InPlaceResolver`] (the first call's).
+pub fn set_in_place_resolver(resolve: InPlaceResolver) {
+    let _ = RESOLVER.set(resolve);
+}
+
+fn resolver() -> Option<InPlaceResolver> {
+    #[cfg(test)]
+    if let Some(resolve) = TEST_RESOLVER.with(std::cell::Cell::get) {
+        return Some(resolve);
+    }
+    RESOLVER.get().copied()
+}
+
+/// Whether title memory `[start, start + len)` would be used in place: the
+/// switch is on and the runtime finds it in one run of a section on a heap.
+pub fn title_memory_in_place(start: u64, len: u64) -> bool {
+    in_place_sections() && resolver().is_some_and(|resolve| resolve(start, len).is_some())
+}
+
+/// Title memory in place, by start: its end. Read by [`is_in_place`] for
+/// every indirect execution while any is in place.
+static IN_PLACE: std::sync::RwLock<std::collections::BTreeMap<u64, u64>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+static IN_PLACE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The longest range in [`IN_PLACE`].
+static IN_PLACE_SPAN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Heaps that title memory in place was found in: kept while the process
+/// lives, since shadows and the page tables naming them may outlive the
+/// section (a few hundred MB at most, under the budget).
+static KEPT: Mutex<Vec<std::sync::Arc<PhysicalHeap>>> = Mutex::new(Vec::new());
+
+/// The title buffer `[start, start + len)` in place, as a zero-copy shadow
+/// over its section's heap, if [`in_place_sections`] and the runtime finds
+/// it in one run of a section on a heap.
+pub(crate) fn in_place_shadow(
+    start: u64,
+    len: u64,
+) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
+    if len == 0 || !in_place_sections() {
+        return None;
+    }
+    let (heap, offset) = resolver()?(start, len)?;
+    if (offset as u64)
+        .checked_add(len)
+        .is_none_or(|end| end > heap.len() as u64)
+    {
+        return None;
+    }
+    crate::host::name(&heap.backing, || "XMem section in place".to_owned());
+    let shadow = crate::shadow::Shadow::new_aliased(
+        heap.backing.clone(),
+        (heap.cpu_address() + offset) as *mut u8,
+        heap.gpu_address() + offset as u64,
+        start,
+        len,
+    );
+    {
+        let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+        if !kept.iter().any(|k| std::sync::Arc::ptr_eq(k, &heap)) {
+            kept.push(heap);
+        }
+    }
+    let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
+    // Two buffers may start at one address: keep the longer end.
+    match map.entry(start) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(start + len);
+            IN_PLACE_COUNT.fetch_add(1, Ordering::Release);
+        }
+        std::collections::btree_map::Entry::Occupied(mut entry) => {
+            let end = entry.get_mut();
+            *end = (*end).max(start + len);
+        }
+    }
+    IN_PLACE_SPAN.fetch_max(len, Ordering::Relaxed);
+    drop(map);
+    if len >= 16 << 20 {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            "title buffer in place on XMem physical pages: no host copy"
+        );
+    } else {
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "title buffer in place on XMem physical pages"
+        );
+    }
+    Some(shadow)
+}
+
+/// Whether any of `[address, address + len)` is title memory in place.
+pub(crate) fn is_in_place(address: u64, len: u64) -> bool {
+    if IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = address.saturating_add(len.max(1));
+    let map = IN_PLACE.read().unwrap_or_else(|e| e.into_inner());
+    let lowest = address.saturating_sub(IN_PLACE_SPAN.load(Ordering::Relaxed));
+    map.range(lowest..end)
+        .any(|(&start, &stop)| start < end && stop > address)
+}
+
+/// Whether an indirect execution whose arguments are at `[address, address +
+/// len)` (and its count at `count`) has them clamped inline, right before it runs:
+/// in place, the card reads what earlier work wrote there only then
+/// (avatarmanz/VIctory-7900XTX 631400f). `VICTORY_INPLACE_SECTIONS_HOIST=1`
+/// lets them be clamped ahead with the others.
+pub(crate) fn clamp_in_place_inline(address: u64, len: u64, count: Option<u64>) -> bool {
+    static HOIST: OnceLock<bool> = OnceLock::new();
+    (is_in_place(address, len) || count.is_some_and(|at| is_in_place(at, 4)))
+        && !*HOIST.get_or_init(|| crate::switch::on("VICTORY_INPLACE_SECTIONS_HOIST"))
+}
+
+/// The runtime mapped other pages over `[at, at + len)`, or unmapped it:
+/// title buffers in place there are looked up again.
+pub(crate) fn forget_in_place(at: u64, len: u64) {
+    if len == 0 || IN_PLACE_COUNT.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let gone: Vec<u64> = {
+        let map = IN_PLACE.read().unwrap_or_else(|e| e.into_inner());
+        let lowest = at.saturating_sub(IN_PLACE_SPAN.load(Ordering::Relaxed));
+        map.range(lowest..end)
+            .filter(|&(_, &stop)| stop > at)
+            .map(|(&start, _)| start)
+            .collect()
+    };
+    if gone.is_empty() {
+        return;
+    }
+    let mut map = IN_PLACE.write().unwrap_or_else(|e| e.into_inner());
+    let (mut from, mut to) = (at, end);
+    for start in gone {
+        if let Some(stop) = map.remove(&start) {
+            IN_PLACE_COUNT.fetch_sub(1, Ordering::Release);
+            from = from.min(start);
+            to = to.max(stop);
+        }
+    }
+    drop(map);
+    crate::shadow::forget_in_place(from, to);
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
@@ -977,6 +1263,127 @@ mod tests {
         // SAFETY: `ptr` was allocated by `VirtualAlloc`.
         assert_ne!(unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) }, 0);
         drop(shadow);
+        // SAFETY: querying device health.
+        assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// The view the test resolver below answers for, and its heap.
+    static TEST_VIEW: AtomicUsize = AtomicUsize::new(0);
+    static TEST_HEAP: Mutex<Option<std::sync::Arc<PhysicalHeap>>> = Mutex::new(None);
+    const TEST_SECTION: usize = 4 * PAGE;
+
+    /// As victory-hle's resolver would for a section of `TEST_SECTION` bytes
+    /// shown whole, in order, at `TEST_VIEW`.
+    fn test_resolve(start: u64, len: u64) -> Option<(std::sync::Arc<PhysicalHeap>, usize)> {
+        let base = TEST_VIEW.load(Ordering::Relaxed) as u64;
+        let heap = TEST_HEAP.lock().unwrap().clone()?;
+        (start >= base && start + len <= base + TEST_SECTION as u64)
+            .then(|| (heap, (start - base) as usize))
+    }
+
+    /// A title buffer on XMem physical pages whose section is on a heap is
+    /// that heap's own memory: the GPU reads what the title wrote through
+    /// any view of the section, the title reads what the GPU wrote, and
+    /// nothing is copied either way. When the title maps other pages there,
+    /// the buffer is looked up again.
+    #[test]
+    fn title_buffers_on_section_heaps_are_used_in_place() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            UnmapViewOfFile,
+        };
+        if !crate::watch::rosetta() || supported().is_none() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        let heap = in_place_heap(TEST_SECTION).expect("a heap for the section");
+        // The section and two views of it, both shown on the heap's pages,
+        // as victory-hle maps the title's.
+        // SAFETY: a fresh section and views of it, ours, unmapped below.
+        let (section, views) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                TEST_SECTION as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let views = [0, 1].map(|_| {
+                MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, TEST_SECTION)
+                    .Value
+                    .cast::<u8>()
+            });
+            for view in views {
+                assert!(!view.is_null());
+                assert!(heap.alias_view(view as usize, 0, TEST_SECTION));
+            }
+            (section, views)
+        };
+        TEST_VIEW.store(views[0] as usize, Ordering::Relaxed);
+        *TEST_HEAP.lock().unwrap() = Some(heap.clone());
+        TEST_RESOLVER.with(|c| c.set(Some(test_resolve)));
+        let start = views[0] as u64 + PAGE as u64;
+        let len = 2 * PAGE;
+        // A resource of our own as the title buffer's.
+        let resource = 0x7e57_1000usize;
+        crate::shadow::register(resource, start, len as u64);
+
+        let shadow = crate::shadow::find(start + 16, 64).expect("a shadow in place");
+        assert!(shadow.is_aliased());
+        assert_eq!(
+            shadow.gpu(start + 16),
+            heap.gpu_address() + PAGE as u64 + 16
+        );
+        assert!(is_in_place(start + 8, 20));
+        assert!(!is_in_place(start - 64, 20));
+        assert!(clamp_in_place_inline(start + 8, 20, None));
+        assert!(clamp_in_place_inline(start - 64, 20, Some(start + 4)));
+        // A shorter buffer from the same start found in place too leaves the
+        // longer one's end in place.
+        assert!(in_place_shadow(start, PAGE as u64).is_some());
+        assert!(is_in_place(start + PAGE as u64 + 8, 20));
+        // The title writes through the other view; the GPU reads it there.
+        let bytes: Vec<u8> = (0..256).map(|i| (i * 7) as u8).collect();
+        // SAFETY: inside the second view.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), views[1].add(PAGE + 256), 256) };
+        assert_eq!(
+            gpu_read(&h.device, &shadow.buffer, (PAGE + 256) as u64, 256),
+            bytes
+        );
+        // The GPU writes; the title reads it through the first view.
+        let new: Vec<u8> = (0..256).map(|i| (i as u8) ^ 0x5a).collect();
+        gpu_write(&h.device, &shadow.buffer, (PAGE + 512) as u64, &new);
+        // SAFETY: inside the first view.
+        let seen = unsafe { std::slice::from_raw_parts(views[0].add(PAGE + 512), 256) };
+        assert_eq!(seen, &new[..]);
+        assert_eq!(shadow.update(start as usize, len), 0);
+        assert_eq!(shadow.copy_back(start as usize, len), 0);
+
+        // The title maps other pages over part of it: looked up again, and
+        // (with no section there any more) copied.
+        TEST_RESOLVER.with(|c| c.set(None));
+        crate::watch::title_memory_remapped(start as usize + PAGE, PAGE);
+        assert!(!is_in_place(start, len as u64));
+        let again = crate::shadow::find(start + 16, 64).expect("a copy");
+        assert!(!again.is_aliased());
+
+        drop((again, shadow));
+        crate::shadow::unregister(resource, start);
+        TEST_IN_PLACE.with(|c| c.set(None));
+        *TEST_HEAP.lock().unwrap() = None;
+        // SAFETY: our views and section, no longer used.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view.cast() });
+            }
+            CloseHandle(section);
+        }
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
     }

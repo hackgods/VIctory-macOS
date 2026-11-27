@@ -434,10 +434,9 @@ unsafe fn map_own_view(section: HANDLE, offset: u64, size: usize) -> MEMORY_MAPP
 struct Section {
     handle: HANDLE,
     size: usize,
-    /// Optional shared CPU/GPU backing. The file still supplies Wine's
-    /// placeholder-view metadata.
-    #[cfg(feature = "diagnostics")]
-    shared: Option<victory_gpu::PhysicalHeap>,
+    /// Optional shared CPU/GPU backing: every view is pointed at its pages.
+    /// The file still supplies Wine's placeholder-view metadata.
+    shared: Option<Arc<victory_gpu::PhysicalHeap>>,
     /// Our own view of the whole section, mapped the first time a
     /// DirectStorage request writes its pages and kept while the section
     /// lives (0: it could not be mapped). A view per request cost a map
@@ -500,8 +499,7 @@ impl Section {
         Section {
             handle,
             size,
-            #[cfg(feature = "diagnostics")]
-            shared: victory_gpu::physical_heap(size),
+            shared: shared_heap(size),
             whole: OnceLock::new(),
             committed,
         }
@@ -510,7 +508,6 @@ impl Section {
     /// The address of our view of the whole section, mapped the first time;
     /// `None` if the host would not map it.
     fn whole(&self) -> Option<usize> {
-        #[cfg(feature = "diagnostics")]
         if let Some(shared) = &self.shared {
             return Some(shared.cpu_address());
         }
@@ -543,6 +540,65 @@ impl Section {
         }
         true
     }
+}
+
+/// A heap for a new section of `size` bytes, whose pages every view then
+/// shows: the diagnostics trial `VICTORY_PHYSICAL_TILES`, or title memory in
+/// place on the GPU's own pages (`VICTORY_INPLACE_SECTIONS=1`, see
+/// [`in_place_run`]).
+fn shared_heap(size: usize) -> Option<Arc<victory_gpu::PhysicalHeap>> {
+    #[cfg(feature = "diagnostics")]
+    let trial = victory_gpu::physical_heap(size).map(Arc::new);
+    #[cfg(not(feature = "diagnostics"))]
+    let trial = None;
+    let heap = trial.or_else(|| victory_gpu::in_place_heap(size))?;
+    if victory_gpu::in_place_sections() {
+        victory_gpu::set_in_place_resolver(in_place_run);
+    }
+    Some(heap)
+}
+
+/// Views of sections on a heap ([`Section::shared`]), by address: their
+/// length and what they show. A copy of their entries in
+/// [`Physical::views`], under a lock of its own that is only ever held
+/// briefly and never while calling out: [`in_place_run`] reads it for the
+/// GPU side, which may hold its own locks then.
+static IN_PLACE_VIEWS: RwLock<BTreeMap<usize, (usize, Slice)>> = RwLock::new(BTreeMap::new());
+
+/// Where title memory `[start, start + len)` lies on a section's heap, if
+/// views next to each other show consecutive pages of one such section
+/// over all of it: the heap, and the offset into it at `start`
+/// ([`victory_gpu::InPlaceResolver`]).
+fn in_place_run(start: u64, len: u64) -> Option<(Arc<victory_gpu::PhysicalHeap>, usize)> {
+    let start = usize::try_from(start).ok()?;
+    let end = start.checked_add(usize::try_from(len).ok()?)?;
+    let views = IN_PLACE_VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let (first, offset) = run_at(&views, start, end)?;
+    Some((first.section.shared.clone()?, offset))
+}
+
+/// The view of `views` holding `start`, if the views after it continue it
+/// up to `end`: each starting where the one before ends, showing the next
+/// pages of the same section. With the offset into the section at `start`.
+fn run_at(
+    views: &BTreeMap<usize, (usize, Slice)>,
+    start: usize,
+    end: usize,
+) -> Option<(&Slice, usize)> {
+    let (&base, (size, first)) = views
+        .range(..=start)
+        .next_back()
+        .filter(|(base, (size, _))| start < *base + size)?;
+    let (mut at, mut index) = (base + size, first.index + size / PAGE);
+    while at < end {
+        let (size, slice) = views.get(&at)?;
+        if !Arc::ptr_eq(&slice.section, &first.section) || slice.index != index {
+            return None;
+        }
+        at += size;
+        index += size / PAGE;
+    }
+    Some((first, first.index * PAGE + (start - base)))
 }
 
 impl Drop for Section {
@@ -1396,7 +1452,6 @@ fn finish_map(
     #[cfg(test)]
     tests::MAPS.with(|m| m.set(m.get() + 1));
     let mapped = slice.section.commit_shown(slice.index, base, len);
-    #[cfg(feature = "diagnostics")]
     let mapped = mapped
         && slice.section.shared.as_ref().is_none_or(|shared| {
             // SAFETY: this live view is ours. The slice will hold the
@@ -1428,6 +1483,12 @@ fn finish_map(
     for (at, others) in aliased {
         // Pages shown elsewhere already: guarded here too if they are there.
         victory_gpu::title_memory_aliased(at, &others);
+    }
+    if slice.section.shared.is_some() {
+        IN_PLACE_VIEWS
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(base, (len, slice.clone()));
     }
     physical.views.insert(base, (len, slice));
     true
@@ -1568,6 +1629,12 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        if slice.section.shared.is_some() {
+            IN_PLACE_VIEWS
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&at);
+        }
         shown_mut().forget(at, size, &slice);
         let going = victory_gpu::title_memory_unmapping(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
@@ -1896,6 +1963,48 @@ mod tests {
             TEST_LEAN.with(|c| c.set(self.prev_lean));
             TEST_MAP_RUNS.with(|c| c.set(self.prev_runs));
         }
+    }
+
+    /// Title memory lies in place on a section's heap only where views next
+    /// to each other show consecutive pages of that one section all along.
+    #[test]
+    fn runs_of_views_hold_title_memory_in_place_only_whole() {
+        let (pages, other) = (allocate(4), allocate(1));
+        let slice = |page: usize| page_table().pages[&page].clone();
+        let base = 0x7000_0000usize;
+        let view = |k: usize, page: usize, n: usize| (base + k * PAGE, (n * PAGE, slice(page)));
+        // Pages 0 and 1 as one view, page 2 as a view of its own after it.
+        let mut views: BTreeMap<usize, (usize, Slice)> =
+            [view(0, pages[0], 2), view(2, pages[2], 1)]
+                .into_iter()
+                .collect();
+        let at = |views: &BTreeMap<usize, (usize, Slice)>, start: usize, end: usize| {
+            run_at(views, start, end).map(|(first, offset)| (first.index, offset))
+        };
+        // Inside the first view, from its second page on, and across into
+        // the next view: offsets into the section.
+        assert_eq!(at(&views, base + 16, base + 32), Some((0, 16)));
+        assert_eq!(
+            at(&views, base + PAGE + 8, base + 3 * PAGE),
+            Some((0, PAGE + 8))
+        );
+        // Past the last view, or starting before the first.
+        assert_eq!(at(&views, base + PAGE, base + 3 * PAGE + 1), None);
+        assert_eq!(at(&views, base - 1, base + 8), None);
+        // A view showing a page out of order breaks the run.
+        views.insert(base + 2 * PAGE, (PAGE, slice(pages[3])));
+        assert_eq!(at(&views, base, base + 3 * PAGE), None);
+        assert_eq!(at(&views, base, base + 2 * PAGE), Some((0, 0)));
+        // So does a page of another section, and a hole between views.
+        views.insert(base + 2 * PAGE, (PAGE, slice(other[0])));
+        assert_eq!(at(&views, base, base + 3 * PAGE), None);
+        views.remove(&(base + 2 * PAGE));
+        views.insert(base + 3 * PAGE, (PAGE, slice(pages[3])));
+        assert_eq!(at(&views, base, base + 4 * PAGE), None);
+        // Sections made without the switch have no heap: nothing is in place.
+        assert!(slice(pages[0]).section.shared.is_none() || cfg!(feature = "diagnostics"));
+        XMemFreePhysicalPages(pages.len(), pages.as_ptr());
+        XMemFreePhysicalPages(other.len(), other.as_ptr());
     }
 
     #[test]

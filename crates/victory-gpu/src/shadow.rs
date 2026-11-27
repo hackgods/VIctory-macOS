@@ -2212,6 +2212,13 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let entry = map.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
+        // On XMem physical pages on a heap, the buffer is that heap's own
+        // memory (`VICTORY_INPLACE_SECTIONS`): no copy.
+        if let Some(shadow) = crate::alias::in_place_shadow(key.0, len) {
+            entry.shadow = Some(shadow);
+            changed();
+            return entry.shadow.clone();
+        }
         // Rounded up so that views ending in the buffer's last 256 bytes fit.
         // Shaders write some buffers (unordered access), so not upload memory.
         let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(1 << 16))?;
@@ -2236,6 +2243,24 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
         changed();
     }
     entry.shadow.clone()
+}
+
+/// Title buffers in place on XMem physical pages (`crate::alias`) that
+/// overlap `[from, to)`, where the title mapped other pages or none: let go,
+/// so that the next lookup finds them again, in place or copied.
+pub(crate) fn forget_in_place(from: u64, to: u64) {
+    let mut map = buffers();
+    let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
+    let mut any = false;
+    for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
+        if entry.end > from && entry.shadow.as_ref().is_some_and(|s| s.aliased) {
+            entry.shadow = None;
+            any = true;
+        }
+    }
+    if any {
+        changed();
+    }
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand
@@ -2621,7 +2646,8 @@ pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
             .iter()
             .filter_map(|(&key, e)| e.shadow.as_ref().map(|c| (Held::Buffer(key), c)))
             .chain(loose.iter().map(|(&key, c)| (Held::Loose(key), c)))
-            .filter(|(_, c)| idle(c, tables, frame))
+            // Memory in place frees nothing when given up.
+            .filter(|(_, c)| !c.aliased && idle(c, tables, frame))
             .map(|(held, c)| (c.used.load(Ordering::Relaxed), c.len, held))
             .collect();
         candidates.sort_unstable_by_key(|&(used, ..)| used);

@@ -510,6 +510,7 @@ impl State {
             }
             self.seen_input[slot].then_some(pad)
         });
+        self.mac.dead_zones(&mut pads);
         #[cfg(any(test, feature = "diagnostics"))]
         merge_scripted(&mut pads, scripted);
         #[cfg(not(any(test, feature = "diagnostics")))]

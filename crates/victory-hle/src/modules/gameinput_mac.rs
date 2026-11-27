@@ -10,6 +10,13 @@
 //! any time since (pressed again as well: down in the reading after). Triggers
 //! show their highest value since the last reading; sticks the latest value.
 //! Readings handed out within `LATCH_HOLD` of each other agree.
+//!
+//! `VICTORY_STICK_DEADZONE=<share>` (for example 0.15): host pad sticks within
+//! that share of full travel of the centre read as centred, and the rest of
+//! the travel is spread over 0 to 1 again (a round dead zone per stick).
+//! XInput values are raw: a stick at rest reads up to several per cent off
+//! centre, more on a worn pad, and every wobble of it was a new reading. The
+//! title has a dead zone of its own; this one comes before it.
 
 use super::{FALLBACK, PADS, PadState};
 
@@ -96,6 +103,18 @@ pub(super) struct Mac {
     /// `Some(hold)` with the latch on.
     latch: Option<u64>,
     latches: [Latch; LATCHED],
+    /// Share of stick travel read as centred; 0 is off.
+    dead_zone: f32,
+}
+
+/// A round dead zone of `zone` on one stick.
+fn dead_zone(x: f32, y: f32, zone: f32) -> (f32, f32) {
+    let length = x.hypot(y);
+    if length <= zone {
+        return (0.0, 0.0);
+    }
+    let scale = ((length - zone) / (1.0 - zone)).min(1.0) / length;
+    (x * scale, y * scale)
 }
 
 impl Mac {
@@ -111,7 +130,32 @@ impl Mac {
             );
             mac.latch = Some(LATCH_HOLD);
         }
+        let zone = std::env::var("VICTORY_STICK_DEADZONE").ok();
+        match zone.as_deref().map(str::trim).filter(|z| !z.is_empty()) {
+            None | Some("0") | Some("off") => {}
+            Some(z) => match z.parse::<f32>() {
+                Ok(share) if (0.0..0.9).contains(&share) => {
+                    tracing::info!(share, "stick dead zone (VICTORY_STICK_DEADZONE)");
+                    mac.dead_zone = share;
+                }
+                _ => tracing::warn!(
+                    value = z,
+                    "VICTORY_STICK_DEADZONE wants a share from 0 to 0.9"
+                ),
+            },
+        }
         mac
+    }
+
+    /// Host pads' sticks through the dead zone.
+    pub(super) fn dead_zones(&self, pads: &mut [Option<PadState>; PADS]) {
+        if self.dead_zone <= 0.0 {
+            return;
+        }
+        for pad in pads.iter_mut().flatten() {
+            (pad.left_x, pad.left_y) = dead_zone(pad.left_x, pad.left_y, self.dead_zone);
+            (pad.right_x, pad.right_y) = dead_zone(pad.right_x, pad.right_y, self.dead_zone);
+        }
     }
 
     /// Device `index`'s gamepad state as its next reading shows it.
@@ -203,6 +247,34 @@ mod tests {
         assert_eq!(buttons(&mut mac, 0, 20), A);
         // Never handed out: shown as the host has it after `LATCH_MAX`.
         assert_eq!(buttons(&mut mac, 0, LATCH_MAX + 1), 0);
+    }
+
+    #[test]
+    fn sticks_near_the_centre_read_centred() {
+        let mut pads = [pad(0, 0.0), None, None, None];
+        pads[0].as_mut().unwrap().right_y = -1.0;
+        let mac = Mac {
+            dead_zone: 0.25,
+            ..Mac::default()
+        };
+        mac.dead_zones(&mut pads);
+        let p = pads[0].unwrap();
+        // 0.25 from centre is inside; full travel stays full.
+        assert_eq!(
+            (p.left_x, p.left_y, p.right_x, p.right_y),
+            (0.0, 0.0, 0.0, -1.0)
+        );
+        let (x, y) = dead_zone(0.0, 0.625, 0.25);
+        assert!(x == 0.0 && (y - 0.5).abs() < 1e-6);
+        let (x, y) = dead_zone(0.8, 0.8, 0.25);
+        assert!(
+            (x - y).abs() < 1e-6 && (x.hypot(y) - 1.0).abs() < 1e-6,
+            "direction kept"
+        );
+        // Off by default.
+        let mut pads = [pad(0, 0.0), None, None, None];
+        Mac::default().dead_zones(&mut pads);
+        assert_eq!(pads[0].unwrap().left_x, 0.25);
     }
 
     #[test]

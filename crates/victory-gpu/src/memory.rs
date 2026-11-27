@@ -307,6 +307,10 @@ struct Stats {
     missed_pages: u64,
     missed_regions: u64,
     first_missed: Vec<u64>,
+    /// Missed pages by 256 MiB region (its first address): mapped memory
+    /// (a copy can be made), free addresses, and whole-region misses (no
+    /// block: the page is not known).
+    missed_by_region: std::collections::BTreeMap<u64, [u64; 3]>,
     /// Pages read with no copy that are reserved with nothing mapped: they
     /// read as zeros, as the console's unmapped tiles do, and are no miss.
     unmapped_pages: u64,
@@ -442,6 +446,24 @@ pub(crate) fn log_frame() {
             format!("{a:#x}")
         })
         .collect();
+    if !s.missed_by_region.is_empty() {
+        // The regions shaders missed most in, with what the memory there is.
+        let mut regions: Vec<(&u64, &[u64; 3])> = s.missed_by_region.iter().collect();
+        regions.sort_by_key(|(_, n)| std::cmp::Reverse(n[0] + n[1] + n[2]));
+        let (mapped, free, whole) = regions
+            .iter()
+            .fold((0, 0, 0), |(m, f, w), (_, n)| (m + n[0], f + n[1], w + n[2]));
+        let top: Vec<String> = regions
+            .iter()
+            .take(24)
+            .map(|(at, [m, f, w])| format!("{at:#x}: {m} mapped {f} free {w} no block"))
+            .collect();
+        tracing::info!(
+            "title memory misses this frame by 256 MiB region: {} regions; {mapped} pages of mapped memory, {free} at free addresses, {whole} misses in regions with no block; most: {}",
+            regions.len(),
+            top.join(", "),
+        );
+    }
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
@@ -513,11 +535,26 @@ fn misses_told_apart() -> bool {
 static MISSED_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const MISSED_COPIES_MAX: u64 = 64;
 
+/// The most copies made of missed pages a frame: `VICTORY_MISSED_COPIES`,
+/// [`MISSED_COPIES_MAX`] by default. The acceleration-structure builder
+/// reads geometry no draw has used through a view (14,000 pages in its
+/// first frame): with the default its lists would miss for hundreds of
+/// frames.
+fn missed_copies_max() -> u64 {
+    static MAX: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_MISSED_COPIES")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(MISSED_COPIES_MAX)
+    })
+}
+
 /// A copy of the mapped page `at` a shader missed, for the lists after
 /// (the next page table names it): whether one was asked for.
 fn copy_missed(at: u64) -> bool {
     use std::sync::atomic::Ordering::Relaxed;
-    if MISSED_COPIES.fetch_add(1, Relaxed) >= MISSED_COPIES_MAX {
+    if MISSED_COPIES.fetch_add(1, Relaxed) >= missed_copies_max() {
         return false;
     }
     crate::shadow::find(at, crate::watch::PAGE as u64).is_some()
@@ -712,6 +749,20 @@ pub(crate) fn prepare(key: usize, mut add: impl FnMut(&Arc<Shadow>, usize, usize
 /// does, so that the next miss there names its page, not the region.
 static MISSED_REGIONS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 const MISSED_REGIONS_MAX: usize = 64;
+
+/// The most missed regions given a block: `VICTORY_MISSED_REGIONS`,
+/// [`MISSED_REGIONS_MAX`] by default, at most half the page table's blocks
+/// (the copies' regions need the rest).
+fn missed_regions_max() -> usize {
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_MISSED_REGIONS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(MISSED_REGIONS_MAX)
+            .min(CAPACITY / 2)
+    })
+}
 static MISSED_REGIONS_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -730,7 +781,7 @@ fn missed_regions_count() -> usize {
 /// so no block has.
 fn note_missed_region(l1: usize) {
     let mut regions = MISSED_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-    if l1 < LEVEL1 && regions.len() < MISSED_REGIONS_MAX && !regions.contains(&l1) {
+    if l1 < LEVEL1 && regions.len() < missed_regions_max() && !regions.contains(&l1) {
         regions.push(l1);
         MISSED_REGIONS_COUNT.store(regions.len(), std::sync::atomic::Ordering::Release);
     }
@@ -808,6 +859,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let (mut unmapped, mut copied) = (0, 0);
+        let mut by_region: Vec<(u64, usize)> = Vec::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -823,6 +875,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     regions += 1;
                     missed.push((entry as u64) << 28);
+                    by_region.push(((entry as u64) << 28, 2));
                     note_missed_region(entry);
                     continue;
                 };
@@ -835,6 +888,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                         k => {
                             pages += 1;
                             missed.push(at);
+                            by_region.push((at & !((1 << 28) - 1), usize::from(k == MissKind::Free)));
                             if k == MissKind::Mapped && misses_told_apart() && copy_missed(at) {
                                 copied += 1;
                             }
@@ -873,6 +927,9 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             s.copies_made += copied;
             let room = 4usize.saturating_sub(s.first_missed.len());
             s.first_missed.extend(missed.into_iter().take(room));
+            for (region, kind) in by_region {
+                s.missed_by_region.entry(region).or_default()[kind] += 1;
+            }
         });
     });
     Some(Map {
@@ -951,7 +1008,7 @@ mod tests {
         assert!(missed_regions().contains(&(LEVEL1 - 7)));
         assert!(!missed_regions().contains(&LEVEL1));
         assert!(missed_regions_count() <= before + 1);
-        assert!(missed_regions_count() <= MISSED_REGIONS_MAX);
+        assert!(missed_regions_count() <= missed_regions_max());
     }
 
     /// Writes of lists using title memory are held back from a frame with a

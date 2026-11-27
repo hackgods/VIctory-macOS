@@ -2340,6 +2340,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Submissions run to completion inside the pump (no Flight-1,
+        // whatever a flight test running beside it asks for).
+        let _mode = crate::host::flight::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
 

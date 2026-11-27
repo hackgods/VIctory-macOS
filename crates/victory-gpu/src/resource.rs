@@ -3924,6 +3924,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Each submission runs to completion before the call returns (no
+        // Flight-1, whatever a flight test running beside it asks for).
+        let _mode = crate::host::flight::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;
@@ -3996,6 +3999,9 @@ mod tests {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
+        // Each submission runs to completion before the call returns (no
+        // Flight-1, whatever a flight test running beside it asks for).
+        let _mode = crate::host::flight::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let iid = &RESOURCE_IIDS[0];
         const COPY_DEST: u32 = 0x400;

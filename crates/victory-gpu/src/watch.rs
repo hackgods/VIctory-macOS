@@ -392,7 +392,88 @@ pub(crate) fn frame_line(frames: f64) -> String {
         faults / 1e3,
         protect / 1e3,
         opened + writable + foreign + other + found
-    )
+    ) + &{
+        #[cfg(feature = "diagnostics")]
+        {
+            other_exceptions::line(frames)
+        }
+        #[cfg(not(feature = "diagnostics"))]
+        {
+            String::new()
+        }
+    }
+}
+
+/// Diagnostics: the exceptions the write-fault handler passes on (not write
+/// faults), by code, each with the last address it came from: lock-free and
+/// allocation-free, as the handler runs inside the exception.
+#[cfg(feature = "diagnostics")]
+mod other_exceptions {
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    const SLOTS: usize = 16;
+    static CODE: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
+    static COUNT: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
+    static AT: [AtomicUsize; SLOTS] = [const { AtomicUsize::new(0) }; SLOTS];
+
+    pub(super) fn note(code: u32, at: usize) {
+        for i in 0..SLOTS {
+            let c = CODE[i].load(Relaxed);
+            if c == code || (c == 0 && CODE[i].compare_exchange(0, code, Relaxed, Relaxed).is_ok()) || CODE[i].load(Relaxed) == code {
+                COUNT[i].fetch_add(1, Relaxed);
+                AT[i].store(at, Relaxed);
+                return;
+            }
+        }
+    }
+
+    /// "; other exceptions by code: 0x... n/frame (last at 0x...), ..."
+    pub(super) fn line(frames: f64) -> String {
+        let mut parts = Vec::new();
+        for i in 0..SLOTS {
+            let code = CODE[i].load(Relaxed);
+            if code == 0 {
+                continue;
+            }
+            let n = COUNT[i].swap(0, Relaxed) as f64 / frames.max(1.0);
+            let at = AT[i].load(Relaxed);
+            parts.push(format!("{code:#010x} {n:.1}/frame (last at {at:#x}{})", place(at)));
+        }
+        if parts.is_empty() { String::new() } else { format!("; other exceptions by code: {}", parts.join(", ")) }
+    }
+
+    /// " = module+0xoffset, bytes .." for an address: its image, and the
+    /// bytes there now (read through the kernel, which refuses an unmapped
+    /// page instead of faulting).
+    fn place(at: usize) -> String {
+        use windows_sys::Win32::System::LibraryLoader::{
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+            GetModuleHandleExW,
+        };
+        let mut module = std::ptr::null_mut();
+        // SAFETY: a query by address; the handle is not kept.
+        let found = unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                at as *const u16,
+                &mut module,
+            )
+        } != 0;
+        let image = if found {
+            let mut name = [0u16; 260];
+            // SAFETY: a buffer of the length passed.
+            let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+            let name = String::from_utf16_lossy(&name[..n]);
+            let short = name.rsplit(['\\', '/']).next().unwrap_or("").to_string();
+            format!(" = {short}+{:#x}", at - module as usize)
+        } else {
+            " = no image".to_string()
+        };
+        let mut bytes = [0u8; 8];
+        let read = crate::host::read_into(at as *const u8, &mut bytes);
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        format!("{image}, bytes {}", if read { hex.join(" ") } else { "unreadable".into() })
+    }
 }
 
 thread_local! {
@@ -1379,6 +1460,8 @@ fn install() {
             || r.ExceptionInformation[0] != WRITE
         {
             fault(3);
+            #[cfg(feature = "diagnostics")]
+            other_exceptions::note(r.ExceptionCode as u32, r.ExceptionAddress as usize);
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];

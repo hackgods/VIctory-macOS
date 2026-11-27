@@ -113,6 +113,52 @@ const LOWEST: u64 = 0x10000;
 /// committed), since the last [`take`].
 static MADE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// The copies [`learn`] made (start, length), and their bytes in all.
+static HELD: std::sync::Mutex<(std::collections::BTreeSet<(u64, u64)>, u64)> =
+    std::sync::Mutex::new((std::collections::BTreeSet::new(), 0));
+
+/// Misses not given a copy because the copies made so far fill the budget
+/// ([`budget`]), since the last [`take_over`].
+static OVER: AtomicU64 = AtomicU64::new(0);
+
+/// `VICTORY_POINTER_PAGES_MB`: how many MB of copies pointer misses may
+/// make in all (default 4,096); past it a miss gets no copy and reads 0, as
+/// without the switch.
+///
+/// After fxceless/victory-fork 3e573d25, whose pages from faults are a
+/// budget of 512 MB held at a time, recycled oldest first. That recycling
+/// is not taken: there a page made from a fault is that line's alone,
+/// while here a miss makes or reuses an ordinary copy (its title buffer
+/// or a 4 MiB loose window) that views take too. Giving one back while a
+/// view holds it would leave two copies of the same memory, each with its
+/// own writes. So this is a bound for the run, high enough that the cell
+/// and the boat stay well under it (about 300 MB in run pp2, guess from
+/// its copy sizes), and the log says when it is met.
+fn budget() -> u64 {
+    static MB: OnceLock<u64> = OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_POINTER_PAGES_MB")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(4096)
+    }) << 20
+}
+
+/// Whether a copy of `len` bytes at `start` that pointer misses made fits
+/// the budget (`budget` bytes, `held` so far); counts it if it does. A copy
+/// counted before is free.
+fn admit(held: &mut (std::collections::BTreeSet<(u64, u64)>, u64), start: u64, len: u64, budget: u64) -> bool {
+    if held.0.contains(&(start, len)) {
+        return true;
+    }
+    if held.1 + len > budget {
+        return false;
+    }
+    held.0.insert((start, len));
+    held.1 += len;
+    true
+}
+
 /// What a missed address is to [`learn`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Missed {
@@ -142,7 +188,37 @@ pub(crate) fn learn(missed: &[Missed]) {
     for &m in missed {
         let page = matches!(m, Missed::Page(_));
         let made = target(m, first_committed).filter(|&at| crate::texture::committed(at as *const u8, 1));
-        match made.and_then(|at| crate::shadow::find(at, 1)) {
+        // A copy that already holds it costs nothing; a new one counts
+        // against the budget. The window or buffer a new copy would take is
+        // known only once made: a copy past the budget is made, and stays
+        // (views may take it), but nothing more is made after it.
+        if made.is_some() {
+            let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+            if held.1 >= budget() {
+                drop(held);
+                OVER.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+        }
+        let copy = made.and_then(|at| crate::shadow::find(at, 1));
+        if let Some(c) = &copy {
+            let (start, len) = c.range();
+            let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+            if !admit(&mut held, start, len, budget()) {
+                // Over the budget with this one: it counts, and is the last.
+                held.0.insert((start, len));
+                held.1 += len;
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        held_mb = held.1 >> 20,
+                        budget_mb = budget() >> 20,
+                        "VICTORY_POINTER_PAGES: the copies pointer misses made fill the budget (VICTORY_POINTER_PAGES_MB); later misses get none"
+                    );
+                }
+            }
+        }
+        match copy {
             Some(_) => {
                 MADE[usize::from(!page)].fetch_add(1, Ordering::Relaxed);
             }
@@ -229,6 +305,13 @@ pub(crate) fn take() -> [u64; 3] {
     MADE.each_ref().map(|n| n.swap(0, Ordering::Relaxed))
 }
 
+/// Misses refused for the budget since the last call, and the MB the
+/// copies pointer misses made hold in all.
+pub(crate) fn take_over() -> (u64, u64) {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner()).1;
+    (OVER.swap(0, Ordering::Relaxed), held >> 20)
+}
+
 /// The first committed, readable address in `[start, end)`, by the
 /// host's memory map.
 fn first_committed(start: u64, end: u64) -> Option<u64> {
@@ -293,6 +376,19 @@ mod tests {
         assert!(!is_null_page(&blocks, 2 * n, n), "region 7");
         assert!(!is_null_page(&blocks, 0, n), "block 0");
         assert!(!is_null_page(&blocks, 3 * n, n), "past the blocks");
+    }
+
+    /// The budget admits new copies until they would pass it; one counted
+    /// before is free; the count is the copies' bytes.
+    #[test]
+    fn the_budget_admits_copies_until_it_is_full() {
+        let mut held = Default::default();
+        assert!(admit(&mut held, 0x1000_0000, 4 << 20, 10 << 20));
+        assert!(admit(&mut held, 0x2000_0000, 4 << 20, 10 << 20));
+        assert!(admit(&mut held, 0x1000_0000, 4 << 20, 10 << 20), "counted before");
+        assert!(!admit(&mut held, 0x3000_0000, 4 << 20, 10 << 20), "past the budget");
+        assert_eq!(held.1, 8 << 20);
+        assert!(admit(&mut held, 0x3000_0000, 2 << 20, 10 << 20), "a smaller one fits");
     }
 
     /// The host's memory map: a committed allocation is found from below

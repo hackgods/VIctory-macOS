@@ -375,10 +375,13 @@ pub(crate) fn log_frame() {
     let missed: Vec<String> = s.first_missed.iter().map(|a| format!("{a:#x}")).collect();
     if pointer_pages::on() {
         let [pages, regions, left] = pointer_pages::take();
+        let (over_budget, held_mb) = pointer_pages::take_over();
         tracing::info!(
             pages,
             regions,
             left,
+            over_budget,
+            held_mb,
             "title memory reached by pointers this frame (VICTORY_POINTER_PAGES): copies asked for missed pages and regions, and misses left with none (not committed)"
         );
     }

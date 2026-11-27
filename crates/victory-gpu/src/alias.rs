@@ -540,6 +540,37 @@ pub fn in_place_sections() -> bool {
     })
 }
 
+/// The most bytes of one section in place: `VICTORY_INPLACE_SECTION_MB`,
+/// [`MOST_SECTION`] (512 MiB) by default. `bench_physical_heap_sizes`
+/// measures what D3DMetal accepts.
+fn most_section() -> usize {
+    static BYTES: OnceLock<usize> = OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("VICTORY_INPLACE_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map_or(MOST_SECTION, |mb| mb << 20)
+    })
+}
+
+/// Whether memory outside buffer objects (the loose windows of
+/// `crate::shadow`) is used in place too where it lies on a section heap:
+/// `VICTORY_INPLACE_LOOSE=1`, with [`in_place_sections`].
+pub(crate) fn in_place_loose() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_IN_PLACE_LOOSE.with(std::cell::Cell::get) {
+        return on && in_place_sections();
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_INPLACE_LOOSE")) && in_place_sections()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Overrides `VICTORY_INPLACE_LOOSE` on this thread.
+    pub(crate) static TEST_IN_PLACE_LOOSE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The bytes all in-place heaps may take together:
 /// `VICTORY_INPLACE_SECTIONS_MB`, 1024 MiB by default.
 fn in_place_budget() -> usize {
@@ -557,7 +588,7 @@ fn in_place_budget() -> usize {
 /// memory in place ([`in_place_sections`], at most `MOST_SECTION`, within
 /// the budget).
 pub fn in_place_heap(len: usize) -> Option<std::sync::Arc<PhysicalHeap>> {
-    if !in_place_sections() || len == 0 || !len.is_multiple_of(PAGE) || len > MOST_SECTION {
+    if !in_place_sections() || len == 0 || !len.is_multiple_of(PAGE) || len > most_section() {
         return None;
     }
     let before = IN_PLACE_BYTES.fetch_add(len, Ordering::Relaxed);
@@ -1580,6 +1611,236 @@ mod tests {
             }
             CloseHandle(section);
         }
+        // SAFETY: querying device health.
+        assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// Bench (`--ignored --nocapture`): how large a `PhysicalHeap` D3DMetal
+    /// accepts and what it costs, for title memory in place at full
+    /// coverage (Grand Theft Auto VI asks for 6.1 GiB of physical pages in
+    /// one call). Per size: creation, first touch of every 16 KiB page,
+    /// pointing views at its first and last 64 MiB, and a GPU copy out of
+    /// and into the last page (offsets past 4 GiB).
+    #[test]
+    #[ignore = "bench: allocates up to VICTORY_HEAP_BENCH_GIB (12) GiB of GPU memory"]
+    fn bench_physical_heap_sizes() {
+        if !crate::watch::rosetta() || supported().is_none() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        let most: usize = std::env::var("VICTORY_HEAP_BENCH_GIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        const VIEW: usize = 64 << 20;
+        let mut held: Vec<PhysicalHeap> = Vec::new();
+        let mut total = 0usize;
+        for mib in [256usize, 1024, 2048, 4096, 6272, 8192, 12288] {
+            let len = mib << 20;
+            if mib > most << 10 {
+                break;
+            }
+            let t = std::time::Instant::now();
+            let heap = match PhysicalHeap::new(&h.device, len) {
+                Ok(heap) => heap,
+                Err(error) => {
+                    println!("heap {mib} MiB: refused: {error}");
+                    break;
+                }
+            };
+            let made = t.elapsed();
+            let base = heap.cpu_address() as *mut u8;
+            let t = std::time::Instant::now();
+            let mut sum = 0u64;
+            for at in (0..len).step_by(16 << 10) {
+                // SAFETY: inside the heap's mapping.
+                unsafe {
+                    sum += u64::from(base.add(at).read_volatile());
+                    base.add(at).write_volatile(at as u8);
+                }
+            }
+            let touched = t.elapsed();
+            // Views of the first and last 64 MiB, as the runtime's.
+            let t = std::time::Instant::now();
+            let mut ok = true;
+            let mut views = Vec::new();
+            for offset in [0, len - VIEW] {
+                // SAFETY: a fresh allocation of ours.
+                let view = unsafe {
+                    VirtualAlloc(std::ptr::null(), VIEW, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+                }
+                .cast::<u8>();
+                assert!(!view.is_null());
+                // SAFETY: our view; the heap outlives it.
+                ok &= unsafe { heap.alias_view(view as usize, offset, VIEW) };
+                views.push(view);
+            }
+            let aliased = t.elapsed();
+            // The title writes the last page through its view; the GPU
+            // reads it and writes the page before it.
+            let pattern: Vec<u8> = (0..4096).map(|i| (i * 13 + mib) as u8).collect();
+            // SAFETY: inside the last view.
+            unsafe {
+                std::ptr::copy_nonoverlapping(pattern.as_ptr(), views[1].add(VIEW - 4096), 4096)
+            };
+            let t = std::time::Instant::now();
+            let read = gpu_read(&h.device, &heap.backing, (len - 4096) as u64, 4096);
+            let copied = t.elapsed();
+            gpu_write(&h.device, &heap.backing, (len - 8192) as u64, &pattern);
+            // SAFETY: inside the last view.
+            let seen = unsafe { std::slice::from_raw_parts(views[1].add(VIEW - 8192), 4096) };
+            // SAFETY: a live placed buffer.
+            let gpu = unsafe { heap.backing.GetGPUVirtualAddress() };
+            // SAFETY: querying device health.
+            let alive = unsafe { h.device.GetDeviceRemovedReason() }.is_ok();
+            total += len;
+            println!(
+                "heap {mib} MiB (total held {} MiB): made {:.1} ms, first touch {:.1} ms ({:.2} us/16K page, zero {}), 2 views {:.2} ms ok {ok}, gpu read ok {} ({:.2} ms), gpu write seen {}, gpu va {gpu:#x}, device alive {alive}",
+                total >> 20,
+                made.as_secs_f64() * 1e3,
+                touched.as_secs_f64() * 1e3,
+                touched.as_secs_f64() * 1e6 / (len >> 14) as f64,
+                sum == 0,
+                aliased.as_secs_f64() * 1e3,
+                read == pattern,
+                copied.as_secs_f64() * 1e3,
+                seen == &pattern[..],
+            );
+            for view in views {
+                // SAFETY: our allocation.
+                unsafe { VirtualFree(view.cast(), 0, MEM_RELEASE) };
+            }
+            if !alive {
+                break;
+            }
+            let t = std::time::Instant::now();
+            drop(heap);
+            total -= len;
+            println!("  released in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        }
+        // Many heaps held together, all touched: the title's whole pool.
+        let together: usize = std::env::var("VICTORY_HEAP_BENCH_TOTAL_GIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16);
+        let t = std::time::Instant::now();
+        while total < together << 30 {
+            let len = 2usize << 30;
+            let Ok(heap) = PhysicalHeap::new(&h.device, len) else {
+                println!("held {} MiB, then refused", total >> 20);
+                break;
+            };
+            let base = heap.cpu_address() as *mut u8;
+            for at in (0..len).step_by(16 << 10) {
+                // SAFETY: inside the heap's mapping.
+                unsafe { base.add(at).write_volatile(1) };
+            }
+            total += len;
+            held.push(heap);
+        }
+        let last = held.last().expect("a heap");
+        let read = gpu_read(&h.device, &last.backing, (2u64 << 30) - 16384, 4096);
+        // SAFETY: querying device health.
+        let alive = unsafe { h.device.GetDeviceRemovedReason() }.is_ok();
+        println!(
+            "held {} MiB in {} heaps, touched, in {:.1} ms; gpu read of the last ok {}; device alive {alive}",
+            total >> 20,
+            held.len(),
+            t.elapsed().as_secs_f64() * 1e3,
+            read[0] == 1,
+        );
+        let t = std::time::Instant::now();
+        drop(held);
+        println!("released in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+
+    /// The view and heap [`loose_resolve`] answers for.
+    static LOOSE_VIEW: AtomicUsize = AtomicUsize::new(0);
+    static LOOSE_HEAP: Mutex<Option<std::sync::Arc<PhysicalHeap>>> = Mutex::new(None);
+
+    fn loose_resolve(start: u64, len: u64) -> Option<(std::sync::Arc<PhysicalHeap>, usize)> {
+        let base = LOOSE_VIEW.load(Ordering::Relaxed) as u64;
+        let heap = LOOSE_HEAP.lock().unwrap().clone()?;
+        (start >= base && start + len <= base + TEST_SECTION as u64)
+            .then(|| (heap, (start - base) as usize))
+    }
+
+    /// Memory outside any buffer object that lies on a section heap is used
+    /// in place too with `VICTORY_INPLACE_LOOSE`: the pages a range touches
+    /// are the heap's own (no 4 MiB copy, nothing refreshed or copied
+    /// back), ranges inside share them, and when the title maps other
+    /// pages there the memory is looked up again.
+    #[test]
+    fn loose_memory_on_section_heaps_is_used_in_place() {
+        if !crate::watch::rosetta() || supported().is_none() {
+            return;
+        }
+        let Some(h) = host() else {
+            return;
+        };
+        TEST_IN_PLACE.with(|c| c.set(Some(true)));
+        let heap = in_place_heap(TEST_SECTION).expect("a heap for the section");
+        // SAFETY: a fresh allocation of ours, pointed at the heap's pages.
+        let view = unsafe {
+            let view = VirtualAlloc(
+                std::ptr::null(),
+                TEST_SECTION,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+            .cast::<u8>();
+            assert!(!view.is_null());
+            assert!(heap.alias_view(view as usize, 0, TEST_SECTION));
+            view
+        };
+        LOOSE_VIEW.store(view as usize, Ordering::Relaxed);
+        *LOOSE_HEAP.lock().unwrap() = Some(heap.clone());
+        TEST_RESOLVER.with(|c| c.set(Some(loose_resolve)));
+
+        // Without the switch: a copy, as before.
+        TEST_IN_PLACE_LOOSE.with(|c| c.set(Some(false)));
+        let far = view as u64 + 3 * PAGE as u64 + 64;
+        let copy = crate::shadow::find(far, 64).expect("a window's copy");
+        assert!(!copy.is_aliased());
+        drop(copy);
+        crate::watch::title_memory_remapped(view as usize, TEST_SECTION);
+
+        // With it: the heap's own pages.
+        TEST_IN_PLACE_LOOSE.with(|c| c.set(Some(true)));
+        let at = view as u64 + PAGE as u64 + 100;
+        let shadow = crate::shadow::find(at, 64).expect("memory in place");
+        assert!(shadow.is_aliased());
+        assert_eq!(shadow.gpu(at), heap.gpu_address() + PAGE as u64 + 100);
+        assert!(is_in_place(at, 64));
+        let again = crate::shadow::find(at + 1000, 16).expect("the same pages");
+        assert!(std::sync::Arc::ptr_eq(&shadow, &again));
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 11 + 3) as u8).collect();
+        // SAFETY: inside the view.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), view.add(PAGE + 100), 64) };
+        assert_eq!(gpu_read(&h.device, &shadow.buffer, (PAGE + 100) as u64, 64), bytes);
+        let new: Vec<u8> = (0..64).map(|i| (i as u8) ^ 0xc3).collect();
+        gpu_write(&h.device, &shadow.buffer, (PAGE + 512) as u64, &new);
+        // SAFETY: inside the view.
+        assert_eq!(unsafe { std::slice::from_raw_parts(view.add(PAGE + 512), 64) }, &new[..]);
+        assert_eq!(shadow.update(at as usize, 64), 0);
+        assert_eq!(shadow.copy_back(at as usize, 64), 0);
+
+        // The title maps other pages there: looked up again, now copied.
+        TEST_RESOLVER.with(|c| c.set(None));
+        crate::watch::title_memory_remapped(view as usize + PAGE, PAGE);
+        assert!(!is_in_place(at, 64));
+        let copied = crate::shadow::find(at, 64).expect("a copy");
+        assert!(!copied.is_aliased());
+
+        drop((copied, again, shadow));
+        crate::watch::title_memory_remapped(view as usize, TEST_SECTION);
+        TEST_IN_PLACE.with(|c| c.set(None));
+        TEST_IN_PLACE_LOOSE.with(|c| c.set(None));
+        *LOOSE_HEAP.lock().unwrap() = None;
+        // SAFETY: our allocation, no longer used.
+        unsafe { VirtualFree(view.cast(), 0, MEM_RELEASE) };
         // SAFETY: querying device health.
         assert!(unsafe { h.device.GetDeviceRemovedReason() }.is_ok());
     }

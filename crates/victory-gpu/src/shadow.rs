@@ -2272,6 +2272,20 @@ pub(crate) fn forget_in_place(from: u64, to: u64) -> Vec<Arc<Shadow>> {
             gone.extend(entry.shadow.take());
         }
     }
+    drop(map);
+    // Windows of loose memory in place there, as the buffers.
+    {
+        let mut loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let lowest = from.saturating_sub(LOOSE_SPAN.load(Ordering::Relaxed));
+        let keys: Vec<(u64, u64)> = loose
+            .range((lowest, 0)..(to, 0))
+            .filter(|&(&(s, l), c)| c.aliased && s.saturating_add(l) > from)
+            .map(|(&key, _)| key)
+            .collect();
+        for key in keys {
+            gone.extend(loose.remove(&key));
+        }
+    }
     if !gone.is_empty() {
         changed();
     }
@@ -2332,8 +2346,33 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let len = rounded_end - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end) {
-        return Some(shadow.clone());
+    let held = enclosing_window(&map, LOOSE_SPAN.load(Ordering::Relaxed), address, end).cloned();
+    let in_place = crate::alias::in_place_loose();
+    if held.as_ref().is_some_and(|shadow| shadow.aliased || !in_place) {
+        return held;
+    }
+    // On XMem physical pages on a heap, the memory is that heap's own
+    // (`VICTORY_INPLACE_LOOSE`): the whole window if it lies in one run of
+    // the section's views, else the 64 KiB pages the range touches. No
+    // copy; later ranges inside share it as they share a window's copy.
+    // Asked before a copy of a window around it is used, which a range
+    // reaching outside the section had made.
+    if in_place {
+        let pages = (
+            address & !(PAGE as u64 - 1),
+            end.next_multiple_of(PAGE as u64),
+        );
+        for (from, to) in [(start, rounded_end), pages] {
+            if let Some(shadow) = crate::alias::in_place_shadow(from, to - from) {
+                LOOSE_SPAN.fetch_max(to - from, Ordering::Relaxed);
+                map.insert((from, to - from), shadow.clone());
+                changed();
+                return Some(shadow);
+            }
+        }
+    }
+    if held.is_some() {
+        return held;
     }
     if !crate::texture::committed(address as *const u8, 1) {
         return None;

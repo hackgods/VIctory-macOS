@@ -2271,55 +2271,69 @@ impl HostHeap {
         slots.len()
     }
 
-    /// Makes again the title slots whose view is one of `copies`, the
+    /// Makes again the title slots whose view reads one of `copies`, the
     /// title's heap starting at `start` with `step` bytes a slot
-    /// ([`crate::descriptor::remake_holding`]).
+    /// ([`crate::descriptor::remake_holding`]). A slot holds its view's
+    /// buffer, and its own copy only when the view has one: so a slot is
+    /// taken whose view's own copy is one of them, or whose buffer is one
+    /// of theirs (a section heap's, which holds more than one title buffer)
+    /// with a view over that one's title range (or a range not known).
     pub(crate) fn remake_holding(
         &self,
         start: u64,
         step: u64,
         copies: &[std::sync::Arc<crate::shadow::Shadow>],
     ) -> usize {
-        let slots: Vec<u32> = {
+        use windows::core::Interface;
+        let buffers: Vec<*mut std::ffi::c_void> =
+            copies.iter().map(|c| c.buffer.as_raw()).collect();
+        let candidates: Vec<(u32, bool)> = {
             let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
             kept.iter()
-                .filter(|&(index, held)| {
-                    let shadow = match &held.1 {
-                        Some(HeldSource::Shadow(s)) | Some(HeldSource::Widened(_, s)) => s,
-                        None => return false,
+                .filter(|&(index, _)| (index as u32) < self.count)
+                .filter_map(|(index, held)| {
+                    let own = match &held.1 {
+                        Some(HeldSource::Shadow(s)) | Some(HeldSource::Widened(_, s)) => {
+                            copies.iter().any(|c| std::sync::Arc::ptr_eq(c, s))
+                        }
+                        None => false,
                     };
-                    (index as u32) < self.count
-                        && copies.iter().any(|c| std::sync::Arc::ptr_eq(c, shadow))
+                    (own || buffers.contains(&held.0.as_raw())).then_some((index as u32, own))
                 })
-                .map(|(index, _)| index as u32)
                 .collect()
         };
-        for &index in &slots {
+        let mut remade = 0;
+        for (index, own) in candidates {
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                let key = made[index as usize];
+                // The view the slot was made from, and the title range it reads.
+                let range = (key != 0)
+                    .then(|| view_at(key as u32, (key >> 32) as u32))
+                    .flatten()
+                    .and_then(|view| match &*view {
+                        &View::Constant(address, size) => Some((address, u64::from(size))),
+                        view => buffer_range(view),
+                    });
+                let reads = own
+                    || range.is_none_or(|(address, len)| {
+                        copies.iter().any(|c| {
+                            let (from, bytes) = c.range();
+                            address < from + bytes && address + len.max(1) > from
+                        })
+                    });
+                if !reads {
+                    continue;
+                }
                 self.ready[index as usize].store(0, Ordering::Relaxed);
                 self.synced[index as usize].store(0, Ordering::Release);
                 made[index as usize] = 0;
                 self.set_made_nonzero(index, false);
             }
             self.mirror(index, start + u64::from(index) * step, true);
+            remade += 1;
         }
-        slots.len()
-    }
-
-    /// The title memory copy slot `index`'s view reads, if it has one (tests).
-    #[cfg(test)]
-    pub(crate) fn held_copy(&self, index: u32) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-        match &self
-            .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)?
-            .1
-        {
-            Some(HeldSource::Shadow(s)) | Some(HeldSource::Widened(_, s)) => Some(s.clone()),
-            None => None,
-        }
+        remade
     }
 
     /// The host textures (raw pointers) slots `slots` view.

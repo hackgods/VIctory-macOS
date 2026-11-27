@@ -649,7 +649,7 @@ pub(crate) fn in_place_shadow(
     start: u64,
     len: u64,
 ) -> Option<std::sync::Arc<crate::shadow::Shadow>> {
-    if len == 0 || !in_place_sections() {
+    if len == 0 || !in_place_sections() || remapped_before(start, len) {
         return None;
     }
     let (heap, offset) = resolver()?(start, len)?;
@@ -757,12 +757,36 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
         }
     }
     drop(map);
-    crate::shadow::forget_in_place(from, to);
-    // shortcut: host view slots made from the buffer keep the section's
-    // pages until the title writes their descriptors again (copies would
-    // be refreshed from the new pages). Rare: counted to see if it is not.
-    static LET_GO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = LET_GO.fetch_add(1, Ordering::Relaxed) + 1;
+    // Never in place there again: a list recorded before the title mapped
+    // other pages there and submitted after it read the old pages through
+    // the addresses it was recorded with (slots are made again, below; a
+    // list's own views cannot be). So that can happen once a range at most,
+    // and the log below counts it.
+    REMAPPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(from)
+        .and_modify(|end| *end = (*end).max(to))
+        .or_insert(to);
+    REMAPPED_COUNT.fetch_add(1, Ordering::Release);
+    let gone = crate::shadow::forget_in_place(from, to);
+    // Host view slots made from them still show the section's pages: they
+    // are made again before the next submission ([`remake_let_go`]), as
+    // slots made from copies show the new pages once those are refreshed.
+    if !gone.is_empty() {
+        let mut gone_ever = LET_GONE.lock().unwrap_or_else(|e| e.into_inner());
+        gone_ever.retain(|w| w.strong_count() > 0);
+        gone_ever.extend(gone.iter().map(std::sync::Arc::downgrade));
+        LET_GONE_ANY.store(true, Ordering::Release);
+        drop(gone_ever);
+        LET_GO
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(gone);
+        LET_GO_PENDING.store(true, Ordering::Release);
+    }
+    static EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
     if n <= 16 || n.is_power_of_two() {
         tracing::info!(
             from = format_args!("{from:#x}"),
@@ -771,6 +795,126 @@ pub(crate) fn forget_in_place(at: u64, len: u64) {
             "title memory in place let go: the title mapped other pages there"
         );
     }
+}
+
+/// Title memory once in place that the title mapped other pages over, by
+/// start: its end. Never in place again ([`in_place_shadow`]).
+static REMAPPED: std::sync::RwLock<std::collections::BTreeMap<u64, u64>> =
+    std::sync::RwLock::new(std::collections::BTreeMap::new());
+static REMAPPED_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Forgets that `[start, end)` was remapped: tests whose memory may lie
+/// where another test's was.
+#[cfg(test)]
+pub(crate) fn clear_remapped(start: u64, end: u64) {
+    REMAPPED
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|&from, &mut to| to <= start || from >= end);
+}
+
+/// Whether any of `[start, start + len)` was in place once and remapped.
+fn remapped_before(start: u64, len: u64) -> bool {
+    if REMAPPED_COUNT.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    let end = start.saturating_add(len);
+    let refused = REMAPPED
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(..end)
+        .any(|(_, &stop)| stop > start);
+    if refused {
+        static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n.is_power_of_two() {
+            tracing::info!(
+                start = format_args!("{start:#x}"),
+                len,
+                n,
+                "title buffer not in place: the title remapped pages there before"
+            );
+        }
+    }
+    refused
+}
+
+/// Every title buffer in place let go that something still holds: a list
+/// recorded with it reads the section's old pages ([`stale_list`]).
+static LET_GONE: Mutex<Vec<std::sync::Weak<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+static LET_GONE_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Lists submitted that read title memory in place let go after they were
+/// recorded ([`stale_list`]).
+static STALE_LISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether `shadows` (what a list about to be submitted refreshes or writes)
+/// hold title memory in place the title has since mapped other pages over:
+/// the list was recorded with the section's old pages, which it reads; the
+/// console would read the new ones. Counted and logged (it cannot be undone
+/// in a recorded list; [`in_place_shadow`] keeps it to once a range).
+pub(crate) fn stale_list<'a>(
+    shadows: impl IntoIterator<Item = &'a std::sync::Arc<crate::shadow::Shadow>>,
+) -> bool {
+    if !LET_GONE_ANY.load(Ordering::Acquire) {
+        return false;
+    }
+    let mut gone = LET_GONE.lock().unwrap_or_else(|e| e.into_inner());
+    gone.retain(|w| w.strong_count() > 0);
+    if gone.is_empty() {
+        LET_GONE_ANY.store(false, Ordering::Release);
+        return false;
+    }
+    let held: Vec<*const crate::shadow::Shadow> =
+        gone.iter().map(std::sync::Weak::as_ptr).collect();
+    drop(gone);
+    let Some(shadow) = shadows
+        .into_iter()
+        .find(|s| held.contains(&std::sync::Arc::as_ptr(s)))
+    else {
+        return false;
+    };
+    let n = STALE_LISTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 16 || n.is_power_of_two() {
+        let (start, len) = shadow.range();
+        tracing::warn!(
+            start = format_args!("{start:#x}"),
+            len,
+            n,
+            "a list recorded before the title mapped other pages over title memory in place reads the old pages"
+        );
+    }
+    true
+}
+
+/// [`stale_list`]'s count so far (tests).
+#[cfg(test)]
+pub(crate) fn stale_lists() -> u64 {
+    STALE_LISTS.load(Ordering::Relaxed)
+}
+
+/// Title buffers in place let go since the last [`remake_let_go`].
+static LET_GO: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>> = Mutex::new(Vec::new());
+static LET_GO_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes again every host view slot made from title memory in place that
+/// was let go since the last call, from the record it was made from: the
+/// view then shows what the title maps there now. Called before each
+/// submission's heap sync; returns the slots made again.
+pub(crate) fn remake_let_go() -> usize {
+    if !LET_GO_PENDING.swap(false, Ordering::AcqRel) {
+        return 0;
+    }
+    let gone = std::mem::take(&mut *LET_GO.lock().unwrap_or_else(|e| e.into_inner()));
+    if gone.is_empty() {
+        return 0;
+    }
+    let made = crate::descriptor::remake_holding(&gone);
+    tracing::info!(
+        buffers = gone.len(),
+        slots = made,
+        "host views of title memory in place let go made again"
+    );
+    made
 }
 
 /// Aliases `[base, base + len)` onto a new write-back L0 D3D12 buffer so CPU
@@ -1304,6 +1448,7 @@ mod tests {
     /// the buffer is looked up again.
     #[test]
     fn title_buffers_on_section_heaps_are_used_in_place() {
+        use crate::backend::HostGpu;
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::System::Memory::{
             CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
@@ -1341,6 +1486,7 @@ mod tests {
             }
             (section, views)
         };
+        clear_remapped(views[0] as u64, views[0] as u64 + TEST_SECTION as u64);
         TEST_VIEW.store(views[0] as usize, Ordering::Relaxed);
         *TEST_HEAP.lock().unwrap() = Some(heap.clone());
         TEST_RESOLVER.with(|c| c.set(Some(test_resolve)));
@@ -1390,6 +1536,13 @@ mod tests {
         assert_eq!(shadow.update(start as usize, len), 0);
         assert_eq!(shadow.copy_back(start as usize, len), 0);
 
+        // A list recorded now reads these pages; submitted after the title
+        // maps other pages there, it is counted as reading the old ones.
+        let before = h.new_list().expect("a list");
+        shadow.refresh(&before, start, len as u64);
+        before.close();
+        let stale = stale_lists();
+
         // The title maps other pages over part of it: looked up again, and
         // (with no section there any more) copied.
         TEST_RESOLVER.with(|c| c.set(None));
@@ -1397,6 +1550,24 @@ mod tests {
         assert!(!is_in_place(start, len as u64));
         let again = crate::shadow::find(start + 16, 64).expect("a copy");
         assert!(!again.is_aliased());
+        // Never in place there again, even where a section on a heap shows.
+        TEST_RESOLVER.with(|c| c.set(Some(test_resolve)));
+        assert!(
+            in_place_shadow(start, len as u64).is_none(),
+            "remapped before"
+        );
+        TEST_RESOLVER.with(|c| c.set(None));
+        h.execute(&[&before]);
+        assert!(
+            stale_lists() > stale,
+            "the list recorded before the remap is counted"
+        );
+        let after = h.new_list().expect("a list");
+        again.refresh(&after, start, len as u64);
+        after.close();
+        let stale = stale_lists();
+        h.execute(&[&after]);
+        assert_eq!(stale_lists(), stale, "a list recorded after it is not");
 
         drop((again, shadow));
         crate::shadow::unregister(resource, start);

@@ -2405,20 +2405,21 @@ fn find_uncached(address: u64, end: u64) -> Option<Arc<Shadow>> {
 
 /// Title buffers in place on XMem physical pages (`crate::alias`) that
 /// overlap `[from, to)`, where the title mapped other pages or none: let go,
-/// so that the next lookup finds them again, in place or copied.
-pub(crate) fn forget_in_place(from: u64, to: u64) {
+/// so that the next lookup finds them again, in place or copied. Returns
+/// them, for the host views made from them to be made again.
+pub(crate) fn forget_in_place(from: u64, to: u64) -> Vec<Arc<Shadow>> {
     let mut map = buffers();
     let lowest = from.saturating_sub(MAX_SPAN.load(Ordering::Relaxed));
-    let mut any = false;
+    let mut gone = Vec::new();
     for (_, entry) in map.range_mut((lowest, 0)..(to, 0)) {
         if entry.end > from && entry.shadow.as_ref().is_some_and(|s| s.aliased) {
-            entry.shadow = None;
-            any = true;
+            gone.extend(entry.shadow.take());
         }
     }
-    if any {
+    if !gone.is_empty() {
         changed();
     }
+    gone
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (Grand

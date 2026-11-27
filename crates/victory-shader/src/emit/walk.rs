@@ -76,6 +76,17 @@
 //! Over the program's edges and its per-lane form's, so over every way a
 //! lane goes.
 //!
+//! LDS that a group of one console wave shares with no barrier the halves
+//! can use (the title's ray budgeting with ray bins,
+//! `sr_tracing:CS_RayBudgeting_Cull_RayBinning`: threads 0 to 7 clear eight
+//! counters, every lane with a ray adds to one, threads 0 to 7 read them;
+//! all behind the early-out) asks for its blocks to be opened as a
+//! hand-over does (`lower::exchange::want_lds`). In the walked form the
+//! accesses are in blocks every lane runs, where `split_wave_barriers`
+//! orders them. The form the walk keeps must then order its LDS: it is
+//! lowered without the race (`Options::halves_shared_lds`), and only the
+//! lowering that finds the places to open may race.
+//!
 //! The reads across the halves in such code are then handed over where the
 //! group runs together (`lower::exchange`): with the switch also in blocks
 //! every thread runs as often as every other on a loop's body
@@ -123,8 +134,19 @@ pub(super) fn exact(input: &EmitInput<'_>, options: Options) -> Option<HostShade
             io,
             res,
         };
+        // Mac (`whole_wave`): the form the walk keeps (translated without
+        // half-local reads) must not leave LDS to race between the halves
+        // either; the one that only finds the places to open (with them,
+        // never kept) may, so that it gets to every place (the module
+        // notes, "Whole-wave code").
+        let race = if options.halves_whole_wave {
+            local
+        } else {
+            options.halves_shared_lds
+        };
         let options = Options {
             halves_local: local,
+            halves_shared_lds: race,
             ..options
         };
         emit_form(&form, options, None)

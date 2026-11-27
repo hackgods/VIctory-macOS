@@ -171,7 +171,10 @@ pub(crate) fn lds_rounds() -> bool {
 /// title's ray bin offsets (`sr_tracing:CS_GenerateRayBinOffsets`,
 /// `9d1d228b02e56a96`) and shader bin offsets
 /// (`shader_binning_utils:CS_GenerateShaderBinOffsets`, `8dd8d739047fe557`)
-/// then count over the whole console wave instead of each half alone.
+/// then count over the whole console wave instead of each half alone, and
+/// one-wave groups whose LDS raced between the halves behind an early-out
+/// or `if` (`sr_tracing:CS_RayBudgeting_Cull_RayBinning`, `03e3e26783a5799b`,
+/// the ray pre-passes, particle emitters, reductions) get barriers instead.
 /// Exact where it applies; a program it does not make exact stays as it was.
 pub(crate) fn whole_wave() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

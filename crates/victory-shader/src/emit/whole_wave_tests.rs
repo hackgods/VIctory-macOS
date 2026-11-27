@@ -11,10 +11,11 @@
 //! too; then, under the `if`'s EXEC again, one lane's value is read with
 //! `v_readfirstlane_b32` (the base an atomic returned).
 
-use super::halves_local_tests::{PROLOGUE, S_ENDPGM, V16_IS_32_TIMES_V0, sop1, store};
-use super::lower::Mac;
+use super::halves_local_tests::{PROLOGUE, S_ENDPGM, V16_IS_32_TIMES_V0, native, sop1, store};
+use super::lower::{self, HalvesLocal, Mac};
+use super::walk;
 use super::walk_tests::translated;
-use crate::gfx10;
+use crate::{gfx10, io, ir, resource, structure};
 
 const EXEC: u8 = 126;
 /// `v_mov_b32 v1, 0`.
@@ -101,6 +102,83 @@ fn whole_wave_value_read_after() -> Vec<u32> {
     w
 }
 
+/// `v_cmp_gt_u32 vcc, 38, v0`: threads 30 to 37 (of those inside).
+const BELOW_38: u32 = 0x7D88_00A6;
+/// `s_and_saveexec_b64 s[4:5], vcc` and back.
+const ONLY_BELOW_38: u32 = sop1(4, 0x24, 106);
+const BACK: u32 = sop1(EXEC, 0x04, 4);
+
+/// A DS instruction on the dword at `v<addr>`, data `v<data>`, result
+/// `v<dst>`.
+const fn ds(op: u32, addr: u8, data: u8, dst: u8) -> [u32; 2] {
+    [0xD800_0000 | op << 18, (dst as u32) << 24 | (data as u32) << 8 | addr as u32]
+}
+
+/// The shape of the title's ray budgeting with ray bins
+/// (`sr_tracing:CS_RayBudgeting_Cull_RayBinning`): behind an early-out (the
+/// lanes from 30 on stay), threads 30 to 37 clear an LDS counter, every lane
+/// left adds 1, and threads 30 to 37 read it back. One console wave runs
+/// it in lockstep, without a barrier: they store 34, every other lane 0.
+fn lds_behind_an_early_out() -> Vec<u32> {
+    let mut w = start();
+    w.extend([INSIDE, execz(15)]);
+    w.extend([0x7E06_0280, 0x7E08_0281, BELOW_38, ONLY_BELOW_38]); // v3 = 0, v4 = 1
+    w.extend(ds(13, 3, 1, 0)); // ds_write_b32 v3, v1
+    w.push(BACK);
+    w.extend(ds(0, 3, 4, 0)); // ds_add_u32 v3, v4
+    w.push(ONLY_BELOW_38);
+    w.extend(ds(54, 3, 0, 1)); // ds_read_b32 v1, v3
+    w.push(BACK);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// `words` as [`translated`] has it, with 4 bytes of LDS, on a host of
+/// narrow waves (as under Wine, where barriers can order a split wave's
+/// LDS), LDS raced between the halves where `race` asks
+/// (`Options::halves_shared_lds`), and as `emit::walk::exact` does with the
+/// switch: raced only in the lowering that finds the places to open.
+fn with_lds(words: &[u32], reads: bool, race: bool, mac: Mac) -> Result<lower::Lowered, crate::ShaderError> {
+    let native = native(words, 64, 4);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lower = |(p, st, io, res): walk::Stages<'_>, reads: bool, race: bool| {
+        lower::lower(&lower::Parts {
+            native: &native,
+            p,
+            st,
+            io,
+            res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+            view_marks: false,
+            atomic_locks: false,
+            atomic_lock_rounds: false,
+            atomic_umax: false,
+            bias_as_gradients: false,
+            narrow_waves: true,
+            halves_local: HalvesLocal { reads, lds: race },
+            mac,
+            host_wave32: true,
+        })
+    };
+    let start = (&p, &st, &io, &res);
+    let walked = |stages: walk::Stages<'_>, local: bool| {
+        lower(stages, local, if mac.whole_wave { local } else { race })
+    };
+    if mac.walk
+        && let Some(exact) = walk::open(&native, start, mac.whole_wave, walked)
+    {
+        return Ok(exact);
+    }
+    lower(start, reads, race)
+}
+
 fn walking(whole_wave: bool) -> Mac {
     Mac {
         exchange: true,
@@ -143,6 +221,12 @@ fn the_test_programs_are_what_their_comments_say() {
         let all = text(&words);
         assert!(all.contains(head) && all.contains(&want), "{all}");
     }
+    let lds = text(&lds_behind_an_early_out());
+    let want_lds = "v_mov_b32 v3, 0\nv_mov_b32 v4, 1\nv_cmp_gt_u32 vcc, 38, v0\n\
+                    s_and_saveexec_b64 s[4:5], vcc\nds_write_b32 v3, v1\ns_mov_b64 exec, s[4:5]\n\
+                    ds_add_u32 v3, v4\ns_and_saveexec_b64 s[4:5], vcc\nds_read_b32 v1, v3\n\
+                    s_mov_b64 exec, s[4:5]";
+    assert!(lds.contains(want_lds) && lds.contains("v_cmpx_lt_u32 exec, 29, v0"), "{lds}");
     let looped = text(&in_a_loop());
     let tail = "s_add_u32 s20, s20, 1\ns_cmp_lt_u32 s20, 2\ns_cbranch_scc1";
     assert!(looped.contains("s_mov_b32 s20, 0") && looped.contains(tail), "{looped}");
@@ -197,6 +281,23 @@ fn whole_wave_code_whose_vgpr_is_read_after_stays_as_it_was() {
     assert_eq!(on, off);
 }
 
+/// Without the switch the LDS behind the early-out is refused (no block
+/// every lane runs holds a place for a barrier), or with
+/// `VICTORY_HALVES_SHARED_LDS` raced. With it the walk opens the early-out
+/// and the program translates with group barriers, raced or not asked:
+/// the same bytes, and other than the raced ones.
+#[test]
+fn lds_behind_an_early_out_is_walked_and_ordered() {
+    let words = lds_behind_an_early_out();
+    assert!(with_lds(&words, false, false, walking(false)).is_err());
+    let raced = with_lds(&words, true, true, walking(false)).expect("raced");
+    // (Ordered by barriers, it no longer needs the console's lanes.)
+    let on = with_lds(&words, false, false, walking(true)).expect("ordered");
+    let on_raced = with_lds(&words, true, true, walking(true)).expect("ordered");
+    assert_eq!(on.dxil, on_raced.dxil);
+    assert_ne!(on.dxil, raced.dxil);
+}
+
 #[cfg(windows)]
 mod gpu {
     use super::super::host::{Dispatch, Host, Root, Stride, View};
@@ -208,6 +309,12 @@ mod gpu {
     /// line per lane whose dword is not `want`'s.
     fn differences(what: &str, words: &[u32], threads: u32, want: &[u32]) -> Vec<String> {
         let l = translated(words, threads, true, false, walking(true)).expect("handed over");
+        run(what, l, threads, want)
+    }
+
+    /// Runs the translation `l` (one group of `threads`) on every hardware
+    /// adapter, 16 times; as [`differences`].
+    fn run(what: &str, l: lower::Lowered, threads: u32, want: &[u32]) -> Vec<String> {
         let shader = super::super::HostShader {
             stage: HwStage::Cs,
             dxil: l.dxil,
@@ -294,6 +401,17 @@ mod gpu {
             let what = format!("{what}, two waves");
             failed.extend(differences(&what, &words, 128, &two));
         }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// The LDS counter behind the early-out is the console's 34 in threads
+    /// 30 to 37 every time (the halves' adds all after the clear and
+    /// before the read), and every other lane keeps 0.
+    #[test]
+    fn lds_behind_an_early_out_is_the_consoles_on_every_gpu() {
+        let l = with_lds(&lds_behind_an_early_out(), false, false, walking(true)).expect("ordered");
+        let want: Vec<u32> = (0..64).map(|l| if (30..38).contains(&l) { 34 } else { 0 }).collect();
+        let failed = run("LDS behind an early-out", l, 64, &want);
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }

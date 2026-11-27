@@ -11,6 +11,7 @@
 //! Resolution order for every import: an implementation in [`modules`],
 //! then the host if [`HostPolicy`] allows that DLL, then `Missing`.
 
+pub mod bink;
 mod host;
 pub mod modules;
 mod registry;

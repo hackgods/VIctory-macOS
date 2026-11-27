@@ -2369,6 +2369,7 @@ impl Host {
                 }
             }
         }
+        back.iter().for_each(|b| unwaited::lines::declared(&b.0));
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -2485,6 +2486,7 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+                unwaited::lines::word(at, bytes);
             }
         }
         // The submission has run and the next waits for our lock. Host

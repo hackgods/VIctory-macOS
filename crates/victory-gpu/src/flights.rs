@@ -1,5 +1,6 @@
 //! mac: the plain arithmetic of the flights (`crate::host::unwaited::flights`,
-//! `VICTORY_FLIGHTS=1`): plain std, so its tests run everywhere.
+//! `VICTORY_FLIGHTS=1`) and of their frame lines: plain std, so its tests
+//! run everywhere.
 
 /// Title memory as ranges `[from, to)`: after [`Spans::join`], in order,
 /// none touching the next.
@@ -77,9 +78,132 @@ pub(crate) fn after_writes(writes: &[(usize, Option<u64>, usize)], address: usiz
     seen
 }
 
+/// mac: E1 of `notes/overlap-stages-design.md` (lines only): per thread that
+/// calls us, the microseconds inside our queue calls (the outermost one),
+/// waiting for the held-work lock and waiting for the submission lock, since
+/// the last frame line. A thread takes its slot once, without a lock; past
+/// [`threads::SLOTS`] threads share the last one (id 0).
+pub(crate) mod threads {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::time::Instant;
+
+    pub(crate) const SLOTS: usize = 16;
+
+    /// What a thread's time went on.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Spent {
+        Inside = 1,
+        Held = 2,
+        Lock = 3,
+    }
+
+    /// Per slot: the thread's id, then microseconds by [`Spent`].
+    static TABLE: [[AtomicU64; 4]; SLOTS] = [const { [const { AtomicU64::new(0) }; 4] }; SLOTS];
+    static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// The thread's id as the table shows it (the Windows thread id).
+    pub(crate) fn id() -> u64 {
+        #[cfg(windows)]
+        // SAFETY: a plain query.
+        return u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+        #[cfg(not(windows))]
+        {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            thread_local!(static ID: u64 = NEXT.fetch_add(1, Relaxed));
+            ID.with(|i| *i)
+        }
+    }
+
+    fn slot() -> usize {
+        SLOT.with(|s| {
+            if s.get() == usize::MAX {
+                let i = CLAIMED.fetch_add(1, Relaxed).min(SLOTS - 1);
+                TABLE[i][0].store(if i < SLOTS - 1 { id() } else { 0 }, Relaxed);
+                s.set(i);
+            }
+            s.get()
+        })
+    }
+
+    pub(crate) fn add(spent: Spent, us: u64) {
+        TABLE[slot()][spent as usize].fetch_add(us, Relaxed);
+    }
+
+    /// Times the thread's outermost call of ours while it lives.
+    pub(crate) struct Inside(Option<Instant>);
+
+    impl Inside {
+        pub(crate) fn enter() -> Inside {
+            let outermost = DEPTH.with(|d| {
+                d.set(d.get() + 1);
+                d.get() == 1
+            });
+            Inside(outermost.then(Instant::now))
+        }
+    }
+
+    impl Drop for Inside {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            if let Some(at) = self.0 {
+                add(Spent::Inside, at.elapsed().as_micros() as u64);
+            }
+        }
+    }
+
+    /// Since the last call, per thread with anything: its id and the
+    /// microseconds inside, held, lock (then zero).
+    pub(crate) fn take() -> Vec<(u64, [u64; 3])> {
+        (0..CLAIMED.load(Relaxed).min(SLOTS))
+            .filter_map(|i| {
+                let us = [1, 2, 3].map(|k| TABLE[i][k].swap(0, Relaxed));
+                (us != [0; 3]).then(|| (TABLE[i][0].load(Relaxed), us))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// E1's table: each thread its own slot, only the outermost call timed,
+    /// the waits added as they come, zero after a take.
+    #[test]
+    fn each_thread_counts_its_outermost_call_and_its_waits() {
+        use threads::{Inside, Spent, add, id, take};
+        let ids: Vec<u64> = (0..2u64)
+            .map(|k| {
+                std::thread::spawn(move || {
+                    let outer = Inside::enter();
+                    {
+                        let _inner = Inside::enter();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    drop(outer);
+                    add(Spent::Held, 1000 * (k + 1));
+                    add(Spent::Lock, 7);
+                    id()
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        let seen = take();
+        for (k, me) in ids.iter().enumerate() {
+            let &(_, [inside, held, lock]) = seen.iter().find(|(i, _)| i == me).expect("the thread's slot");
+            assert!((20_000..1_000_000).contains(&inside), "once, not twice: {inside}");
+            assert_eq!((held, lock), (1000 * (k as u64 + 1), 7));
+        }
+        assert!(take().iter().all(|(i, _)| !ids.contains(i)), "zero after a take");
+    }
 
     #[test]
     fn spans_join_where_they_touch_and_find_what_they_share() {

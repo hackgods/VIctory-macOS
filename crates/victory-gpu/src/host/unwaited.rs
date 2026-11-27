@@ -59,6 +59,8 @@ use super::*;
 
 /// mac: the next submission prepared while this one runs (`VICTORY_FLIGHTS`).
 pub(crate) mod flights;
+/// mac: the overlap line's counts (E1 of `notes/overlap-stages-design.md`).
+pub(crate) mod lines;
 
 /// Whether the title's submissions may return before the host GPU has run
 /// them (`VICTORY_ASYNC_SUBMIT=1`).
@@ -578,6 +580,7 @@ pub(super) fn log(frames: f64) {
     }
     crate::descriptor::ahead::log(frames);
     flights::log(frames);
+    lines::log(frames);
     if !prewarms() {
         return;
     }
@@ -605,7 +608,7 @@ impl Host {
     /// any) is finished: the holder prepares or submits with none running.
     /// `next`: the lists that run next, if known ([`Host::prewarm`]).
     pub(super) fn submissions(&self, by: By, next: &[&HostList]) -> std::sync::MutexGuard<'_, u64> {
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = lines::lock_submitted(&self.submitted);
         self.settle_held(&mut submitted, by, next);
         submitted
     }

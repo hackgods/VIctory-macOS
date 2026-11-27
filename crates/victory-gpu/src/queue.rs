@@ -118,6 +118,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        let _inside = crate::flights::threads::Inside::enter();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();
@@ -163,7 +164,11 @@ static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held
 
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
-    HELD.lock().unwrap_or_else(|e| e.into_inner())
+    // mac: its wait, per thread (E1, `crate::flights::threads`).
+    let at = std::time::Instant::now();
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    crate::flights::threads::add(crate::flights::threads::Spent::Held, at.elapsed().as_micros() as u64);
+    held
 }
 
 /// Runs held work that may run now (`why` for the frame line).
@@ -431,6 +436,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     {
+        let _inside = crate::flights::threads::Inside::enter();
         let mut held = held();
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
@@ -464,6 +470,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
+        let _inside = crate::flights::threads::Inside::enter();
         let mut held = held();
         held.push(this as usize, Item::FenceWait(fence as usize, value));
         pump(&mut held, Why::Wait);
@@ -674,6 +681,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let _inside = crate::flights::threads::Inside::enter();
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.

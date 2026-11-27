@@ -115,6 +115,15 @@ static FINISHED_BY: [AtomicU64; WHYS] = [const { AtomicU64::new(0) }; WHYS];
 static WAITED_BY: [AtomicU64; WHYS] = [const { AtomicU64::new(0) }; WHYS];
 /// Refreshes the early form refused all the same (0 if the rules hold).
 static REFUSED: AtomicU64 = AtomicU64::new(0);
+/// E1 (`notes/overlap-stages-design.md`): later parts of a copy-order split
+/// that finished it before they were prepared, and the microseconds they
+/// waited for the GPU (counted under "the title's next submission" only);
+/// microseconds of landing (finishing it once the GPU was done) by those
+/// and by [`Why`]; of the finishes by a declaration and by a title copy,
+/// those on aliased copies and between aliased buffers, and their waits.
+static SPLIT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static LANDING: AtomicU64 = AtomicU64::new(0);
+static ON_ALIASED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
@@ -228,7 +237,7 @@ impl Host {
         &self,
         next: &[&HostList],
     ) -> (std::sync::MutexGuard<'_, u64>, Option<Beside>) {
-        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let mut submitted = super::lines::lock_submitted(&self.submitted);
         // Not a list it runs too (a list submitted twice): its steps are
         // looked at under the list's lock, which finishing it takes.
         let running = (VALUE.load(Acquire) != 0)
@@ -240,8 +249,21 @@ impl Host {
                     .filter(|l| !l.lists.iter().any(|h| next.iter().any(|n| std::ptr::eq(&**h, *n))))
                     .map(|l| l.value)
             })
-            .flatten()
-            .filter(|_| !next.iter().any(|l| l.deferred().after_copy));
+            .flatten();
+        let split = running.is_some() && next.iter().any(|l| l.deferred().after_copy);
+        if split {
+            // [`Host::settle_held`] (one is left, and `next` is not empty),
+            // its wait and landing counted.
+            if prewarms() {
+                self.prewarm(next);
+            }
+            let at = Instant::now();
+            let waited = self.finish_left(&mut submitted, By::Next);
+            SPLIT[0].fetch_add(1, Relaxed);
+            SPLIT[1].fetch_add(waited.as_micros() as u64, Relaxed);
+            LANDING.fetch_add(at.elapsed().saturating_sub(waited).as_micros() as u64, Relaxed);
+            return (submitted, None);
+        }
         let Some(value) = running else {
             self.settle_held(&mut submitted, By::Next, next);
             return (submitted, None);
@@ -257,20 +279,24 @@ impl Host {
         (submitted, Some(beside))
     }
 
-    /// Finishes the submission left, if `beside` still runs it ([`Why`]).
-    pub(in crate::host) fn finish_beside(&self, submitted: &mut u64, beside: &mut Option<Beside>, why: Why) {
-        let Some(b) = beside.as_mut() else { return };
-        let Some(value) = b.value.take() else { return };
+    /// Finishes the submission left, if `beside` still runs it ([`Why`]):
+    /// how long that waited for the GPU.
+    pub(in crate::host) fn finish_beside(&self, submitted: &mut u64, beside: &mut Option<Beside>, why: Why) -> Duration {
+        let Some(b) = beside.as_mut() else { return Duration::ZERO };
+        let Some(value) = b.value.take() else { return Duration::ZERO };
         b.footprint = None;
         let at = Instant::now();
         BESIDE[1].fetch_add((at - b.started).as_micros() as u64, Relaxed);
+        let mut waited = Duration::ZERO;
         // Only finished under the lock we hold: still the one left.
         if VALUE.load(Acquire) == value {
-            let waited = self.finish_left(submitted, By::Next);
+            waited = self.finish_left(submitted, By::Next);
             FINISHED_BY[why as usize].fetch_add(1, Relaxed);
             WAITED_BY[why as usize].fetch_add(waited.as_micros() as u64, Relaxed);
         }
         b.finishing += at.elapsed();
+        LANDING.fetch_add(at.elapsed().saturating_sub(waited).as_micros() as u64, Relaxed);
+        waited
     }
 
     /// Finishes the submission left if the GPU has run it.
@@ -297,7 +323,24 @@ impl Host {
             Step::Refresh(..) | Step::Slot(..) | Step::Heap(_) | Step::Texture(..) => None,
         };
         match why {
-            Some(why) => self.finish_beside(submitted, beside, why),
+            Some(why) => {
+                // E1: of these, the finishes stage 3 would leave out (a
+                // declaration on an aliased copy, a title copy between
+                // aliased buffers).
+                let aliased = match step {
+                    Step::GpuWrite(copy, ..) => copy.is_aliased().then_some(0),
+                    &Step::Copy(dst, src, len) => {
+                        let inside = |at: usize| crate::shadow::find_aliased(at as u64, (at + len) as u64).is_some();
+                        (inside(dst) && inside(src)).then_some(2)
+                    }
+                    _ => None,
+                };
+                let waited = self.finish_beside(submitted, beside, why);
+                if let Some(k) = aliased {
+                    ON_ALIASED[k].fetch_add(1, Relaxed);
+                    ON_ALIASED[k + 1].fetch_add(waited.as_micros() as u64, Relaxed);
+                }
+            }
             None if b.steps.is_multiple_of(POLL) => self.poll_beside(submitted, beside),
             None => {}
         }
@@ -362,13 +405,21 @@ pub(super) fn log(frames: f64) {
     let ms: [f64; WHYS] = std::array::from_fn(|i| WAITED_BY[i].swap(0, Relaxed) as f64 / 1000.0 / frames);
     let refused = REFUSED.swap(0, Relaxed) as f64 / frames;
     let met = MET.swap(0, Relaxed) as f64 / frames;
+    let [split, split_ms] = [0, 1].map(|i| SPLIT[i].swap(0, Relaxed) as f64 / if i == 0 { frames } else { 1000.0 * frames });
+    let landing = LANDING.swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let [write, write_ms, copy, copy_ms] =
+        [0, 1, 2, 3].map(|i| ON_ALIASED[i].swap(0, Relaxed) as f64 / if i % 2 == 0 { frames } else { 1000.0 * frames });
     tracing::info!(
         "flights: {beside:.1}/frame prepared while the submission before ran on the host GPU, {beside_ms:.1} ms/frame \
          of preparing beside it; it was finished by (its GPU work done, eviction, unordered views made again, heap \
          sync, texture uploads, a title copy, a step of ours, a shader-write declaration, a title-memory program, a \
          fill from what it may write, refreshes of what it may write, the next going to the GPU, a view heap made): \
          {by:.1?} per frame, after waiting {ms:.1?} ms/frame for the GPU; {refused:.1} early refreshes refused (0 if \
-         the rules hold); {met:.1} held-wait looks/frame answered from a pending write"
+         the rules hold); {met:.1} held-wait looks/frame answered from a pending write; split parts: {split:.1}/frame \
+         later parts of a copy-order split finished it before they were prepared, after waiting {split_ms:.1} \
+         ms/frame (only under the title's next submission above); landing it after its wait took {landing:.1} \
+         ms/frame of these finishes; of them, shader-write declarations on aliased copies {write:.1}/frame \
+         ({write_ms:.1} ms waited) and title copies between aliased buffers {copy:.1}/frame ({copy_ms:.1} ms)"
     );
 }
 

@@ -596,6 +596,76 @@ fn write_report_atomically(path: &Path, report: &BenchReport) -> std::io::Result
     Ok(())
 }
 
+/// Per-frame CSV of `VICTORY_BENCH_FRAMES=<path>`: one `world_frame,ms,draws`
+/// line per presented frame (`world_frame` is -1 before the world's frames
+/// start; the first present has no frame time and is skipped). Written
+/// through a buffer flushed every 30 frames; nothing happens when unset.
+struct FrameLog {
+    out: std::io::BufWriter<std::fs::File>,
+    last_present: Option<Instant>,
+    lines: u64,
+}
+
+const FRAME_LOG_HEADER: &str = "world_frame,ms,draws";
+
+/// One line of the per-frame CSV.
+fn write_frame_line(
+    out: &mut impl std::io::Write,
+    world_frame: Option<u64>,
+    ms: f64,
+    draws: u64,
+) -> std::io::Result<()> {
+    match world_frame {
+        Some(w) => writeln!(out, "{w},{ms:.3},{draws}"),
+        None => writeln!(out, "-1,{ms:.3},{draws}"),
+    }
+}
+
+impl FrameLog {
+    fn open(path: &Path) -> Option<Self> {
+        use std::io::Write;
+        if let Err(err) = ensure_outside_repo(path) {
+            tracing::error!(
+                path = %path.display(),
+                error = %err,
+                "refusing VICTORY_BENCH_FRAMES inside repository"
+            );
+            return None;
+        }
+        let file = std::fs::File::create(path)
+            .inspect_err(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "per-frame CSV not created");
+            })
+            .ok()?;
+        let mut out = std::io::BufWriter::new(file);
+        writeln!(out, "{FRAME_LOG_HEADER}").ok()?;
+        Some(Self { out, last_present: None, lines: 0 })
+    }
+
+    fn frame(&mut self, world_frame: Option<u64>, draws: u64) {
+        use std::io::Write;
+        let now = Instant::now();
+        let Some(prev) = self.last_present.replace(now) else {
+            return;
+        };
+        let ms = now.saturating_duration_since(prev).as_secs_f64() * 1000.0;
+        let _ = write_frame_line(&mut self.out, world_frame, ms, draws);
+        self.lines += 1;
+        if self.lines.is_multiple_of(30) {
+            let _ = self.out.flush();
+        }
+    }
+}
+
+/// The per-frame CSV, when `VICTORY_BENCH_FRAMES` names one.
+fn frame_log() -> &'static Mutex<Option<FrameLog>> {
+    static LOG: OnceLock<Mutex<Option<FrameLog>>> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let path = std::env::var_os("VICTORY_BENCH_FRAMES").filter(|v| !v.is_empty());
+        Mutex::new(path.and_then(|p| FrameLog::open(Path::new(&p))))
+    })
+}
+
 /// Called once per presented frame from `queue::present`.
 pub(crate) fn on_present(drawn: u64, black_frame: bool) {
     let prev = LAST_DRAWN.swap(drawn, Ordering::Relaxed);
@@ -612,6 +682,10 @@ pub(crate) fn on_present(drawn: u64, black_frame: bool) {
     } else {
         WORLD_FRAME.fetch_add(1, Ordering::Relaxed) + 1
     };
+
+    if let Some(log) = frame_log().lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        log.frame((next_wf > 0).then_some(next_wf), frame_draws);
+    }
 
     let cfg = config();
     if !cfg.enabled {
@@ -693,6 +767,15 @@ mod tests {
             input_script_digest(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn frame_csv_lines_match_the_report_format() {
+        let mut out = Vec::new();
+        write_frame_line(&mut out, None, 120.5, 12).unwrap();
+        write_frame_line(&mut out, Some(7), 33.3333, 1500).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "-1,120.500,12\n7,33.333,1500\n");
+        assert_eq!(FRAME_LOG_HEADER, "world_frame,ms,draws");
     }
 
     #[test]

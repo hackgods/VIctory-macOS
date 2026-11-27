@@ -169,7 +169,7 @@ pub fn run(
         }
     }
     // The title's output size, render scale and upscaler (`VICTORY_OUTPUT`,
-    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`; each
+    // `VICTORY_RENDER_SCALE`, `VICTORY_UPSCALER`, `VICTORY_UI_SIZE`; each
     // off without it), ported from avatarmanz/VIctory-7900XTX.
     #[cfg(windows)]
     if execute {

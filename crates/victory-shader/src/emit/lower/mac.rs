@@ -153,6 +153,12 @@ pub(crate) struct Mac {
     /// (64bitMango 759c4d6b measured it, and Metal's bounds-checked pool
     /// views). Table and heap views on Metal are not measured.
     pub wide_loads: bool,
+    /// Every BVH node test misses without reading the node
+    /// (`lower::bvh`, `emit::Options::bvh_miss`): a box node gives no
+    /// child, a triangle node the triangle miss. For a title whose
+    /// structures are never built here (the builder held back): its walks
+    /// then end at the root instead of in whatever lies in that memory.
+    pub bvh_miss: bool,
 }
 
 thread_local! {

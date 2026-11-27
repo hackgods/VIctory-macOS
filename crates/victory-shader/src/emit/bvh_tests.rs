@@ -517,6 +517,11 @@ fn program(wide: bool) -> Vec<u32> {
 }
 
 fn build(wide: bool, memory: bool) -> HostShader {
+    build_with(wide, memory, Default::default())
+}
+
+/// [`build`] with the Mac line's settings `mac`.
+fn build_with(wide: bool, memory: bool, mac: lower::Mac) -> HostShader {
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -599,7 +604,7 @@ fn build(wide: bool, memory: bool) -> HostShader {
         host_wave32: false,
         narrow_waves: false,
         halves_local: Default::default(),
-        mac: Default::default(),
+        mac,
         view_marks: false,
     })
     .expect("lower");
@@ -721,7 +726,13 @@ fn case(rng: &mut Rng) -> (Vec<u32>, u32, Ray) {
 }
 
 fn run_cases(wide: bool, batches: usize, memory: bool) {
-    let shader = build(wide, memory);
+    run_cases_with(wide, batches, memory, false);
+}
+
+/// [`run_cases`]; with `miss`, the lowering of `lower::Mac::bvh_miss`,
+/// against every node's miss.
+fn run_cases_with(wide: bool, batches: usize, memory: bool, miss: bool) {
+    let shader = build_with(wide, memory, lower::Mac { bvh_miss: miss, ..Default::default() });
     // A program with the BVH instruction reads its root SRV as title
     // memory too.
     assert!(shader.memory);
@@ -793,7 +804,7 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
                 )
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             for (n, (w, ty, ray)) in cases.iter().enumerate() {
-                let want = intersect(w, *ty, ray);
+                let want = if miss { missed(*ty) } else { intersect(w, *ty, ray) };
                 let got = &out[0][4 * n..4 * n + 4];
                 assert_eq!(got, want, "{label}: type {ty}, {ray:?}, node {w:08x?}");
                 match ty {
@@ -807,6 +818,24 @@ fn run_cases(wide: bool, batches: usize, memory: bool) {
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// What `lower::Mac::bvh_miss` gives for a node behind a pointer of type
+/// `ty`: a triangle's miss, else no child.
+fn missed(ty: u32) -> [u32; 4] {
+    match ty & 7 {
+        0..=3 => [f32::INFINITY.to_bits(), 1.0f32.to_bits(), 0, 0],
+        _ => [INVALID; 4],
+    }
+}
+
+/// With `Mac::bvh_miss` (`VICTORY_BVH_MISS`) every node misses, whatever
+/// it holds, in both pointer widths and from title memory.
+#[test]
+fn with_bvh_miss_every_node_misses_on_the_gpu() {
+    run_cases_with(false, 2, false, true);
+    run_cases_with(true, 2, false, true);
+    run_cases_with(false, 2, true, true);
 }
 
 #[test]

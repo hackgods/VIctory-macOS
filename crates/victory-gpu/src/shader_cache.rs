@@ -356,6 +356,15 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And the BVH tests that all miss (`VICTORY_BVH_MISS=1`); off, nothing.
+    let key = if options.bvh_miss {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"bvh miss");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -402,6 +411,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         halves_walk: crate::mac_switches::walk(),
         halves_across: crate::mac_switches::across(),
         wide_loads: crate::mac_switches::wide_loads(),
+        bvh_miss: crate::mac_switches::bvh_miss(),
     }
 }
 
@@ -719,6 +729,16 @@ mod tests {
         assert!(!rounds_on(true, Some("0")), "0 goes back to the turns");
         assert!(!rounds_on(false, None), "no rounds without the locks");
         assert!(!rounds_on(false, Some("1")), "nor when asked for");
+    }
+
+    /// `VICTORY_BVH_MISS` changes the translation, so the cache keys on it;
+    /// off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_bvh_miss() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { bvh_miss: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { bvh_miss: false, ..off }));
     }
 
     fn shader() -> HostShader {

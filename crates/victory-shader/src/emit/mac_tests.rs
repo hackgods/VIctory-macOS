@@ -132,6 +132,7 @@ const EARLY: Mac = Mac {
     walk: false,
     across: false,
     wide_loads: false,
+    bvh_miss: false,
 };
 
 /// The rule by itself: bit 12, and nothing that D3D's flag would change.
@@ -286,6 +287,7 @@ const WRITERS: Mac = Mac {
     walk: false,
     across: false,
     wide_loads: false,
+    bvh_miss: false,
 };
 
 /// `image_atomic_<op> v[vdata..], v[vaddr:vaddr+1], s[srsrc:srsrc+7]` on a

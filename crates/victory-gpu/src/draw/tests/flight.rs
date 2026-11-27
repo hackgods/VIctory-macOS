@@ -944,3 +944,89 @@ void main() {
     );
     crate::shadow::unregister(buf as usize, p as u64);
 }
+
+/// Bench (`--ignored --nocapture`): a title that submits and then reads its
+/// fence from memory until the Signal behind the submission moved it, as
+/// Grand Theft Auto VI's render thread does, with the submission waited
+/// for (`VICTORY_FLIGHT1` off) and as a flight `victory-flight` lands: the
+/// time from submitting to the fence moved, per submission. And what a host
+/// list costs made new and reset after it ran (a title list reset while its
+/// host list is in the air takes a spare one, or one made new).
+#[test]
+#[ignore = "bench: prints what a flight costs the title"]
+fn what_a_flight_costs_the_title() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    const N: u32 = 200;
+    let mut rig = Rig::new(0);
+    for slot in 0..2 {
+        let pool = crate::watch::tests::pool(1);
+        let buffer = buffer_at_address(pool as u64, crate::watch::PAGE as u64);
+        if slot == 0 {
+            rig.view_srv(slot, buffer);
+        } else {
+            rig.view(slot, buffer);
+        }
+    }
+    let sink = buffer(256);
+    crate::descriptor::create_uav(
+        std::ptr::null(),
+        sink,
+        std::ptr::null(),
+        &RAW_256,
+        rig.handle(SINK),
+    );
+    let _ = rig.heap_host.mirror(SINK, rig.handle(SINK), true);
+    let (queue, fence) = (title_queue(), title_fence());
+    let median = |mut t: Vec<Duration>| {
+        t.sort();
+        t[t.len() / 2]
+    };
+    let mut value = 0;
+    for _ in 0..2 {
+        for flight in [false, true] {
+            let _mode = ModeGuard::new(flight, false);
+            let (mut turn, mut gpu) = (Vec::new(), Vec::new());
+            for i in 0..N {
+                rig.write(0, 4 * (i % 32), i);
+                let list = rig.copying(0, 1, 4 * (i % 32));
+                value += 1;
+                let since = Instant::now();
+                submit(&list);
+                let back = since.elapsed();
+                assert_eq!(crate::queue::signal_for_test(queue, fence, value), S_OK);
+                while crate::fence::value(fence) < value {
+                    std::hint::spin_loop();
+                }
+                turn.push(since.elapsed());
+                gpu.push(back);
+            }
+            host.finish_flight_now();
+            println!(
+                "flight {flight}: submit-to-fence median {:?} (submission returned after {:?})",
+                median(turn),
+                median(gpu)
+            );
+        }
+    }
+    let t = Instant::now();
+    let lists: Vec<Arc<HostList>> = (0..64)
+        .map(|_| Arc::new(host.new_list().expect("host list")))
+        .collect();
+    let made = t.elapsed() / 64;
+    for list in &lists {
+        list.close();
+    }
+    let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+    host.execute_sync(&runs, &[]);
+    let t = Instant::now();
+    for list in &lists {
+        list.reset();
+    }
+    println!(
+        "a host list made new {made:?}, reset after a run {:?}",
+        t.elapsed() / 64
+    );
+    release(fence);
+}

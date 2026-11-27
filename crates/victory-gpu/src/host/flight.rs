@@ -322,6 +322,18 @@ static SECOND_MARK: std::sync::OnceLock<SecondMark> = std::sync::OnceLock::new()
 /// and was not waited for ran while the CPU did other work.
 static OVERLAP: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
+/// Since the last frame line, where flights' time goes off the GPU (the
+/// `flight costs:` line): `[0]` flights `victory-flight` landed, `[1]`
+/// flights a submitting thread landed, `[2]` microseconds `victory-flight`
+/// waited for the submission lock once the GPU had run its flight, `[3]`
+/// microseconds from the GPU having run a flight (seen so) to its Signals
+/// delivered, `[4]` of them in its post-GPU work (copy-back and the rest of
+/// `finish_post_gpu`), `[5]` in recycling its lists, `[6]` microseconds
+/// submitting threads waited for the submission lock, `[7]` microseconds
+/// `victory-flight` ran held work a landing let go (`queue::on_flight_landed`)
+/// instead of waiting for the next flight.
+static COSTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
 /// A host submission ran on the GPU for `ran`, `waited` of it waited for by
 /// a thread of the title's or ours (the overlap line).
 pub(super) fn ran_for(ran: Duration, waited: Duration, flight: bool) {
@@ -483,6 +495,38 @@ pub(super) fn log(frames: f64) {
         if ran > 0.0 { 100.0 * hidden / ran } else { 0.0 },
         syncs / frames,
         sync_us / 1000.0 / frames,
+    );
+    let [
+        by_lander,
+        by_thread,
+        lander_lock,
+        landing,
+        post,
+        recycling,
+        lock,
+        pumped,
+    ] = COSTS.each_ref().map(per);
+    let turns: [f64; 6] = std::array::from_fn(|i| per(&crate::list::TURNS[i]));
+    tracing::info!(
+        "flight costs: {by_lander:.1} flights/frame landed by victory-flight, {by_thread:.1} by the thread \
+         submitting next; victory-flight waited {:.1} ms/frame for the submission lock after the GPU ran, \
+         submitting threads {:.1}; from the GPU having run a flight to its Signals {:.1} ms/frame ({:.1} of it \
+         post-GPU work with the copy-back, {:.1} recycling lists); victory-flight ran held work the landings let \
+         go {:.1} ms/frame; title list resets {:.1}/frame taking {:.1} ms/frame, held host lists replaced from \
+         the spares {:.1} and made new {:.1}/frame, run lists dropped as the spares were full {:.1}/frame, spare \
+         scratch given up {:.1} MB/frame",
+        lander_lock / 1000.0,
+        lock / 1000.0,
+        landing / 1000.0,
+        post / 1000.0,
+        recycling / 1000.0,
+        pumped / 1000.0,
+        turns[0],
+        turns[1] / 1000.0,
+        turns[2],
+        turns[3],
+        turns[4],
+        turns[5] / 1e6,
     );
     let armed = per(&ARMED);
     if flight1_enabled() {
@@ -700,7 +744,9 @@ impl Host {
             return;
         }
 
+        let asked = Instant::now();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        COSTS[6].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
         let _holding = Holding::enter();
         // While Flight N-1 still runs, the buffer copies these lists ask for
         // that it cannot write are brought up to date
@@ -1182,6 +1228,7 @@ impl Host {
             u.release_worker();
         }
 
+        let post = Instant::now();
         {
             let run_refs: Vec<&HostList> = flight
                 .uploads
@@ -1202,6 +1249,7 @@ impl Host {
             );
         }
 
+        let post = post.elapsed();
         // Its copy-back is done: what it armed is as anything else again.
         for copy in &flight.armed {
             copy.disarm_undeclared();
@@ -1213,7 +1261,9 @@ impl Host {
         // Return the upload list to `bindless::LIST` and recycle host lists
         // only after the GPU fence and post-GPU work have finished.
         drop(flight.uploads);
+        let recycling = Instant::now();
         flight.segments.into_iter().for_each(crate::list::recycle);
+        let recycling = recycling.elapsed();
 
         // Deliver every title fence signal queued behind this flight (then
         // those attached while it was landed as the only one) atomically
@@ -1227,6 +1277,10 @@ impl Host {
             crate::fence::let_go(fence as This);
         }
         state.landing -= 1;
+        COSTS[usize::from(waited_at.is_none())].fetch_add(1, Ordering::Relaxed);
+        for (i, d) in [(3, gpu_done.elapsed()), (4, post), (5, recycling)] {
+            COSTS[i].fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+        }
         true
     }
 }
@@ -1502,7 +1556,9 @@ fn spawn_flight_worker() {
                     continue;
                 }
                 let landed = {
+                    let asked = Instant::now();
                     let mut submitted = host.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                    COSTS[2].fetch_add(asked.elapsed().as_micros() as u64, Ordering::Relaxed);
                     let _holding = Holding::enter();
                     host.finish_flight_locked(&mut submitted, Some(fence_value), Some(gpu_done))
                 };
@@ -1510,7 +1566,9 @@ fn spawn_flight_worker() {
                 // the submit worker in case this flight's BoP writes or fence
                 // signals unblocked another queue.
                 if landed {
+                    let pumping = Instant::now();
                     crate::queue::on_flight_landed();
+                    COSTS[7].fetch_add(pumping.elapsed().as_micros() as u64, Ordering::Relaxed);
                 }
             }
         });

@@ -182,6 +182,16 @@ static CUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0)
 /// Theft Auto VI does, 0-21 times a world frame).
 static EARLY_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Since the last frame line (`crate::host::flight`'s `flight costs:`
+/// line): `[0]` title list resets, `[1]` microseconds in them (their
+/// host lists' restart), `[2]` held host lists replaced from [`SPARE`],
+/// `[3]` replaced by a list made new, `[4]` lists run and reset that
+/// [`SPARE`] had no room for (dropped), `[5]` scratch bytes spare lists
+/// gave up.
+#[cfg(windows)]
+pub(crate) static TURNS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
 /// Cuts and early resets since the last call (the frame line).
 pub(crate) fn take_cuts() -> (u64, u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -298,12 +308,15 @@ fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, 
     // SAFETY: the title passes one of our lists.
     let list = unsafe { &*this.cast::<List>() };
     let used = list.segment.load(std::sync::atomic::Ordering::Relaxed);
+    let started = std::time::Instant::now();
     let mut hosts = list.hosts.lock().unwrap_or_else(|e| e.into_inner());
     let left = restart_hosts(
         &mut hosts,
         used,
         || {
             let spare = SPARE.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let turn = if spare.is_some() { 2 } else { 3 };
+            TURNS[turn].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let Some(fresh) = spare {
                 Ok(std::sync::Arc::new(fresh.list))
             } else if let Some(host) = crate::host::host() {
@@ -319,6 +332,11 @@ fn restart(this: This) -> Result<Option<std::sync::Arc<crate::host::HostList>>, 
         crate::host::HostList::reset,
     )?;
     list.segment.store(0, std::sync::atomic::Ordering::Relaxed);
+    TURNS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    TURNS[1].fetch_add(
+        started.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(left)
 }
 
@@ -399,6 +417,8 @@ pub(crate) fn recycle(list: std::sync::Arc<crate::host::HostList>) {
                 at: now,
                 bytes,
             });
+        } else {
+            TURNS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
     shed(&mut spare, now);
@@ -420,6 +440,7 @@ fn shed(spare: &mut [Idle], now: std::time::Instant) {
     let n = crate::recent::idle_shed(spare.iter().map(|i| (i.at, i.bytes)), now, SPARE_BYTES);
     for idle in &mut spare[..n] {
         if idle.bytes > 0 {
+            TURNS[5].fetch_add(idle.bytes, std::sync::atomic::Ordering::Relaxed);
             idle.list.shed_scratch();
             #[cfg(feature = "diagnostics")]
             SPARE_SHED.fetch_add(idle.bytes, std::sync::atomic::Ordering::Relaxed);

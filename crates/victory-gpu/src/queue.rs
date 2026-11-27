@@ -707,9 +707,9 @@ fn log_planes(frame: u64, planes: u32, found: &[Vec<This>], shown: usize) {
 }
 
 /// The plane whose first resource is shown: `VICTORY_PRESENT_PLANE=<n>`
-/// (counted from 0) when that plane was found, else the plane whose first
-/// resource has the most pixels (#15: on Series S plane 0 is a 1920x1080
-/// overlay and plane 1 the 3840x2160 picture). Ties keep the earlier plane.
+/// (counted from 0) when that plane was found, else the first plane with a
+/// resource (#15: on Series S plane 0 is the scene, at the title's output
+/// size, and plane 1 the 3840x2160 UI drawn over it).
 #[cfg(windows)]
 fn shown_plane(found: &[Vec<This>]) -> usize {
     static PLANE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
@@ -730,7 +730,8 @@ fn shown_plane(found: &[Vec<This>]) -> usize {
 }
 
 /// The plane to show given an override and each plane's first resource
-/// area (0 when unknown): the override when in range, else the largest.
+/// area (0 when unknown): the override when in range, else the first plane
+/// with a known resource, else plane 0.
 #[cfg(any(windows, test))]
 fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     if let Some(w) = want
@@ -738,17 +739,11 @@ fn pick_plane(want: Option<usize>, areas: &[u64]) -> usize {
     {
         return w;
     }
-    let mut best = 0;
-    for (i, &a) in areas.iter().enumerate() {
-        if a > areas.get(best).copied().unwrap_or(0) {
-            best = i;
-        }
-    }
-    best
+    areas.iter().position(|&a| a > 0).unwrap_or(0)
 }
 
-/// Shows the first resource of one plane in our window (the largest
-/// plane unless `VICTORY_PRESENT_PLANE` picks another).
+/// Shows the first resource of one plane in our window (the first plane
+/// unless `VICTORY_PRESENT_PLANE` picks another).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -825,8 +820,8 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        // The other plane's first resource, blended over the picture when
-        // `VICTORY_PRESENT_COMPOSITE=1` (#15: a 1080p overlay on Series S).
+        // The other plane's first resource, blended over the picture unless
+        // `VICTORY_PRESENT_COMPOSITE=0` (#15: the 4K UI on Series S).
         let other = (found.len() == 2)
             .then(|| found[1 - shown].first().copied())
             .flatten()
@@ -1059,21 +1054,21 @@ mod tests {
     }
 
     /// Which plane gets shown: the one `VICTORY_PRESENT_PLANE` names when
-    /// it names one, else the plane whose first resource has the most
-    /// pixels. It only weighs the areas it is handed, so it runs on every
-    /// host.
+    /// it names one, else the first plane with a known resource. It only
+    /// weighs the areas it is handed, so it runs on every host.
     #[test]
-    fn the_largest_plane_is_shown_unless_one_is_named() {
-        // Series S: a 1080p overlay, then the 4K picture.
+    fn the_first_plane_is_shown_unless_one_is_named() {
+        // Series S: the 1080p scene, then the 4K UI that goes over it.
         let series_s = [1920 * 1080, 3840 * 2160];
-        assert_eq!(pick_plane(None, &series_s), 1);
-        assert_eq!(pick_plane(Some(0), &series_s), 0);
-        // An override past the planes found falls back to the largest.
-        assert_eq!(pick_plane(Some(5), &series_s), 1);
-        // Series X: one plane. Ties and unknown sizes keep the first.
+        assert_eq!(pick_plane(None, &series_s), 0);
+        assert_eq!(pick_plane(Some(1), &series_s), 1);
+        // An override past the planes found falls back to the first.
+        assert_eq!(pick_plane(Some(5), &series_s), 0);
+        // A first plane whose resource is not known yet is passed over.
+        assert_eq!(pick_plane(None, &[0, 3840 * 2160]), 1);
+        // Series X: one plane. Unknown sizes keep the first.
         assert_eq!(pick_plane(None, &[3840 * 2160]), 0);
         assert_eq!(pick_plane(None, &[0, 0]), 0);
-        assert_eq!(pick_plane(None, &[100, 100]), 0);
         assert_eq!(pick_plane(None, &[]), 0);
     }
 

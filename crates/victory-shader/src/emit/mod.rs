@@ -146,8 +146,9 @@
 //!   page's memory: two copies of title memory, or pages of a heap that
 //!   do not follow each other, read as the one range they are to the
 //!   title.
-//!   shortcut: a dword that itself lies across two pages (an address that
-//!   is not 4-byte aligned) is read whole from the page it starts on.
+//!   An access at an offset not known to be 4-byte aligned puts each
+//!   dword together from the two aligned dwords it lies in, each read
+//!   where it is, so a dword across two pages takes its bytes from both.
 //!
 //! * **Texture atomics** (added 2026-11-23): a texture UAV the shader uses
 //!   atomically is declared a 32-bit unsigned single-channel view; the

@@ -2686,18 +2686,14 @@ impl<'a> Lower<'a> {
     /// `dx.op.rawBufferLoad.f32` of the handle, index, offset, mask and
     /// alignment in `args`, in `block`.
     fn raw_buffer_load(&mut self, block: usize, args: &[V]) -> V {
-        let r = self.s.op(
-            block,
-            "rawBufferLoad.f32",
-            Attr::ReadOnly,
-            self.s.t.res_ret,
-            139,
-            args,
-        );
-        if let Some(&read) = self.record_reads.get(&args[0]) {
-            self.record_load(block, args, r, read);
+        match self.record_reads.get(&args[0]) {
+            Some(&read) => self.record_load(block, args, read),
+            None => self.raw_op(block, args),
         }
-        r
+    }
+
+    fn raw_op(&mut self, block: usize, args: &[V]) -> V {
+        self.s.op(block, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139, args)
     }
 
     /// `dx.op.atomicBinOp.i32` of the handle, operation, coordinates and

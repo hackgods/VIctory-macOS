@@ -1314,3 +1314,101 @@ fn a_wave64_program_in_halves_reads_constants_from_the_titles_record() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+/// A dword read at an offset that is not 4-byte aligned is put together
+/// from the two aligned dwords it lies in: inside one copy of title memory,
+/// and across two (its low bytes at the end of one copy's last page, the
+/// rest at the start of another's).
+#[test]
+fn a_dword_off_alignment_is_read_from_both_its_dwords_and_pages() {
+    const TITLE: u64 = 0x12_3450_0000;
+    const PAGE: usize = 0x1_0000;
+    const HEAP_AT: usize = 0x100;
+    const INSIDE_AT: usize = 0x400;
+    // [`HEAP_CONSTANT_WAVE32`], reading the dword at byte 6.
+    let mut words = HEAP_CONSTANT_WAVE32.to_vec();
+    assert_eq!(words[11], 0xFA00_0008);
+    words[11] = 0xFA00_0006;
+    let layout = vec![
+        param(RootType::Constants, 0),
+        param(RootType::ResourceHeap, 1),
+        param(RootType::Table, 2),
+    ];
+    lower::GPU_RECORDS.set(1);
+    let shader = build(&words, layout, vec![entry(ResourceType::Uav, 4, 2)], 32);
+    lower::GPU_RECORDS.set(0);
+    let memory_with = |record: [u32; 3]| {
+        let mut first = vec![0u32; PAGE / 4];
+        first[(HEAP_AT + 32) / 4..][..3].copy_from_slice(&record);
+        first[INSIDE_AT / 4..][..4].copy_from_slice(&[70, 80, 90, 100]);
+        first[PAGE / 4 - 2..].copy_from_slice(&[0x0102_0304, 0xAABB_CCDD]);
+        first
+    };
+    let second: Vec<u32> = vec![0x1122_3344, 0x5566_7788, 0, 0];
+    let heap = TITLE + HEAP_AT as u64;
+    let table = pages_table(&[(TITLE, 2, TITLE), (TITLE + PAGE as u64, 6, TITLE + PAGE as u64)], 4);
+    let own: Vec<u32> = vec![7; 16];
+    let cases = [
+        // Bytes 6-9 of 70, 80, 90, 100: the top half of 80, the low of 90.
+        ("inside a copy", constant_record(TITLE + INSIDE_AT as u64, 16), 90 << 16),
+        // Eight bytes before the first copy's end: bytes 6-9 are the last
+        // two of the first copy and the first two of the second.
+        ("across two copies", constant_record(TITLE + PAGE as u64 - 8, 16), 0x3344_AABB),
+        // The same view two bytes short of the dword's end: nothing of its
+        // second dword is read.
+        ("past the view's size", constant_record(TITLE + PAGE as u64 - 8, 8), 0x0000_AABB),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (what, record, expected) in cases {
+            let first = memory_with(record);
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => 1,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(ud)),
+                            (1, Root::View { srv: true, data: table.clone() }),
+                            (2, Root::View { srv: true, data: vec![heap as u32, (heap >> 32) as u32, 2, 0] }),
+                            (3, Root::View { srv: true, data: vec![4; 8] }),
+                        ],
+                        views: &[
+                            View::RawUav(32),
+                            View::Buffer { data: &own, stride: Stride::Raw },
+                            View::Memory(&first),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                            View::Memory(&second),
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], vec![expected; 32], "{label}: {what}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

@@ -34,6 +34,12 @@ pub(super) struct RecordRead {
     tail_at: V,
     crosses: V,
     before: V,
+    /// For an access whose offset is not known to be 4-byte aligned: its
+    /// low two bits, whether they are set, and the handles of the first
+    /// page's memory and the next page's where they are (the null view's
+    /// where the access is aligned): [`Lower::record_load`] then puts each
+    /// dword together from the two aligned dwords it lies in.
+    odd: Option<(V, V, V, V)>,
 }
 
 /// What the title's record at a heap index names, read by the shader
@@ -60,7 +66,11 @@ impl Lower<'_> {
     /// are read through the view of the memory holding that page, which
     /// need not be the first page's (two copies of title memory, or
     /// pages of a heap that do not follow each other).
-    pub(super) fn record_load(&mut self, block: usize, args: &[V], r: V, read: RecordRead) {
+    pub(super) fn record_load(&mut self, block: usize, args: &[V], read: RecordRead) -> V {
+        if let Some(odd) = read.odd {
+            return self.record_load_odd(block, args, read, odd);
+        }
+        let r = self.raw_op(block, args);
         // How far this load is from the access's start.
         let moved = if args[1] == read.given {
             self.s.m.i32(0)
@@ -103,9 +113,93 @@ impl Lower<'_> {
             *field = Some(crate::emit::bitcode::Masked {
                 held,
                 tail: Some((past, tail, 0)),
+                whole: None,
             });
         }
         self.s.m.masked.insert(r, masked);
+        r
+    }
+
+    /// [`Self::record_load`] at an offset that need not be 4-byte aligned:
+    /// raw loads address dwords, so each dword read is put together from
+    /// the two aligned dwords it lies in (its low bytes from the first,
+    /// the rest from the second), and each of those is read where it is:
+    /// in the first page's memory or the next page's, 0 past the view's
+    /// size. A dword across two pages so takes its bytes from both. Where
+    /// the offset turns out aligned, the second dwords are read through
+    /// the null view and not used.
+    fn record_load_odd(&mut self, block: usize, args: &[V], read: RecordRead, odd: (V, V, V, V)) -> V {
+        let (low, is_odd, main_next, tail_next) = odd;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let fields = self.s.m.int_value(args[3]).map_or(0xF, |mask| mask as u8);
+        // The load, from the aligned dword its first dword starts in.
+        let aligned = self.s.m.bin(block, Bin::Sub, args[1], low);
+        let r = self.raw_op(block, &[args[0], aligned, args[2], args[3], args[4]]);
+        // That dword's place from the access's start (below 0 by up to 3)
+        // and in the view.
+        let moved = self.s.m.bin(block, Bin::Sub, aligned, read.given);
+        let user = self.s.m.bin(block, Bin::Add, read.user, moved);
+        let tail_at = self.s.m.bin(block, Bin::Add, read.tail_at, moved);
+        let (one, zero) = (self.s.m.i8(1), k(self, 0));
+        // Aligned dword `j` from there, as a number.
+        let mut words: [Option<V>; 5] = [None; 5];
+        for (j, slot) in words.iter_mut().enumerate() {
+            let own = j < 4 && fields >> j & 1 != 0;
+            let next = j > 0 && fields >> (j - 1) & 1 != 0;
+            if !own && !next {
+                continue;
+            }
+            let step = k(self, 4 * j as u32);
+            let (from, at, tail_at) = (
+                self.s.m.bin(block, Bin::Add, moved, step),
+                self.s.m.bin(block, Bin::Add, user, step),
+                self.s.m.bin(block, Bin::Add, tail_at, step),
+            );
+            // In the first page's memory: a field of the load, or for a
+            // dword only the last odd dword needs, a load of its own.
+            let main = if own {
+                self.s.m.extract(block, r, j as u32)
+            } else {
+                let at = self.s.m.bin(block, Bin::Add, aligned, step);
+                let x = self.raw_op(block, &[main_next, at, args[2], one, args[4]]);
+                self.s.m.extract(block, x, 0)
+            };
+            let through = if own { read.tail } else { tail_next };
+            let tail = self.raw_op(block, &[through, tail_at, args[2], one, args[4]]);
+            let tail = self.s.m.extract(block, tail, 0);
+            let past = self.s.m.cmp(block, pred::SGE, from, read.before);
+            let past = self.s.m.bin(block, Bin::And, read.crosses, past);
+            let word = self.s.m.select(block, past, tail, main);
+            let word = self.s.m.cast(block, Cast::Bitcast, word, self.s.t.i32);
+            let held = self.s.m.cmp(block, pred::IULE, at, read.last);
+            *slot = Some(self.s.m.select(block, held, word, zero));
+        }
+        let (k3, k31, k32) = (k(self, 3), k(self, 31), k(self, 32));
+        let down = self.s.m.bin(block, Bin::Shl, low, k3);
+        let up = self.s.m.bin(block, Bin::Sub, k32, down);
+        let up = self.s.m.bin(block, Bin::And, up, k31);
+        let held = self.s.m.bool(true);
+        let mut masked = [None; 4];
+        for (j, field) in masked.iter_mut().enumerate() {
+            let (Some(first), Some(second)) = (words[j], words[j + 1]) else {
+                continue;
+            };
+            if fields >> j & 1 == 0 {
+                continue;
+            }
+            let lower = self.s.m.bin(block, Bin::LShr, first, down);
+            let upper = self.s.m.bin(block, Bin::Shl, second, up);
+            let both = self.s.m.bin(block, Bin::Or, lower, upper);
+            let whole = self.s.m.select(block, is_odd, both, first);
+            let whole = self.s.m.cast(block, Cast::Bitcast, whole, self.s.t.f32);
+            *field = Some(crate::emit::bitcode::Masked {
+                held,
+                tail: None,
+                whole: Some(whole),
+            });
+        }
+        self.s.m.masked.insert(r, masked);
+        r
     }
 
     /// The bound view heap's first descriptor in title memory (low dword,
@@ -354,9 +448,9 @@ impl Lower<'_> {
     /// past the constant buffer's size read 0, and the dwords of an access
     /// of `bytes` bytes that crosses onto the next 64 KiB page are read
     /// through that page's memory, looked up only where the access crosses
-    /// ([`Self::raw_buffer_load`]). May end in a new block.
-    // shortcut: a dword that itself lies across two pages (an address that
-    // is not 4-byte aligned) is read whole from the page it starts on.
+    /// ([`Self::raw_buffer_load`]). An access at an offset not known to be
+    /// 4-byte aligned is read a dword's two aligned dwords at a time
+    /// ([`Self::record_load_odd`]). May end in a new block.
     pub(super) fn record_read(&mut self, src: &Source, record: RecordView, off: V, bytes: u32) -> (V, V) {
         // The host's own views of the heap are still read for other records.
         if self.is_heap_direct(src) {
@@ -373,6 +467,21 @@ impl Lower<'_> {
         let in_memory = self.s.m.bin(c, Bin::Sub, lo, start);
         let at = self.s.m.select(c, record.constant, in_memory, off);
         let h = self.s.heap_handle(c, index, false, true, (11, 0));
+        // An offset that may be off a dword: its low bits (the view itself
+        // is aligned), and the same memory for the dwords' second halves,
+        // the null view where it is not.
+        let odd = match self.s.m.int_value(off) {
+            Some(off) if off % 4 == 0 => None,
+            _ => {
+                let (three, zero) = (self.s.m.i32(3), self.s.m.i32(0));
+                let low = self.s.m.bin(c, Bin::And, at, three);
+                let is_odd = self.s.m.cmp(c, pred::NE, low, zero);
+                let next = self.s.m.select(c, is_odd, index, null);
+                let next = self.s.heap_handle(c, next, false, true, (11, 0));
+                self.s.view_index.remove(&next);
+                Some((low, is_odd, next))
+            }
+        };
         let all = self.s.m.i32(u32::MAX);
         let last = self.s.m.bin(c, Bin::Sub, record.size, four);
         let last = self.s.m.select(c, record.constant, last, all);
@@ -399,6 +508,12 @@ impl Lower<'_> {
         let tail = self.s.heap_handle(c, tail_view, false, true, (11, 0));
         self.s.view_index.remove(&tail);
         let tail_at = self.s.m.bin(c, Bin::Sub, lo, tail_start);
+        let odd = odd.map(|(low, is_odd, next)| {
+            let view = self.s.m.select(c, is_odd, tail_view, null);
+            let tail_next = self.s.heap_handle(c, view, false, true, (11, 0));
+            self.s.view_index.remove(&tail_next);
+            (low, is_odd, next, tail_next)
+        });
         self.record_reads.insert(
             h,
             RecordRead {
@@ -409,6 +524,7 @@ impl Lower<'_> {
                 tail_at,
                 crosses,
                 before,
+                odd,
             },
         );
         (h, at)

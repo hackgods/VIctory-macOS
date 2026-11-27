@@ -196,11 +196,13 @@ enum MdDef {
 }
 
 /// A field of a load in [`Module::masked`]: read where `held`, and where
-/// `tail`'s condition holds from that field of its other load.
+/// `tail`'s condition holds from that field of its other load; or `whole`,
+/// a value put together elsewhere that stands for the field.
 #[derive(Clone, Copy)]
 pub(crate) struct Masked {
     pub held: V,
     pub tail: Option<(V, V, u32)>,
+    pub whole: Option<V>,
 }
 
 #[derive(Default)]
@@ -448,7 +450,8 @@ impl Module {
         };
         let field = self.masked.get(&agg).and_then(|fields| *fields.get(index as usize)?);
         match field {
-            Some(Masked { held, tail }) => {
+            Some(Masked { whole: Some(whole), .. }) => whole,
+            Some(Masked { held, tail, .. }) => {
                 let x = match tail {
                     Some((cond, other, field)) => {
                         let y = self.push(block, ty, Op::Extract(other, field));

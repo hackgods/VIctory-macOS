@@ -189,7 +189,11 @@ pub fn skip_clamped(
     let buffers = state.buffers.clone();
     let (mut passes, mut barriers) = (0, 0);
     let mut out: Vec<Cmd> = Vec::with_capacity(cmds.len());
-    // Where the binding of a clamp pass began, if one is being bound.
+    // Where the binding of a clamp pass began, if one is being bound. After
+    // a clamp left out, where the next one's begins: a batch of clamps (the
+    // prelude of a host list, `crate::indirect::record_batch`) binds the
+    // pass once and sets only each clamp's own arguments before its
+    // dispatch, which would be left naming no root signature.
     let mut binding: Option<usize> = None;
     let mut bound = NONE;
     for (i, c) in cmds.into_iter().enumerate() {
@@ -205,6 +209,7 @@ pub fn skip_clamped(
                 if let Some(from) = binding.take() {
                     out.truncate(from);
                 }
+                binding = Some(out.len());
                 passes += 1;
                 continue;
             }
@@ -719,6 +724,113 @@ mod tests {
         assert_eq!((first.len(), passes), (0, 3));
         let (second, _, _) = skip_clamped(calls, &clamps, &roots, &mut state);
         assert_eq!(second, [call(RESULTS, 32), call(RESULTS, 64), call(60, 48)]);
+    }
+
+    /// The clamps of a host list's prelude, as `crate::indirect::record_batch`
+    /// records them: the pass bound once, then each clamp's arguments and
+    /// dispatch, a wait for unordered access between two.
+    #[test]
+    fn a_batch_of_clamps_is_kept_and_skipped() {
+        let (clamp, clamp_root) = (9, 8);
+        let view = |kind, param, res, offset| Cmd::RootView {
+            graphics: false,
+            kind,
+            param,
+            va: Va::At { res, offset },
+        };
+        // One record of 16 bytes.
+        let constants = Cmd::Constants {
+            graphics: false,
+            param: 0,
+            offset: 0,
+            values: vec![2, 16, 1, 0, 65_535],
+        };
+        let transitions = |before, after| Cmd::Barriers {
+            all: vec![
+                Barrier::Uav { flags: 0, res: NONE },
+                Barrier::Transition {
+                    flags: 0,
+                    res: 50,
+                    sub: u32::MAX,
+                    before,
+                    after,
+                },
+            ],
+        };
+        let wait = Cmd::Barriers {
+            all: vec![Barrier::Uav { flags: 0, res: NONE }],
+        };
+        let mut prelude = vec![
+            transitions(0, 8),
+            root(false, clamp_root),
+            pipeline(clamp),
+            view(slot::UAV, 2, 70, 0),
+        ];
+        for (i, at) in [0, 16, 32].into_iter().enumerate() {
+            if i > 0 {
+                prelude.push(wait.clone());
+            }
+            prelude.extend([
+                constants.clone(),
+                view(slot::SRV, 1, 40, at),
+                view(slot::UAV, 3, 50, at),
+                view(slot::SRV, 4, 40, at),
+                Cmd::Dispatch { groups: [1, 1, 1] },
+            ]);
+        }
+        prelude.push(transitions(8, 0x200));
+        let call = |args, at| Cmd::Indirect {
+            signature: 5,
+            most: 1,
+            args,
+            at,
+            count: NONE,
+            count_at: 0,
+        };
+        let calls = vec![
+            root(true, 1),
+            pipeline(1),
+            call(50, 0),
+            call(50, 16),
+            call(50, 32),
+            transitions(0x200, 0),
+        ];
+        let clamps = HashSet::from([clamp]);
+        let roots = HashSet::from([clamp_root]);
+        // Kept: each clamp writes to a place of its own, and its call reads
+        // there.
+        let mut state = Clamped::default();
+        let kept = keep_clamped(prelude.clone(), &clamps, &mut state);
+        let places: Vec<&Cmd> = kept
+            .iter()
+            .filter(|c| matches!(c, Cmd::RootView { param: 3, .. }))
+            .collect();
+        assert_eq!(
+            places,
+            [
+                &view(slot::UAV, 3, RESULTS, 0),
+                &view(slot::UAV, 3, RESULTS, 16),
+                &view(slot::UAV, 3, RESULTS, 32),
+            ]
+        );
+        let read = keep_clamped(calls.clone(), &clamps, &mut state);
+        assert_eq!(&read[2..5], [call(RESULTS, 0), call(RESULTS, 16), call(RESULTS, 32)]);
+        // Skipped: nothing of the batch is left, not the arguments of its
+        // second and third clamps either.
+        let mut state = Clamped::default();
+        let (left, passes, barriers) = skip_clamped(prelude, &clamps, &roots, &mut state);
+        assert_eq!((left, passes, barriers), (vec![], 3, 4));
+        let (left, _, _) = skip_clamped(calls.clone(), &clamps, &roots, &mut state);
+        assert_eq!(
+            left,
+            [
+                calls[0].clone(),
+                calls[1].clone(),
+                call(RESULTS, 0),
+                call(RESULTS, 16),
+                call(RESULTS, 32),
+            ]
+        );
     }
 
     #[test]

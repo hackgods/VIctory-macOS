@@ -167,7 +167,7 @@ the BLAKE3 of their DXIL.
 | `--timing detailed` | times commands (above); `--top <n>` pipelines and pieces are listed |
 | `--wait-lists` | each list sent alone and waited for (as `VICTORY_GPU_TIMING` does in a run): the heaviest lists, with what they do |
 | `--leave-out <n>` | after the detailed report, for its `n` costliest pipelines: the frame with and without what runs each, turn by turn. What leaving one out saves is what it costs in the frame. (A pass that makes arguments for later calls cannot be left out this way: the calls then read stale ones.) |
-| `--skip-clamps` | leaves out the host layer's argument clamps (the passes, what binds them, their barriers); the calls they serve read arguments kept from a first run with them |
+| `--skip-clamps` | leaves out the host layer's argument clamps (the passes, what binds them, their barriers), those it hoists into the prelude of a list as one batch too; the calls they serve read arguments kept from a first run with them |
 | `--no-buffer-barriers`, `--no-barriers` | leaves out the barriers of buffers, or all (no valid D3D12; D3DMetal runs it) |
 | `--no-pixels` | every scissor rectangle one texel: draws without their pixels |
 | `--binds-only` | nothing that works is sent: what the lists bind, and their barriers |

@@ -279,7 +279,9 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let apart = options.host_wave32 && !options.halves_rendezvous;
     let cap_barriers = victory_shader::emit::cap_barriers_refused();
     let limits = options.thread_limits;
-    if !locks
+    let records = usize::from(options.gpu_records & 3);
+    if records == 0
+        && !locks
         && !bias
         && !narrow
         && !no_literal
@@ -290,7 +292,7 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     {
         return build();
     }
-    static BUILDS: [OnceLock<[u8; 32]>; 1024] = [const { OnceLock::new() }; 1024];
+    static BUILDS: [OnceLock<[u8; 32]>; 4096] = [const { OnceLock::new() }; 4096];
     let n = usize::from(locks)
         | usize::from(bias) << 1
         | usize::from(narrow) << 2
@@ -300,10 +302,15 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
         | usize::from(uav_level0) << 6
         | usize::from(apart) << 7
         | usize::from(cap_barriers) << 8
-        | usize::from(limits) << 9;
+        | usize::from(limits) << 9
+        | records << 10;
     BUILDS[n].get_or_init(|| {
         let mut h = blake3::Hasher::new();
         h.update(build());
+        if records != 0 {
+            h.update(b"views from the title's records");
+            h.update(&[records as u8]);
+        }
         if locks {
             h.update(b"atomic locks");
         }
@@ -359,6 +366,7 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         // Only for the pipelines a dispatch counted in threads needs it
         // for (`crate::pipeline::thread_limited`).
         thread_limits: false,
+        gpu_records: crate::descriptor::gpu_records(),
     }
 }
 

@@ -211,6 +211,10 @@ pub(crate) struct Module {
     /// Structures chosen between by a condition: `(cond, other)` by the
     /// one taken where `cond` holds. [`Module::extract`] chooses the field.
     pub chosen: Map<V, (V, V)>,
+    /// Structures whose first four fields read as 0 where a condition does
+    /// not hold (a load's dwords past the end of what its view names):
+    /// each field's condition. [`Module::extract`] applies it.
+    pub masked: Map<V, [Option<V>; 4]>,
 }
 
 impl Module {
@@ -424,10 +428,18 @@ impl Module {
             t => panic!("extractvalue from {t:?}"),
         };
         let x = self.push(block, ty, Op::Extract(agg, index));
-        match self.chosen.get(&agg).copied() {
+        let x = match self.chosen.get(&agg).copied() {
             Some((cond, other)) => {
                 let y = self.push(block, ty, Op::Extract(other, index));
                 self.select(block, cond, x, y)
+            }
+            None => x,
+        };
+        let held = self.masked.get(&agg).and_then(|fields| *fields.get(index as usize)?);
+        match held {
+            Some(held) => {
+                let zero = self.f32(0);
+                self.select(block, held, x, zero)
             }
             None => x,
         }

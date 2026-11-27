@@ -969,3 +969,158 @@ fn d16_x_loads_read_r16_uint_and_r16_float_views() {
         }
     }
 }
+
+/// The dwords of a record that names the constant buffer view of `size`
+/// bytes at `address` whole (victory-gpu's `descriptor::constant_words`).
+fn constant_record(address: u64, size: u32) -> [u32; 3] {
+    assert!(size < 1 << 14 && address >> 47 == 0);
+    [
+        lower::RECORD_TAG,
+        address as u32,
+        1 << 30 | size << 15 | (address >> 32) as u32,
+    ]
+}
+
+/// With `Options::gpu_records` bit 0, a constant buffer read through the
+/// resource heap takes the title's own record at the heap index: a record
+/// naming a constant buffer view whole reads the memory the page table
+/// names at its address (dwords past its size 0); any other record, a slot
+/// past the heap, or a heap of no slots reads the host's own view of the
+/// slot, as without the option.
+#[test]
+fn a_constant_buffer_is_taken_from_the_titles_record() {
+    const TITLE: u64 = 0x12_3450_0000;
+    const HEAP_AT: usize = 0x100;
+    const CONSTANTS_AT: usize = 0x400;
+    let layout = || {
+        vec![
+            param(RootType::Constants, 0),
+            param(RootType::ResourceHeap, 1),
+            param(RootType::Table, 2),
+        ]
+    };
+    let legacy = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
+    assert_eq!(legacy.root_srvs, [VIEW_STRIDES]);
+    assert!(!legacy.memory);
+    lower::GPU_RECORDS.set(1);
+    let shader = build(HEAP_CONSTANT_WAVE32, layout(), vec![entry(ResourceType::Uav, 4, 2)], 32);
+    lower::GPU_RECORDS.set(0);
+    assert!(shader.heap && !shader.heap_writes);
+    assert_eq!(shader.root_srvs, [super::HEAP_RECORDS, VIEW_STRIDES], "heap info, then the stride table");
+    assert!(shader.memory && !shader.memory_writes, "reads the page table, marks nothing");
+    // The host's own view of slot 1, and title memory holding the heap's
+    // records and other constants.
+    let own: Vec<u32> = vec![7, 8, 9, 10];
+    let memory_with = |record: [u32; 3]| {
+        let mut memory = vec![0u32; 0x800 / 4];
+        memory[(HEAP_AT + 32) / 4..][..3].copy_from_slice(&record);
+        memory[CONSTANTS_AT / 4..][..4].copy_from_slice(&[70, 80, 90, 100]);
+        memory
+    };
+    let constants = TITLE + CONSTANTS_AT as u64;
+    let heap = TITLE + HEAP_AT as u64;
+    let info = |slots: u32| vec![heap as u32, (heap >> 32) as u32, slots, 0];
+    // The page table: title memory's views at heap index 2, the null pair at 4.
+    let table = {
+        let mut t = vec![0u32; 4096];
+        let (hi, lo) = ((TITLE >> 32) as u32, TITLE as u32);
+        t[(hi << 4 | lo >> 28) as usize] = 1;
+        for _ in 0..2 * 4096 {
+            t.extend([4, 0]);
+        }
+        let at = 4096 + 2 * (4096 + (lo >> 16 & 0xFFF) as usize);
+        t[at..at + 2].copy_from_slice(&[2, lo]);
+        t
+    };
+    let cases: [(&str, [u32; 3], u32, u32); 7] = [
+        ("a constant buffer named whole", constant_record(constants, 16), 2, 90),
+        ("its third dword just inside", constant_record(constants, 12), 2, 90),
+        ("its third dword past its size", constant_record(constants, 8), 2, 0),
+        ("a table entry's record", [lower::RECORD_TAG, 5, 1], 2, 9),
+        ("no record", [0, constants as u32, 1 << 30 | 16 << 15 | (constants >> 32) as u32], 2, 9),
+        ("a slot past the heap", constant_record(constants, 16), 1, 9),
+        ("no memory at the address", constant_record(constants + (1 << 30), 16), 2, 0),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let user_data = |shader: &HostShader| {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match u.root {
+                    RootType::Constants => 1,
+                    RootType::Table => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            ud
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (what, record, slots, expected) in cases {
+            let memory = memory_with(record);
+            let words = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (0, Root::Constants(user_data(&shader))),
+                            (1, Root::View { srv: true, data: info(slots) }),
+                            (2, Root::View { srv: true, data: vec![4, 4, 4, 4, 4, 4] }),
+                            (3, Root::View { srv: true, data: table.clone() }),
+                        ],
+                        views: &[
+                            View::RawUav(32),
+                            View::Buffer { data: &own, stride: Stride::Raw },
+                            View::Memory(&memory),
+                            View::Pair,
+                            View::NullPair,
+                            View::Pair,
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(words[0], vec![expected; 32], "{label}: {what}");
+        }
+        // Without the option, the same heap reads the host's view.
+        let (root, pso) = host
+            .compute_pipeline(&legacy)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let memory = memory_with(constant_record(constants, 16));
+        let words = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(user_data(&legacy))),
+                        (1, Root::View { srv: true, data: vec![4, 4, 4, 4, 4, 4] }),
+                    ],
+                    views: &[
+                        View::RawUav(32),
+                        View::Buffer { data: &own, stride: Stride::Raw },
+                        View::Memory(&memory),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(words[0], vec![9; 32], "{label}: without the option");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

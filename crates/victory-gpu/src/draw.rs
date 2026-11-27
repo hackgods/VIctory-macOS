@@ -1198,6 +1198,30 @@ impl State {
             }
             for (views, kind) in [(&stage.root_cbvs, 0), (&stage.root_srvs, 1), (&stage.root_uavs, 2)] {
                 for &(slot, param) in views {
+                    if kind == 1 && slot == victory_shader::emit::HEAP_RECORDS {
+                        // The bound view heap's info table: where its
+                        // records lie in title memory, and how many.
+                        let table = (self.heaps[0] != 0)
+                            .then(|| crate::descriptor::heap(self.heaps[0] as This).records_info())
+                            .flatten();
+                        let Some(table) = table else {
+                            once!("a shader reads the title's records without a view heap: dropped");
+                            not_run("heap records without a view heap");
+                            return false;
+                        };
+                        list.keep(table);
+                        // SAFETY: an open list; the table lives while the list
+                        // holds it.
+                        unsafe {
+                            let gpu = table.GetGPUVirtualAddress();
+                            if compute {
+                                l.SetComputeRootShaderResourceView(param, gpu);
+                            } else {
+                                l.SetGraphicsRootShaderResourceView(param, gpu);
+                            }
+                        }
+                        continue;
+                    }
                     if kind == 1 && slot == victory_shader::emit::VIEW_STRIDES {
                         // The bound view heap's stride table; without one
                         // the shader would read an unbound root view.

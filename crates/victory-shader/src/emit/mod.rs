@@ -294,7 +294,7 @@ pub use shader::{
     ATOMIC_LOCK_ROUNDS, ATOMIC_LOCK_SPINS, ATOMIC_LOCK_SPINS_DRAWN, ATOMIC_LOCKS, ATOMIC_LOCKS_AT,
     ATOMIC_LOCKS_GAVE_UP_AT, HEAP_SAMPLERS, HEAP_VIEWS, MEMORY_SPACE, NULL_BUFFER_VIEW,
     ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE, VIEW_INTEGER, VIEW_MARK_NONE, VIEW_MARKS,
-    VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
+    HEAP_RECORDS, VIEW_READS, VIEW_SIGNED, VIEW_STRIDE_BITS, VIEW_STRIDES, VIEW_WRITE_BITS, VIEW_WRITES,
     VIEW_WRITES_BYTES,
 };
 
@@ -580,6 +580,11 @@ pub struct Options {
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,
+    /// The view kinds a shader takes from the title's own records instead
+    /// of the host's slots ("Views from the title's records"): bit 0,
+    /// constant buffer views. The host then binds the heap-info table and
+    /// keeps the title's heap in a copy the page table names.
+    pub gpu_records: u8,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1074,6 +1079,7 @@ fn emit_pruned(
         halves_rendezvous: options.halves_rendezvous,
     };
     let (literal, limits) = (!options.disable_literal_halves, options.thread_limits);
+    lower::GPU_RECORDS.set(options.gpu_records);
     let (l, heap_index_sources) = match lower::lower_limited(
         &parts(st, res),
         keep,

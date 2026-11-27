@@ -18,6 +18,11 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// the buffer view at view-heap index `i` ([`VIEW_STRIDE_BITS`]), with
 /// [`VIEW_INTEGER`] and [`VIEW_SIGNED`] for typed views of integer formats.
 pub const VIEW_STRIDES: u8 = 255;
+/// The root SRV slot (in [`ROOT_CBV_SPACE`]) of the heap-info table of a
+/// shader that takes views from the title's records: three dwords, the
+/// title address (low, high) of the bound view heap's first descriptor and
+/// the heap's slots (0: no record is read).
+pub const HEAP_RECORDS: u8 = 254;
 /// The bits of a view-stride table dword holding the stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 /// In a view-stride table dword: a typed buffer view of an integer format

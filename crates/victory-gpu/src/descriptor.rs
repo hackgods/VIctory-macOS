@@ -68,6 +68,104 @@ pub(crate) struct Heap {
     /// copies descriptors into it itself, as bytes (`sync_heaps`).
     #[cfg(windows)]
     written: Option<crate::watch::Tracked>,
+    /// The heap-info table of shaders that take views from the title's
+    /// records ([`Heap::records_info`]), and whether records are read from
+    /// this heap (then its memory is a title buffer of ours, for a copy
+    /// the page table names).
+    #[cfg(windows)]
+    records: std::sync::OnceLock<Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, bool)>>,
+}
+
+/// The view kinds translated shaders take from the title's own records
+/// instead of host slots made for them: `VICTORY_GPU_RECORDS`, a list of
+/// `cb` (constant buffer views named whole in their records, bit 0);
+/// nothing by default. `placed` and `all` are accepted and mean `cb` until
+/// those kinds are read from records too.
+pub(crate) fn gpu_records() -> u8 {
+    #[cfg(test)]
+    if let Some(kinds) = tests::GPU_RECORDS.with(|k| k.get()) {
+        return kinds;
+    }
+    static KINDS: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *KINDS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_GPU_RECORDS").unwrap_or_default();
+        let kinds = asked
+            .split(',')
+            .map(str::trim)
+            .fold(0u8, |kinds, kind| match kind {
+                "cb" | "placed" | "all" | "1" => kinds | 1,
+                _ => kinds,
+            });
+        if kinds != 0 {
+            tracing::info!(
+                asked,
+                "constant buffer views are read from the title's records on the GPU (VICTORY_GPU_RECORDS)"
+            );
+        }
+        kinds
+    })
+}
+
+/// The address and bytes of the constant buffer view that record words
+/// name whole; `None` for any other record.
+pub(crate) fn constant_record(i: u32, generation: u32) -> Option<(u64, u32)> {
+    if generation >> KIND_SHIFT != CONSTANT {
+        return None;
+    }
+    match constant_of(i, generation) {
+        View::Constant(address, size) => Some((address, size)),
+        _ => None,
+    }
+}
+
+#[cfg(windows)]
+impl Heap {
+    /// The heap-info table of a shader that takes views from the title's
+    /// records (root SRV `HEAP_RECORDS`): the title address of the heap's
+    /// first descriptor and its slots. Records are read from a view heap
+    /// in the title's own memory, 4-byte aligned, with
+    /// [`gpu_records`]: its memory is then registered as a title buffer,
+    /// so a copy of it (or the memory itself, in place) is in the page
+    /// table and refreshed with it, and its host heap stops making views
+    /// for records named whole ([`host::HostHeap::records_on`]). Any other
+    /// heap's table says no slots: its shaders read the host's views.
+    pub(crate) fn records_info(&self) -> Option<&windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
+        use crate::backend::HostMemory;
+        let bytes = u64::from(self.desc.count) * 32;
+        let (table, on) = self
+            .records
+            .get_or_init(|| {
+                let host = crate::host::host()?;
+                let (table, data) = host.upload_buffer(256)?;
+                let on = gpu_records() & 1 != 0
+                    && self.memory.is_none()
+                    && self.desc.kind == VIEWS_KIND
+                    && self.desc.flags & SHADER_VISIBLE != 0
+                    && self.start.is_multiple_of(4)
+                    && self.host().is_some();
+                let words = [self.start as u32, (self.start >> 32) as u32, if on { self.desc.count } else { 0 }, 0];
+                // SAFETY: the table's mapping, 256 bytes.
+                unsafe { data.cast::<[u32; 4]>().write_volatile(words) };
+                if on {
+                    crate::shadow::register(std::ptr::from_ref(self) as usize, self.start, bytes);
+                    if let Some(host) = self.host() {
+                        host.records_on();
+                    }
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        slots = self.desc.count,
+                        "a view heap's records are read on the GPU"
+                    );
+                }
+                Some((table, on))
+            })
+            .as_ref()?;
+        if *on {
+            // The copy the page table is to name (made here the first time).
+            let _ = crate::shadow::find(self.start, bytes);
+        }
+        Some(table)
+    }
 }
 
 #[cfg(windows)]
@@ -552,6 +650,9 @@ impl Drop for Heap {
         // round, so it is taken here after the heaps' lock is let go.
         drop(heaps);
         crate::memory::release(at);
+        if matches!(self.records.get(), Some(Some((_, true)))) {
+            crate::shadow::unregister(at, self.start);
+        }
     }
 }
 
@@ -1608,6 +1709,8 @@ pub(crate) extern "system" fn create_heap(
         written: (placed && visible)
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
+        #[cfg(windows)]
+        records: std::sync::OnceLock::new(),
     });
     #[cfg(windows)]
     let at = std::ptr::from_ref::<Heap>(&heap) as usize;
@@ -2523,6 +2626,13 @@ pub(crate) mod tests {
         /// as with `VICTORY_VIEW_INLINE=0`.
         pub(crate) static ENTRIES_ONLY: std::cell::Cell<bool> =
             const { std::cell::Cell::new(false) };
+    }
+
+    thread_local! {
+        /// Set in a test: the view kinds shaders read from the title's records
+        /// on that thread, as `VICTORY_GPU_RECORDS` gives them.
+        pub(crate) static GPU_RECORDS: std::cell::Cell<Option<u8>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// The record of a view written to a fresh slot, and the view it reads back as.

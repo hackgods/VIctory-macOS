@@ -22,6 +22,22 @@ use crate::host::host;
 
 const SYNC_BLOCK_SLOTS: u32 = 128;
 
+/// Slots whose record named a constant buffer view whole and got no host
+/// view (`[0]`), and those of them that held a view and went null (`[1]`).
+static RECORD_SLOTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Logs [`RECORD_SLOTS`] per frame over `frames`.
+pub(crate) fn records_line(frames: f64) {
+    let [slots, nulled] = [0, 1].map(|i| RECORD_SLOTS[i].swap(0, Ordering::Relaxed));
+    if slots != 0 {
+        tracing::info!(
+            "views from the title's records: {:.0} heap slots/frame given no host view ({:.0} of them held one and went null)",
+            slots as f64 / frames,
+            nulled as f64 / frames,
+        );
+    }
+}
+
 thread_local! {
     /// True while this thread is inside [`HostHeap::publish`], preventing
     /// `mirror(..., true)` from re-enqueuing the slot being published.
@@ -550,6 +566,10 @@ pub(crate) struct HostHeap {
     /// byte stride of the buffer view there, 0 for none. Mapped at the
     /// address kept beside it.
     strides: Option<(ID3D12Resource, usize)>,
+    /// Shaders take constant buffer views from the title's records in this
+    /// heap ([`HostHeap::records_on`]): none is made for a record that
+    /// names one whole.
+    records: std::sync::atomic::AtomicBool,
     /// View heaps: the view-mark table translated shaders read
     /// (`victory_shader::emit`, "Write marks"), two dwords per slot as the
     /// stride table has one: the mark bit and phase of the unordered buffer
@@ -737,6 +757,7 @@ impl HostHeap {
                 _ => total,
             },
             strides,
+            records: std::sync::atomic::AtomicBool::new(false),
             marks,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -1125,6 +1146,43 @@ impl HostHeap {
         unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride) };
     }
 
+    /// From now on no host view is made for a record that names a constant
+    /// buffer view whole: shaders read such views from the record itself
+    /// (`crate::descriptor::Heap::records_info`).
+    pub(crate) fn records_on(&self) {
+        self.records.store(true, Ordering::Release);
+    }
+
+    /// Slot `index` holds `record`, which names a constant buffer view
+    /// whole, in a heap whose shaders read such views from the records:
+    /// no host view is made. What a made view gave is kept: memory for the
+    /// shader to read (the copy holding the view's bytes is made if there
+    /// is none yet, as making the view did; the page table's refresh keeps
+    /// it current), the slot's stride (4, as a raw view's), and a slot that
+    /// held another view goes null, once.
+    fn constant_record(&self, index: u32, [_, view, generation]: [u32; 3]) {
+        let key = u64::from(generation) << 32 | u64::from(view);
+        if self.synced[index as usize].load(Ordering::Acquire) == key {
+            return;
+        }
+        if let Some((address, size)) = crate::descriptor::constant_record(view, generation) {
+            let _ = crate::shadow::find(address, u64::from(size));
+        }
+        if self.made_is_nonzero(index) {
+            let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            if made[index as usize] != 0 {
+                self.ready[index as usize].store(0, Ordering::Release);
+                made[index as usize] = 0;
+                self.set_made_nonzero(index, false);
+                self.make_null(index);
+                RECORD_SLOTS[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.write_stride(index, 4);
+        self.synced[index as usize].store(key, Ordering::Release);
+        RECORD_SLOTS[0].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// The view-stride table, for root SRV `VIEW_STRIDES`.
     pub(crate) fn strides(&self) -> Option<&ID3D12Resource> {
         self.strides.as_ref().map(|(buffer, _)| buffer)
@@ -1481,6 +1539,7 @@ impl HostHeap {
         let mut legacy_verify = false;
 
         if fast {
+            let records = self.records.load(Ordering::Acquire);
             let mut stale: Vec<(u32, [u32; 3])> = Vec::new();
             let all_in_buf =
                 at(first) >= buf_start && at(last - 1).saturating_add(12) <= buf_end;
@@ -1511,6 +1570,11 @@ impl HostHeap {
                                 if (nonzero_word >> (i & 63)) & 1 != 0 {
                                     stale.push((i, record));
                                 }
+                                i += 1;
+                                continue;
+                            }
+                            if records && generation >> 30 == 1 {
+                                self.constant_record(i, record);
                                 i += 1;
                                 continue;
                             }
@@ -1561,6 +1625,11 @@ impl HostHeap {
                                 if (nonzero_word >> (i & 63)) & 1 != 0 {
                                     stale.push((i, record));
                                 }
+                                i += 1;
+                                continue;
+                            }
+                            if records && generation >> 30 == 1 {
+                                self.constant_record(i, record);
                                 i += 1;
                                 continue;
                             }
@@ -2060,6 +2129,13 @@ impl HostHeap {
         }
         // SAFETY: the handle is a descriptor slot in title memory.
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        // A constant buffer view named whole, in a heap whose shaders read
+        // such views from the records: no host view (a draw's own tables
+        // still get theirs).
+        if tag == VIEW_TAG && !for_draw && generation >> 30 == 1 && self.records.load(Ordering::Acquire) {
+            self.constant_record(index, [tag, i, generation]);
+            return None;
+        }
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         // Made from this record already and readable as it is (what the

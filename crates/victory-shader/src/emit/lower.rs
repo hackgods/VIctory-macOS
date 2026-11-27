@@ -430,7 +430,7 @@ struct Lower<'a> {
     /// ([`halves::lane_uniform`]), whose first lane either half reads.
     alike: HashSet<Value>,
     /// The results of first-lane reads each host half makes by itself
-    /// ([`first_lane::read_alone`]).
+    /// ([`first_lane::read_alone`], [`first_lane::index_waterfalls`]).
     first_alone: HashSet<Value>,
     /// Pixel: an ordered section (POPS), whose UAVs the host makes
     /// rasterizer-ordered views.
@@ -708,9 +708,12 @@ impl<'a> Lower<'a> {
         let (mut halves, mut halves_refused) = (false, None);
         let mut alike_cache: Option<HashSet<Value>> = None;
         // First-lane reads each 32-lane host half of a console wave makes
-        // by itself (`first_lane`).
+        // by itself (`first_lane`): reads only active lanes see, and those
+        // opening a register-index waterfall.
         let first_alone = if x.host_wave32 {
-            first_lane::read_alone(x)
+            let mut alone = first_lane::read_alone(x);
+            alone.extend(first_lane::index_waterfalls(x));
+            alone
         } else {
             HashSet::new()
         };

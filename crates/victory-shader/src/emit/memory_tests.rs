@@ -448,13 +448,10 @@ fn title_memory_is_read_and_written_at_computed_addresses() {
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
 
-/// Four dwords from 4 bytes before a copy that starts 8 bytes into its page
-/// (which the page table gives it), read with a scalar and a global load:
-/// the offset in the copy wraps to 0 after the first dword, which reads 0,
-/// and the other three read the copy's first three, as one load a dword
-/// did.
-#[test]
-fn runs_from_just_before_a_copy_read_its_first_dwords() {
+/// A program that reads four dwords at the pointer in its first two user
+/// dwords, with a scalar load and with a global load, and stores them to
+/// dwords 0-3 and 4-7 of the UAV in its table.
+fn four_dwords_at_a_pointer() -> HostShader {
     let mut w = vec![s_mov_b32(5, 0x80)]; // s[4:5]: the table at s4
     w.extend(s_load(2, 8, 4, 0)); // s[8:11]: the result UAV
     w.extend(s_load(2, 12, 0, 0)); // s[12:15]: four dwords at the pointer
@@ -554,6 +551,17 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
         v.validate(&mut shader.dxil.clone())
             .expect("DXIL validation failed");
     }
+    shader
+}
+
+/// Four dwords from 4 bytes before a copy that starts 8 bytes into its page
+/// (which the page table gives it), read with a scalar and a global load:
+/// the offset in the copy wraps to 0 after the first dword, which reads 0,
+/// and the other three read the copy's first three, as one load a dword
+/// did.
+#[test]
+fn runs_from_just_before_a_copy_read_its_first_dwords() {
+    let shader = four_dwords_at_a_pointer();
     let _one = super::valu_tests::ONE_AT_A_TIME
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -607,6 +615,81 @@ fn runs_from_just_before_a_copy_read_its_first_dwords() {
         let want = [0, copy[0], copy[1], copy[2]];
         assert_eq!(out[0][..4], want, "{label}: the scalar load");
         assert_eq!(out[0][4..], want, "{label}: the global load");
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+/// Four dwords from 8 bytes before the end of one host copy's last page,
+/// where another copy's first page follows: the first two are the first
+/// copy's last, the other two the second copy's first. Through the first
+/// copy's view alone those two lie past its end and read 0, where the
+/// console reads the memory that is there.
+#[test]
+fn runs_across_two_copies_read_both() {
+    const PAGE: u64 = 0x1_0000;
+    let shader = four_dwords_at_a_pointer();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // The first copy holds exactly its page; the second starts the next.
+    let first: Vec<u32> = (0..PAGE as u32 / 4).map(|k| 0x1000_0000 + k).collect();
+    let second: Vec<u32> = (0..64).map(|k| 0x2000_0000 + k).collect();
+    let mut table = page_table(1, 3);
+    let entry = 4096 + 2 * (4096 + (TITLE as u32 >> 16 & 0xFFF) as usize);
+    table[entry + 2..entry + 4].copy_from_slice(&[5, (TITLE + PAGE) as u32]);
+    let pointer = TITLE + PAGE - 8;
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+        let mut ud = vec![0u32; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] =
+                    [pointer as u32, (pointer >> 32) as u32, 0, 0][u.dword as usize];
+            }
+        }
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(ud)),
+                        (
+                            1,
+                            Root::View {
+                                srv: true,
+                                data: table.clone(),
+                            },
+                        ),
+                        (2, Root::Uav(2 * 4096 / 32)),
+                    ],
+                    views: &[
+                        View::RawUav(8),
+                        View::Memory(&first),
+                        View::Pair,
+                        View::NullPair,
+                        View::Pair,
+                        View::Memory(&second),
+                        View::Pair,
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: {e}"));
+        let last = first.len();
+        let want = [first[last - 2], first[last - 1], second[0], second[1]];
+        assert_eq!(out[0][..4], want, "{label}: the scalar load");
+        assert_eq!(out[0][4..], want, "{label}: the global load");
+        // Nothing missed: no page is marked.
+        let marked: Vec<usize> = (0..out[3].len() * 32).filter(|&b| out[3][b / 32] >> (b % 32) & 1 != 0).collect();
+        assert!(marked.is_empty(), "{label}: pages marked: {marked:?}");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

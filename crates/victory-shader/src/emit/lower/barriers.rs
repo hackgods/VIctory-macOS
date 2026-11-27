@@ -6,6 +6,11 @@
 
 use super::*;
 
+/// An explicit `s_barrier` a lane may not reach because it left the program
+/// at a capped back edge's iteration limit ([`step_and_cap`]).
+pub(super) const CAP_BARRIER: Why =
+    "an s_barrier where a lane may have left the program early at a loop's iteration limit";
+
 /// Where a compute group that is one console wave needs group barriers
 /// when the host splits it into narrower waves: (block, instruction) to
 /// sync before, instruction index = the block's length for its end.

@@ -438,19 +438,23 @@ fn sync_make(
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncCreateUs);
     #[cfg(feature = "diagnostics")]
-    {
-        static MADE: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
-        let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
-        let made = made.get_or_insert_with(Default::default);
-        if made.len() >= 1 << 20 {
-            made.clear();
-        }
-        crate::copystat::add(crate::copystat::C::SyncCreates, 1);
-        if !made.insert(key) {
-            crate::copystat::add(crate::copystat::C::SyncCreatesAgain, 1);
-        }
-    }
+    note_made(key);
     make_marked(view, at)
+}
+
+/// Diagnostics: a heap sync makes a view of `key` (see [`sync_make`]).
+#[cfg(feature = "diagnostics")]
+fn note_made(key: u64) {
+    static MADE: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let made = made.get_or_insert_with(Default::default);
+    if made.len() >= 1 << 20 {
+        made.clear();
+    }
+    crate::copystat::add(crate::copystat::C::SyncCreates, 1);
+    if !made.insert(key) {
+        crate::copystat::add(crate::copystat::C::SyncCreatesAgain, 1);
+    }
 }
 
 /// Most bytes [`live_records`] reads in one kernel call: a page.
@@ -1924,6 +1928,13 @@ impl HostHeap {
                         } else if next_template < st.count {
                             let t = next_template;
                             next_template += 1;
+                            #[cfg(feature = "diagnostics")]
+                            let _made = crate::watch::Timed(
+                                std::time::Instant::now(),
+                                crate::copystat::C::SyncCreateUs,
+                            );
+                            #[cfg(feature = "diagnostics")]
+                            note_made(key);
                             // SAFETY: live buffer held by `resolved_buf` and slot of our staging heap.
                             unsafe {
                                 h.device.CreateShaderResourceView(
@@ -1943,6 +1954,13 @@ impl HostHeap {
                             });
                             (k, None)
                         } else {
+                            #[cfg(feature = "diagnostics")]
+                            let _made = crate::watch::Timed(
+                                std::time::Instant::now(),
+                                crate::copystat::C::SyncCreateUs,
+                            );
+                            #[cfg(feature = "diagnostics")]
+                            note_made(key);
                             // SAFETY: live buffer held by `resolved_buf` and slot of our host heap.
                             unsafe {
                                 h.device.CreateShaderResourceView(
@@ -1957,6 +1975,13 @@ impl HostHeap {
                             )
                         }
                     } else if let Some(h) = host {
+                        #[cfg(feature = "diagnostics")]
+                        let _made = crate::watch::Timed(
+                            std::time::Instant::now(),
+                            crate::copystat::C::SyncCreateUs,
+                        );
+                        #[cfg(feature = "diagnostics")]
+                        note_made(key);
                         // SAFETY: live buffer held by `resolved_buf` and slot of our host heap.
                         unsafe {
                             h.device.CreateShaderResourceView(

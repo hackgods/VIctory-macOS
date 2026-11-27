@@ -990,6 +990,29 @@ fn lane_reads_pass_between_halves() {
     }
 }
 
+/// An exchange between the halves that the group runs once has group-shared
+/// dwords of its own, so it needs only the barrier after its store: no
+/// earlier exchange's reads can still be at them. One in a loop keeps the
+/// barrier before its store as well, since its own reads of the run before
+/// may not be done.
+#[test]
+fn exchanges_run_once_need_only_the_barrier_after_their_store() {
+    let barriers = |words: &[u32], own: bool| {
+        super::with_own_exchange_words(own, || {
+            lowered(&native(words, true, 64, 0), true).expect("halves").barriers
+        })
+    };
+    // Two lane reads across the halves in the entry block: two exchanges,
+    // each without the barrier before its store.
+    let once = lane_reads(40, 33);
+    assert_eq!(barriers(&once, false) - barriers(&once, true), 2);
+    // One lane read in a loop the host waves count alike: one exchange,
+    // run twice, which keeps both.
+    let readlane = [0xD760_000C, 0x0001_5100]; // v_readlane_b32 s12, v0, 40
+    let looped = in_a_loop(&readlane, 12, Count::Two);
+    assert_eq!(barriers(&looped, true), barriers(&looped, false));
+}
+
 /// [`lane_reads`] and [`first_lane_of_the_thread_id`] on every hardware
 /// adapter give the console's lanes: in a group of one console wave, of
 /// two, of 96 (the second console wave has no upper half), and of 32.

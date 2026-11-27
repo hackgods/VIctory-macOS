@@ -323,7 +323,9 @@ impl Lower<'_> {
     /// Each host wave stores its own in a group-shared dword of its own, and
     /// reads its console wave's two after a group barrier; a barrier before
     /// the store keeps it from overwriting what the other half has not read
-    /// of an earlier exchange. A console wave with no upper half (a group not
+    /// of an earlier exchange, unless the exchange has dwords of its own and
+    /// runs at most once ([`Lower::drop_barriers_of_exchanges_run_once`]).
+    /// A console wave with no upper half (a group not
     /// a multiple of 64) reads `missing` for it. Every lane of the group must
     /// run `at` together ([`in_step`]), in halves.
     pub(super) fn exchange_halves(&mut self, own: V, missing: V, at: usize) -> Result<(V, V), Why> {
@@ -336,7 +338,23 @@ impl Lower<'_> {
         }
         let i32t = self.s.t.i32;
         let f = self.relabelled_flat();
+        // Dwords of the exchange's own while they fit beside the shared ones
+        // and the rendezvous' (`lower::meet`, laid out before any exchange):
+        // an exchange the group runs at most once then needs no barrier
+        // before its store, as no earlier exchange's reads can still be at
+        // its dwords ([`Lower::drop_barriers_of_exchanges_run_once`]).
+        let meet_words = group.div_ceil(64) * 2 * (self.meet_layout.stride + 1);
+        let own_words = super::super::own_exchange_words()
+            && self.s.lds_dwords + meet_words + 2 * dwords + self.own_exchange_dwords
+                <= GROUP_SHARED_DWORDS
+            && self.own_exchange_dwords + dwords <= OWN_EXCHANGE_DWORDS;
         let words = match self.half_words {
+            _ if own_words => {
+                let arr = self.s.m.array(dwords, i32t);
+                let name = format!("half_words_{}", self.own_exchanges.len());
+                self.own_exchange_dwords += dwords;
+                self.s.m.global(&name, arr, 3)
+            }
             Some(g) => g,
             None => {
                 let arr = self.s.m.array(dwords, i32t);
@@ -357,9 +375,12 @@ impl Lower<'_> {
             // Group sync with a group-shared memory fence.
             let mode = l.s.m.i32(1 | 8);
             let void = l.s.t.void;
-            l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+            l.s.op(at, "barrier", Attr::NoDuplicate, void, 80, &[mode])
         };
-        sync(self);
+        let before = sync(self);
+        if own_words {
+            self.own_exchanges.push((before, at));
+        }
         let mine = self.s.m.element(at, words, slot);
         self.s.m.store(at, mine, own);
         sync(self);
@@ -374,6 +395,23 @@ impl Lower<'_> {
             hi = self.s.m.select(at, there, hi, missing);
         }
         Ok((lo, hi))
+    }
+
+    /// Once the program is lowered, takes out the barrier before the store
+    /// of each exchange with dwords of its own ([`Lower::exchange_halves`])
+    /// in a block on no cycle of the control flow: the group runs it at most
+    /// once, so its dwords hold nothing an earlier read still wants. The
+    /// barrier after the store stays, ordering it before the reads.
+    pub(super) fn drop_barriers_of_exchanges_run_once(&mut self) {
+        if self.own_exchanges.is_empty() {
+            return;
+        }
+        let cyclic = self.s.m.blocks_on_cycles();
+        for &(before, block) in &self.own_exchanges {
+            if !cyclic[block] {
+                self.s.m.drop_call(before);
+            }
+        }
     }
 
     /// `v_readlane_b32` of `x` at console lane `lane` (the low 6 bits), in
@@ -639,6 +677,10 @@ pub(super) const MASK_ACROSS: Why = "a lane mask read as data (wave64 on a 32-la
 /// The group-shared dwords a D3D12 compute program may declare, at most
 /// (32 KiB).
 const GROUP_SHARED_DWORDS: u32 = 8192;
+
+/// At most this many group-shared dwords go to exchanges' own dwords
+/// ([`Lower::exchange_halves`]): 4 KiB, beside what the program declares.
+const OWN_EXCHANGE_DWORDS: u32 = 1024;
 
 /// Why a first-lane read stops in halves: the console's first lane may be
 /// in the other half, and the value is not known to be the same there.

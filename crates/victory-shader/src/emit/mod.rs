@@ -518,6 +518,46 @@ fn cap_barriers_from(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
+/// Whether an exchange between the 32-lane halves of a console wave that
+/// runs at most once takes group-shared dwords of its own and leaves out
+/// the group barrier before its store (`lower::halves`). On by default;
+/// `VICTORY_HALVES_OWN_WORDS=0` keeps that barrier. Tests run with it on
+/// unless they turn it off ([`with_own_exchange_words`]).
+pub fn own_exchange_words() -> bool {
+    #[cfg(test)]
+    {
+        OWN_EXCHANGE_WORDS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| {
+            own_exchange_words_from(std::env::var("VICTORY_HALVES_OWN_WORDS").ok().as_deref())
+        })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static OWN_EXCHANGE_WORDS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `f` with [`own_exchange_words`] answering `on` on this thread.
+#[cfg(test)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn with_own_exchange_words<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let before = OWN_EXCHANGE_WORDS.with(|c| c.replace(on));
+    let r = f();
+    OWN_EXCHANGE_WORDS.with(|c| c.set(before));
+    r
+}
+
+/// `VICTORY_HALVES_OWN_WORDS`'s value as a switch: only `0` turns it off.
+#[cfg_attr(test, allow(dead_code))]
+fn own_exchange_words_from(value: Option<&str>) -> bool {
+    value != Some("0")
+}
+
 /// How a translation is made.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Options {
@@ -1267,6 +1307,14 @@ mod tests {
         assert!(!super::cap_barriers_from(Some("0")));
         assert!(!super::cap_barriers_from(Some("")));
         assert!(super::cap_barriers_from(Some("1")));
+    }
+
+    /// Exchanges' own words are on unless the switch says `0`.
+    #[test]
+    fn own_exchange_words_are_opt_out() {
+        assert!(super::own_exchange_words_from(None));
+        assert!(super::own_exchange_words_from(Some("1")));
+        assert!(!super::own_exchange_words_from(Some("0")));
     }
 
     use super::bitcode::Attr;

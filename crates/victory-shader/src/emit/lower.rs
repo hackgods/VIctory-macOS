@@ -411,6 +411,11 @@ struct Lower<'a> {
     /// In halves: the group-shared dwords values pass between the halves
     /// through, once made ([`Lower::exchange_halves`]).
     half_words: Option<V>,
+    /// In halves: the exchanges with group-shared dwords of their own, by
+    /// the barrier before their store and the block they are in, and the
+    /// dwords they take ([`Lower::exchange_halves`]).
+    own_exchanges: Vec<(V, usize)>,
+    own_exchange_dwords: u32,
     /// In halves, a group of more than one host wave: the divergent
     /// regions where the halves can meet (`lower::meet`).
     meet: Option<meet::Meet>,
@@ -939,6 +944,8 @@ impl<'a> Lower<'a> {
             group_scalars,
             cap_escaped,
             half_words: None,
+            own_exchanges: Vec::new(),
+            own_exchange_dwords: 0,
             meet,
             meet_plan,
             meet_found,
@@ -1691,6 +1698,7 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        self.drop_barriers_of_exchanges_run_once();
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();

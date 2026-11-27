@@ -1220,6 +1220,11 @@ impl HostHeap {
             if later {
                 // Made once a shader reads it (`crate::shadow::take_reads`).
                 crate::shadow::forget_read(index);
+                // mac: `VICTORY_FLICKER_WATCH=1`: why it is null when read.
+                if crate::flicker::on() {
+                    let shown = self.kept.get(index as usize, |held| held.is_some());
+                    crate::flicker::nulled(index, if shown { crate::flicker::Why::Shown } else { crate::flicker::Why::Fresh });
+                }
             }
             made.set(index, key);
             super::slots::made();
@@ -1311,6 +1316,7 @@ impl HostHeap {
             if index < self.count {
                 self.viewed.set(index, view.as_deref(), false);
                 crate::shadow::forget_read(index);
+                crate::flicker::nulled(index, crate::flicker::Why::GivenUp);
                 if view.as_deref().is_some_and(is_unordered_texture) {
                     self.nulled_unordered.lock().unwrap_or_else(|e| e.into_inner()).push(index);
                 }

@@ -2281,6 +2281,12 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        // mac: `VICTORY_FLICKER_WATCH=1`: lists whose indirect records ran
+        // past the budget.
+        if crate::flicker::on() {
+            let words: Vec<u32> = runs.iter().filter_map(|l| l.budget_word()).collect();
+            crate::flicker::log_budgets(crate::queue::presented(), &words);
+        }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -3705,6 +3711,19 @@ impl HostList {
     /// The list's indirect executions charge its own budget (again).
     pub(crate) fn own_budget(&self) {
         *self.budget_from.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// mac: the list's own budget word as it is now, if this recording
+    /// zeroed and charged it (not one it shares with the list before it,
+    /// which reads that one): read once the list has run
+    /// (`VICTORY_FLICKER_WATCH`).
+    fn budget_word(&self) -> Option<u32> {
+        if self.budget_from.lock().unwrap_or_else(|e| e.into_inner()).is_some() || !self.deferred().budget_zeroed {
+            return None;
+        }
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: a mapped word of a live buffer; the list has run.
+        Some(unsafe { (*data as *const u32).read_volatile() })
     }
 
     /// The work charged so far to the budget the list's indirect executions

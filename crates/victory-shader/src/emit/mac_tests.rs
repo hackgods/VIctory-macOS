@@ -136,6 +136,7 @@ const EARLY: Mac = Mac {
     lds_rounds: false,
     descriptor_as_data: false,
     whole_wave: false,
+    whole_wave_no_lds: false,
 };
 
 /// The rule by itself: bit 12, and nothing that D3D's flag would change.
@@ -294,6 +295,7 @@ const WRITERS: Mac = Mac {
     lds_rounds: false,
     descriptor_as_data: false,
     whole_wave: false,
+    whole_wave_no_lds: false,
 };
 
 /// `image_atomic_<op> v[vdata..], v[vaddr:vaddr+1], s[srsrc:srsrc+7]` on a

@@ -139,7 +139,7 @@ pub(super) fn exact(input: &EmitInput<'_>, options: Options) -> Option<HostShade
         // either; the one that only finds the places to open (with them,
         // never kept) may, so that it gets to every place (the module
         // notes, "Whole-wave code").
-        let race = if options.halves_whole_wave {
+        let race = if options.halves_whole_wave && !options.halves_whole_wave_no_lds {
             local
         } else {
             options.halves_shared_lds

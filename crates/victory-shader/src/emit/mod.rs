@@ -629,6 +629,11 @@ pub struct Options {
     /// budgeting (`CS_RayBudgeting_Cull_RayBinning`) counts every lane's
     /// rays. Mac; the shader cache keys on it.
     pub halves_whole_wave: bool,
+    /// With [`Options::halves_whole_wave`]: leave out its LDS part (the
+    /// walk opening the code round unsynced one-wave LDS for barriers), as
+    /// before it came (`VICTORY_HALVES_WHOLE_WAVE_LDS` lists the programs
+    /// that keep it; mac, `notes/far-ray.md`). The shader cache keys on it.
+    pub halves_whole_wave_no_lds: bool,
 }
 
 /// Metal's limit on a mesh shader's outputs per thread group, in bytes
@@ -1120,6 +1125,7 @@ fn emit_form(
             descriptor_as_data: options.descriptor_as_data,
             lds_rounds: options.lds_rounds,
             whole_wave: options.halves_whole_wave,
+            whole_wave_no_lds: options.halves_whole_wave_no_lds,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

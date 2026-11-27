@@ -431,6 +431,16 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And that switch without its LDS part (`VICTORY_HALVES_WHOLE_WAVE_LDS`);
+    // off, it adds nothing.
+    let key = if options.halves_whole_wave_no_lds {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"halves whole wave no lds");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     // And the form for dispatches counted in threads (the BVH builder's,
     // `VICTORY_BVH_BUILDER=1`); off, it adds nothing.
     let key = if options.thread_counts {
@@ -506,6 +516,8 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         lds_rounds: crate::mac_switches::lds_rounds(),
         descriptor_as_data: descriptor_as_data(),
         halves_whole_wave: crate::mac_switches::whole_wave(),
+        // Per program (`host_shader_with`, `VICTORY_HALVES_WHOLE_WAVE_LDS`).
+        halves_whole_wave_no_lds: false,
         // Only for the BVH builder's pipelines, which ask for it
         // (`crate::pipeline::builder`).
         thread_counts: false,
@@ -527,6 +539,9 @@ pub(crate) fn host_shader_with(
     let mut options = options;
     // One program at a time, if the switch lists hashes (mac).
     options.uav_size_level0 = crate::mac_switches::uav_size_level0_for(container);
+    // The whole-wave switch's LDS part, if a list leaves this program out.
+    options.halves_whole_wave_no_lds =
+        options.halves_whole_wave && !crate::mac_switches::whole_wave_lds_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = translation_build(options);
@@ -867,6 +882,16 @@ mod tests {
         let on = victory_shader::emit::Options { halves_whole_wave: true, ..off };
         assert_ne!(translation_build(off), translation_build(on));
         assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { halves_whole_wave: false, ..off }));
+    }
+
+    /// The whole-wave switch without its LDS part is another translation,
+    /// so the cache keys on it; off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_halves_whole_wave_no_lds() {
+        let on = victory_shader::emit::Options { halves_whole_wave: true, ..Default::default() };
+        let no_lds = victory_shader::emit::Options { halves_whole_wave_no_lds: true, ..on };
+        assert_ne!(translation_build(on), translation_build(no_lds));
+        assert_eq!(translation_build(on), translation_build(victory_shader::emit::Options { halves_whole_wave_no_lds: false, ..on }));
     }
 
     /// The form for dispatches counted in threads (`Options::thread_counts`)

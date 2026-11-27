@@ -149,6 +149,9 @@ pub(crate) struct Mac {
     /// ([`super::exchange`], `emit::Options::halves_whole_wave`; the walk's
     /// part is `emit::walk`).
     pub whole_wave: bool,
+    /// With [`Mac::whole_wave`]: not its LDS part
+    /// (`emit::Options::halves_whole_wave_no_lds`).
+    pub whole_wave_no_lds: bool,
     /// In halves, a read across them in a block every lane runs once is
     /// handed over through group-shared memory, exact across the halves
     /// ([`super::exchange`], `emit::Options::halves_exchange`). Also: a

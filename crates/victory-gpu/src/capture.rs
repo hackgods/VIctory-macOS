@@ -1,7 +1,9 @@
 //! Presented frames written to PNG files, to see what reaches the screen:
 //! with `VICTORY_CAPTURE=<folder>`, every frame whose number is a power of
 //! two (the frames the log reports) is saved as `frame-<n>.png`, at half
-//! size. Only in builds with diagnostics.
+//! size. `VICTORY_CAPTURE_EVERY=<n>` adds every n-th frame from the world's
+//! first on, small, and keeps `latest.png` the newest of them (see
+//! [`every`]). Only in builds with diagnostics.
 
 use std::path::PathBuf;
 
@@ -51,33 +53,249 @@ pub(crate) fn presented(n: u64) {
     static LAST: AtomicU64 = AtomicU64::new(0);
     let drawn = crate::draw::drawn();
     let draws = drawn - LAST.swap(drawn, Relaxed).min(drawn);
-    if draws >= 500 && WORLD.get().is_none() && !world_offsets().is_empty() {
+    if draws >= 500 && WORLD.get().is_none() && (!world_offsets().is_empty() || every().is_some()) {
         let _ = WORLD.set(n);
-        tracing::info!(frame = n, draws, "the world's first frame (VICTORY_CAPTURE_WORLD counts from it)");
+        tracing::info!(
+            frame = n,
+            draws,
+            "the world's first frame (VICTORY_CAPTURE_WORLD and VICTORY_CAPTURE_EVERY count from it)"
+        );
     }
+}
+
+/// `VICTORY_CAPTURE_EVERY=<n>`: with `VICTORY_CAPTURE`, every `n`-th frame
+/// from the world's first on (the first that ran 500 draws, as
+/// `VICTORY_CAPTURE_WORLD` counts; `1` for every frame) is saved too, at
+/// most `VICTORY_CAPTURE_WIDTH` pixels wide (see [`small_width`]), as
+/// `every/frame-<n>.png` with `<n>` zero-padded to 8 digits, so the names
+/// sort in frame order for a clip (`ffmpeg -pattern_type glob -i
+/// 'every/frame-*.png'`); `every/times.txt` gets a line per frame, its
+/// number and when it was presented (seconds since the world's first
+/// frame, to play a clip at its true speed). Each of them also replaces
+/// `latest.png` (written as `latest.png.tmp` and renamed over it, so a
+/// watcher never reads half a picture). They are not listed frames: no
+/// draws traced, nothing dumped.
+fn every() -> Option<u64> {
+    static EVERY: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        let every = std::env::var("VICTORY_CAPTURE_EVERY").ok()?;
+        every.trim().parse().ok().filter(|&n| n > 0)
+    })
+}
+
+/// `VICTORY_CAPTURE_WIDTH=<px>`: how wide `VICTORY_CAPTURE_EVERY`'s frames
+/// are at most (640 by default): every `k`-th pixel of every `k`-th row,
+/// `k` the smallest whole step that fits (`1280` keeps a 1280x720 picture
+/// whole).
+fn small_width() -> u32 {
+    static WIDTH: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let width = std::env::var("VICTORY_CAPTURE_WIDTH").unwrap_or_default();
+        width.trim().parse().ok().filter(|&w| w > 0).unwrap_or(640)
+    })
+}
+
+/// The step [`sample`] takes for a picture `width` wide to be at most
+/// `most` wide.
+fn step(width: u32, most: u32) -> u32 {
+    width.div_ceil(most.max(1)).max(1)
+}
+
+/// Whether frame `n` is one of `VICTORY_CAPTURE_EVERY`'s.
+fn periodic(n: u64) -> bool {
+    every()
+        .zip(WORLD.get().copied())
+        .is_some_and(|(every, world)| nth(n, world, every))
+}
+
+/// Whether frame `n` is `world`, or a multiple of `every` frames after it.
+fn nth(n: u64, world: u64, every: u64) -> bool {
+    n >= world && (n - world).is_multiple_of(every)
 }
 
 /// Whether frame `n` is saved.
 pub(crate) fn wanted(n: u64) -> bool {
-    folder().is_some() && (n.is_power_of_two() || listed(n))
+    folder().is_some() && (n.is_power_of_two() || listed(n) || periodic(n))
 }
 
-/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
+/// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`: at
+/// half size as `frame-<n>.png` (a power of two or a listed frame), and as
+/// one of `VICTORY_CAPTURE_EVERY`'s (see [`every`]).
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    if n.is_power_of_two() || listed(n) {
+        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+    }
+    if periodic(n)
+        && let Some(folder) = folder()
+    {
+        // The world's first frame is the first of them.
+        static FIRST: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let started = std::time::Instant::now();
+        let at = started.duration_since(*FIRST.get_or_init(|| started));
+        let image = Image {
+            width,
+            height,
+            pitch,
+            bgra,
+            rows,
+        };
+        let (width, height, raw) = sample(&image, step(width, small_width()));
+        let small = Small {
+            frame: n,
+            at,
+            width,
+            height,
+            raw,
+            sampled: started.elapsed(),
+        };
+        write_later(folder, small);
+    }
+}
+
+/// 8-bit RGBA or BGRA rows, `pitch` bytes apart.
+#[derive(Clone, Copy)]
+struct Image<'a> {
+    width: u32,
+    height: u32,
+    pitch: usize,
+    bgra: bool,
+    rows: &'a [u8],
+}
+
+/// A `VICTORY_CAPTURE_EVERY` frame, sampled (see [`sample`]), to compress
+/// and write.
+struct Small {
+    frame: u64,
+    /// When it was presented, since the world's first frame.
+    at: std::time::Duration,
+    width: u32,
+    height: u32,
+    raw: Vec<u8>,
+    /// How long the present took to sample it.
+    sampled: std::time::Duration,
+}
+
+/// Compresses and writes `small` to `folder` (the same each time) on a
+/// thread of its own, so the present waits only for the sampling. Under
+/// Wine (`periodic_capture_cost`), a 640x360 frame takes the present under
+/// 1 ms and the writer 11-16 ms; a 1280x720 one 2 ms and 35-40 ms. Frames
+/// are written in order, none dropped; with four waiting, the present
+/// waits for the writer.
+fn write_later(folder: &'static std::path::Path, small: Small) {
+    type Writer = std::sync::Mutex<std::sync::mpsc::SyncSender<Small>>;
+    static WRITER: std::sync::OnceLock<Option<Writer>> = std::sync::OnceLock::new();
+    let writer = WRITER.get_or_init(|| {
+        let (send, frames) = std::sync::mpsc::sync_channel::<Small>(4);
+        std::thread::Builder::new()
+            .name("victory-capture".into())
+            .spawn(move || {
+                for small in frames {
+                    write_small(folder, &small);
+                }
+            })
+            .map_err(
+                |e| tracing::warn!(error = %e, "no capture thread: frames written at the present"),
+            )
+            .ok()
+            .map(|_| std::sync::Mutex::new(send))
+    });
+    match writer {
+        Some(send) => {
+            let send = send.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(std::sync::mpsc::SendError(small)) = send.send(small) {
+                write_small(folder, &small);
+            }
+        }
+        None => write_small(folder, &small),
+    }
+}
+
+/// Compresses `small` and writes it to `folder` (see [`every`]), and logs it.
+fn write_small(folder: &std::path::Path, small: &Small) {
+    let started = std::time::Instant::now();
+    let png = encode(small.width, small.height, &small.raw, SMALL_LEVEL);
+    match write_frame(folder, small.frame, small.at, &png) {
+        Ok(()) => tracing::info!(
+            frame = small.frame,
+            at = small.at.as_secs_f64(),
+            bytes = png.len(),
+            sampled_us = small.sampled.as_micros() as u64,
+            written_us = started.elapsed().as_micros() as u64,
+            "frame saved, and as latest.png (VICTORY_CAPTURE_EVERY)"
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, frame = small.frame, "frame not saved (VICTORY_CAPTURE_EVERY)")
+        }
+    }
+}
+
+/// How hard `VICTORY_CAPTURE_EVERY`'s frames are compressed (miniz levels,
+/// 1 fastest): level 1, which under Wine compresses them 2.5 to 3.5 times
+/// as fast as level 3, for files 4-8% larger.
+const SMALL_LEVEL: u8 = 1;
+
+/// Writes `png`, frame `frame` presented `at`, as `every/frame-<n>.png`
+/// in `folder`, notes it in `every/times.txt`, and replaces `latest.png`
+/// with it all at once for a watcher (written as `latest.png.tmp`, then
+/// renamed over it).
+fn write_frame(
+    folder: &std::path::Path,
+    frame: u64,
+    at: std::time::Duration,
+    png: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let every = folder.join("every");
+    std::fs::create_dir_all(&every)?;
+    std::fs::write(every.join(format!("frame-{frame:08}.png")), png)?;
+    let temp = folder.join("latest.png.tmp");
+    std::fs::write(&temp, png)?;
+    std::fs::rename(&temp, folder.join("latest.png"))?;
+    let mut times = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(every.join("times.txt"))?;
+    writeln!(times, "{frame} {:.3}", at.as_secs_f64())
 }
 
 /// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
 fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     let Some(folder) = folder() else { return };
-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
+    let image = Image {
+        width,
+        height,
+        pitch,
+        bgra,
+        rows,
+    };
+    let (w, h, raw) = sample(&image, 2);
+    let png = encode(w, h, &raw, 3);
+    let path = folder.join(format!("{name}.png"));
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
+        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+    }
+}
+
+/// Every `step`-th pixel of every `step`-th row of `image`, as the rows of
+/// an RGB PNG (each after its filter byte, 0), and their width and height.
+fn sample(image: &Image, step: u32) -> (u32, u32, Vec<u8>) {
+    let Image {
+        width,
+        height,
+        pitch,
+        bgra,
+        rows,
+    } = *image;
+    let (w, h) = ((width / step).max(1), (height / step).max(1));
+    let step = step as usize;
     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
     for y in 0..h as usize {
         raw.push(0);
-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
+        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
         for x in 0..w as usize {
-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
+            let p = &row[(step * x).min(width as usize - 1) * 4..][..3];
             if bgra {
                 raw.extend([p[2], p[1], p[0]]);
             } else {
@@ -85,23 +303,25 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
             }
         }
     }
+    (w, h, raw)
+}
+
+/// An RGB PNG of `width` x `height` from [`sample`]'s rows, compressed at
+/// miniz `level`.
+fn encode(width: u32, height: u32, raw: &[u8], level: u8) -> Vec<u8> {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
-    header.extend(w.to_be_bytes());
-    header.extend(h.to_be_bytes());
+    header.extend(width.to_be_bytes());
+    header.extend(height.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
     chunk(
         &mut png,
         b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
+        &miniz_oxide::deflate::compress_to_vec_zlib(raw, level),
     );
     chunk(&mut png, b"IEND", &[]);
-    let path = folder.join(format!("{name}.png"));
-    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
-        Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
-        Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
-    }
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -113,13 +333,27 @@ fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
     png.extend(crc.to_be_bytes());
 }
 
+/// A byte at a time from a table rather than bit by bit: a
+/// 1280x720 frame's few megabytes are checked while the title runs.
 fn crc32(bytes: &[u8]) -> u32 {
+    const TABLE: [u32; 256] = {
+        let mut table = [0; 256];
+        let mut i = 0;
+        while i < 256 {
+            let mut crc = i as u32;
+            let mut bit = 0;
+            while bit < 8 {
+                crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+                bit += 1;
+            }
+            table[i] = crc;
+            i += 1;
+        }
+        table
+    };
     let mut crc = !0u32;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
-        }
+        crc = TABLE[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
     }
     !crc
 }
@@ -999,6 +1233,301 @@ mod tests {
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);
+        assert_eq!(super::crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(super::crc32(b""), 0);
+    }
+
+    #[test]
+    fn every_nth_frame_counts_from_the_worlds_first() {
+        use super::nth;
+
+        assert!(nth(1617, 1617, 3), "the world's first frame itself");
+        assert!(!nth(1616, 1617, 3), "nothing before it");
+        assert!(!nth(1, 1617, 1));
+        assert!(!nth(1618, 1617, 3) && !nth(1619, 1617, 3));
+        assert!(nth(1620, 1617, 3) && nth(1617 + 300, 1617, 3));
+        assert!((1617..1700).all(|n| nth(n, 1617, 1)));
+    }
+
+    /// A synthetic `width` x `height` BGRA picture: a gradient with some
+    /// noise in it, like a rendered frame (`noise` 255: noise only).
+    fn picture(width: u32, height: u32, noise: u8) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let mut rows = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in 0..height {
+            for x in 0..width {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                let n = (seed as u8) & noise;
+                let b = ((x * 255 / width) as u8).wrapping_add(n);
+                let g = ((y * 255 / height) as u8).wrapping_add(n);
+                rows.extend([b, g, (x ^ y) as u8 & 0x3f, 255]);
+            }
+        }
+        rows
+    }
+
+    /// A PNG's width, height and RGB pixel rows (each after its filter byte).
+    fn decoded(png: &[u8]) -> (u32, u32, Vec<u8>) {
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let width = u32::from_be_bytes(png[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(png[20..24].try_into().unwrap());
+        let len = u32::from_be_bytes(png[33..37].try_into().unwrap()) as usize;
+        assert_eq!(&png[37..41], b"IDAT");
+        let raw = miniz_oxide::inflate::decompress_to_vec_zlib(&png[41..41 + len]).unwrap();
+        assert_eq!(raw.len(), (width as usize * 3 + 1) * height as usize);
+        (width, height, raw)
+    }
+
+    /// `image` sampled as a `VICTORY_CAPTURE_EVERY` frame at most `most`
+    /// wide is, presented `at` seconds after the world's first.
+    fn small(frame: u64, at: f64, image: &super::Image, most: u32) -> super::Small {
+        let (width, height, raw) = super::sample(image, super::step(image.width, most));
+        super::Small {
+            frame,
+            at: std::time::Duration::from_secs_f64(at),
+            width,
+            height,
+            raw,
+            sampled: std::time::Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn periodic_frames_are_small_numbered_and_replace_latest_png() {
+        use super::{Image, write_small};
+
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("frames");
+        // Wider pictures are sampled more sparsely, to stay within the
+        // width asked for (640 by default).
+        let sizes = [
+            (1280, 720, 640, (640, 360)),
+            (1366, 768, 640, (455, 256)),
+            (320, 200, 640, (320, 200)),
+            (1280, 720, 1280, (1280, 720)),
+            (1920, 1080, 1280, (960, 540)),
+        ];
+        // A 4K picture: every 6th pixel for 640, every 3rd for 1280.
+        assert_eq!((super::step(3840, 640), super::step(3840, 1280)), (6, 3));
+        assert_eq!(
+            super::step(1280, 0),
+            1280,
+            "a width of 0 is not a step of 0"
+        );
+        let mut times = String::new();
+        for (i, (width, height, most, size)) in sizes.into_iter().enumerate() {
+            let rows = picture(width, height, 7);
+            let image = Image {
+                width,
+                height,
+                pitch: width as usize * 4,
+                bgra: true,
+                rows: &rows,
+            };
+            let frame = 1617 + i as u64;
+            write_small(&folder, &small(frame, i as f64 * 0.35, &image, most));
+            let latest = std::fs::read(folder.join("latest.png")).unwrap();
+            let numbered = folder.join(format!("every/frame-0000{frame}.png"));
+            assert_eq!(std::fs::read(numbered).unwrap(), latest);
+            assert!(
+                !folder.join("latest.png.tmp").exists(),
+                "renamed into place"
+            );
+            let (w, h, raw) = decoded(&latest);
+            assert_eq!((w, h), size, "{width}x{height} within {most}");
+            // Pixel (1, 1) of the small picture is (step, step) of the
+            // picture, red and blue swapped back from BGRA.
+            let step = width.div_ceil(most) as usize;
+            let at = (step * width as usize + step) * 4;
+            let row = w as usize * 3 + 1;
+            assert_eq!(
+                raw[row + 1 + 3..][..3],
+                [rows[at + 2], rows[at + 1], rows[at]]
+            );
+            times += &format!("{frame} {:.3}\n", i as f64 * 0.35);
+        }
+        assert_eq!(
+            std::fs::read_to_string(folder.join("every/times.txt")).unwrap(),
+            times
+        );
+        assert_eq!(times.lines().nth(3), Some("1620 1.050"));
+    }
+
+    /// The writer thread writes frames in order, so `latest.png` ends up
+    /// the newest, and their names sort in frame order.
+    #[test]
+    fn the_writer_thread_keeps_frame_order() {
+        use super::{Image, write_later};
+
+        let dir = tempfile::tempdir().unwrap();
+        let folder: &'static std::path::Path =
+            Box::leak(dir.path().join("frames").into_boxed_path());
+        let frames = [8, 9, 10, 99, 100, 1000];
+        for (i, frame) in frames.into_iter().enumerate() {
+            let width = 16 * (i as u32 + 1);
+            let rows = picture(width, 8, 0);
+            let image = Image {
+                width,
+                height: 8,
+                pitch: width as usize * 4,
+                bgra: false,
+                rows: &rows,
+            };
+            write_later(folder, small(frame, i as f64, &image, 640));
+        }
+        let times = folder.join("every/times.txt");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while std::fs::read_to_string(&times).map_or(0, |t| t.lines().count()) < frames.len()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let times = std::fs::read_to_string(times).unwrap();
+        assert_eq!(
+            times,
+            "8 0.000\n9 1.000\n10 2.000\n99 3.000\n100 4.000\n1000 5.000\n"
+        );
+        // Sorted as a glob sorts them: by name.
+        let mut names: Vec<_> = std::fs::read_dir(folder.join("every"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".png"))
+            .collect();
+        names.sort();
+        let expected: Vec<_> = frames.iter().map(|f| format!("frame-{f:08}.png")).collect();
+        assert_eq!(names, expected);
+        let latest = std::fs::read(folder.join("latest.png")).unwrap();
+        assert_eq!(
+            latest,
+            std::fs::read(folder.join("every/frame-00001000.png")).unwrap()
+        );
+        assert_eq!(decoded(&latest).0, 96);
+    }
+
+    /// What one `VICTORY_CAPTURE_EVERY` frame costs on the host GPU and the
+    /// CPU, for a 1280x720 picture (what Series X 1.0.2.1 presents here),
+    /// kept 640 and 1280 wide: `cargo test --release --features diagnostics
+    /// -- --ignored --nocapture periodic_capture_cost` under Wine.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn periodic_capture_cost() {
+        use std::time::Instant;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+
+        use super::{Image, encode, sample, write_frame};
+        use crate::backend::HostGpu;
+        use crate::host::transition;
+
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let (width, height) = (1280, 720);
+        let texture = crate::composite::result_texture(
+            &host.device,
+            width.into(),
+            height,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        )
+        .unwrap();
+        let to_copy = transition(
+            &texture,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        let back = transition(
+            &texture,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1e3;
+        let dir = tempfile::tempdir().unwrap();
+        // A picture like a rendered frame: `noise` 3 compresses about as
+        // much as the world does (its 640x360 frames are ~300 KB at level 3).
+        let rows = picture(width, height, 3);
+        let picture = Image {
+            width,
+            height,
+            pitch: width as usize * 4,
+            bgra: false,
+            rows: &rows,
+        };
+        let mut frame = 0;
+        for _ in 0..6 {
+            // A present's copy list without the capture, then with it.
+            let list = host.new_list().unwrap();
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(&[to_copy.clone(), back.clone()]) };
+            list.close();
+            let t = Instant::now();
+            host.execute(&[&list]);
+            let plain = ms(t);
+
+            let list = host.new_list().unwrap();
+            let t = Instant::now();
+            // SAFETY: an open list and a live texture.
+            unsafe { list.list.ResourceBarrier(std::slice::from_ref(&to_copy)) };
+            let (buffer, footprint) = super::read_back(&host.device, &list.list, &texture).unwrap();
+            // SAFETY: as above.
+            unsafe { list.list.ResourceBarrier(std::slice::from_ref(&back)) };
+            let record = ms(t);
+            list.close();
+            let t = Instant::now();
+            host.execute(&[&list]);
+            let copied = ms(t);
+            eprintln!(
+                "present: submission {plain:.2} ms without the capture, {copied:.2} ms with it; \
+                 readback buffer and copy recorded {record:.2} ms"
+            );
+
+            for most in [640, 1280] {
+                let step = super::step(width, most);
+                // The present's part: map the copy and sample it.
+                let t = Instant::now();
+                let f = footprint.Footprint;
+                let mut data = std::ptr::null_mut();
+                // SAFETY: the copy ran; the mapping spans the footprint's rows.
+                let (w, _, _) = unsafe {
+                    buffer.Map(0, None, Some(&mut data)).unwrap();
+                    let len = f.RowPitch as usize * f.Height as usize;
+                    let image = Image {
+                        width: f.Width,
+                        height: f.Height,
+                        pitch: f.RowPitch as usize,
+                        bgra: false,
+                        rows: std::slice::from_raw_parts(data.cast::<u8>(), len),
+                    };
+                    let sampled = sample(&image, step);
+                    buffer.Unmap(0, None);
+                    sampled
+                };
+                let mapped = ms(t);
+                assert_eq!(w, most);
+
+                // The writer thread's part, for a picture like a frame (the
+                // copy holds zeros, which compress at once).
+                let (w, h, raw) = sample(&picture, step);
+                for level in [1, 3] {
+                    let t = Instant::now();
+                    let png = encode(w, h, &raw, level);
+                    let encoded = ms(t);
+                    let t = Instant::now();
+                    std::hint::black_box(super::crc32(std::hint::black_box(&png)));
+                    let crc = ms(t);
+                    let t = Instant::now();
+                    frame += 1;
+                    write_frame(dir.path(), frame, std::time::Duration::ZERO, &png).unwrap();
+                    let written = ms(t);
+                    eprintln!(
+                        "  {w}x{h}: present maps and samples {mapped:.2} ms; writer at level {level}: \
+                         encode {encoded:.2} ms (of it the CRC about {crc:.2}), write {written:.2} ms, {} KB",
+                        png.len() / 1024
+                    );
+                }
+            }
+        }
     }
 
     /// R16G16B16A16_UNORM is integers, not half floats; 89 is 10:10:10:2,

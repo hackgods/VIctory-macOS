@@ -265,6 +265,9 @@ struct Guards {
     /// with no question to the runtime (whose lock its page mappings hold
     /// for long).
     alias_of: BTreeMap<usize, Vec<usize>>,
+    /// Pages written in frame after frame, left open by takes
+    /// (`VICTORY_HOT_PAGES`, [`crate::hot_pages`]).
+    hot: crate::hot_pages::Hot,
     /// From 64bitMango 131721b7 (`VICTORY_VETTED_PAGES=1`): pages found to be
     /// the runtime's GPU memory when they were last guarded, with the page
     /// their region was known to end before: guarded again after a write
@@ -283,6 +286,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     holders: BTreeMap::new(),
     busy: Vec::new(),
     alias_of: BTreeMap::new(),
+    hot: crate::hot_pages::Hot::new(),
     vetted: BTreeMap::new(),
     #[cfg(feature = "diagnostics")]
     written: BTreeSet::new(),
@@ -297,10 +301,13 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
 static TIMES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Whether pages guarded before are guarded again without asking what memory
-/// they are (`VICTORY_VETTED_PAGES=1`, from 64bitMango 131721b7; off by default).
+/// they are (`VICTORY_VETTED_PAGES`, from 64bitMango 131721b7; on by default, `0` turns it off).
 fn vetted_pages() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_VETTED_PAGES"))
+    // mac: on unless `VICTORY_VETTED_PAGES=0`. Prison cell, 24 GB M5 Pro,
+    // with VICTORY_OPENED_FAULTS: copies 84 -> 74 ms, guard lock waits
+    // 84 -> 71 ms a frame (1,800 pages a frame guarded again unasked).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VETTED_PAGES").is_none_or(|v| crate::switch::value_is_on(Some(&v))))
 }
 
 /// mac: since the last frame line, the exceptions the write-fault handler
@@ -341,7 +348,9 @@ static OPENED_BLOCKS: [AtomicU64; 1 << 12] = [const { AtomicU64::new(0) }; 1 << 
 /// Whether faults on blocks found open skip the lock (`VICTORY_OPENED_FAULTS`).
 fn opened_faults() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_OPENED_FAULTS"))
+    // mac: on unless `VICTORY_OPENED_FAULTS=0` (245 faults a frame in the
+    // prison cell return without the lock; waits in faults 23 -> 16 ms).
+    *ON.get_or_init(|| std::env::var_os("VICTORY_OPENED_FAULTS").is_none_or(|v| crate::switch::value_is_on(Some(&v))))
 }
 
 fn opened_slot(page: usize) -> &'static AtomicU64 {
@@ -890,6 +899,9 @@ impl Tracked {
         let mut changed = self.changed.0.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "diagnostics")]
         drop(waited);
+        // Hot pages (`VICTORY_HOT_PAGES`) are copied, not guarded: they stay
+        // open and changed, as partial pages do.
+        whole.retain(|&p| !left_open(&g, p));
         #[cfg(feature = "diagnostics")]
         let asked = Timed(std::time::Instant::now(), crate::copystat::C::AliasUs);
         let others = aliases(&g, &whole);
@@ -1267,6 +1279,29 @@ fn mark_changed(g: &mut Guards, first: usize, last: usize, save: bool) {
     }
 }
 
+/// Whether a take leaves page `page` open and changed instead of guarding
+/// it: it is hot ([`crate::hot_pages`]) and no host buffer copy holds it,
+/// since a buffer copy's copy-back needs the bytes its guard's fault saves.
+fn left_open(g: &Guards, page: usize) -> bool {
+    if !crate::hot_pages::enabled() || !g.hot.is_hot(page) {
+        return false;
+    }
+    let open = g.holders.get(&page).is_some_and(|holders| holders.iter().all(|c| !c.3));
+    #[cfg(feature = "diagnostics")]
+    if open {
+        crate::copystat::add(crate::copystat::C::HotKept, 1);
+    }
+    open
+}
+
+/// At each presented frame: moves the hot pages' streaks on a frame
+/// (`VICTORY_HOT_PAGES`).
+pub(crate) fn frame_presented() {
+    if crate::hot_pages::enabled() {
+        guards().hot.frame_done();
+    }
+}
+
 /// At each presented frame (diagnostics): counts the tracked pages written
 /// in it, and those written the frame before too.
 #[cfg(feature = "diagnostics")]
@@ -1500,6 +1535,9 @@ fn install() {
         let mut g = guards();
         IN_FAULT.with(|f| f.set(false));
         if changed(&mut g, at / PAGE, at / PAGE + 1, true) {
+            if crate::hot_pages::enabled() {
+                g.hot.written(at / PAGE);
+            }
             fault(0);
             // Every tracker holding it is marked: other threads' faults on
             // it need no lock.
@@ -1713,6 +1751,53 @@ pub(crate) mod tests {
         drop(t);
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn pages_written_every_frame_are_left_open_unless_a_buffer_copy_holds_them() {
+        use crate::hot_pages::{HOLD, STREAK};
+        crate::hot_pages::force_on_this_thread();
+        let p = pool(2);
+        let tex = track(p, 2 * PAGE, true).expect("pool memory is tracked");
+        let copy = track_copy(p + PAGE, PAGE, true).expect("tracked");
+        assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+        for _ in 0..STREAK {
+            // SAFETY: committed pages of ours; a guarded one faults and the
+            // handler opens it.
+            unsafe {
+                (p as *mut u8).write_volatile(1);
+                ((p + PAGE) as *mut u8).write_volatile(1);
+            }
+            assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+            assert_eq!(copy.take(p, p + 2 * PAGE), [(p + PAGE, p + 2 * PAGE)]);
+            frame_presented();
+        }
+        // The first page, held by the texture's tracker alone, is hot: left
+        // open and changed, so every take copies it. The second, which a
+        // buffer copy holds, is guarded as before.
+        assert!(writable(p), "hot page left open");
+        assert!(read_only(p + PAGE), "a buffer copy's page stays guarded");
+        assert!(tex.changed(p / PAGE) && !tex.changed(p / PAGE + 1));
+        assert!(copy.clean());
+        assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + PAGE)]);
+        assert_eq!(
+            tex.take(p, p + 2 * PAGE),
+            [(p, p + PAGE)],
+            "copied at every take"
+        );
+        // SAFETY: open, so no fault: the tracker has the page changed anyway.
+        unsafe { (p as *mut u8).write_volatile(2) };
+        assert!(tex.changed(p / PAGE));
+        // After the hold the page is guarded again by the next take.
+        for _ in 0..HOLD {
+            frame_presented();
+        }
+        assert_eq!(tex.take(p, p + 2 * PAGE), [(p, p + PAGE)]);
+        assert!(read_only(p), "guarded again after the hold");
+        assert!(tex.take(p, p + 2 * PAGE).is_empty());
+        drop((tex, copy));
+        free(p);
     }
 
     #[test]

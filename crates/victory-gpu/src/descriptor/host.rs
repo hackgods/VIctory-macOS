@@ -146,6 +146,29 @@ const DYNAMIC: u32 = 1 << 18;
 /// (a capped heap, NVIDIA): the title's slots keep their room first.
 const MIN_DYNAMIC: u32 = 1 << 16;
 
+/// From upstream #542 (Nick233x): whether heap syncs leave a made slot as
+/// it is when the title wrote bytes there that are no record of ours (zeros,
+/// or its own data between its descriptors): `VICTORY_STALE_LEFT=1`, off by
+/// default. In 64bitMango's fork most slots a sync made were such (32,000 of
+/// 47,000 a frame; heap syncs 35.4 -> 23.4 ms). Left, the slot keeps the view
+/// it had: a draw reading it through a table makes it null then
+/// ([`HostHeap::mirror`] finds no record of ours), and a title thread
+/// writing a view there makes it. A record of ours naming no view is still
+/// made null.
+/// shortcut: a shader that takes such a slot from the heap at an index from
+/// its data reads the view the slot had, not nothing.
+fn stale_left() -> bool {
+    #[cfg(test)]
+    {
+        false
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::switch::on("VICTORY_STALE_LEFT"))
+    }
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         Self::new_as(sampler, count, super::slots::mode().split)
@@ -911,7 +934,7 @@ impl HostHeap {
             };
             let [tag, view, generation] = record;
             if tag != VIEW_TAG {
-                if self.made_is_nonzero(i) {
+                if self.made_is_nonzero(i) && !stale_left() {
                     stale.push(i);
                 }
                 continue;

@@ -63,6 +63,9 @@ pub mod fence;
 #[cfg(any(windows, test))]
 mod flights;
 pub mod frame;
+// Plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod hot_pages;
 mod hold;
 #[cfg(windows)]
 mod host;

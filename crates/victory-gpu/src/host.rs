@@ -5183,6 +5183,8 @@ impl Meter {
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
         crate::memory::log_frame();
+        #[cfg(windows)]
+        crate::watch::frame_presented();
         #[cfg(feature = "diagnostics")]
         crate::watch::frame_done();
         let next = FrameWindow {

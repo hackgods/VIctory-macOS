@@ -24,6 +24,8 @@ pub(crate) mod pool;
 pub(crate) mod reports;
 #[cfg(any(windows, test))]
 pub(crate) mod slots;
+// mac: views named whole in their records (`VICTORY_VIEW_INLINE`).
+mod inline;
 
 const HEAP_IIDS: [Iid; 4] = [
     guid(
@@ -804,7 +806,8 @@ struct Views {
 
 /// Read by every view written and every slot a draw binds, on the
 /// title's threads at once; written when a view is first seen or its
-/// resource released.
+/// resource released. mac: taken through [`views_read`] and
+/// [`views_write`], which count the waits for it.
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
     index: std::collections::BTreeMap::new(),
@@ -812,6 +815,94 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     free: Vec::new(),
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+
+/// mac: since the last views line ([`log_views`]): waits for [`VIEWS`] that
+/// was not free, shared and alone, and their nanoseconds; new table
+/// entries; records written as entries and named whole
+/// (`VICTORY_VIEW_INLINE`). Always counted, so that both sides of an A/B
+/// show them: a free lock costs one try, as before.
+static VIEWS_METER: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+const READ_WAITS: usize = 0;
+const WRITE_WAITS: usize = 2;
+const NEW_ENTRIES: usize = 4;
+const AS_ENTRIES: usize = 5;
+const NAMED_WHOLE: usize = 6;
+
+fn meter(at: usize, n: u64) {
+    VIEWS_METER[at].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`VIEWS`] shared; a wait for it is counted.
+fn views_read() -> std::sync::RwLockReadGuard<'static, Views> {
+    use std::sync::TryLockError;
+    match VIEWS.try_read() {
+        Ok(views) => views,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let began = std::time::Instant::now();
+            let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+            meter(READ_WAITS, 1);
+            meter(READ_WAITS + 1, began.elapsed().as_nanos() as u64);
+            views
+        }
+    }
+}
+
+/// [`VIEWS`] alone; a wait for it is counted.
+fn views_write() -> std::sync::RwLockWriteGuard<'static, Views> {
+    use std::sync::TryLockError;
+    match VIEWS.try_write() {
+        Ok(views) => views,
+        Err(TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            let began = std::time::Instant::now();
+            let views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+            meter(WRITE_WAITS, 1);
+            meter(WRITE_WAITS + 1, began.elapsed().as_nanos() as u64);
+            views
+        }
+    }
+}
+
+/// mac: with the frame line (`frames` since the last one): the view table's
+/// size and growth, the records named whole, and the waits for its lock.
+#[cfg(windows)]
+pub(crate) fn log_views(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [read, read_ns, write, write_ns, new, entries, whole] =
+        std::array::from_fn(|i| VIEWS_METER[i].swap(0, Relaxed) as f64 / frames);
+    let (len, free, constants, placed, bytes) = {
+        let views = views_read();
+        let (mut constants, mut placed) = (0usize, 0usize);
+        for (view, _) in &views.list {
+            match view {
+                View::Constant(..) => constants += 1,
+                View::Placed(..) => placed += 1,
+                _ => {}
+            }
+        }
+        // An estimate (the fork's): an entry of the table, and one of the
+        // index with its share of a tree node.
+        let each = size_of::<(View, u32)>();
+        let bytes = views.list.capacity() * each + views.index.len() * each * 3 / 2;
+        (views.list.len(), views.free.len(), constants, placed, bytes)
+    };
+    let mode = match crate::mac_switches::view_inline() {
+        crate::mac_switches::ViewInline::Off => "0",
+        crate::mac_switches::ViewInline::Constants => "1",
+        crate::mac_switches::ViewInline::All => "all",
+    };
+    tracing::info!(
+        "view table (VICTORY_VIEW_INLINE={mode}): {len} entries ({free} free; {constants} constant buffer views, \
+         {placed} placed), {:.1} MB with its index, {} placed shapes; per frame: {new:.0} new entries, records \
+         written {entries:.0} as entries and {whole:.0} whole; lock waits {read:.0} shared ({:.2} ms) and \
+         {write:.0} alone ({:.2} ms)",
+        bytes as f64 / 1e6,
+        inline::shapes(),
+        read_ns / 1e6,
+        write_ns / 1e6,
+    );
+}
 
 impl View {
     /// The resource objects the view names.
@@ -828,10 +919,34 @@ fn record(handle: u64, view: View) {
     if handle == 0 {
         return;
     }
+    record_as(handle, view, crate::mac_switches::view_inline());
+}
+
+/// [`record`] under `inline`: with `VICTORY_VIEW_INLINE`, a constant buffer
+/// view (and with `all` a view of placed memory) is named whole in its
+/// record where it fits: no table entry and no table lock (`inline`).
+fn record_as(handle: u64, view: View, inline: crate::mac_switches::ViewInline) {
+    if inline != crate::mac_switches::ViewInline::Off
+        && let Some([i, generation]) = inline::words(&view, inline == crate::mac_switches::ViewInline::All)
+    {
+        // SAFETY: the handle is a descriptor slot, at least 16 bytes.
+        unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
+        meter(NAMED_WHOLE, 1);
+        #[cfg(windows)]
+        mirror(handle);
+        return;
+    }
+    record_entry(handle, view);
+}
+
+/// The record of `view` at `handle` as a table entry (the record before
+/// `VICTORY_VIEW_INLINE`).
+fn record_entry(handle: u64, view: View) {
+    meter(AS_ENTRIES, 1);
     // A view seen before, as most are: its entry is found under the shared
     // lock, which keeps `forget` from making it stale while it is written.
     let known = {
-        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        let views = views_read();
         let found = views.index.get(&view).map(|&i| (i, views.list[i as usize].1));
         if let Some((i, generation)) = found {
             // SAFETY: the handle is a descriptor slot, at least 16 bytes.
@@ -844,10 +959,11 @@ fn record(handle: u64, view: View) {
         mirror(handle);
         return;
     }
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let i = match views.index.get(&view) {
         Some(&i) => i,
         None => {
+            meter(NEW_ENTRIES, 1);
             let i = match views.free.pop() {
                 Some(i) => {
                     views.list[i as usize].0 = view.clone();
@@ -883,7 +999,7 @@ pub(crate) fn views_forgot() -> u64 {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+    let mut views = views_write();
     let Some(entries) = views.by_resource.remove(&resource) else {
         return;
     };
@@ -896,7 +1012,9 @@ pub(crate) fn forget(resource: usize) {
             continue;
         }
         views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+        // mac: below the bits that say a record is no table entry
+        // (`inline::GENERATIONS`; a billion releases of one entry away).
+        views.list[i as usize].1 = (generation.wrapping_add(1) & inline::GENERATIONS).max(1);
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
@@ -955,7 +1073,12 @@ impl Drop for ViewPin {
 /// for it.
 #[cfg(any(windows, test))]
 fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    // mac: a view named whole in its record (`inline`) names no resource
+    // object: nothing to pin.
+    if inline::kind(generation) != 0 {
+        return inline::view_of(i, generation).map(|view| ViewPin { view, held: [0; 2] });
+    }
+    let views = views_read();
     let (view, current) = views.list.get(i as usize)?;
     if *current != generation {
         return None;
@@ -984,9 +1107,15 @@ fn view_at(i: u32, generation: u32) -> Option<ViewPin> {
 /// is current, as [`view_at`] would find it (one lock for them all).
 fn views_current_into(records: &[[u32; 3]], out: &mut Vec<bool>) {
     out.clear();
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let views = views_read();
     out.extend(records.iter().map(|&[tag, i, generation]| {
-        tag == VIEW_TAG && views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+        tag == VIEW_TAG
+            && if inline::kind(generation) != 0 {
+                // mac: named whole in its record (`inline`).
+                inline::current(i, generation)
+            } else {
+                views.list.get(i as usize).is_some_and(|(_, current)| *current == generation)
+            }
     }));
 }
 
@@ -1488,6 +1617,59 @@ pub(crate) mod tests {
             FREED.lock().unwrap().push(this as usize);
         }
         crate::object::release_boxed::<crate::object::Object>(this)
+    }
+
+    /// mac: `VICTORY_VIEW_INLINE` (the leak of the fork's run 65): constant
+    /// buffer views at ever new addresses, and with `all` views of placed
+    /// memory, add no table entries, read back as written and are current;
+    /// equal views have equal records (the host knows a slot's view by
+    /// them). Off, each new address is an entry, as before.
+    #[test]
+    fn views_named_whole_add_no_entries() {
+        use crate::mac_switches::ViewInline;
+        let slots = [0u64; 4 * 4];
+        let at = |k: u64| slots.as_ptr() as u64 + k * 32;
+        // SAFETY: the slots above, 32 bytes each.
+        let words = |handle: u64| unsafe { (handle as *const [u32; 3]).read_unaligned() };
+        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee2_0000 + k as u32);
+        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a72_0000 + k as u32);
+        let mine = |v: &View| match v {
+            View::Constant(address, _) => (0x6_2000_0000..0x6_3000_0000).contains(address),
+            View::Placed(_, r, _) => *r == resource,
+            _ => false,
+        };
+        let entries = || views_read().list.iter().filter(|(v, _)| mine(v)).count();
+        let mut current = Vec::new();
+        for n in 0..2_000u64 {
+            let address = 0x6_2000_0000 + n * 0x100;
+            record_as(at(0), View::Constant(address, 512), ViewInline::Constants);
+            assert_eq!(view(at(0)).as_deref(), Some(&View::Constant(address, 512)));
+            let placed = 0xd_4950_0000 + n * 0x1_0000;
+            (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
+            record_as(at(1), View::Placed(false, resource, desc), ViewInline::All);
+            assert_eq!(view(at(1)).as_deref(), Some(&View::Placed(false, resource, desc)));
+            views_current_into(&[words(at(0)), words(at(1))], &mut current);
+            assert_eq!(current, [true, true]);
+        }
+        assert_eq!(entries(), 0, "no table entries");
+        // `=1` leaves placed views entries.
+        record_as(at(1), View::Placed(false, resource, desc), ViewInline::Constants);
+        assert_eq!(view(at(1)).as_deref(), Some(&View::Placed(false, resource, desc)));
+        assert_eq!(entries(), 1);
+        // Equal views, equal records; another address, another record.
+        record_as(at(2), View::Constant(0x6_2000_0040, 512), ViewInline::Constants);
+        record_as(at(3), View::Constant(0x6_2000_0040, 512), ViewInline::Constants);
+        assert_eq!(words(at(2)), words(at(3)));
+        record_as(at(3), View::Constant(0x6_2000_0140, 512), ViewInline::Constants);
+        assert_ne!(words(at(2)), words(at(3)));
+        // Off: an entry per new address, current as before.
+        for n in 0..3u64 {
+            record_as(at(0), View::Constant(0x6_2f00_0000 + n * 0x100, 256), ViewInline::Off);
+            assert_eq!(view(at(0)).as_deref(), Some(&View::Constant(0x6_2f00_0000 + n * 0x100, 256)));
+        }
+        views_current_into(&[words(at(0))], &mut current);
+        assert_eq!(current, [true]);
+        assert_eq!(entries(), 4);
     }
 
     /// A released resource's views go stale; the same view of a new

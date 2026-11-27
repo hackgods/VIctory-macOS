@@ -518,6 +518,58 @@ pub(crate) fn placed_at_once() -> PlacedAtOnce {
     })
 }
 
+/// Which views a record names whole instead of through the view table
+/// (`crate::descriptor::inline`, after fxceless's fork):
+/// `VICTORY_VIEW_INLINE=1`, constant buffer views; `all`, also views of
+/// placed memory. Unset or `0`: every view is a table entry, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewInline {
+    Off,
+    Constants,
+    All,
+}
+
+/// `VICTORY_VIEW_INLINE`'s rule.
+fn view_inline_rule(value: Option<&str>) -> ViewInline {
+    match value.map(str::trim) {
+        Some("1") => ViewInline::Constants,
+        Some("all") => ViewInline::All,
+        _ => ViewInline::Off,
+    }
+}
+
+/// `VICTORY_VIEW_INLINE`, read once ([`ViewInline`]).
+pub(crate) fn view_inline() -> ViewInline {
+    static ON: OnceLock<ViewInline> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let mode = view_inline_rule(std::env::var("VICTORY_VIEW_INLINE").ok().as_deref());
+        match mode {
+            ViewInline::Off => {}
+            ViewInline::Constants => tracing::info!(
+                "VICTORY_VIEW_INLINE=1: constant buffer views are named whole in their records, not entries of the view table"
+            ),
+            ViewInline::All => tracing::info!(
+                "VICTORY_VIEW_INLINE=all: constant buffer views and views of placed memory are named whole in their records, not entries of the view table"
+            ),
+        }
+        mode
+    })
+}
+
+#[cfg(test)]
+mod view_inline_tests {
+    use super::{ViewInline, view_inline_rule};
+
+    #[test]
+    fn views_are_entries_unless_the_switch_says_otherwise() {
+        assert_eq!(view_inline_rule(None), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("0")), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("yes")), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("1")), ViewInline::Constants);
+        assert_eq!(view_inline_rule(Some(" all ")), ViewInline::All);
+    }
+}
+
 #[cfg(test)]
 mod census_tests {
     use super::census_rule;

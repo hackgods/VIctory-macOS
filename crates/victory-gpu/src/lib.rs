@@ -60,6 +60,8 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 // mac: plain std, so its tests run everywhere.
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(any(windows, test))]
 mod flights;
 // mac: `VICTORY_FLICKER_WATCH`; plain std, so its tests run everywhere.

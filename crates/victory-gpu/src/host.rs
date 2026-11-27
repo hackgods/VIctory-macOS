@@ -2116,8 +2116,12 @@ impl Host {
         // (Not a submission cut at a deferred UAV-to-SRV prelude,
         // `VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE`: its native calls and their
         // marks are the waited path's below.)
+        // mac: not with uploads the background heap worker staged
+        // (VIctory-macOS #417, `VICTORY_HEAP_WORKER=1`): their staging space
+        // goes back to the worker when the submission has run.
         if let Some(title) = title
             && native_boundaries.is_empty()
+            && !uploads.as_ref().is_some_and(crate::bindless::Uploads::has_worker)
             && unwaited::may(groups.len(), traced)
         {
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(aside).as_micros() as u64, Ordering::Relaxed);
@@ -2237,6 +2241,10 @@ impl Host {
                 removed_in = Some(i);
             }
             let _ = (i, started);
+        }
+        // The GPU fence has completed: return worker-owned staging chunks now.
+        if let Some(u) = &uploads {
+            u.release_worker();
         }
         let _ = &firsts;
         let gpu = prepared.elapsed();
@@ -4527,6 +4535,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::Fallbacks, 1);
+    #[cfg(test)]
+    COPY_MAPPED_FALLBACKS.with(|n| n.set(n.get() + 1));
     #[cfg(feature = "diagnostics")]
     let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FallbackUs);
     // The whole copy failed. Copy each readable region in one call and
@@ -4570,6 +4580,18 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         }
         at = next;
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static COPY_MAPPED_FALLBACKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Number of `copy_mapped` calls on the current thread that fell back to
+/// piece-by-piece region reads after encountering an unreadable page.
+#[cfg(test)]
+pub(crate) fn copy_mapped_fallbacks() -> u64 {
+    COPY_MAPPED_FALLBACKS.with(std::cell::Cell::get)
 }
 
 /// Moves bytes between overlapping title ranges when both are committed.
@@ -5142,6 +5164,7 @@ impl Meter {
                 log_gpu_times(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
+                crate::heap_worker::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_lookups(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
@@ -6607,6 +6630,58 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
             pixels,
             "a draw on the new queue runs whole"
         );
+    }
+
+    /// Background heap-worker staging runs concurrently with `Host::quiet()` /
+    /// `HostHeap::new()` and `Host::execute()` without deadlock or lock
+    /// inversion (verifies Issue #31 compatibility).
+    #[test]
+    fn worker_concurrent_with_quiet_heap_creation_does_not_deadlock() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _worker = crate::heap_worker::EnableForTest::new();
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 32, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let _ = title_heap.host().expect("host view heap");
+        let pool = crate::watch::tests::pool(1);
+        // SAFETY: dedicated pool page.
+        unsafe { std::ptr::write_bytes(pool as *mut u8, 0x22, crate::watch::PAGE) };
+        let placed_res = [3u32, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[2], desc[5]) = (28, 4, 0x1688, 1);
+        (desc[10], desc[11]) = (pool as u32, (pool >> 32) as u32);
+        for i in 0..8u64 {
+            crate::descriptor::create_placed_srv(null, &placed_res, &desc, title_heap.start + 32 * i);
+        }
+        assert!(crate::heap_worker::kick(title_heap));
+        let quiet_thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let _q = host.quiet();
+                let _ = crate::descriptor::host::HostHeap::new(false, 64);
+            }
+        });
+        let list = host.new_list().unwrap();
+        for _ in 0..4 {
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        }
+        quiet_thread.join().unwrap();
+        crate::object::release_ref(heap);
+        crate::watch::tests::free(pool);
     }
 }
 

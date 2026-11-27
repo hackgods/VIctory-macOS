@@ -143,7 +143,11 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
                 out.extend_from_slice(cursor.data.get(at..at + count)?);
             } else {
                 let source = cursor.data.get(at..at + count + 1)?;
-                out.extend(source.windows(2).map(|pair| (pair[0] << shift) | (pair[1] >> (8 - shift))));
+                out.extend(
+                    source
+                        .windows(2)
+                        .map(|pair| (pair[0] << shift) | (pair[1] >> (8 - shift))),
+                );
             }
             cursor.pos += count * 8;
         } else {

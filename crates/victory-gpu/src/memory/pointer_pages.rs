@@ -30,8 +30,8 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `VICTORY_POINTER_PAGES=1`: missed pages get copies. Unset or anything
-/// else: off.
+/// `VICTORY_POINTER_PAGES=1` (or `2`, [`null_page_free`]): missed pages
+/// get copies. Unset or anything else: off.
 pub(crate) fn on() -> bool {
     #[cfg(test)]
     if FORCED.load(Ordering::Relaxed) {
@@ -39,7 +39,7 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var("VICTORY_POINTER_PAGES").is_ok_and(|v| v.trim() == "1");
+        let on = matches!(level(), 1 | 2);
         if on {
             tracing::info!(
                 "VICTORY_POINTER_PAGES=1: title memory shaders reach by address with no copy gets one from the next submission on"
@@ -48,6 +48,55 @@ pub(crate) fn on() -> bool {
         on
     })
 }
+
+/// `VICTORY_POINTER_PAGES`'s value: 0 (off), 1 or 2.
+fn level() -> u8 {
+    static LEVEL: OnceLock<u8> = OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_POINTER_PAGES").as_deref().map(str::trim) {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// `VICTORY_POINTER_PAGES=2`: also, a read of the null page (an address
+/// below 64 KiB, which no copy can hold) is no miss: the list's writes are
+/// not withheld for it.
+///
+/// Every frame some list reads the null page (2 to 4 pages a frame in the
+/// runs of 27 November, builder on or off), so every frame withholds what
+/// shaders wrote (`super::withholding`): nothing a shader writes goes back
+/// into title memory, and the ranges are taken back from title memory at
+/// the frame's end, or right after a submission with such a list. So no
+/// structure the builder makes outlasts its frame, or its submission. The
+/// null page holds nothing on the console either (guess: such reads are the
+/// lanes of empty slots, which read zeros there too). Its writes are still
+/// dropped.
+pub(crate) fn null_page_free() -> bool {
+    #[cfg(test)]
+    if NULL_FREE.load(Ordering::Relaxed) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = level() == 2;
+        if on {
+            tracing::info!("VICTORY_POINTER_PAGES=2: reads of the null page are no miss (the list's writes are not withheld for them)");
+        }
+        on
+    })
+}
+
+/// Whether page-table entry `entry` (of `blocks`, the level-1 index of each
+/// block) is the null page: region 0's first page.
+pub(crate) fn is_null_page(blocks: &[usize], entry: usize, block_len: usize) -> bool {
+    let block = entry / block_len;
+    block != 0 && blocks.get(block) == Some(&0) && entry % block_len == 0
+}
+
+/// Tests: [`null_page_free`] whatever the variable says.
+#[cfg(test)]
+pub(crate) static NULL_FREE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Tests: [`on`] whatever the variable says.
 #[cfg(test)]
@@ -161,6 +210,19 @@ mod tests {
         assert_eq!(target(Missed::Region(0), at), Some(0x10000 + 0x40_0000));
         assert_eq!(asked.get(), (0x10000, 0x1000_0000));
         assert_eq!(target(Missed::Region(0x71_5000_0000), none), None, "nothing committed");
+    }
+
+    /// The null page is region 0's first page, in a block of its own; not
+    /// block 0 (regions with no block), nor another page or region.
+    #[test]
+    fn the_null_page_is_region_0s_first_page() {
+        let blocks = [usize::MAX, 0, 7];
+        let n = 4096;
+        assert!(is_null_page(&blocks, n, n));
+        assert!(!is_null_page(&blocks, n + 1, n), "the second page");
+        assert!(!is_null_page(&blocks, 2 * n, n), "region 7");
+        assert!(!is_null_page(&blocks, 0, n), "block 0");
+        assert!(!is_null_page(&blocks, 3 * n, n), "past the blocks");
     }
 
     /// The host's memory map: a committed allocation is found from below

@@ -560,6 +560,10 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let block = entry / BLOCK;
+            // Mac (`VICTORY_POINTER_PAGES=2`): the null page is no miss.
+            if pointer_pages::null_page_free() && pointer_pages::is_null_page(&l.blocks, entry, BLOCK) {
+                continue;
+            }
             if block == 0
                 || l.blocks.get(block).is_none()
                 || l.owner.get(entry).is_none_or(|o| o.is_none())
@@ -615,6 +619,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let mut writes = Vec::new();
         // Mac (`VICTORY_POINTER_PAGES=1`): every miss, for copies of them.
         let learning = pointer_pages::on();
+        let null_free = pointer_pages::null_page_free();
         let mut learn = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
             // Most words are 0: write back only the ones that are not.
@@ -639,6 +644,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
+                    _ if null_free && pointer_pages::is_null_page(blocks, entry, BLOCK) => {}
                     _ => {
                         pages += 1;
                         missed.push(at);
@@ -820,6 +826,29 @@ mod tests {
         let oob = 2 * BLOCK + 1;
         marks[oob / 32] = 1 << (oob % 32);
         assert!(has_missed(&marks, &l));
+    }
+
+    /// `VICTORY_POINTER_PAGES=2`: a read of the null page (region 0's
+    /// first page, in a block) is no miss; any other page still is.
+    #[test]
+    fn the_null_page_is_no_miss_under_pointer_pages_2() {
+        let l = Layout {
+            copies: Vec::new(),
+            bits: Vec::new(),
+            blocks: vec![usize::MAX, 0],
+            owner: vec![None; 2 * BLOCK],
+        };
+        let mut marks = vec![0u32; BITMAP_WORDS];
+        marks[BLOCK / 32] = 1 << (BLOCK % 32);
+        assert!(has_missed(&marks, &l), "a miss as before");
+        pointer_pages::NULL_FREE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let free = has_missed(&marks, &l);
+        let next = BLOCK + 1;
+        marks[next / 32] |= 1 << (next % 32);
+        let other = has_missed(&marks, &l);
+        pointer_pages::NULL_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(!free, "the null page alone");
+        assert!(other, "the page after it");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

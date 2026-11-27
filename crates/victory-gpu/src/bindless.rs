@@ -712,10 +712,15 @@ impl Uploads {
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
+///
+/// mac: while the submission before still runs beside this one (flights),
+/// also the clean copies its landing may tell (`crate::flights::asked`).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
+        if crate::flights::asked(crate::watch::clean_bit(*bit), beside, *address as usize, *len as usize) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -756,11 +761,14 @@ pub(crate) fn refresh_slot(
     index: u32,
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
+    // mac: as in [`refresh`], asked before the lock.
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if crate::flights::asked(crate::watch::clean_bit(shadow.dirty_bit()), beside, *address as usize, *len as usize) {
         add(shadow, *address as usize, *len as usize);
     }
 }

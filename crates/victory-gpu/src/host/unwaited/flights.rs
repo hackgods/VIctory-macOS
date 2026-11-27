@@ -195,16 +195,16 @@ static UPLOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
 pub(in crate::host) struct Footprint {
-    /// It runs programs that use title memory: they write copies at
-    /// addresses they compute, so every copy and all title memory.
-    every: bool,
+    /// Title memory its landing may change (`crate::flights::Landing`):
+    /// with programs that use title memory (they write copies at addresses
+    /// they compute) every copy and all of it; else its declared ranges,
+    /// the copies below whole, its read-backs and texture copy-backs, its
+    /// bottom-of-pipe writes and the fences behind it; and the other
+    /// addresses of those pages.
+    landing: crate::flights::Landing,
     /// Copies its heaps view for unordered access (their shaders may write
     /// them with no list declaring it).
     written: std::collections::HashSet<usize>,
-    /// Title memory it may write or lands in: its declared ranges, the
-    /// copies above whole, its read-backs and texture copy-backs, its
-    /// bottom-of-pipe writes and the fences behind it.
-    spans: crate::flights::Spans,
     /// Title memory whose copies hold shader writes kept from it
     /// (`crate::memory::kept`): a refresh there drops them.
     kept: crate::flights::Spans,
@@ -229,17 +229,24 @@ impl Footprint {
             spans.add(at as usize, (at + n) as usize);
         }
         spans.join();
+        let mut pages = Vec::new();
+        crate::watch::shown_elsewhere(spans.iter(), &mut pages);
+        let mut others = crate::flights::Spans::default();
+        for page in pages {
+            others.add(page, page + crate::watch::PAGE);
+        }
+        others.join();
         let mut kept = crate::flights::Spans::default();
         for (at, n) in crate::memory::kept() {
             kept.add(at, at + n);
         }
         kept.join();
-        Footprint { every: left.memory, written, spans, kept }
+        Footprint { landing: crate::flights::Landing { every: left.memory, spans, others }, written, kept }
     }
 
     /// Whether title memory `[at, at + len)` may change when it is finished.
     fn reaches(&self, at: usize, len: usize) -> bool {
-        self.every || self.spans.touches(at, len)
+        self.landing.reaches(at, len)
     }
 
     /// Whether a read of title memory `[at, at + len)` while it runs could
@@ -251,7 +258,7 @@ impl Footprint {
     fn meets(&self, at: usize, len: usize) -> Option<usize> {
         if self.reaches(at, len) {
             Some(1)
-        } else if len > 0 && with_alias() && !self.spans.is_empty() && crate::watch::aliased(at, len) {
+        } else if len > 0 && with_alias() && !self.landing.spans.is_empty() && crate::watch::aliased(at, len) {
             Some(2)
         } else {
             None
@@ -259,16 +266,80 @@ impl Footprint {
     }
 
     /// Whether `copy` may not be refreshed before it is finished (the
-    /// prewarm's rules, and title memory it lands in): `ranges` are what is
-    /// to be refreshed.
+    /// prewarm's rules, and title memory its landing may tell the copy of:
+    /// what it lands in, and those pages' other addresses): `ranges` are
+    /// what is to be refreshed.
     fn holds(&self, copy: &std::sync::Arc<crate::shadow::Shadow>, ranges: &crate::ranges::Ranges) -> bool {
-        if self.every || !copy.idle() || self.written.contains(&(std::sync::Arc::as_ptr(copy) as usize)) {
+        if self.landing.every || !copy.idle() || self.written.contains(&(std::sync::Arc::as_ptr(copy) as usize)) {
             return true;
         }
         let (start, len) = copy.range();
-        self.kept.touches(start as usize, len as usize) || ranges.iter().any(|(from, to)| self.spans.touches(from, to - from))
+        self.kept.touches(start as usize, len as usize) || ranges.iter().any(|(from, to)| self.landing.tells(from, to - from))
     }
 }
+
+/// The footprint of the submission left, shared by the preparation beside
+/// it ([`Beside`]) and that preparation's refreshes ([`landing`]); worked
+/// out when first asked for, and done with once it is finished.
+pub(crate) struct Shared {
+    done: std::sync::atomic::AtomicBool,
+    footprint: OnceLock<Footprint>,
+}
+
+impl Shared {
+    fn footprint(&self) -> &Footprint {
+        self.footprint.get_or_init(|| {
+            LEFT.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or_else(
+                || Footprint { landing: crate::flights::Landing { every: true, ..Default::default() }, ..Footprint::empty() },
+                Footprint::of,
+            )
+        })
+    }
+
+    /// What its landing may change (`crate::flights::asked`).
+    pub(crate) fn landing(&self) -> &crate::flights::Landing {
+        &self.footprint().landing
+    }
+}
+
+thread_local! {
+    /// The submission left while this thread prepares the next one beside
+    /// it (under the submission lock): set by [`Host::submissions_beside`],
+    /// let go with its [`Beside`].
+    static NOW: std::cell::RefCell<Option<std::sync::Arc<Shared>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// mac: while this thread prepares a submission beside the one left and
+/// that one is not finished yet: its footprint, worked out now, so that
+/// asks for clean copies its landing may tell are kept for after it
+/// (`crate::flights::asked`; the stale reads it ends are in
+/// `notes/overlap-stages-design.md`, "E2: the run"). Asked before a heap's
+/// lock is taken: working it out takes the heaps' locks.
+pub(crate) fn landing() -> Option<std::sync::Arc<Shared>> {
+    let now = NOW.with(|n| n.borrow().clone()).filter(|s| !s.done.load(Acquire))?;
+    now.footprint();
+    Some(now)
+}
+
+/// [`landing`] lent to `f` (none when nothing runs beside), without taking
+/// a hold on it: for each ask of the refreshes. Worked out here if it was
+/// not yet, so not under a heap's lock (the walks of the heaps ask
+/// [`landing`] before they take theirs).
+pub(crate) fn with_landing<R>(f: impl FnOnce(Option<&crate::flights::Landing>) -> R) -> R {
+    NOW.with(|n| {
+        let now = n.borrow();
+        f(now.as_ref().filter(|s| !s.done.load(Acquire)).map(|s| s.landing()))
+    })
+}
+
+/// An ask for a clean copy kept for after the finish (the frame line).
+pub(crate) fn kept_clean() {
+    KEPT.fetch_add(1, Relaxed);
+}
+
+/// Since the last frame line: asks for clean copies kept for after the
+/// finish of the submission left ([`landing`]).
+static KEPT: AtomicU64 = AtomicU64::new(0);
 
 /// The submission left while the title's next is prepared under the
 /// submission lock ([`Host::submissions_beside`]).
@@ -277,7 +348,9 @@ pub(in crate::host) struct Beside {
     value: Option<u64>,
     started: Instant,
     steps: u32,
-    footprint: Option<Footprint>,
+    /// Its footprint, shared with the refreshes of the one prepared
+    /// ([`landing`]).
+    shared: std::sync::Arc<Shared>,
     /// Time spent finishing it (its wait and what it owes): not the next
     /// one's preparation.
     pub(in crate::host) finishing: Duration,
@@ -290,21 +363,22 @@ impl Beside {
     }
 
     fn footprint(&mut self) -> &Footprint {
-        self.footprint.get_or_insert_with(|| {
-            LEFT.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map_or_else(|| Footprint { every: true, ..Footprint::empty() }, Footprint::of)
-        })
+        self.shared.footprint()
+    }
+}
+
+impl Drop for Beside {
+    fn drop(&mut self) {
+        self.shared.done.store(true, Release);
+        NOW.with(|n| n.borrow_mut().take());
     }
 }
 
 impl Footprint {
     fn empty() -> Footprint {
         Footprint {
-            every: false,
+            landing: Default::default(),
             written: Default::default(),
-            spans: Default::default(),
             kept: Default::default(),
         }
     }
@@ -352,11 +426,13 @@ impl Host {
             return (submitted, None);
         };
         BESIDE[0].fetch_add(1, Relaxed);
+        let shared = std::sync::Arc::new(Shared { done: Default::default(), footprint: OnceLock::new() });
+        NOW.with(|n| *n.borrow_mut() = Some(shared.clone()));
         let beside = Beside {
             value: Some(value),
             started: Instant::now(),
             steps: 0,
-            footprint: None,
+            shared,
             finishing: Duration::ZERO,
         };
         (submitted, Some(beside))
@@ -367,7 +443,7 @@ impl Host {
     pub(in crate::host) fn finish_beside(&self, submitted: &mut u64, beside: &mut Option<Beside>, why: Why) -> Duration {
         let Some(b) = beside.as_mut() else { return Duration::ZERO };
         let Some(value) = b.value.take() else { return Duration::ZERO };
-        b.footprint = None;
+        b.shared.done.store(true, Release);
         let at = Instant::now();
         BESIDE[1].fetch_add((at - b.started).as_micros() as u64, Relaxed);
         let mut waited = Duration::ZERO;
@@ -523,6 +599,7 @@ pub(super) fn log(frames: f64) {
     let met = MET.swap(0, Relaxed) as f64 / frames;
     let [split, split_ms] = [0, 1].map(|i| SPLIT[i].swap(0, Relaxed) as f64 / if i == 0 { frames } else { 1000.0 * frames });
     let landing = LANDING.swap(0, Relaxed) as f64 / 1000.0 / frames;
+    let kept = KEPT.swap(0, Relaxed) as f64 / frames;
     let [write, write_ms, copy, copy_ms] =
         [0, 1, 2, 3].map(|i| ON_ALIASED[i].swap(0, Relaxed) as f64 / if i % 2 == 0 { frames } else { 1000.0 * frames });
     tracing::info!(
@@ -535,7 +612,9 @@ pub(super) fn log(frames: f64) {
          later parts of a copy-order split finished it before they were prepared, after waiting {split_ms:.1} \
          ms/frame (only under the title's next submission above); landing it after its wait took {landing:.1} \
          ms/frame of these finishes; of them, shader-write declarations on aliased copies {write:.1}/frame \
-         ({write_ms:.1} ms waited) and title copies between aliased buffers {copy:.1}/frame ({copy_ms:.1} ms){}",
+         ({write_ms:.1} ms waited) and title copies between aliased buffers {copy:.1}/frame ({copy_ms:.1} ms); \
+         {kept:.0}/frame asks for copies the title had not written kept for after its finish (its landing may tell \
+         them){}",
         uploads_line(frames)
     );
 }

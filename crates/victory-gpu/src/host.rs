@@ -4325,8 +4325,15 @@ impl Batch {
         }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        // mac: but while the submission left still runs beside this one, a
+        // clean copy its landing may tell stays, for after its finish
+        // (`crate::flights::asked`, `unwaited::flights::landing`).
+        let clean = shadow.clean();
+        if !unwaited::flights::with_landing(|beside| crate::flights::asked(clean, beside, address, len)) {
             return;
+        }
+        if clean {
+            unwaited::flights::kept_clean();
         }
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.

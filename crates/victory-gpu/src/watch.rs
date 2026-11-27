@@ -1382,6 +1382,23 @@ pub(crate) fn aliased(at: usize, len: usize) -> bool {
     guards().alias_of.range(first..last).next().is_some()
 }
 
+/// mac: the title addresses of the pages that show a page of `ranges`
+/// elsewhere, as the runtime told when it mapped them (a write there marks
+/// the trackers here too, [`notify_written`]): pushed to `out`, once per
+/// page of a range. One take of the guard lock (`crate::host::unwaited::
+/// flights`, for the submission left to the GPU).
+pub(crate) fn shown_elsewhere(ranges: impl Iterator<Item = (usize, usize)>, out: &mut Vec<usize>) {
+    let g = guards();
+    if g.alias_of.is_empty() {
+        return;
+    }
+    for (from, to) in ranges {
+        for (_, others) in g.alias_of.range(from / PAGE..to.div_ceil(PAGE)) {
+            out.extend(others.iter().map(|&o| o * PAGE));
+        }
+    }
+}
+
 /// Registers the handler that takes writes to guarded blocks, once, ahead
 /// of the crash reporter's.
 fn install() {

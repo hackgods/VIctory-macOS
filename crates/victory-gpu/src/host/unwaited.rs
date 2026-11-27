@@ -1343,6 +1343,63 @@ mod tests {
         drop(flights);
     }
 
+    /// mac: with flights, a host copy the title had not written when the
+    /// next submission asked for it, beside the one left whose landing then
+    /// writes its memory (as a texture read back into a buffer lands): the
+    /// ask is kept and made after the finish, so the next submission reads
+    /// the landed bytes, not the copy's old ones. Needs the heap sync ahead
+    /// (`VICTORY_ASYNC_HEAP_SYNC=1`, else every flight is finished at the
+    /// heap sync) and tracked memory (`VICTORY_FAULT_TRACKING=1`, else no
+    /// copy is clean).
+    #[test]
+    fn with_flights_a_clean_copy_the_one_left_lands_in_is_read_after_it() {
+        let Some(host) = host() else {
+            return; // no host GPU here
+        };
+        let flights = Flights::on();
+        if !crate::descriptor::ahead::on() || !crate::watch::fault_tracking() {
+            eprintln!("skipped: needs VICTORY_ASYNC_HEAP_SYNC=1 and VICTORY_FAULT_TRACKING=1");
+            return;
+        }
+        settle(By::Signal);
+        let page = crate::watch::PAGE;
+        let p = crate::watch::tests::pool(1);
+        // SAFETY: the pool's page.
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0x11, page) };
+        crate::shadow::register(p, p as u64, page as u64);
+        let copy = crate::shadow::find(p as u64, page as u64).expect("a host copy");
+        assert!(!copy.is_aliased());
+        let _ = copy.update(p, page);
+        assert!(copy.clean(), "current and tracked");
+        let lists = [0, 1].map(|_| std::sync::Arc::new(host.new_list().unwrap()));
+        // The first lands 0x22 over the page when it is finished.
+        lists[0].note_landing(p, page);
+        lists[0].defer_after(move || {
+            let _writing = crate::watch::writing(p, page);
+            // SAFETY: the pool's page.
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0x22, page) };
+        });
+        // The second asks for the copy: its only step.
+        copy.refresh(&lists[1], p as u64, page as u64);
+        lists.iter().for_each(|l| l.close());
+        let flushes = flights::finished_for(flights::Why::Flush);
+        let mut back = host.execute_title(1, vec![lists[0].clone()]);
+        let left = VALUE.load(Acquire) != 0;
+        back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        // The copy as the second went to the GPU with it.
+        let read = copy.read_host(p as u64, 1)[0];
+        settle(By::Signal);
+        drop(flights);
+        assert_eq!(read, 0x2222_2222, "the second read what the first landed");
+        // (Left unless a diagnostics build captures.)
+        if left {
+            assert_eq!(flights::finished_for(flights::Why::Flush), flushes + 1, "finished for the held refresh");
+        }
+        crate::shadow::unregister(p, p as u64);
+        drop(back);
+        drop(take_done());
+    }
+
     /// A title submission left to the host GPU owes its bottom-of-pipe
     /// write until something waits for it; then the write is there, the
     /// mark shows it ran, and its list comes back.

@@ -43,10 +43,54 @@ impl Spans {
         self.0.is_empty()
     }
 
+    /// The ranges, in order (joined).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.0.iter().copied()
+    }
+
     #[cfg(test)]
     fn ranges(&self) -> &[(usize, usize)] {
         &self.0
     }
+}
+
+/// What the landing of the submission left (its finish) may change in title
+/// memory, as the next submission's preparation beside it sees it.
+#[derive(Debug, Default)]
+pub(crate) struct Landing {
+    /// It runs programs that use title memory: all of it.
+    pub(crate) every: bool,
+    /// Title memory it may write or lands in (joined).
+    pub(crate) spans: Spans,
+    /// The pages that show a page of `spans` at another address (joined): a
+    /// write or a landing there marks the trackers here too.
+    pub(crate) others: Spans,
+}
+
+impl Landing {
+    /// Whether `[at, at + len)` is in what it may write or lands in.
+    pub(crate) fn reaches(&self, at: usize, len: usize) -> bool {
+        self.every || self.spans.touches(at, len)
+    }
+
+    /// Whether a tracker over `[at, at + len)` may be told at its landing
+    /// that the memory changed: what it reaches, and its pages' other
+    /// addresses.
+    pub(crate) fn tells(&self, at: usize, len: usize) -> bool {
+        self.reaches(at, len) || self.others.touches(at, len)
+    }
+}
+
+/// mac: whether a submission's ask to bring `[at, at + len)` of a host copy
+/// up to date goes into its refreshes. A copy the title wrote since the copy
+/// took it does (`clean` false). A clean one does only while the submission
+/// before still runs beside it (`beside`) and its landing may tell the copy
+/// ([`Landing::tells`]): then the ask is held and made once that one is
+/// finished, when its copy-back has told the copy what changed. Before, a
+/// clean copy asked for before that finish was left out, and the next
+/// submission read it one submission old.
+pub(crate) fn asked(clean: bool, beside: Option<&Landing>, at: usize, len: usize) -> bool {
+    !clean || beside.is_some_and(|l| l.tells(at, len))
 }
 
 /// What the `bytes` (1 to 8) at `address` will hold once `writes` are made
@@ -211,6 +255,32 @@ pub(crate) mod threads {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clean copy asked for beside the submission left stays in the
+    /// refreshes where that one's landing may tell it (what it writes or
+    /// lands in, and those pages' other addresses), so that it is made after
+    /// the finish; elsewhere, and with nothing beside, it is left out as
+    /// before. A copy the title wrote is always asked for.
+    #[test]
+    fn a_clean_copy_the_landing_may_tell_is_kept_for_after_it() {
+        let mut landing = Landing::default();
+        landing.spans.add(0x1_0000, 0x2_0000);
+        landing.others.add(0x9_0000, 0xa_0000);
+        landing.spans.join();
+        landing.others.join();
+        // Clean: kept only where the landing may tell it.
+        assert!(asked(true, Some(&landing), 0x1_8000, 0x100), "in what it lands in");
+        assert!(asked(true, Some(&landing), 0x9_ff00, 0x1000), "a page shown there too");
+        assert!(!asked(true, Some(&landing), 0x2_0000, 0x1000), "next to it");
+        assert!(!asked(true, Some(&landing), 0x1_8000, 0), "nothing asked");
+        assert!(!asked(true, None, 0x1_8000, 0x100), "nothing beside: as before");
+        // Written by the title: always.
+        assert!(asked(false, None, 0x5_0000, 0x10));
+        assert!(asked(false, Some(&landing), 0x5_0000, 0x10));
+        // Title-memory programs: all of it.
+        let every = Landing { every: true, ..Landing::default() };
+        assert!(asked(true, Some(&every), 0x5_0000, 0x10));
+    }
 
     /// `VICTORY_FLIGHTS_WITH`: names in their order, each needing those
     /// before it; unknown, unbuilt and otherwise refused names named.

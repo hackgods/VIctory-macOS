@@ -113,7 +113,8 @@ impl Lower<'_> {
     /// the walk to open, so that barriers can order them there
     /// ([`super::exchange::want_lds`]).
     pub(super) fn halves_lds(x: &Parts, group: u32, lds_dwords: u32) -> Option<Why> {
-        if x.mac.whole_wave && lds_dwords > 0 && group > HALF && group <= 64 {
+        let lds_part = x.mac.whole_wave && !x.mac.whole_wave_no_lds;
+        if lds_part && lds_dwords > 0 && group > HALF && group <= 64 {
             super::exchange::want_lds(x.p);
         }
         (lds_dwords > 0 && group > HALF && group <= 64 && !x.halves_local.lds)

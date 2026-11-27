@@ -193,6 +193,56 @@ pub(crate) fn whole_wave() -> bool {
     })
 }
 
+/// Whether the program `container` keeps the LDS part of
+/// `VICTORY_HALVES_WHOLE_WAVE=1` (the walk opening the code round unsynced
+/// one-wave LDS, which barriers then order; `notes/far-ray.md`):
+/// `VICTORY_HALVES_WHOLE_WAVE_LDS` unset or empty is every program (as
+/// before the list came), `0` none, a comma list of 16-digit shader hashes
+/// those programs only. The list to test (28 November) is the ray chain:
+/// `03e3e26783a5799b` (`CS_RayBudgeting_Cull_RayBinning`) and the six
+/// `CS_RayPrePass_*` (`fd8393c7f4e0e3da`, `7168dd781ca7efb9`,
+/// `d2b169b82f67ec5b`, `edb8e66237fc38e6`, `049459e0c78e0d50`,
+/// `11276d0c8bbe180a`): runs with the whole part showed a growing GPU cost
+/// in three of five boat runs.
+pub(crate) fn whole_wave_lds_for(container: &[u8]) -> bool {
+    match whole_wave_lds_rule() {
+        None => true,
+        Some(only) => only.contains(&blake3::hash(container).to_hex()[..16].to_owned()),
+    }
+}
+
+fn whole_wave_lds_rule() -> &'static Option<Vec<String>> {
+    static RULE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = whole_wave_lds(std::env::var("VICTORY_HALVES_WHOLE_WAVE_LDS").ok().as_deref());
+        if let Some(only) = &rule {
+            tracing::info!(
+                programs = ?only,
+                "VICTORY_HALVES_WHOLE_WAVE_LDS: the whole-wave walk orders one-wave LDS in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_HALVES_WHOLE_WAVE_LDS`'s rule: `None` is every program (unset,
+/// empty or unreadable: today's behaviour), `Some` the programs listed
+/// (`0`: none).
+fn whole_wave_lds(value: Option<&str>) -> Option<Vec<String>> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "0" {
+        return Some(Vec::new());
+    }
+    let hashes: Vec<String> = value.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+    hashes
+        .iter()
+        .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(hashes)
+}
+
 /// Whether a size query on a writable image asks for level 0 in every
 /// program (`victory_shader::emit::Options::uav_size_level0`): only with
 /// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
@@ -1154,7 +1204,7 @@ pub(crate) fn key(
 pub(crate) mod tests {
     use super::{
         copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
-        spans_rule, texture_workers, uav_size, writers,
+        spans_rule, texture_workers, uav_size, whole_wave_lds, writers,
     };
 
     thread_local! {
@@ -1314,6 +1364,18 @@ pub(crate) mod tests {
         assert_eq!(uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")), (false, two));
         // A list with a wrong entry is no list: nothing is turned on.
         assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    #[test]
+    fn the_whole_wave_lds_list_is_every_program_unless_it_names_some() {
+        assert_eq!(whole_wave_lds(None), None);
+        assert_eq!(whole_wave_lds(Some("")), None);
+        assert_eq!(whole_wave_lds(Some(" ")), None);
+        assert_eq!(whole_wave_lds(Some("0")), Some(vec![]));
+        let two = vec!["03e3e26783a5799b".to_owned(), "fd8393c7f4e0e3da".to_owned()];
+        assert_eq!(whole_wave_lds(Some("03E3E26783A5799B, fd8393c7f4e0e3da")), Some(two));
+        // A list with a wrong entry is no list: every program, as unset.
+        assert_eq!(whole_wave_lds(Some("03e3e26783a5799b,1")), None);
     }
 
     #[test]

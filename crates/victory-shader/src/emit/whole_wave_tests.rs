@@ -169,7 +169,8 @@ fn with_lds(words: &[u32], reads: bool, race: bool, mac: Mac) -> Result<lower::L
     };
     let start = (&p, &st, &io, &res);
     let walked = |stages: walk::Stages<'_>, local: bool| {
-        lower(stages, local, if mac.whole_wave { local } else { race })
+        let lds_part = mac.whole_wave && !mac.whole_wave_no_lds;
+        lower(stages, local, if lds_part { local } else { race })
     };
     if mac.walk
         && let Some(exact) = walk::open(&native, start, mac.whole_wave, walked)
@@ -296,6 +297,21 @@ fn lds_behind_an_early_out_is_walked_and_ordered() {
     let on_raced = with_lds(&words, true, true, walking(true)).expect("ordered");
     assert_eq!(on.dxil, on_raced.dxil);
     assert_ne!(on.dxil, raced.dxil);
+}
+
+/// With the LDS part left out (`VICTORY_HALVES_WHOLE_WAVE_LDS` not naming
+/// the program) the LDS behind the early-out is as without the switch:
+/// refused, or raced with the same bytes.
+#[test]
+fn without_the_lds_part_the_lds_stays_as_it_was() {
+    let words = lds_behind_an_early_out();
+    let no_lds = Mac {
+        whole_wave_no_lds: true,
+        ..walking(true)
+    };
+    assert!(with_lds(&words, false, false, no_lds).is_err());
+    let raced = with_lds(&words, true, true, walking(false)).expect("raced").dxil;
+    assert_eq!(with_lds(&words, true, true, no_lds).expect("raced").dxil, raced);
 }
 
 #[cfg(windows)]

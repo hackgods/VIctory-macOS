@@ -258,6 +258,33 @@ fn the_test_programs_are_what_their_comments_say() {
             ],
         ),
         (
+            sum_after_a_loop_lanes_leave(),
+            &[
+                "v_and_b32 v5, 3, v0",
+                "v_mov_b32 v6, 0",
+                "s_mov_b64 s[4:5], exec",
+                "v_cmp_lt_u32 vcc, v6, v5",
+                "s_and_b64 exec, exec, vcc",
+                "s_cbranch_execz",
+                "v_add_nc_u32 v6, 1, v6",
+                "s_branch",
+                "s_mov_b64 exec, s[4:5]",
+                "v_cvt_f32_u32 v3, v6",
+            ],
+        ),
+        (
+            loops_sharing_a_latch(),
+            &[
+                "s_add_u32 s22, s22, 1",
+                "s_cmp_lt_u32 s22, 3",
+                "s_add_u32 s20, s20, 1",
+                "s_cmp_gt_u32 s20, 2",
+                "s_mov_b32 s22, 0",
+                "s_add_u32 s21, s21, 1",
+                "v_mov_b32 v1, s21",
+            ],
+        ),
+        (
             first_lane_of_the_thread_id(),
             &[
                 "v_mbcnt_lo_u32_b32 v1, -1, 0",
@@ -599,6 +626,58 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
     w
 }
 
+/// Each lane counts to the low two bits of its thread id in a loop it leaves
+/// on its own, whose back edge is unconditional (`s_branch`): lowering caps
+/// that back edge at the loop iteration limit. Then the console compiler's
+/// whole-wave sum of the counts ([`reduction`] of `v_cvt_f32_u32 v3, v6`).
+/// Per thread, one dword at `l * 32`: its console wave's sum.
+fn sum_after_a_loop_lanes_leave() -> Vec<u32> {
+    let sum = reduction(V_ADD_F32, 0x80, 0x7E06_0D06);
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x360A_0083, // v_and_b32 v5, 3, v0
+        0x7E0C_0280, // v_mov_b32 v6, 0
+        0xBE84_047E, // s_mov_b64 s[4:5], exec
+        0x7D82_0B06, // v_cmp_lt_u32 vcc, v6, v5
+        0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+        0xBF88_0002, // s_cbranch_execz (past the s_branch)
+        0x4A0C_0C81, // v_add_nc_u32 v6, 1, v6
+        0xBF82_FFFB, // s_branch (back to the v_cmp)
+        0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+    ]);
+    w.extend(&sum[PROLOGUE.len() + 1..]);
+    w
+}
+
+/// Two scalar loops whose latches share a block, as the console compiler
+/// lays them out: the latch branches back to the inner loop's header three
+/// times and otherwise falls through to the outer loop's header, which runs
+/// twice. Both targets of that branch are back edges. Per thread, one dword
+/// at `l * 32`: the inner loop's passes, 6.
+fn loops_sharing_a_latch() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0xBE94_0380, // s_mov_b32 s20, 0
+        0xBE95_0380, // s_mov_b32 s21, 0
+        0xBF82_0003, // s_branch (to the outer header)
+        0x8016_8116, // s_add_u32 s22, s22, 1 (the shared latch)
+        0xBF0A_8316, // s_cmp_lt_u32 s22, 3
+        0xBF85_0004, // s_cbranch_scc1 (back to the inner header)
+        0x8014_8114, // s_add_u32 s20, s20, 1 (the outer header)
+        0xBF08_8214, // s_cmp_gt_u32 s20, 2
+        0xBF85_0003, // s_cbranch_scc1 (out of both loops)
+        0xBE96_0380, // s_mov_b32 s22, 0
+        0x8015_8115, // s_add_u32 s21, s21, 1 (the inner header)
+        0xBF82_FFF7, // s_branch (to the shared latch)
+        0x7E02_0215, // v_mov_b32 v1, s21
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// The console's low-half f16 whole-wave64 sum of `v0`: DPP within rows,
 /// `v_permlanex16` across rows, then lanes 31 and 63 (each 32-lane half's
 /// sum) read and added. Its high half is kept from lane 31, as the
@@ -904,6 +983,66 @@ fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
             .collect();
         failed.extend(differences(&half_sum, threads, 1, &want));
     }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A reduction after a loop the lanes leave one by one, whose back edge is
+/// capped at the loop iteration limit ([`sum_after_a_loop_lanes_leave`]):
+/// the console runs the loop to its end, so with the cap taken as never
+/// reached every lane of the group runs the reduction together and the
+/// halves pass each other their sums. Only with the cap's barriers refused
+/// (`VICTORY_CAP_BARRIERS=1`) is a lane taken to have left at the cap, and
+/// the reduction refused.
+#[test]
+fn a_reduction_after_a_loop_lanes_leave_passes_between_halves() {
+    let words = sum_after_a_loop_lanes_leave();
+    for threads in [64, 96, 128] {
+        let why = super::with_cap_barriers(true, || refusal(&words, threads, 0));
+        assert!(
+            why.contains("a wave reduction over both 32-lane halves"),
+            "{threads}: {why}"
+        );
+        let translated = super::with_cap_barriers(false, || refusal(&words, threads, 0));
+        assert_eq!(translated, "translated", "{threads}");
+    }
+    assert_eq!(refusal(&words, 32, 0), "translated");
+}
+
+/// [`sum_after_a_loop_lanes_leave`] on every hardware adapter gives the
+/// console's sums, in a group of 64 (one console wave in two halves), of 96
+/// (the second console wave has no upper half) and of 128 (two).
+#[test]
+#[cfg(windows)]
+fn a_reduction_after_a_loop_lanes_leave_matches_the_console_on_every_gpu() {
+    let words = sum_after_a_loop_lanes_leave();
+    let mut failed = Vec::new();
+    for threads in [64, 96, 128] {
+        let want: Vec<u32> = (0..threads)
+            .map(|l| (console_reduction(threads, l, |a, b| a + b, |t| t & 3) as f32).to_bits())
+            .collect();
+        failed.extend(super::with_cap_barriers(false, || {
+            differences(&words, threads, 1, &want)
+        }));
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`loops_sharing_a_latch`] in whole-wave halves: each side of the shared
+/// latch's branch counts its own loop's passes under the iteration limit.
+#[test]
+fn a_branch_back_to_two_loops_runs_in_whole_wave_halves() {
+    let n = native(&loops_sharing_a_latch(), true, 64, 0);
+    let literal = lower_halves(&n, true, false, true).expect("whole-wave halves");
+    assert_eq!(literal.wave_size, Some(32));
+}
+
+/// [`loops_sharing_a_latch`] in whole-wave halves on every hardware adapter
+/// gives the console's count in every lane.
+#[test]
+#[cfg(windows)]
+fn a_branch_back_to_two_loops_matches_the_console_on_every_gpu() {
+    let words = loops_sharing_a_latch();
+    let failed = differences_in(true, &words, 64, 1, &[6; 64], 0, false, true);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 

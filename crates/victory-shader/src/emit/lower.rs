@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod atomics;
+mod back_edges;
 mod barriers;
 mod bvh;
 mod f64;
@@ -11276,10 +11277,9 @@ impl<'a> Lower<'a> {
                     && back(self, taken)
                     && back(self, not_taken)
                 {
-                    return Err(unsupported(
-                        offset,
-                        "a wave64 branch with two loop back edges",
-                    ));
+                    let term = self.two_back_edges(b, cond, taken, not_taken);
+                    self.s.m.terminate(self.cur, term);
+                    return Ok(());
                 }
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)

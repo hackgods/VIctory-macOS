@@ -4049,16 +4049,27 @@ fn the_scalar_readfirstlane_programs_are_what_their_comments_say() {
 /// EXEC, it still passes the halves' first lanes and ballots between them.
 #[test]
 fn a_first_lane_read_only_active_lanes_see_is_made_in_each_half() {
+    for own in [true, false] {
+        super::with_own_exchange_words(own, || {
+            read_first_lane_in_halves(own);
+        });
+    }
+}
+
+fn read_first_lane_in_halves(own: bool) {
     for mask in [&MASK_LANES_8_9, &MASK_LANES_40_41, &MASK_LANES_12_44] {
         let inside = readfirstlane_of_a_scalar_in_branch(mask, true, true);
         let alone = lowered(&native(&inside, true, 64, 0), true).expect("read alone in halves");
         assert_eq!(alone.wave_size, Some(32));
         let outside = readfirstlane_of_a_scalar_in_branch(mask, true, false);
         let across = lowered(&native(&outside, true, 64, 0), true).expect("read across in halves");
-        // At least two exchanges (the value, the ballot) of two barriers.
+        // At least two exchanges (the value, the ballot) of two barriers;
+        // with VICTORY_HALVES_OWN_WORDS on (the default), an exchange the
+        // group runs once leaves out its leading barrier (halves-once-slots).
+        let want = if own { 3 } else { 4 };
         assert!(
-            across.barriers >= alone.barriers + 4,
-            "{} {}",
+            across.barriers >= alone.barriers + want,
+            "{} {} (own words {own})",
             across.barriers,
             alone.barriers
         );

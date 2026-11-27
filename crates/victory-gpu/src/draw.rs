@@ -2709,7 +2709,8 @@ impl State {
         // Decide hoisting before `prepare`/`bind`, which record *this* call's
         // own GPU writes (those only constrain subsequent indirect calls).
         let hoist = crate::indirect::batch_clamps_enabled()
-            && list.can_hoist_clamp(arguments, len, count);
+            && list.can_hoist_clamp(arguments, len, count)
+            && !crate::alias::clamp_in_place_inline(arguments, len, count);
         let inline_clamped = if hoist {
             None
         } else {

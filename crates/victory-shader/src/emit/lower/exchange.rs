@@ -30,6 +30,21 @@
 //! none ([`super::together`]), and `emit::walk` makes more blocks ones every
 //! lane runs by leaving out the skips around them.
 //!
+//! With [`Mac::whole_wave`] (`emit::Options::halves_whole_wave`, off unless
+//! asked for; `notes/far-ray.md`) also:
+//!
+//! * a lane's value where the group runs together ([`Lower::exchange_together`]),
+//!   not only where every lane runs once, with a barrier after the loads
+//!   (such a block may come round again) and no reuse of an earlier
+//!   hand-over;
+//! * blocks every thread runs as often as every other on a loop's body,
+//!   none having ended ([`Lower::exchange_met`]): a lane's own `if` inside
+//!   the body joins again before the loop goes round, so it changes nothing;
+//! * the first lane under a narrowed EXEC, for `v_readfirstlane_b32`
+//!   ([`Lower::exchanged_first`]): the console's EXEC there handed over as a
+//!   ballot, its lowest lane, and that lane's value handed over. The
+//!   title's bin offsets read so the base a bin's atomic returned.
+//!
 //! What is handed over:
 //!
 //! * a lane's value, for `v_readlane_b32` ([`Lower::exchanged_lane`]), as
@@ -150,6 +165,10 @@ pub(super) struct State {
     /// The value the last exchange handed over, and the first slot of its
     /// set.
     last: Option<(V, u32)>,
+    /// With [`Mac::whole_wave`]: blocks every thread of the group runs as
+    /// often as every other, none having ended ([`lds_rounds::met_with`]),
+    /// when first asked.
+    met: Option<Option<Vec<bool>>>,
     /// Bytes of group-shared memory the exchanges have taken.
     bytes: u32,
 }
@@ -198,8 +217,16 @@ impl Lower<'_> {
     /// not in a block every lane runs exactly once.
     pub(super) fn exchanged_lane(&mut self, x: V, lane: V) -> Option<V> {
         let per_set = self.exchange_slots()?;
-        if !self.exchange_in(self.cur_ir) {
+        // Mac (`whole_wave`): also in a block the group runs together
+        // ([`Lower::exchange_together`], with [`Lower::exchange_met`]), with
+        // no reuse of an earlier hand-over (such a block may come round
+        // again, or be gone round) and a barrier after the loads.
+        let together = !self.exchange_in(self.cur_ir);
+        if together && !(self.x.mac.whole_wave && self.exchange_together(self.cur_ir)) {
             return None;
+        }
+        if together {
+            self.exchange.last = None;
         }
         let i32t = self.s.t.i32;
         let slots = match self.exchange.slots {
@@ -251,7 +278,55 @@ impl Lower<'_> {
         let k = self.s.m.i32(base);
         let from = self.s.m.bin(c, Bin::Add, from, k);
         let at = self.s.m.element(c, slots, from);
-        Some(self.s.m.load(c, at))
+        let r = self.s.m.load(c, at);
+        if together {
+            // The next lane exchange may store to this set: none before
+            // every thread has loaded (on a cycle, this one next round).
+            self.exchange.last = None;
+            self.group_barrier();
+        }
+        Some(r)
+    }
+
+    /// Mac (`whole_wave`): what `v_readfirstlane_b32` `inst` reads of `x`
+    /// under a narrowed EXEC, exact across the halves: the console's EXEC
+    /// at `inst` as a ballot handed over ([`Lower::exchanged_ballot`]), its
+    /// lowest lane (lane 0 where it is empty, as the hardware reads), and
+    /// that lane's value handed over ([`Lower::exchanged_lane`]). `None`
+    /// where either hand-over cannot be placed: not asked for, not in
+    /// halves, a block not every thread runs alike, an EXEC not known per
+    /// lane.
+    pub(super) fn exchanged_first(&mut self, inst: &Inst, x: V) -> Option<V> {
+        if !(self.halves && self.x.mac.exchange && self.x.mac.whole_wave) {
+            return None;
+        }
+        let b = self.cur_ir;
+        let exec = inst.read(Reg::S(EXEC))?;
+        let &m = self.x.st.masks.get(&exec)?;
+        // Both hand-overs, or neither.
+        let lanes = self.exchange_in(b) || self.exchange_together(b);
+        if !(lanes && self.exchange_halves_in(b)) {
+            return None;
+        }
+        let c = self.cur;
+        let bit = self.boolean(m, c).ok()?;
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let r = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let low = self.s.m.extract(c, r, 0);
+        let (lo, hi) = self.exchanged_ballot(c, low);
+        // The lowest set bit of the 64; lane 0 for none.
+        let c = self.cur;
+        let (zero, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let flo = self.unary_bits(c, 32, lo);
+        let fhi = self.unary_bits(c, 32, hi);
+        let fhi = self.s.m.bin(c, Bin::Add, fhi, k32);
+        let none_hi = self.s.m.cmp(c, pred::EQ, hi, zero);
+        let fhi = self.s.m.select(c, none_hi, zero, fhi);
+        let some_lo = self.s.m.cmp(c, pred::NE, lo, zero);
+        let first = self.s.m.select(c, some_lo, flo, fhi);
+        self.exchanged_lane(x, first)
     }
 
     /// Whether the first-lane read `inst` (of the block being lowered) reads
@@ -290,10 +365,30 @@ impl Lower<'_> {
     /// ([`Lower::exchange_again`]).
     fn exchange_together(&mut self, b: usize) -> bool {
         let x = self.x;
-        self.halves
+        let together = self.halves
             && x.mac.exchange
             && x.mac.walk
-            && self.exchange.together.get_or_insert_with(|| together::blocks(x)).blocks[b]
+            && self.exchange.together.get_or_insert_with(|| together::blocks(x)).blocks[b];
+        together || self.exchange_met(b)
+    }
+
+    /// Whether IR block `b` is one every thread of the group runs as often
+    /// as every other, with no thread ended on the way
+    /// ([`lds_rounds::met_with`]), in a program in halves asked to exchange
+    /// there ([`Mac::whole_wave`], with [`Mac::walk`]). That is
+    /// [`together`]'s premise for a hand-over, by a finer rule: a branch
+    /// whose two ways join again before the block (a lane's own `if` in a
+    /// loop's body) does not change how often the block runs. Ended threads
+    /// are left out: an ended half would leave its slot unwritten.
+    fn exchange_met(&mut self, b: usize) -> bool {
+        let x = self.x;
+        if !(self.halves && x.mac.exchange && x.mac.walk && x.mac.whole_wave) {
+            return false;
+        }
+        // (`together` keeps the cycles for `exchange_again`.)
+        self.exchange.together.get_or_insert_with(|| together::blocks(x));
+        let met = self.exchange.met.get_or_insert_with(|| lds_rounds::met_with(x, false));
+        met.as_ref().is_some_and(|m| m[b])
     }
 
     /// Whether the hand-over written in DXIL block `at` is in an IR block on

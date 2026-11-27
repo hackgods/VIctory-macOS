@@ -30,6 +30,7 @@ const ORDER: Mac = Mac {
     bvh_miss: false,
     lds_rounds: false,
     descriptor_as_data: false,
+    whole_wave: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

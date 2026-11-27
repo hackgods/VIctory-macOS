@@ -96,6 +96,14 @@ pub(crate) fn wanted(x: &Parts, group: u32, lds_dwords: u32) -> Option<Set<(usiz
 /// shape is not followed (an indirect branch, a barrier of its own, a block
 /// from which no way leads to the end).
 pub(super) fn met(x: &Parts) -> Option<Vec<bool>> {
+    met_with(x, true)
+}
+
+/// [`met`]; without `ends`, a branch with a way that leads only to the end
+/// counts as any other (it must be decided for the group), so the blocks
+/// are those every thread of the group runs as often as every other, none
+/// having ended (mac: [`super::exchange`] with [`Mac::whole_wave`]).
+pub(super) fn met_with(x: &Parts, ends: bool) -> Option<Vec<bool>> {
     let p = x.p;
     let n = p.blocks.len();
     let own_barrier = |b: &Block| b.insts.iter().any(|i| i.name() == "s_barrier");
@@ -133,7 +141,7 @@ pub(super) fn met(x: &Parts) -> Option<Vec<bool>> {
         let same = values(x, &met);
         let mut next: Vec<bool> = ending.iter().map(|e| !e).collect();
         for &d in &branches {
-            if to_end(d) || decided(x, &same, d) {
+            if ends && to_end(d) || decided(x, &same, d) {
                 continue;
             }
             for (b, r) in rounds[d].iter().enumerate() {

@@ -1113,6 +1113,7 @@ fn emit_form(
             bvh_miss: options.bvh_miss,
             descriptor_as_data: options.descriptor_as_data,
             lds_rounds: options.lds_rounds,
+            whole_wave: options.halves_whole_wave,
         },
     };
     let l = match lower::lower_pruned(&parts(st, res), keep) {

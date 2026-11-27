@@ -7601,6 +7601,14 @@ impl<'a> Lower<'a> {
                             return int(self, r);
                         }
                     }
+                    // Mac (`whole_wave`): under a narrowed EXEC, the
+                    // console's first lane and its value handed over.
+                    if self.x.mac.whole_wave {
+                        let a = s(self, 0)?;
+                        if let Some(r) = self.exchanged_first(inst, a) {
+                            return int(self, r);
+                        }
+                    }
                     // The Mac port's hand-over (`halves`), where it comes
                     // first or nothing else answers ([`Lower::across_first`]).
                     if self.across_first() && self.across_here() {

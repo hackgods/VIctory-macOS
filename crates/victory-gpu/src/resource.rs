@@ -2453,6 +2453,27 @@ fn written_twin(address: u64, desc: &ResourceDesc) -> Option<This> {
     Some(twin)
 }
 
+/// mac: whether [`texture_at`] finds a resource for `address` and `desc`
+/// whose host texture is made, without making either
+/// (`VICTORY_FLICKER_WATCH`). A placed view of a written title texture
+/// (`VICTORY_PLACED_TWIN`) counts as not made.
+#[cfg(windows)]
+pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> bool {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, desc)).is_some_and(|&r| current(r as This) && made(resource(r as This)).is_some())
+}
+
+/// mac: width, height, mip levels and format of a resource description
+/// as words (`VICTORY_FLICKER_WATCH`).
+#[cfg(windows)]
+pub(crate) fn desc_size(desc: &[u32; 14]) -> (u64, u32, u16, u32) {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.width, d.height, d.mip_levels, d.format)
+}
+
 /// The resource for a texture placed at `address` with the resource
 /// description `desc` (as words), made on first use.
 #[cfg(windows)]

@@ -62,6 +62,9 @@ pub mod fence;
 // mac: plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
 mod flights;
+// mac: `VICTORY_FLICKER_WATCH`; plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod flicker;
 pub mod frame;
 mod hold;
 #[cfg(windows)]

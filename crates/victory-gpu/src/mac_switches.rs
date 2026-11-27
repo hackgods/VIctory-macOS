@@ -460,6 +460,25 @@ pub(crate) fn census_batch() -> bool {
     })
 }
 
+/// Whether a heap sync makes a slot rewritten with a view of a placed
+/// texture at once when that texture's host texture is made already,
+/// instead of leaving it null until a shader has read it (one submission of
+/// zeros for the draws that pick it by index: an object black for a frame,
+/// notes/flicker.md). Making such a view makes no texture, which is what the
+/// null rule spares. Only with `VICTORY_PLACED_AT_ONCE=1`, read once.
+pub(crate) fn placed_at_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = census_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=1: heap slots rewritten with views of placed textures whose host texture is made are made at once, not left null until read"
+            );
+        }
+        on
+    })
+}
+
 #[cfg(test)]
 mod census_tests {
     use super::census_rule;
@@ -471,6 +490,14 @@ mod census_tests {
         }
         assert!(census_rule(Some("1")));
         assert!(census_rule(Some(" 1 ")));
+    }
+
+    #[test]
+    fn placed_views_at_once_are_off_by_default() {
+        // Read once; the tests never set it.
+        if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
+            assert!(!super::placed_at_once());
+        }
     }
 
     #[test]

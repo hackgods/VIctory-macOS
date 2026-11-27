@@ -402,7 +402,7 @@ pub(crate) fn make_read(slots: &[u32]) {
     // a texture takes up to milliseconds; title threads waited 1-6 s a frame,
     // runs evict2, noevict1). They are never released, so they outlive it;
     // the lock is held only to look the slots up and to make the views.
-    let placed: Vec<View> = {
+    let (placed, at): (Vec<View>, Vec<u32>) = {
         let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
         heaps
             .iter()
@@ -410,9 +410,16 @@ pub(crate) fn make_read(slots: &[u32]) {
             .map(|&(_, _, at)| unsafe { &*(at as *const Heap) })
             .filter(|heap| heap.desc.kind == VIEWS_KIND)
             .filter_map(|heap| heap.host.get()?.as_ref().map(|host| (heap, host)))
-            .flat_map(|(heap, host)| slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| host.unmade_placed(i)))
-            .collect()
+            .flat_map(|(heap, host)| {
+                slots.iter().filter(|&&i| i < heap.desc.count).filter_map(|&i| Some((host.unmade_placed(i)?, i)))
+            })
+            .unzip()
     };
+    // mac: `VICTORY_FLICKER_WATCH=1`: the slots read while null, before
+    // their textures are made.
+    if crate::flicker::on() {
+        flicker_reads(slots, &placed, &at);
+    }
     #[cfg(test)]
     tests::while_making(slots);
     // Several at a time (each a committed texture; hundreds in a new shot,
@@ -435,6 +442,34 @@ pub(crate) fn make_read(slots: &[u32]) {
             host.stamp_read(i);
         }
     }
+}
+
+/// mac: `VICTORY_FLICKER_WATCH=1`: logs which of `slots` (a submission's
+/// shaders' first reads) were null when read: the views `placed` at slots
+/// `at` (placed textures not made, [`HostHeap::unmade_placed`]) and the
+/// other slots whose texture was given up. Before the textures are made, so
+/// that "made already" means made before the read.
+#[cfg(windows)]
+fn flicker_reads(slots: &[u32], placed: &[View], at: &[u32]) {
+    use crate::flicker::{Placed, Read, Why};
+    let mut reads: Vec<Read> = Vec::new();
+    for (view, &slot) in placed.iter().zip(at) {
+        let why = crate::flicker::take(slot);
+        let View::Placed(_, resource, desc) = view else { continue };
+        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+        let (width, height, mips, format) = crate::resource::desc_size(resource);
+        let made_already = crate::resource::placed_made(address, resource);
+        reads.push(Read { slot, why, placed: Some(Placed { address, width, height, mips, format, made_already }) });
+    }
+    let placed_at: std::collections::HashSet<u32> = at.iter().copied().collect();
+    for &slot in slots.iter().filter(|s| !placed_at.contains(s)) {
+        // A note of a slot made since (a draw read it through a table) is
+        // dropped with it.
+        if let Some(Why::GivenUp) = crate::flicker::take(slot) {
+            reads.push(Read { slot, why: Some(Why::GivenUp), placed: None });
+        }
+    }
+    crate::flicker::log_reads(crate::queue::presented(), slots.len(), &reads);
 }
 
 /// Makes again, in every shader-visible view heap, the unordered texture

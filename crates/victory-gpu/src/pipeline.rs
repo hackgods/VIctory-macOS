@@ -659,6 +659,14 @@ pub(crate) fn stop_builder(why: String) {
     builder::trip(why);
 }
 
+/// The host GPU ended a submission before it finished: under
+/// `VICTORY_BVH_BUILDER=1` the builder stops if it ran this frame or the
+/// last (`builder::submission_lost`).
+#[cfg(windows)]
+pub(crate) fn submission_lost() {
+    builder::submission_lost();
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).

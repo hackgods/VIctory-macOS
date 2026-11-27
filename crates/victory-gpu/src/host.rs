@@ -1774,6 +1774,9 @@ impl Host {
     /// submission lock.
     fn lost(&self, submitted: &mut u64, mark: &Mark) {
         let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        // Mac (`VICTORY_BVH_BUILDER=1`): a lock-up while the BVH builder
+        // runs stops it.
+        crate::pipeline::submission_lost();
         // A lane that held a lock of an emulated 64-bit atomic when the GPU
         // ended its shader never frees it (`victory_shader::emit`, "Atomic
         // locks"): free them all before anything else runs.

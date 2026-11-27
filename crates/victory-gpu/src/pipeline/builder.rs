@@ -204,6 +204,31 @@ pub(crate) fn note_threads(t: &ThreadForm) {
     note_kind(&t.pending, Kind::Threads);
 }
 
+/// The frame the builder last ran in (`u64::MAX`: never).
+static RAN_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The host GPU ended a submission before it finished (macOS ends a
+/// command buffer when the GPU locks up or takes a page fault;
+/// `host::Host::lost`). Under [`on`], if the builder ran in this frame or
+/// the one before, it may be the cause: it runs no more ([`trip`]), so a
+/// bad structure or a loop of its costs one lost submission, not every
+/// frame's.
+pub(crate) fn submission_lost() {
+    let ran = RAN_IN.load(Ordering::Relaxed);
+    if on() && ran_lately(ran, crate::frame::current()) {
+        trip(format!(
+            "the host GPU ended a submission in frame {} while the builder ran (it ran in frame {ran})",
+            crate::frame::current()
+        ));
+    }
+}
+
+/// Whether a builder that last ran in frame `ran` (`u64::MAX`: never) ran
+/// in frame `now` or the one before.
+fn ran_lately(ran: u64, now: u64) -> bool {
+    ran != u64::MAX && now <= ran.saturating_add(1)
+}
+
 /// Why the builder stopped for good, once it did ([`trip`]).
 static TRIPPED: OnceLock<String> = OnceLock::new();
 
@@ -298,6 +323,9 @@ pub(crate) fn runs() -> bool {
         }
     }
     *decided = (frame, open);
+    if open {
+        RAN_IN.store(frame, Ordering::Relaxed);
+    }
     open
 }
 
@@ -384,6 +412,17 @@ mod tests {
         assert!(!opens(&[Some(true), Some(false)], false));
         assert!(!opens(&[Some(true)], true), "64-lane programs run as halves");
         assert!(!opens(&[], true));
+    }
+
+    /// A lost submission stops the builder if it ran in that frame or the
+    /// one before; never if it has not run.
+    #[test]
+    fn a_lost_submission_stops_a_builder_that_ran_lately() {
+        assert!(!ran_lately(u64::MAX, 0));
+        assert!(!ran_lately(u64::MAX, u64::MAX));
+        assert!(ran_lately(7, 7));
+        assert!(ran_lately(7, 8), "the frame after: its work may still run");
+        assert!(!ran_lately(7, 9));
     }
 
     /// Under `VICTORY_BVH_BUILDER=1`: every plain pipeline must be an exact

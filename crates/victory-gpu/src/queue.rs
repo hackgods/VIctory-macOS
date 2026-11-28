@@ -848,8 +848,15 @@ pub(crate) fn pump_held_if_free(why: Why) {
 // shortcut: a safety valve against a wait nothing satisfies (a write we do
 // not make), which would hold the title's fences until its 30 s watchdog
 // ends the run; counted and logged, remove once runs show it never fires.
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 const VALVE: std::time::Duration = std::time::Duration::from_secs(10);
+/// Tests share one process and its held work, and a suite under load stalls
+/// a test's thread (or the held-work timer, on a lock a slow submission of
+/// another test holds) past ten seconds: a held segment then ran without the
+/// wait that orders it after another queue's write. No test depends on the
+/// valve (the `hold` tests give `force_older_than` a limit of their own).
+#[cfg(all(windows, test))]
+const VALVE: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Whether ready segments across queues and chained bottom-of-pipe waits are
 /// coalesced into one host submission (`VICTORY_COALESCE_PIECES`, on by default

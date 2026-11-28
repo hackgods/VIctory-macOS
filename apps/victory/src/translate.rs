@@ -640,6 +640,17 @@ fn translate_programs(
                         None
                     }
                 };
+                // ES, GS, LS and HS programs have no lowering: listed, so a
+                // census counts them as not emitted rather than leaving them out.
+                if !(graphics || compute || p.stage == HwStage::Ms)
+                    && res.is_some()
+                    && structured.is_some()
+                {
+                    t.fail(
+                        format!("stage: {:?} programs are not lowered", p.stage),
+                        || format!("{} {:?}", example(), p.stage),
+                    );
+                }
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
@@ -965,6 +976,60 @@ mod tests {
         let o = super::emit_options(false, true);
         assert!(!o.host_wave32 && !o.narrow_waves);
         assert!(super::emit_options(false, false).view_marks);
+    }
+
+    /// A geometry program that tracks is listed as not lowered (no host
+    /// geometry stage yet), not left out of the census: here the console
+    /// compiler's prologue reading the runtime's table through user data 0-1.
+    #[test]
+    fn geometry_programs_are_listed_as_not_lowered() {
+        use victory_shader::native::{RootParam, StageIo};
+        let words: [u32; 7] = [
+            0xBE80_0308, // s_mov_b32 s0, s8
+            0x8701_FF09,
+            0x0000_00FF, // s_and_b32 s1, s9, 0xff
+            0xF400_0000,
+            0xFA00_00B8, // s_load_dword s0, s[0:1], 0xb8
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF81_0000, // s_endpgm
+        ];
+        let program = super::NativeProgram {
+            stage: super::HwStage::Gs,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![RootParam {
+                root: super::RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 8,
+                slot: 0,
+            }],
+            used: Vec::new(),
+            io: StageIo::None,
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut t = super::Tally {
+            list: true,
+            ..Default::default()
+        };
+        let mut checks = super::Checks {
+            keep: None,
+            validator: None,
+            host: None,
+            wave32: true,
+        };
+        let container = super::Container { parts: Vec::new() };
+        super::translate_programs(
+            &container,
+            vec![program],
+            &|| "gs".into(),
+            &mut t,
+            &mut checks,
+        );
+        let reasons: Vec<_> = t.failed.keys().map(String::as_str).collect();
+        assert_eq!(reasons, ["stage: Gs programs are not lowered"]);
+        assert_eq!(t.lines, ["gs Gs  stage: Gs programs are not lowered"]);
     }
 
     /// Shader dumps are game-derived, so a dump directory in the repo is refused.

@@ -50,6 +50,16 @@ pub const MEMORY: usize = usize::MAX - 1;
 /// The offset is the user-data byte offset (dword 16 at 0x40).
 pub const USER_DATA: usize = usize::MAX - 2;
 
+/// [`Address::param`] of a load from the console runtime's table for a
+/// geometry program (`HwStage::Gs`, the GS half of a merged ES+GS wave):
+/// its 40-bit address is in user data 0-1 (s8-s9) when no root parameter
+/// fills them, so what it holds is the runtime's, neither a root parameter
+/// nor title data. (The title's geometry programs read one dword there and
+/// place their output vertices in LDS by it, past the ES half's outputs,
+/// which only the linked pipeline knows.) The offset is the byte offset in
+/// the table; lowering has no value for it.
+pub const GS_TABLE: usize = usize::MAX - 3;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -1089,6 +1099,16 @@ impl<'a> Tracer<'a> {
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
+        if self.gs_table(lo, hi) {
+            return match self.term(inst, soffset) {
+                Some(Term::Const(c)) => Ok(Address {
+                    param: GS_TABLE,
+                    offset: (offset as u32).wrapping_add(c),
+                    dynamic: None,
+                }),
+                _ => Err("a computed offset into the runtime's geometry table"),
+            };
+        }
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,
@@ -1098,6 +1118,31 @@ impl<'a> Tracer<'a> {
         }
         extra.offset = extra.offset.wrapping_add(offset as u32);
         self.address(lo, hi, extra)
+    }
+
+    /// Whether `lo` and `hi` address the runtime's geometry table
+    /// ([`GS_TABLE`]): user data 0, and user data 1 masked to address bits
+    /// 32-39, in a geometry program whose root parameters leave both free.
+    fn gs_table(&self, lo: Term, hi: Term) -> bool {
+        if self.stage != HwStage::Gs || self.layout.iter().any(|p| p.sgprs > 0 && p.user_data < 2) {
+            return false;
+        }
+        let input = |index| {
+            let reg = Reg::S(self.stage.user_sgpr(index));
+            self.p
+                .inputs
+                .iter()
+                .find(|i| i.0 == reg)
+                .map(|i| Term::Value(i.1))
+        };
+        let (Some(ud0), Some(ud1)) = (input(0), input(1)) else {
+            return false;
+        };
+        let masked =
+            |(a, b)| (a, b) == (ud1, Term::Const(0xFF)) || (b, a) == (ud1, Term::Const(0xFF));
+        lo == ud0
+            && matches!(hi, Term::Value(v)
+                if self.sop2(v, &["s_and_b32"]).is_some_and(|(_, [a, b])| masked((a, b))))
     }
 
     /// The source of the descriptor operand `op` of `inst`, at `at`.
@@ -2768,6 +2813,83 @@ pub(crate) mod tests {
             HwStage::Cs,
         );
         assert_eq!(r.scalar, [((0, 0), at(MEMORY, 0)), ((0, 1), at(MEMORY, 0))]);
+    }
+
+    /// A geometry program's prologue (the console compiler's form): user data
+    /// 0-1 (s8-s9, after the merged stage's 8 system SGPRs) with the high
+    /// dword masked to 40 bits address the runtime's geometry table; then a
+    /// table load through user data 8 (s16).
+    fn gs_table_words(high: u32, offset: u32) -> Vec<u32> {
+        vec![
+            0xBE80_0308, // s_mov_b32 s0, s8
+            high,
+            0x0000_00FF, // (s_and_b32 s1, s9, 0xff)
+            0xF400_0000,
+            offset,      // s_load_dword s0, s[0:1], ...
+            0xBE91_0380, // s_mov_b32 s17, 0
+            0xF408_0208,
+            0xFA00_0920, // s_load_dwordx4 s[8:11], s[16:17], 0x920
+            S_ENDPGM,
+        ]
+    }
+
+    const S_AND_S1_S9_FF: u32 = 0x8701_FF09;
+
+    #[test]
+    fn a_geometry_program_reads_the_runtime_table_in_user_data_0_1() {
+        let r = track_words(
+            &gs_table_words(S_AND_S1_S9_FF, 0xFA00_00B8), // offset 0xb8
+            &[param(Table, 8, 1)],
+            HwStage::Gs,
+        );
+        assert_eq!(
+            r.scalar,
+            [((0, 2), at(GS_TABLE, 0xB8)), ((0, 4), at(0, 0x920))]
+        );
+    }
+
+    /// Only that form: another stage, a root parameter in user data 0-1, an
+    /// unmasked high dword or a computed offset are not the table.
+    #[test]
+    fn the_runtime_table_is_only_user_data_0_1_of_a_geometry_program() {
+        let code =
+            |words: &[u32]| -> Vec<u8> { words.iter().flat_map(|w| w.to_le_bytes()).collect() };
+        let fails = |words: &[u32], layout: &[RootParam], stage| {
+            let p = crate::ir::build(&code(words), false, 256).unwrap();
+            match track(&p, layout, stage, lanes(&p).as_ref()) {
+                Err(ShaderError::Unsupported { what, .. }) => what,
+                r => panic!("{r:?}"),
+            }
+        };
+        let masked = gs_table_words(S_AND_S1_S9_FF, 0xFA00_00B8);
+        // A vertex program's user data 0-1 are s0-s1; s8-s9 hold nothing.
+        assert_eq!(
+            fails(&masked, &[param(Table, 16, 1)], HwStage::Vs),
+            "an address in an SGPR that is no root parameter"
+        );
+        // s[8:9] are a root descriptor here: its address, not the table.
+        let r = track_words(
+            &masked,
+            &[param(Descriptor, 0, 2), param(Table, 8, 1)],
+            HwStage::Gs,
+        );
+        assert!(
+            r.scalar.iter().all(|s| s.1.param != GS_TABLE),
+            "{:?}",
+            r.scalar
+        );
+        let mut unmasked = masked.clone();
+        unmasked.splice(1..3, [0xBE81_0309]); // s_mov_b32 s1, s9
+        assert_eq!(
+            fails(&unmasked, &[param(Table, 8, 1)], HwStage::Gs),
+            "an address in an SGPR that is no root parameter"
+        );
+        // s_load_dword s0, s[0:1], s5 (a system SGPR)
+        let computed = gs_table_words(S_AND_S1_S9_FF, 0x0A00_0000);
+        assert_eq!(
+            fails(&computed, &[param(Table, 8, 1)], HwStage::Gs),
+            "a computed offset into the runtime's geometry table"
+        );
     }
 
     #[test]

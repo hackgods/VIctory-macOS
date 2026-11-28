@@ -313,6 +313,8 @@ The title has eight loops that write cache lines back with `clwb`, which faults 
 
 Under Rosetta with D3DMetal on Macs with at least 20 GiB of RAM, memory the title commits read-write with `XMemVirtualAlloc`, in whole 64 KiB pages, is pointed at the pages of a D3DMetal buffer with `mach_vm_remap` (#204). The GPU then reads and writes the title's own memory, so those buffers need no host copy, no copy-back after a submission that wrote them, and no refresh before one. A probe at start-up falls back to the copies if the remap does not work; `VICTORY_ALIAS_BUFFERS=0` keeps the copies, and `VICTORY_ALIAS_BUFFERS=1` enables aliasing on 8–18 GiB Macs.
 
+Such a buffer is one host buffer of the region's length, which can exceed 512 MiB. Root views are raw views from a copy's first byte, and D3DMetal returns zeros for raw loads past a view's end, so under Wine raw views hold up to 2 GiB instead of D3D12's 2^27 elements (512 MiB). `VICTORY_RAW_VIEWS_512MIB=1` keeps the old size.
+
 ## The title's output size on a Mac
 
 The title takes its output size from its own settings (`settings.xml`, `video/resolutionFullscreen`), which a Series X wrote as 3840x2160, so a run without `VICTORY_OUTPUT` drew the world at 3840x2160. On a Mac the output size is 1280x720 now, the smallest of the title's own modes: `victory-loader/src/resolution.rs` writes it into the title's code at load, where the bytes match build 1.0.2.1, and logs `resolution: ... Done` for each site. On a 16 GB M4 (Series X), 1280x720 brought the GPU time of a world frame from about 8.4 s to 0.86 s.

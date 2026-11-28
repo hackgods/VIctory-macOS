@@ -1093,9 +1093,11 @@ impl HostHeap {
             unsafe { b.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 != 0
         };
         let buffer = buffer.filter(|&b| !uav || writable(b));
-        // shortcut: a buffer view holds at most 2^27 elements (512 MiB raw).
         let (first, elements) = match buffer {
-            Some(_) => (first / 4, (bytes / 4).clamp(1, 1 << 27) as u32),
+            Some(_) => (
+                first / 4,
+                (bytes / 4).clamp(1, raw_view_most(raw_views_long())) as u32,
+            ),
             // A null view still names its size.
             None => (0, 1),
         };
@@ -3847,9 +3849,87 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     };
 }
 
+/// The most 32-bit elements a raw view holds ([`HostHeap::raw_view_at`]).
+///
+/// A root view is a raw view from its copy's first byte, and its shader adds
+/// the root address's offset. D3D12 sizes buffer views up to 2^27 elements
+/// (512 MiB raw). Under D3DMetal a shader reads zeros past a raw view's end
+/// (its loads are bounds-checked), and reads raw views of up to 2 GiB right:
+/// on an M5 Pro a 512 MiB view read 600 MiB, 1 GiB, 1.25 GiB and 1.5 GiB in
+/// returns zeros, a 2 GiB one read 1.5 GiB in returns the bytes there. A
+/// title buffer aliased zero-copy (`crate::alias`) is one host buffer of the
+/// region's length, more than 512 MiB for a pool of the title's, so a root
+/// view into it more than 512 MiB in read zeros. Under Wine a raw view holds
+/// up to 2 GiB.
+pub(crate) fn raw_view_most(long: bool) -> u64 {
+    if long { (2 << 30) / 4 - 1 } else { 1 << 27 }
+}
+
+/// Whether raw views hold up to 2 GiB ([`raw_view_most`]): under Wine, unless
+/// `VICTORY_RAW_VIEWS_512MIB=1` keeps them at 2^27 elements, as before.
+pub(crate) fn raw_views_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::under_wine() && !crate::switch::on("VICTORY_RAW_VIEWS_512MIB"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_views_hold_2_gib_under_wine_and_512_mib_elsewhere() {
+        assert_eq!(raw_view_most(false), 1 << 27);
+        assert_eq!(raw_view_most(true) * 4, (2 << 30) - 4);
+    }
+
+    /// A raw view of a host buffer longer than 512 MiB, as a root view into
+    /// a region aliased zero-copy is made, reads its words past 512 MiB under
+    /// D3DMetal.
+    #[test]
+    fn a_raw_view_reads_past_512_mib() {
+        use crate::backend::{HostGpu, HostMemory};
+        use crate::compute::{Param, srv};
+        if !crate::under_wine() {
+            return;
+        }
+        let (Some(host), Some(heap)) = (host(), HostHeap::new(false, 2)) else {
+            return;
+        };
+        const DEEP: usize = 600 << 20;
+        let (buffer, data) = host.shared_buffer(1 << 30).expect("a 1 GiB buffer");
+        // SAFETY: inside the 1 GiB mapping; no GPU use yet.
+        unsafe { data.add(DEEP).cast::<u32>().write_volatile(0x600d_f00d) };
+        heap.raw_view_at(0, Some(&buffer), 0, 1 << 30, false);
+        const READ: &str = "ByteAddressBuffer t : register(t0);\n\
+            RWByteAddressBuffer u : register(u0);\n\
+            [numthreads(1, 1, 1)] void main() { u.Store(0, t.Load(600 << 20)); }\n";
+        let (root, pso) = crate::compute::pipeline(
+            READ,
+            windows::core::s!("raw view past 512 MiB"),
+            0,
+            &[Param::Table(&[srv(0, 1)]), Param::Uav { register: 0 }],
+        )
+        .expect("a pipeline reading the view");
+        let (out, out_data) = host.shared_buffer(1 << 16).expect("an output buffer");
+        let list = host.new_list().expect("a list");
+        // SAFETY: an open list; our heap, pipeline and buffers outlive the
+        // waited submission.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap.gpu(0));
+            list.list.SetComputeRootUnorderedAccessView(1, out.GetGPUVirtualAddress());
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(1, 1, 1);
+        }
+        list.keep(&buffer);
+        list.keep(&out);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the shader's word, read after its submission ran.
+        let word = unsafe { out_data.cast::<u32>().read_volatile() };
+        assert_eq!(word, 0x600d_f00d, "the view's word 600 MiB in");
+    }
 
     thread_local! {
         /// Set in a test: heap syncs of its thread leave slots of foreign

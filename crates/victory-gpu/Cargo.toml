@@ -21,6 +21,9 @@ victory-shader = { workspace = true, features = ["host"] }
 tracing-subscriber.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+victory-game.workspace = true
+
 [features]
 # Debugging switches (frame capture, the host debug layer, per-draw data).
 diagnostics = []

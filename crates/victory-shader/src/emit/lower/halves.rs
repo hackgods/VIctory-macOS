@@ -17,8 +17,10 @@
 //! * within a half, exact: DPP (rows of 16, DPP8 groups of 8), `ds_swizzle`
 //!   (groups of 32 or quads), and `ds_bpermute_b32`, which in wave64 permutes
 //!   each half on its own (RDNA2 ISA, "Data Share Operations"; measured on
-//!   RDNA2 in upstream PR #573, banbanzhige's). A lane's own bit of a mask
-//!   held as a number (a constant, data loaded or computed by scalar code),
+//!   RDNA2 in upstream PR #573, banbanzhige's). The row gathers
+//!   `v_permlane16_b32` and `v_permlanex16_b32` also stay within a half.
+//!   A lane's own bit of a mask held as a number (a constant, data loaded
+//!   or computed by scalar code),
 //!   `v_writelane_b32` (the lane named takes the scalar) and the row a DPP
 //!   row mask names (rows 2 and 3 are the upper half's) are decided by the
 //!   console lane ([`Lower::console_lane`]);
@@ -698,7 +700,12 @@ pub(super) fn needs_first_lane(
 /// iteration limit: the latch leaves the program there too. That generated
 /// exit is block `n` here, a terminal exit just like a `Ret`, so a closed
 /// loop with a capped back edge does not look like it has no way out (which
-/// would make everything post-dominate its branches).
+/// would make everything post-dominate its branches). A loop that has a way
+/// out of its own gets that exit only with the cap's barriers refused
+/// (`VICTORY_CAP_BARRIERS=1`, [`crate::emit::cap_barriers_refused`]):
+/// otherwise the cap is taken as never reached there, as the console runs
+/// the loop to its end, and the blocks after it post-dominate the branches
+/// before it as they do on the console.
 pub(super) fn branch_regions(p: &Program, st: &Structured) -> Option<Vec<(usize, Vec<bool>)>> {
     branch_regions_with(p, &st.exits)
 }
@@ -715,8 +722,16 @@ pub(super) fn branch_regions_with(
     for (r, &b) in order.iter().enumerate() {
         rpo[b] = r;
     }
+    // Blocks with a way to the program's end of their own: with the cap
+    // taken as never reached, their loops leave by it.
+    let ends = if crate::emit::cap_barriers_refused() {
+        vec![false; n]
+    } else {
+        reaches_end(exits)?
+    };
     let capped = |b: usize| {
         matches!(exits[b], LaneExit::Jump(t) if rpo[b] != usize::MAX && rpo[t] <= rpo[b])
+            && !ends[b]
     };
     // Block `n` is the virtual exit of every capped latch.
     let m = n + 1;
@@ -792,6 +807,35 @@ pub(super) fn branch_regions_with(
         regions.push((d, seen[..n].to_vec()));
     }
     Some(regions)
+}
+
+/// Per block, whether a path of `exits` leads from it to an end of the
+/// program. None with an indirect exit.
+fn reaches_end(exits: &[LaneExit]) -> Option<Vec<bool>> {
+    let n = exits.len();
+    let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut stack = Vec::new();
+    for (b, e) in exits.iter().enumerate() {
+        match *e {
+            LaneExit::Jump(t) => preds[t].push(b),
+            LaneExit::Branch {
+                taken, not_taken, ..
+            } => {
+                preds[taken].push(b);
+                preds[not_taken].push(b);
+            }
+            LaneExit::End => stack.push(b),
+            LaneExit::Indirect => return None,
+        }
+    }
+    let mut ends = vec![false; n];
+    while let Some(b) = stack.pop() {
+        if std::mem::replace(&mut ends[b], true) {
+            continue;
+        }
+        stack.extend(preds[b].iter().copied().filter(|&q| !ends[q]));
+    }
+    Some(ends)
 }
 
 /// The thread id's x (`v0` on entry) of a wave64 compute program whose

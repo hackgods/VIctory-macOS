@@ -141,6 +141,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held_for(Why::Submission);
+        let entered = std::time::Instant::now();
         for &l in lists {
             for segment in crate::list::segments(l) {
                 let waits = segment.waits();
@@ -152,8 +153,10 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             drop(held);
             ensure_submit_worker();
             wake_submit();
+            add_run(Why::Submission, entered);
         } else if crate::host::flight1_enabled() {
             drop(held);
+            add_run(Why::Submission, entered);
             pump_unlocked(Why::Submission);
         } else {
             pump(&mut held, Why::Submission);
@@ -190,8 +193,24 @@ pub(crate) fn signal_for_test(this: This, fence: This, value: u64) -> HRESULT {
     signal(this, fence, value)
 }
 
+#[cfg(all(windows, test))]
+pub(crate) fn wait_for_test(this: This, fence: This, value: u64) -> HRESULT {
+    wait(this, fence, value)
+}
+
+/// `CopyPageMappingsBatchX` with one batch of one range.
+#[cfg(all(windows, test))]
+pub(crate) fn map_pages_for_test(this: This, destination: u64, kind: u32, start: u32, count: u32) -> HRESULT {
+    let range = PageRange { kind, start, count };
+    let batch = PageBatch { destination, count: 1, ranges: &raw const range };
+    copy_page_mappings(this, 1, &batch, 0, 0, 0)
+}
+
 /// What ran held work: the title's submission, a queue's Signal or Wait, a
-/// CPU fence call, PresentX, our timer, or a completed Flight-1 landing.
+/// CPU fence call, PresentX, host work of ours that runs synchronously
+/// behind the queued work (`VICTORY_ASYNC_SUBMIT=1` or `VICTORY_FLIGHT1=1`:
+/// read-backs, captures, page mappings), our timer, or a completed Flight-1
+/// landing.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Why {
     Submission,
@@ -199,6 +218,7 @@ pub(crate) enum Why {
     Wait,
     Fence,
     Present,
+    Sync,
     Timer,
     #[cfg(windows)]
     Flight,
@@ -273,8 +293,26 @@ fn submit_worker() {
             }
             *work = false;
         }
-        pump_unlocked(Why::Submission);
+        let started = std::time::Instant::now();
+        {
+            let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+            let _on = OnSubmit::enter();
+            pump_ready_under_drain(Why::Submission);
+        }
+        WORKER_US.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
+}
+
+/// Microseconds `victory-submit` spent running queued work since the last
+/// [`take_worker_us`]: host work that, without `VICTORY_ASYNC_SUBMIT=1`,
+/// holds the title's threads.
+#[cfg(windows)]
+static WORKER_US: AtomicU64 = AtomicU64::new(0);
+
+/// [`WORKER_US`] since the last call, cleared (the frame report).
+#[cfg(windows)]
+pub(crate) fn take_worker_us() -> u64 {
+    WORKER_US.swap(0, Ordering::Relaxed)
 }
 
 #[cfg(windows)]
@@ -356,6 +394,13 @@ fn pump_ready_under_drain(why: Why) -> bool {
         };
         moved_any = true;
         match ready {
+            Ready::Action(act) => {
+                // The queue's work before it is on the host GPU: land it
+                // (as the next preparation would), so its copy-back reaches
+                // memory as it was mapped, then act.
+                host.finish_flight_now();
+                act();
+            }
             Ready::Signal { fence, value } => {
                 if !crate::host::flight1_enabled()
                     || !host.attach_signal(fence as This, value, true)
@@ -418,11 +463,16 @@ fn pump_ready_under_drain(why: Why) -> bool {
     moved_any
 }
 
+/// Runs what may run now on the calling thread (`VICTORY_FLIGHT1=1` without
+/// the submit worker), its wait for [`SUBMIT_DRAIN`] and its run counted in
+/// [`BLOCKED_US`] as `why`'s.
 #[cfg(windows)]
 fn pump_unlocked(why: Why) {
-    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);
     let _on = OnSubmit::enter();
+    let entered = std::time::Instant::now();
     pump_ready_under_drain(why);
+    add_run(why, entered);
 }
 
 /// Drains all runnable queued work on `victory-submit` and waits for any
@@ -437,8 +487,11 @@ pub(crate) fn drain_submit(why: Why) {
         host.finish_flight_now();
         return;
     }
-    let _drain = SUBMIT_DRAIN.lock().unwrap_or_else(|e| e.into_inner());
+    // The calling thread waits here for the submit worker's turn and the
+    // flight in the air, then runs what is left: counted as `why`'s.
+    let _drain = lock_timed(&SUBMIT_DRAIN, &BLOCKED_US[why as usize][0]);
     let _on = OnSubmit::enter();
+    let entered = std::time::Instant::now();
     loop {
         let moved = pump_ready_under_drain(why);
         let landed = host.finish_flight_now();
@@ -446,18 +499,88 @@ pub(crate) fn drain_submit(why: Why) {
             break;
         }
     }
+    add_run(why, entered);
 }
 
 /// Called by synchronous `Host::execute` callers (`present`, `resource.rs`,
 /// `composite`, `capture`) before touching the GPU so they execute strictly
 /// after any queued async-submit work or in-flight Flight-1 submission.
 #[cfg(windows)]
+#[track_caller]
 pub(crate) fn before_sync() {
     if (crate::host::async_submit_enabled() || crate::host::flight1_enabled())
         && !ON_SUBMIT_THREAD.with(std::cell::Cell::get)
     {
-        drain_submit(Why::Submission);
+        let caller = std::panic::Location::caller();
+        let started = std::time::Instant::now();
+        drain_submit(Why::Sync);
+        note_sync(caller, started.elapsed());
     }
+}
+
+/// What drained the queued work (`VICTORY_ASYNC_SUBMIT=1` or
+/// `VICTORY_FLIGHT1=1`), for the frame report ([`log_drains`]).
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum Drain {
+    /// PresentX waited for all queued work.
+    Present,
+    /// A page mapping batch was done at once: its queue held nothing and no
+    /// host submission was in flight.
+    MappingAtOnce,
+    /// A page mapping batch was queued behind its queue's work.
+    MappingQueued,
+}
+
+#[cfg(windows)]
+static DRAINS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+#[cfg(windows)]
+fn note_drain(d: Drain) {
+    DRAINS[d as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Our synchronous host work that drained queued work since the last
+/// report: where it was called from, how often, and microseconds waited.
+#[cfg(windows)]
+static SYNCS: std::sync::Mutex<Vec<(&'static std::panic::Location<'static>, u64, u64)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn note_sync(at: &'static std::panic::Location<'static>, waited: std::time::Duration) {
+    let mut syncs = SYNCS.lock().unwrap_or_else(|e| e.into_inner());
+    let us = waited.as_micros() as u64;
+    match syncs.iter_mut().find(|(l, ..)| *l == at) {
+        Some((_, n, t)) => (*n, *t) = (*n + 1, *t + us),
+        None => syncs.push((at, 1, us)),
+    }
+}
+
+/// The frame report's line of what drained the queued work, per frame over
+/// `frames`: nothing unless something did.
+#[cfg(windows)]
+pub(crate) fn log_drains(frames: f64) {
+    let [present, at_once, queued] = DRAINS.each_ref().map(|a| a.swap(0, Ordering::Relaxed));
+    let mut syncs = std::mem::take(&mut *SYNCS.lock().unwrap_or_else(|e| e.into_inner()));
+    if present + at_once + queued == 0 && syncs.is_empty() {
+        return;
+    }
+    syncs.sort_by_key(|&(_, _, us)| std::cmp::Reverse(us));
+    let per = |n: u64| n as f64 / frames;
+    let sites: Vec<String> = syncs
+        .iter()
+        .take(6)
+        .map(|(l, n, us)| format!("{}:{} {:.1}x {:.1} ms", l.file(), l.line(), per(*n), *us as f64 / 1e3 / frames))
+        .collect();
+    tracing::info!(
+        "queued host work drained per frame: by presents {:.1}; page mappings done at once {:.1}, queued \
+         behind their queue {:.1}; by our own host work {:.1} ({})",
+        per(present),
+        per(at_once),
+        per(queued),
+        per(syncs.iter().map(|s| s.1).sum()),
+        if sites.is_empty() { "none".into() } else { sites.join(", ") }
+    );
 }
 
 /// Called by `victory-flight` (and `Quiet::drop`) strictly AFTER releasing
@@ -486,8 +609,22 @@ fn held() -> std::sync::MutexGuard<'static, Holding> {
 /// the pump, the host submissions included. The thread that called is held
 /// for both: a title thread for all but [`Why::Timer`], which is ours. The
 /// frame report divides them by its frames ([`take_blocked`]).
+///
+/// With `VICTORY_ASYNC_SUBMIT=1` a title's call only queues its work, and
+/// `[1]` is that; the threads that wait for the submit worker to drain
+/// (PresentX, our synchronous host work) count the lock they wait for in
+/// `[0]` and what they then wait for and run in `[1]`. The worker's own
+/// time is [`WORKER_US`].
 #[cfg(windows)]
-static BLOCKED_US: [[AtomicU64; 2]; 6] = [const { [const { AtomicU64::new(0) }; 2] }; 6];
+static BLOCKED_US: [[AtomicU64; 2]; WHY_NAMES.len()] =
+    [const { [const { AtomicU64::new(0) }; 2] }; WHY_NAMES.len()];
+
+/// Adds the microseconds since `entered` to `why`'s time in the pump
+/// ([`BLOCKED_US`]`[why][1]`).
+#[cfg(windows)]
+fn add_run(why: Why, entered: std::time::Instant) {
+    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
 
 /// [`held`] for a caller that runs held work for `why`, its wait for the
 /// lock counted in [`BLOCKED_US`].
@@ -510,14 +647,16 @@ fn lock_timed<'a, T>(
 
 /// [`Why`]'s variants in their order, as the frame report names them: the
 /// title's submissions, its queues' Signals and Waits, its CPU fence calls,
-/// its presents, and our timer thread.
+/// its presents, our synchronous host work behind queued work, and our
+/// timer thread.
 #[cfg(windows)]
-pub(crate) const WHY_NAMES: [&str; 6] = [
+pub(crate) const WHY_NAMES: [&str; 7] = [
     "title submissions",
     "queue signals",
     "queue waits",
     "fence calls",
     "presents",
+    "our syncs",
     "our timer",
 ];
 #[cfg(windows)]
@@ -526,7 +665,7 @@ const _: () = assert!(Why::Timer as usize + 1 == WHY_NAMES.len());
 /// [`BLOCKED_US`] since the last call, cleared: for each [`Why`], the
 /// microseconds waiting for the queues' lock and in the pump.
 #[cfg(windows)]
-pub(crate) fn take_blocked() -> [[u64; 2]; 6] {
+pub(crate) fn take_blocked() -> [[u64; 2]; WHY_NAMES.len()] {
     BLOCKED_US
         .each_ref()
         .map(|w| w.each_ref().map(|a| a.swap(0, Ordering::Relaxed)))
@@ -562,7 +701,9 @@ pub(crate) fn pump_held_if_free(why: Why) {
         } else if crate::host::flight1_enabled() {
             if let Ok(_drain) = SUBMIT_DRAIN.try_lock() {
                 let _on = OnSubmit::enter();
+                let entered = std::time::Instant::now();
                 pump_ready_under_drain(why);
+                add_run(why, entered);
             }
         } else if let Ok(mut held) = HELD.try_lock() {
             pump(&mut held, why);
@@ -614,7 +755,7 @@ fn join_lists() -> usize {
 fn pump(held: &mut Holding, why: Why) {
     let entered = std::time::Instant::now();
     pump_work(held, why);
-    BLOCKED_US[why as usize][1].fetch_add(entered.elapsed().as_micros() as u64, Ordering::Relaxed);
+    add_run(why, entered);
 }
 
 #[cfg(windows)]
@@ -743,7 +884,7 @@ fn account_frame(frame: u64) {
         return;
     }
     let longest = a.released.iter().map(|r| r.1).max().unwrap_or_default();
-    let mut by = [0u32; 7];
+    let mut by = [0u32; 8];
     for r in &a.released {
         by[r.2 as usize] += 1;
     }
@@ -763,7 +904,7 @@ fn account_frame(frame: u64) {
         fence_wait_ms = fence_waited.as_secs_f64() * 1e3,
         "held work this frame (submissions; host submissions, segments; lists cut at waits; lists reset or released \
          while held, each keeping its own host list; segments that waited, released by \
-         submission/signal/wait/fence/present/timer {by:?}; coalesced BoP waits and hazard splits; time in the pump \
+         submission/signal/wait/fence/present/sync/timer/flight {by:?}; coalesced BoP waits and hazard splits; time in the pump \
          outside host submissions; events the title waited on for fence values and their summed waits); held at the \
          present: {}",
         blocked.len()
@@ -1102,6 +1243,7 @@ extern "system" fn present(
     // shows the frame as far as it ran); the frame line names such work.
     #[cfg(windows)]
     if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
+        note_drain(Drain::Present);
         drain_submit(Why::Present);
     } else {
         pump_held(Why::Present);
@@ -1240,6 +1382,7 @@ fn blinks(frame: u64, resource: This, state: u32, shown: Option<bool>) {
 /// `start` on, 1 pool page `start` each, 2 unmapped, 3 left as they are)
 /// and how many.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct PageRange {
     kind: u32,
     start: u32,
@@ -1261,10 +1404,18 @@ const PAGE: u64 = 64 << 10;
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. Grand Theft Auto VI streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once.
+/// one constant page or of unmapped pages).
 ///
-/// shortcut: done ahead of work the queue still holds (counted in the frame
-/// line); queue it as an item like Signal if that count is not 0.
+/// On the console the batch is a queue operation, in the queue's order.
+/// With `VICTORY_ASYNC_SUBMIT=1` or `VICTORY_FLIGHT1=1` it is: while the
+/// queue holds work or a host submission is in flight, the batch is queued
+/// as an [`Item::Action`] (the submit worker lands the flight, maps, then
+/// prepares the queue's later work) and the title's thread goes on; else it
+/// is done at once. (It drained all queued work before: 124-182 ms of a
+/// 428 ms frame on the title's thread.)
+///
+/// shortcut: otherwise done at once, ahead of work the queue still holds
+/// (counted in the frame line).
 extern "system" fn copy_page_mappings(
     this: This,
     count: u32,
@@ -1279,29 +1430,67 @@ extern "system" fn copy_page_mappings(
     if batches.is_null() && count > 0 {
         return E_INVALIDARG;
     }
+    // The batches as the title passed them: it may reuse them once we return.
+    let batches: Vec<(u64, Vec<PageRange>)> = if count == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: the title passes `count` batches.
+        unsafe { std::slice::from_raw_parts(batches, count as usize) }
+            .iter()
+            .filter(|b| !b.ranges.is_null())
+            .map(|b| {
+                // SAFETY: each batch holds `count` ranges.
+                let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+                (b.destination, ranges.to_vec())
+            })
+            .collect()
+    };
     #[cfg(windows)]
     {
-        if crate::host::async_submit_enabled() || crate::host::flight1_enabled() {
-            drain_submit(Why::Submission);
+        let queued = crate::host::async_submit_enabled() || crate::host::flight1_enabled();
+        let mut held = if queued { held_for(Why::Sync) } else { held() };
+        if queued
+            && (held.holds_work(this as usize)
+                || crate::host::host().is_some_and(crate::host::Host::has_in_flight))
+        {
+            held.push(
+                this as usize,
+                Item::Action(Box::new(move || map_pages(map, &batches, pool, pool_pages))),
+            );
+            drop(held);
+            note_drain(Drain::MappingQueued);
+            if crate::host::async_submit_enabled() {
+                ensure_submit_worker();
+                wake_submit();
+            } else {
+                pump_unlocked(Why::Sync);
+            }
+            return S_OK;
         }
-        if held().holds_work(this as usize) {
+        if held.holds_work(this as usize) {
             account().mappings += 1;
+        }
+        drop(held);
+        if queued {
+            note_drain(Drain::MappingAtOnce);
         }
     }
     #[cfg(not(windows))]
     let _ = this;
-    let batches = (count > 0).then(|| {
-        // SAFETY: the title passes `count` batches.
-        unsafe { std::slice::from_raw_parts(batches, count as usize) }
-    });
+    map_pages(map, &batches, pool, pool_pages);
+    S_OK
+}
+
+/// Maps `batches` of `pool` (`pool_pages` pages) with `map`.
+fn map_pages(
+    map: crate::resource::PageMapper,
+    batches: &[(u64, Vec<PageRange>)],
+    pool: u64,
+    pool_pages: u32,
+) {
     let mut ok = true;
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
+    for (destination, ranges) in batches {
+        let mut at = *destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
@@ -1322,7 +1511,6 @@ extern "system" fn copy_page_mappings(
             tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
         });
     }
-    S_OK
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {

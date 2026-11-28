@@ -247,8 +247,30 @@ pub(in crate::emit) enum Spoiler {
 /// `s_andn2`/`s_cbranch_scc1`) counting its passes in `v6` while `v15`
 /// goes down by 1. The lanes past 40 run no pass on the console and keep a
 /// positive `v15`. Stores `v6` and the first lane's id (`v7`) at `l * 32`.
+///
+/// In halves this loop alone now runs in lockstep (`predicate`'s `while`
+/// loops, #591), where lanes that left are no longer counted as staying;
+/// [`nested_fixture`] keeps it per lane.
 #[cfg(test)]
 pub(in crate::emit) fn fixture(spoiler: Spoiler) -> Vec<u32> {
+    fixture_shaped(spoiler, false)
+}
+
+/// [`fixture`]'s loop inside an outer loop of the same kind (its own mask
+/// `s[36:37]`, a latch giving EXEC back from `s[38:39]`, EXEC saved around
+/// the inner loop in `s[44:45]`, and the same `v_cmpx_ge_f32 exec, 0, v15`
+/// test after it: one pass in the lanes that run it), as in
+/// `63381c3250b287fa`. Neither loop runs in lockstep: the outer one holds a
+/// cycle, and the inner one is entered from a block the lanes do not run
+/// together. Each has an exit test to rewrite; the console's results are
+/// [`fixture`]'s.
+#[cfg(test)]
+pub(in crate::emit) fn nested_fixture(spoiler: Spoiler) -> Vec<u32> {
+    fixture_shaped(spoiler, true)
+}
+
+#[cfg(test)]
+fn fixture_shaped(spoiler: Spoiler, nested: bool) -> Vec<u32> {
     let mut w = vec![
         0xBE84_0300, // s_mov_b32 s4, s0
         0xBE85_0380, // s_mov_b32 s5, 0
@@ -280,6 +302,18 @@ pub(in crate::emit) fn fixture(spoiler: Spoiler) -> Vec<u32> {
         0x7E18_0500, // v_readfirstlane_b32 s12, v0
         0x7E0E_020C, // v_mov_b32 v7, s12
         0xBE98_047E, // s_mov_b64 s[24:25], exec
+    ]);
+    let outer = w.len() + 2;
+    if nested {
+        w.extend([
+            0xBEA4_047E, // s_mov_b64 s[36:37], exec
+            0xBF82_0001, // s_branch outer body
+            0x87FE_2426, // outer latch: s_and_b64 exec, s[38:39], s[36:37]
+            0xBEA6_047E, // outer body: s_mov_b64 s[38:39], exec
+            0xBEAC_047E, // s_mov_b64 s[44:45], exec
+        ]);
+    }
+    w.extend([
         0xBE94_047E, // s_mov_b64 s[20:21], exec
         0xBF82_0001, // s_branch body
     ]);
@@ -306,6 +340,15 @@ pub(in crate::emit) fn fixture(spoiler: Spoiler) -> Vec<u32> {
     ]);
     let back = latch as i32 - (w.len() as i32 + 1);
     w.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 latch
+    if nested {
+        w.extend([
+            0xBEFE_042C, // s_mov_b64 exec, s[44:45]
+            0x7C2C_1E80, // v_cmpx_ge_f32 0, v15
+            0x8AA4_7E24, // s_andn2_b64 s[36:37], s[36:37], exec
+        ]);
+        let back = outer as i32 - (w.len() as i32 + 1);
+        w.push(0xBF85_0000 | (back as u32 & 0xFFFF)); // s_cbranch_scc1 outer latch
+    }
     w.push(0xBEFE_0418); // s_mov_b64 exec, s[24:25]
     if spoiler == Spoiler::ScalarAfter {
         w.push(0xBE9A_0314); // s_mov_b32 s26, s20
@@ -318,7 +361,8 @@ pub(in crate::emit) fn fixture(spoiler: Spoiler) -> Vec<u32> {
     w
 }
 
-/// [`fixture`]'s console results, per lane: the passes and the first lane.
+/// [`fixture`]'s (and [`nested_fixture`]'s) console results, per lane: the
+/// passes and the first lane.
 #[cfg(all(test, windows))]
 pub(in crate::emit) fn console_fixture(l: u32) -> [u32; 2] {
     if l < 40 { [(l & 7) + 1, 0] } else { [0, 0] }
@@ -326,7 +370,7 @@ pub(in crate::emit) fn console_fixture(l: u32) -> [u32; 2] {
 
 #[cfg(test)]
 mod tests {
-    use super::{Spoiler, fixture, natural_loop, refusal};
+    use super::{Spoiler, fixture, natural_loop, nested_fixture, refusal};
     use crate::emit::lower::{self, Parts};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -451,6 +495,39 @@ mod tests {
         }
     }
 
+    /// The nested form: the outer loop's mask, latch and test around the
+    /// inner loop, which is [`fixture`]'s.
+    #[test]
+    fn the_nested_fixture_is_what_its_comments_say() {
+        let code: Vec<u8> = nested_fixture(Spoiler::None)
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+        let list = gfx10::decode(&code).expect("decodes");
+        let text: Vec<String> = list.iter().map(|i| i.text(true)).collect();
+        let at = |want: &str| {
+            text.iter()
+                .position(|t| t.starts_with(want))
+                .unwrap_or_else(|| panic!("{want:?} not in:\n{}", text.join("\n")))
+        };
+        let outer_mask = at("s_mov_b64 s[36:37], exec");
+        let outer_latch = at("s_and_b64 exec, s[38:39], s[36:37]");
+        let inner_latch = at("s_and_b64 exec, s[22:23], s[20:21]");
+        let restore = at("s_mov_b64 exec, s[44:45]");
+        let outer_test = at("s_andn2_b64 s[36:37], s[36:37], exec");
+        assert!(outer_mask < outer_latch && outer_latch < inner_latch);
+        assert!(inner_latch < restore && restore < outer_test);
+        assert!(text[restore + 1].starts_with("v_cmpx_ge_f32 exec, 0, v15"));
+        // Each `s_cbranch_scc1` goes back to its own latch.
+        let target = |i: usize| {
+            let simm = list[i].words[0] as u16 as i16 as i64;
+            (list[i].offset as i64 + 4 + 4 * simm) as usize
+        };
+        assert_eq!(target(restore - 1), list[inner_latch].offset);
+        assert_eq!(target(outer_test + 1), list[outer_latch].offset);
+        assert!(text[outer_test + 2].starts_with("s_mov_b64 exec, s[24:25]"));
+    }
+
     /// The loop is its header (the body after the `s_branch`) and the
     /// latch, without the early exit's end or the stores.
     #[test]
@@ -539,15 +616,20 @@ mod tests {
         }
     }
 
-    /// With the switch, the fixture's one loop exit is rewritten; without
-    /// it, or where the loop does not allow it, none is.
+    /// With the switch, the nested fixture's two loop exits are rewritten;
+    /// without it, or where the loops do not allow it, none is. The loop
+    /// alone runs in lockstep in halves (#591): nothing to rewrite there.
     #[test]
     fn the_loop_exit_is_rewritten_only_with_the_switch_and_where_exact() {
-        let plain = fixture(Spoiler::None);
+        assert_eq!(rewritten(&fixture(Spoiler::None), true), 0);
+        let plain = nested_fixture(Spoiler::None);
         assert_eq!(rewritten(&plain, false), 0);
-        assert_eq!(rewritten(&plain, true), 1);
-        assert_eq!(rewritten(&fixture(Spoiler::ScalarAfter), true), 0);
-        assert_eq!(rewritten(&fixture(Spoiler::NeighbourInside), true), 0);
-        assert_eq!(rewritten(&fixture(Spoiler::SampleInside), true), 0);
+        assert_eq!(rewritten(&plain, true), 2);
+        assert_eq!(rewritten(&nested_fixture(Spoiler::ScalarAfter), true), 0);
+        assert_eq!(
+            rewritten(&nested_fixture(Spoiler::NeighbourInside), true),
+            0
+        );
+        assert_eq!(rewritten(&nested_fixture(Spoiler::SampleInside), true), 0);
     }
 }

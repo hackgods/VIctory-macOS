@@ -4100,19 +4100,21 @@ fn lowered_entry_exit(
 /// exit left run no pass of the later loop on the console. In halves they
 /// are kept on predicated, and their stale positive counter never meets
 /// the loop's test: without the switch they run to the loop limit, with it
-/// they leave at the first test. Both give the console's results on every
-/// hardware adapter (and the one-wave64 form where the adapter has 64-lane
-/// waves); with the switch, many groups of the program also finish in a
-/// fraction of the time.
+/// they leave at the first test. The loop sits in an outer one
+/// ([`lower::entry_exit::nested_fixture`]), so it runs per lane, not in
+/// lockstep. Both give the console's results on every hardware adapter
+/// (and the one-wave64 form where the adapter has 64-lane waves); with the
+/// switch, many groups of the program also finish in a fraction of the
+/// time.
 #[test]
 #[cfg(windows)]
 fn early_exited_lanes_leave_a_later_loop_as_the_console_on_every_gpu() {
-    use lower::entry_exit::{Spoiler, console_fixture, fixture};
-    let words = fixture(Spoiler::None);
+    use lower::entry_exit::{Spoiler, console_fixture, nested_fixture};
+    let words = nested_fixture(Spoiler::None);
     let n = native(&words, true, 64, 0);
     let on = lowered_entry_exit(&n, true).expect("halves, entry exit");
     let off = lowered_entry_exit(&n, false).expect("halves");
-    assert_eq!((on.loop_entry_exits, off.loop_entry_exits), (1, 0));
+    assert_eq!((on.loop_entry_exits, off.loop_entry_exits), (2, 0));
     assert_eq!((on.wave_size, off.wave_size), (Some(32), Some(32)));
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         for l in [&on, &off] {

@@ -1161,7 +1161,15 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
-        host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
+        // To the copy's end in its buffer: `offset` counts from the buffer's start.
+        let (start, len) = shadow.range();
+        host.raw_view_at(
+            index,
+            Some(&shadow.buffer),
+            0,
+            shadow.offset(start + len) & !3,
+            uav,
+        );
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));
         }

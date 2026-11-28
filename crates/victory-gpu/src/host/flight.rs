@@ -1055,6 +1055,11 @@ mod tests {
     /// thread that submitted it, which lands the flight itself: when the
     /// submission returns, the flight has landed and the held list is in
     /// the air, with no landing by `victory-flight` in between.
+    ///
+    /// Something else may land the flight first (another test's
+    /// `Host::quiet`, the gate's watchdog after a paused run): the held list
+    /// then runs all the same, which every attempt checks, and the scenario
+    /// is tried again until the submitting thread was the one that landed.
     #[test]
     fn prep_beside_lands_the_flight_for_work_held_behind_it() {
         let Some(host) = host() else {
@@ -1063,64 +1068,74 @@ mod tests {
         let _mode = ModeGuard::new(true, false);
         let _beside = BesideGuard::new(true);
         let (q, f) = make_queue_and_fence();
-        let mut bop_word: u64 = 0;
-        let bop = (&raw mut bop_word) as usize;
+        let mut landed_by_submitter = false;
+        for attempt in 1..=20u64 {
+            let value = 0x1234_0000 + attempt;
+            let word = Box::leak(Box::new(0u64));
+            let bop = std::ptr::from_mut(word) as usize;
 
-        let mut gate = Gate::hold(host);
-        let first = Arc::new(host.new_list().expect("host list"));
-        first.defer_write(bop as *mut u8, Written::Value(0x1234_5678), 8);
-        first.close();
-        host.execute_flight1(vec![first], vec![]);
-        assert!(host.has_in_flight());
+            let mut gate = Gate::hold(host);
+            let first = Arc::new(host.new_list().expect("host list"));
+            first.defer_write(bop as *mut u8, Written::Value(value), 8);
+            first.close();
+            host.execute_flight1(vec![first], vec![]);
 
-        // The held list: it waits for the flight's bottom-of-pipe value.
-        let ran = Arc::new(AtomicBool::new(false));
-        let flag = ran.clone();
-        let saw_value = Arc::new(AtomicBool::new(false));
-        let saw = saw_value.clone();
-        let second = Arc::new(host.new_list().expect("host list"));
-        second.defer_wait(crate::hold::ValueWait {
-            address: bop as u64,
-            bytes: 8,
-            comparison: 3,
-            reference: 0x1234_5678,
-            mask: u64::MAX,
-        });
-        second.defer_after(move || {
-            flag.store(true, Ordering::Release);
-            // SAFETY: the word outlives the flights.
-            if unsafe { (bop as *const u64).read_volatile() } == 0x1234_5678 {
-                saw.store(true, Ordering::Release);
+            // The held list: it waits for the flight's bottom-of-pipe value.
+            let ran = Arc::new(AtomicBool::new(false));
+            let flag = ran.clone();
+            let saw_value = Arc::new(AtomicBool::new(false));
+            let saw = saw_value.clone();
+            let second = Arc::new(host.new_list().expect("host list"));
+            second.defer_wait(crate::hold::ValueWait {
+                address: bop as u64,
+                bytes: 8,
+                comparison: 3,
+                reference: value,
+                mask: u64::MAX,
+            });
+            second.defer_after(move || {
+                flag.store(true, Ordering::Release);
+                // SAFETY: the word is never freed.
+                if unsafe { (bop as *const u64).read_volatile() } == value {
+                    saw.store(true, Ordering::Release);
+                }
+            });
+            second.close();
+
+            let before = beside_counts();
+            // The gate opens while the submitting thread waits for the flight.
+            let opener = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.open();
+            });
+            crate::queue::submit_segment_for_test(q, second);
+            opener.join().expect("the gate's thread");
+            // The call returned: the first flight has landed and the held
+            // list was given to the GPU, whoever landed the flight.
+            // SAFETY: the word is never freed.
+            assert_eq!(unsafe { (bop as *const u64).read_volatile() }, value);
+            let by_submitter = beside_counts()[5] > before[5];
+            queue_signal(q, f, attempt);
+            assert!(
+                wait_fence(f, attempt, Duration::from_secs(5)),
+                "the held list ran"
+            );
+            assert!(ran.load(Ordering::Acquire), "its work after it ran");
+            assert!(
+                saw_value.load(Ordering::Acquire),
+                "it ran after the flight's bottom-of-pipe write"
+            );
+            host.finish_flight_now();
+            assert!(!host.has_in_flight());
+            if by_submitter {
+                landed_by_submitter = true;
+                break;
             }
-        });
-        second.close();
-
-        let before = beside_counts();
-        // The gate opens while the submitting thread waits for the flight.
-        let opener = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            gate.open();
-        });
-        crate::queue::submit_segment_for_test(q, second);
-        opener.join().expect("the gate's thread");
-        // The call returned: the first flight landed on this thread and the
-        // held list was given to the GPU.
-        // SAFETY: the flight has landed.
-        assert_eq!(unsafe { (&raw const bop_word).read_volatile() }, 0x1234_5678);
-        assert_eq!(
-            beside_counts()[5],
-            before[5] + 1,
+        }
+        assert!(
+            landed_by_submitter,
             "the submitting thread landed the flight its held work waited for"
         );
-        queue_signal(q, f, 3);
-        assert!(wait_fence(f, 3, Duration::from_secs(5)), "the held list ran");
-        assert!(ran.load(Ordering::Acquire), "its work after it ran");
-        assert!(
-            saw_value.load(Ordering::Acquire),
-            "it ran after the flight's bottom-of-pipe write"
-        );
-        host.finish_flight_now();
-        assert!(!host.has_in_flight());
     }
 
     /// `Host::quiet()` drains any active Flight-1 work cleanly before

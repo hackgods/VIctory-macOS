@@ -330,6 +330,9 @@ fn pump_ready_under_drain(why: Why) -> bool {
     let mut waited_all = Vec::new();
     let started = std::time::Instant::now();
     let mut ran = std::time::Duration::ZERO;
+    // `VICTORY_PREP_BESIDE`: the heads were tested once more after a flight
+    // was found landed by another thread.
+    let mut looked_again = false;
     loop {
         let next = {
             let mut held = held();
@@ -378,19 +381,29 @@ fn pump_ready_under_drain(why: Why) -> bool {
             // (its waits read what the flight writes at its end) is not left
             // to `victory-flight`: this thread refreshes for the held lists
             // beside the flight, lands it and looks again.
-            if crate::host::prep_beside_enabled() && host.has_in_flight() {
-                let heads = held().heads(HEADS_BESIDE);
-                if !heads.is_empty() {
-                    host.prepare_beside(&heads);
-                    drop(heads);
-                    if host.finish_flight_now() {
-                        host.landed_for_held_work();
+            if crate::host::prep_beside_enabled() {
+                if host.has_in_flight() {
+                    let heads = held().heads(HEADS_BESIDE);
+                    if !heads.is_empty() {
+                        host.prepare_beside(&heads);
+                        drop(heads);
+                        if host.finish_flight_now() {
+                            host.landed_for_held_work();
+                        }
+                        // Landed, by this thread or by `victory-flight`
+                        // meanwhile: what it wrote may let the heads go.
                         continue;
                     }
+                } else if !looked_again {
+                    // `victory-flight` may have landed a flight since the
+                    // heads were tested, and its own pump waits for this one.
+                    looked_again = true;
+                    continue;
                 }
             }
             break;
         };
+        looked_again = false;
         moved_any = true;
         match ready {
             Ready::Signal { fence, value } => {

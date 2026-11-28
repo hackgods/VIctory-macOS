@@ -28,6 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
 pub(crate) mod overlap;
+pub(crate) mod timeline;
 
 /// A console state as a host texture state: PC bits only (not the console's
 /// own, compression hints from bit 25 up, which the host rejects), and none
@@ -2364,7 +2365,9 @@ impl Host {
     pub(crate) fn execute_sync(&self, runs: &[&HostList], barrier_before: &[bool]) {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
+        let asked = timeline::asked();
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        timeline::begin(asked, runs.len());
         let _holding = Holding::enter();
         self.finish_flight_locked(&mut submitted, None, None);
 
@@ -2464,6 +2467,9 @@ impl Host {
                 let waited = queue
                     .Signal(&self.fence, *submitted)
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                if timeline::on() {
+                    timeline::called(started.elapsed().as_micros() as u64);
+                }
                 match waited {
                     Ok(()) => {
                         self.wait_gpu(*submitted, overlapped);
@@ -2564,6 +2570,7 @@ impl Host {
         if let Some(u) = &prep.uploads {
             u.release_worker();
         }
+        timeline::stamp(timeline::At::Ran);
         self.finish_post_gpu(
             runs,
             prep.batch,
@@ -2618,6 +2625,7 @@ impl Host {
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
         }
+        timeline::stamp(timeline::At::Evicted);
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
@@ -2625,6 +2633,7 @@ impl Host {
         crate::descriptor::sync_heaps();
         #[cfg(feature = "diagnostics")]
         drop(syncing);
+        timeline::stamp(timeline::At::Heaps);
         // Textures heap-indexing shaders may read, uploaded first by a list
         // of ours where their title memory changed.
         let heaps: Vec<std::sync::Arc<crate::bindless::Viewed>> = runs
@@ -2664,6 +2673,7 @@ impl Host {
         let uploads = crate::bindless::uploads(&heaps, &textures);
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        timeline::stamp(timeline::At::Uploads);
         let uploads_offset = usize::from(uploads.is_some());
         let run_refs: Vec<&HostList> = uploads
             .as_ref()
@@ -2744,7 +2754,9 @@ impl Host {
             lists.push(list.list.cast().ok());
         }
         drop(barrier_pool);
+        timeline::stamp(timeline::At::Steps);
         batch.flush();
+        timeline::stamp(timeline::At::Prepared);
         #[cfg(feature = "diagnostics")]
         batch.log_refreshes(*submitted + 1, runs.len());
         #[cfg(not(feature = "diagnostics"))]
@@ -2873,6 +2885,9 @@ impl Host {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
+                    if goes_back {
+                        timeline::declared(*address, *len);
+                    }
                     match index.get(&key) {
                         Some(&i) => back[i].3 &= goes_back,
                         None => {
@@ -2996,8 +3011,13 @@ impl Host {
             crate::copystat::C::FaultsBack,
             crate::copystat::page_faults().saturating_sub(faults),
         );
+        timeline::stamp(timeline::At::Back);
         for list in runs {
-            for &(at, what, bytes) in &list.deferred().writes {
+            let deferred = list.deferred();
+            if timeline::on() {
+                timeline::owed(deferred.writes.len(), deferred.after.len(), deferred.texture_backs.len());
+            }
+            for &(at, what, bytes) in &deferred.writes {
                 what.write(at as *mut u8, bytes);
             }
         }
@@ -3006,6 +3026,7 @@ impl Host {
         release_retired();
         release_later(Box::new((batch, back, withheld, heaps)));
         self.log_messages();
+        timeline::end();
     }
 
     /// With `VICTORY_D3D12_DRED`: the faulting address and the allocations
@@ -4772,6 +4793,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_copied(dst, len);
+                    timeline::title_copy(src, len);
                     if matches!(step, Step::Move(..)) {
                         move_mapped(dst as *mut u8, src as *const u8, len);
                     } else {
@@ -4794,6 +4816,7 @@ impl HostList {
                         add(C::Copies, 1);
                         add(C::CopyBytes, len as u64);
                     }
+                    timeline::title_copy(src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -5046,6 +5069,7 @@ impl Batch {
                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                     REFRESHED_BYTES.fetch_add(copied as u64, Ordering::Relaxed);
+                    timeline::refreshed(from, to, copied, shadow.marked());
                     total += copied;
                     let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                     let (_, have) = match self.current.entry(key) {
@@ -5077,6 +5101,7 @@ impl Batch {
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
                 REFRESHED_BYTES.fetch_add(copied as u64, Ordering::Relaxed);
+                timeline::refreshed(from, to, copied, shadow.marked());
                 total += copied;
                 let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                 // The copy's memory joins the index as its first range

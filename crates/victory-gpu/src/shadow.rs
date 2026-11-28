@@ -1824,6 +1824,12 @@ pub(crate) fn copy_back_marks(withheld: &[(Arc<Shadow>, usize, usize)], memory_w
         list.sort_unstable();
         list.dedup();
     }
+    #[cfg(windows)]
+    if crate::host::timeline::on() {
+        for page in by_copy.iter().flat_map(|(_, list)| list) {
+            crate::host::timeline::marked(*page);
+        }
+    }
     let total_bytes: usize = by_copy.iter().map(|(_, list)| list.len() * PAGE).sum();
     let shadow_ranges: Vec<(u64, u64)> = by_copy.iter().map(|(copy, _)| copy.range()).collect();
     let parallel = parallel_copies_enabled()

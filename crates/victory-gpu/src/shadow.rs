@@ -670,6 +670,13 @@ impl Shadow {
         Some((base + u32::try_from(page).ok()?, (start & 0xFFFF) as u32))
     }
 
+    /// Whether the title's writes to its memory are tracked: a refresh then
+    /// copies only the pages written since ([`Shadow::update`]), else all of
+    /// the range every time.
+    pub(crate) fn is_tracked(&self) -> bool {
+        self.tracked.is_some()
+    }
+
     /// Whether writes through views of this copy are marked.
     pub(crate) fn marked(&self) -> bool {
         self.marks.is_some()

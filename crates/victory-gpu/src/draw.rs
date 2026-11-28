@@ -3105,6 +3105,7 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod beside;
     mod flight;
 
     use super::*;

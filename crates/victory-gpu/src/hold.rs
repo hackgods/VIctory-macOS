@@ -736,6 +736,25 @@ impl<S> Held<S> {
         self.queues.retain(|(_, items)| !items.is_empty());
     }
 
+    /// The segments at each queue's head, up to `limit` a queue (those
+    /// before its first Signal or fence Wait): what would run next once
+    /// their waits hold. Nothing is taken.
+    pub(crate) fn heads(&self, limit: usize) -> Vec<S>
+    where
+        S: Clone,
+    {
+        let mut out = Vec::new();
+        for (_, fifo) in &self.queues {
+            for (item, _, _) in fifo.iter().take(limit) {
+                match item {
+                    Item::Segment(segment, _) => out.push(segment.clone()),
+                    Item::Signal(..) | Item::FenceWait(..) => break,
+                }
+            }
+        }
+        out
+    }
+
     /// Whether no queue holds anything and none is currently running.
     pub(crate) fn is_empty(&self) -> bool {
         self.running.is_empty() && self.queues.is_empty()
@@ -770,6 +789,24 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    /// The segments that would run next are the ones before each queue's
+    /// first Signal or Wait, in the queues' order, and looking takes none.
+    #[test]
+    fn heads_are_the_segments_before_each_queues_first_signal_or_wait() {
+        let mut held: Held<&'static str> = Held::new();
+        held.push(1, Item::Segment("a", vec![]));
+        held.push(1, Item::Segment("b", vec![]));
+        held.push(1, Item::Signal(7, 1));
+        held.push(1, Item::Segment("c", vec![]));
+        held.push(2, Item::FenceWait(7, 1));
+        held.push(2, Item::Segment("d", vec![]));
+        held.push(3, Item::Segment("e", vec![]));
+        assert_eq!(held.heads(64), ["a", "b", "e"]);
+        assert_eq!(held.heads(1), ["a", "e"]);
+        assert!(held.holds_work(1) && held.holds_work(2) && held.holds_work(3));
+        assert_eq!(held.heads(64), ["a", "b", "e"], "nothing was taken");
+    }
 
     /// Memory, fences and a log of what ran, for a recording executor.
     #[derive(Default)]

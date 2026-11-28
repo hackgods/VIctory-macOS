@@ -185,6 +185,25 @@ pub(crate) fn execute_for_test(this: This, lists: &[This]) {
     execute(this, lists.len() as u32, lists.as_ptr());
 }
 
+/// Tests: `segment` submitted to `this` as the title's
+/// `ExecuteCommandLists` does with a list's segments.
+#[cfg(all(windows, test))]
+pub(crate) fn submit_segment_for_test(this: This, segment: std::sync::Arc<crate::host::HostList>) {
+    let mut held = held_for(Why::Submission);
+    let waits = segment.waits();
+    held.push(this as usize, Item::Segment(segment, waits));
+    if crate::host::async_submit_enabled() {
+        drop(held);
+        ensure_submit_worker();
+        wake_submit();
+    } else if crate::host::flight1_enabled() {
+        drop(held);
+        pump_unlocked(Why::Submission);
+    } else {
+        pump(&mut held, Why::Submission);
+    }
+}
+
 #[cfg(all(windows, test))]
 pub(crate) fn signal_for_test(this: This, fence: This, value: u64) -> HRESULT {
     signal(this, fence, value)
@@ -290,6 +309,11 @@ fn start_held_timer() {
     });
 }
 
+/// How many held segments a queue's refreshes beside a flight look at
+/// (`VICTORY_PREP_BESIDE`): a piece joins up to [`join_lists`].
+#[cfg(windows)]
+const HEADS_BESIDE: usize = 64;
+
 /// Pumps all currently ready segments/signals from `HELD` while holding
 /// `SUBMIT_DRAIN` and releasing `HELD` around every host GPU call.
 #[cfg(windows)]
@@ -350,6 +374,21 @@ fn pump_ready_under_drain(why: Why) -> bool {
             }
         };
         let Some(ready) = next else {
+            // `VICTORY_PREP_BESIDE`: work held behind the flight in the air
+            // (its waits read what the flight writes at its end) is not left
+            // to `victory-flight`: this thread refreshes for the held lists
+            // beside the flight, lands it and looks again.
+            if crate::host::prep_beside_enabled() && host.has_in_flight() {
+                let heads = held().heads(HEADS_BESIDE);
+                if !heads.is_empty() {
+                    host.prepare_beside(&heads);
+                    drop(heads);
+                    if host.finish_flight_now() {
+                        host.landed_for_held_work();
+                        continue;
+                    }
+                }
+            }
             break;
         };
         moved_any = true;

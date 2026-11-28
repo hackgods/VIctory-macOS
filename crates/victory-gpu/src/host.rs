@@ -8,8 +8,8 @@
 
 mod flight;
 #[cfg(test)]
-pub(crate) use flight::{Gate, ModeGuard};
-pub(crate) use flight::{async_submit_enabled, flight1_enabled};
+pub(crate) use flight::{BesideGuard, Gate, ModeGuard, beside_counts};
+pub(crate) use flight::{async_submit_enabled, flight1_enabled, prep_beside_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -4848,6 +4848,9 @@ impl HostList {
     }
 }
 
+/// Bytes refreshes copied since the last frame line (`flight::log_beside`).
+static REFRESHED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A submission's refreshes not done yet, as the ranges of each buffer copy
 /// asked for (ranges less than [`JOIN`] apart are done as one): done before
 /// a step that writes title memory or gives a range to shaders, and before
@@ -5042,6 +5045,7 @@ impl Batch {
                     }
                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    REFRESHED_BYTES.fetch_add(copied as u64, Ordering::Relaxed);
                     total += copied;
                     let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                     let (_, have) = match self.current.entry(key) {
@@ -5072,6 +5076,7 @@ impl Batch {
                 }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                REFRESHED_BYTES.fetch_add(copied as u64, Ordering::Relaxed);
                 total += copied;
                 let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                 // The copy's memory joins the index as its first range
@@ -5872,6 +5877,7 @@ impl Meter {
             crate::ray_skip::log(report_frames);
             crate::ambient_estimate::log(report_frames);
             overlap::log(report_frames);
+            flight::log_beside(report_frames, REFRESHED_BYTES.swap(0, Ordering::Relaxed));
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
             let (heaps, heap_used, heap_free) = crate::placement::stats();
             tracing::info!(

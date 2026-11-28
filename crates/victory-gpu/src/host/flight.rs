@@ -20,8 +20,165 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 
+use std::sync::atomic::AtomicU64;
+
 use super::{Batch, Holding, Host, HostList, Mark, Step};
 use crate::object::This;
+
+/// Whether the next submission's buffer copies are brought up to date beside
+/// the flight in the air (`VICTORY_PREP_BESIDE=1`, with Flight-1 and without
+/// the async submit worker; off by default).
+///
+/// Flight-1 lands the flight before it prepares the next submission, so the
+/// whole preparation follows the copy-back. Most of it has nothing to do with
+/// the flight: of the bytes a world frame's refreshes copy, about a tenth lie
+/// in pages the submission before wrote. With the switch, the thread that
+/// asks for a submission first refreshes what its lists ask for outside the
+/// ranges the flight may write ([`InFlight::writes`]), while the GPU still
+/// runs the flight; then it lands the flight itself and prepares as before,
+/// and the refreshes it asks for again find those pages current.
+///
+/// A refresh there is the one the preparation makes later
+/// ([`crate::shadow::Shadow::update`]: the pages the title wrote since the
+/// copy took them, guarded again), only earlier, so a page the title writes
+/// afterwards is copied again and the submission reads the same bytes as
+/// without the switch. What the flight may write is left alone until its
+/// copy-back: its declared ranges and those armed for it
+/// ([`arm_undeclared`]), as whole 64 KiB pages. Descriptors, uploads, title
+/// copies and snapshots are not moved.
+///
+/// Work held behind the flight's bottom-of-pipe writes is run by the thread
+/// that asked for it too: it refreshes for the held lists, lands the flight
+/// and goes on, with no wake-up of `victory-flight` in between.
+pub(crate) fn prep_beside_enabled() -> bool {
+    #[cfg(test)]
+    match TEST_PREP_BESIDE.load(Ordering::Acquire) {
+        1 => return false,
+        2 => return flight1_enabled(),
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = flight1_enabled()
+            && !async_submit_env()
+            && std::env::var_os("VICTORY_PREP_BESIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!(
+                "VICTORY_PREP_BESIDE=1: buffer copies the flight in the air cannot write are refreshed beside it"
+            );
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+static TEST_PREP_BESIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: `VICTORY_PREP_BESIDE` on or off until dropped (under a
+/// [`ModeGuard`], which serializes the tests that set modes).
+#[cfg(test)]
+pub(crate) struct BesideGuard(u8);
+
+#[cfg(test)]
+impl BesideGuard {
+    pub(crate) fn new(on: bool) -> Self {
+        Self(TEST_PREP_BESIDE.swap(if on { 2 } else { 1 }, Ordering::AcqRel))
+    }
+}
+
+#[cfg(test)]
+impl Drop for BesideGuard {
+    fn drop(&mut self) {
+        TEST_PREP_BESIDE.store(self.0, Ordering::Release);
+    }
+}
+
+/// Since the last frame line, of [`Host::prepare_beside`]: `[0]` times it
+/// ran beside a flight still on the GPU, `[1]` times the GPU had finished
+/// first (nothing done), `[2]` bytes its refreshes copied, `[3]` bytes asked
+/// for and left as the flight may write them, `[4]` microseconds, `[5]`
+/// flights landed by the thread whose held work waited for them, `[6]`
+/// microseconds landings waited for the GPU (with or without the switch).
+static BESIDE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// [`BESIDE`] since the start (tests).
+static BESIDE_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+fn beside(i: usize, n: u64) {
+    BESIDE[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    BESIDE_TOTAL[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`BESIDE_TOTAL`] (tests).
+#[cfg(test)]
+pub(crate) fn beside_counts() -> [u64; 7] {
+    BESIDE_TOTAL.each_ref().map(|a| a.load(Ordering::Relaxed))
+}
+
+/// The frame line of `VICTORY_PREP_BESIDE`, per frame over `frames`: how
+/// much of the frame's refreshes ran beside a flight and how much after its
+/// landing (`refreshed`: all the bytes refreshes copied since the last line).
+pub(super) fn log_beside(frames: f64, refreshed: u64) {
+    if !flight1_enabled() {
+        return;
+    }
+    let b = BESIDE
+        .each_ref()
+        .map(|a| a.swap(0, std::sync::atomic::Ordering::Relaxed));
+    let per = |n: u64| n as f64 / frames.max(1.0);
+    tracing::info!(
+        "prepared beside a flight per frame (VICTORY_PREP_BESIDE={}): {:.1} goes beside a flight still on the GPU, \
+         {:.1} found it finished; refreshes copied {:.2} MB beside it and {:.2} MB after its landing, left {:.2} MB \
+         asked for in ranges it may write; {:.1} ms; {:.1} flights landed by the thread whose held work waited for them; \
+         landings still waited {:.1} ms for the GPU",
+        u8::from(prep_beside_enabled()),
+        per(b[0]),
+        per(b[1]),
+        per(b[2]) / 1e6,
+        per(refreshed.saturating_sub(b[2])) / 1e6,
+        per(b[3]) / 1e6,
+        per(b[4]) / 1e3,
+        per(b[5]),
+        per(b[6]) / 1e3,
+    );
+}
+
+/// `ranges` sorted and joined, each widened to whole 64 KiB pages.
+fn pages_joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let page = crate::watch::PAGE;
+    for r in &mut ranges {
+        *r = (r.0 / page * page, r.1.div_ceil(page).saturating_mul(page));
+    }
+    ranges.retain(|r| r.0 < r.1);
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (from, to) in ranges {
+        match out.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => out.push((from, to)),
+        }
+    }
+    out
+}
+
+/// The parts of `[from, to)` outside the sorted, joined `writes`.
+fn outside(writes: &[(usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = from;
+    let first = writes.partition_point(|w| w.1 <= from);
+    for &(a, b) in &writes[first..] {
+        if a >= to {
+            break;
+        }
+        if a > at {
+            out.push((at, a));
+        }
+        at = at.max(b);
+    }
+    if at < to {
+        out.push((at, to));
+    }
+    out
+}
 
 /// Whether Wait-Before-Prep Flight-1 overlap is enabled (`VICTORY_FLIGHT1=1`,
 /// or implicitly enabled when `VICTORY_ASYNC_SUBMIT=1` unless
@@ -138,11 +295,13 @@ impl Drop for ModeGuard {
 fn arm_undeclared(
     segments: &[Arc<HostList>],
     heaps: &[Arc<crate::bindless::Viewed>],
-) -> Vec<Arc<crate::shadow::Shadow>> {
+) -> (Vec<Arc<crate::shadow::Shadow>>, Vec<(usize, usize)>) {
     let mut armed: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+    let mut ranges = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut arm = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
         copy.arm_undeclared(address, len);
+        ranges.push((address, address.saturating_add(len)));
         if seen.insert(Arc::as_ptr(copy) as usize) {
             armed.push(copy.clone());
         }
@@ -160,7 +319,21 @@ fn arm_undeclared(
             }
         }
     }
-    armed
+    (armed, ranges)
+}
+
+/// Title memory a flight of `segments` may write, as sorted, joined whole
+/// pages: the ranges armed for it (`armed`, from [`arm_undeclared`]) and
+/// those its lists declare their shaders write.
+fn flight_writes(segments: &[Arc<HostList>], mut armed: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    for list in segments {
+        for step in &list.deferred().copies {
+            if let Step::GpuWrite(_, address, len, _, _) = step {
+                armed.push((*address, address.saturating_add(*len)));
+            }
+        }
+    }
+    pages_joined(armed)
 }
 
 /// Tests: the host queue waits on a fence of ours from [`Gate::hold`] to
@@ -221,6 +394,12 @@ impl Gate {
     pub(crate) fn open(&mut self) {
         self.fence.open(&self.opened);
     }
+
+    /// Whether it still holds the queue (the watchdog has not opened it):
+    /// what a test saw so far, it saw with the flight in the air.
+    pub(crate) fn held(&self) -> bool {
+        !self.opened.load(Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +435,9 @@ struct InFlight {
     /// Copies whose pages it armed for its shaders' undeclared writes
     /// ([`arm_undeclared`]), disarmed once it has landed.
     armed: Vec<Arc<crate::shadow::Shadow>>,
+    /// Title memory its shaders may write ([`flight_writes`]): what a
+    /// preparation beside it leaves alone ([`Host::prepare_beside`]).
+    writes: Vec<(usize, usize)>,
     uploads: Option<crate::bindless::Uploads>,
     batch: Batch,
     heaps: Vec<Arc<crate::bindless::Viewed>>,
@@ -291,6 +473,9 @@ impl Host {
 
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let _holding = Holding::enter();
+        // `VICTORY_PREP_BESIDE`: what these lists ask for and the flight in
+        // the air cannot write is refreshed while the GPU still runs it.
+        self.prepare_beside_locked(&segments);
         // Wait-Before-Prep: drain Flight N-1 completely before Flight N
         // touches any shared Shadow, descriptor heap, upload staging pool, or
         // Mark buffer.
@@ -342,7 +527,8 @@ impl Host {
         }
         // Armed before the GPU may write: a title write from here on saves
         // its page.
-        let armed = arm_undeclared(&segments, &prep.heaps);
+        let (armed, armed_ranges) = arm_undeclared(&segments, &prep.heaps);
+        let writes = flight_writes(&segments, armed_ranges);
         let queue = self.queue();
         let launched = std::time::Instant::now();
         // SAFETY: closed lists; fence and events are ours.
@@ -379,6 +565,7 @@ impl Host {
             fence_value,
             segments,
             armed,
+            writes,
             uploads: prep.uploads,
             batch: prep.batch,
             heaps: prep.heaps,
@@ -434,6 +621,95 @@ impl Host {
         self.flight.lock().unwrap_or_else(|e| e.into_inner()).active
     }
 
+    /// [`Host::prepare_beside_locked`] for lists still held behind the
+    /// flight in the air (`crate::queue`), which the caller then lands.
+    pub(crate) fn prepare_beside(&self, lists: &[Arc<HostList>]) {
+        if !prep_beside_enabled() || lists.is_empty() || !self.has_in_flight() {
+            return;
+        }
+        let _submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        self.prepare_beside_locked(lists);
+    }
+
+    /// The flight in the air was landed by the thread whose held work waited
+    /// for it (the frame line).
+    pub(crate) fn landed_for_held_work(&self) {
+        beside(5, 1);
+    }
+
+    /// With `VICTORY_PREP_BESIDE=1` and a flight still on the GPU: brings up
+    /// to date the buffer ranges `lists` ask for (their refreshes, table
+    /// slots and heaps' views) outside what the flight may write
+    /// ([`prep_beside_enabled`]). Called under `Host::submitted`, so the
+    /// flight is not landed meanwhile.
+    fn prepare_beside_locked(&self, lists: &[Arc<HostList>]) {
+        if !prep_beside_enabled() {
+            return;
+        }
+        let (fence_value, writes) = {
+            let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
+            match state.in_flight.as_ref() {
+                Some(f) if f.waited => (f.fence_value, f.writes.clone()),
+                _ => return,
+            }
+        };
+        // SAFETY: a plain query of our fence.
+        if unsafe { self.fence.GetCompletedValue() } >= fence_value {
+            beside(1, 1);
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut batch = Batch::default();
+        let mut left = 0u64;
+        let mut add = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
+            // Memory that is not tracked is copied whole at every refresh:
+            // done here it would be done again by the preparation.
+            if copy.clean() || !copy.is_tracked() {
+                return;
+            }
+            // Cut to the copy first: what is asked past its end is no byte
+            // of it.
+            let (start, bytes) = copy.range();
+            let (from, to) = (
+                address.max(start as usize),
+                address.saturating_add(len).min((start + bytes) as usize),
+            );
+            if from >= to {
+                return;
+            }
+            let mut ahead = 0;
+            for (a, b) in outside(&writes, from, to) {
+                batch.add(copy, a, b - a);
+                ahead += b - a;
+            }
+            left += (to - from - ahead) as u64;
+        };
+        for list in lists {
+            for step in &list.deferred().copies {
+                match step {
+                    Step::Refresh(copy, address, len) => add(copy, *address, *len),
+                    Step::Slot(viewed, index) => crate::bindless::refresh_slot(viewed, *index, &mut add),
+                    Step::Heap(viewed) => crate::bindless::refresh(viewed, &mut add),
+                    // Title copies, fills, snapshots, page tables, textures
+                    // and host work stay where they are.
+                    Step::Copy(..)
+                    | Step::Move(..)
+                    | Step::Fill(..)
+                    | Step::Host(_)
+                    | Step::GpuWrite(..)
+                    | Step::Texture(..)
+                    | Step::Memory(_) => {}
+                }
+            }
+        }
+        let copied = batch.flush();
+        beside(0, 1);
+        beside(2, copied as u64);
+        beside(3, left);
+        beside(4, started.elapsed().as_micros() as u64);
+    }
+
     /// Waits for and lands any active flight now. Returns `true` if a flight
     /// was landed by this call.
     pub(crate) fn finish_flight_now(&self) -> bool {
@@ -473,8 +749,14 @@ impl Host {
         let gpu_done = if flight.waited {
             // SAFETY: plain fence completion query.
             if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                let asked = std::time::Instant::now();
                 self.wait_for(flight.fence_value);
-                std::time::Instant::now()
+                let now = std::time::Instant::now();
+                // What a landing still waits for the GPU (the frame line of
+                // `VICTORY_PREP_BESIDE`; reporting the wait left as upstream
+                // #687 by AEMONET-Dev does for its prep-ahead).
+                beside(6, (now - asked).as_micros() as u64);
+                now
             } else {
                 waited_at.unwrap_or_else(std::time::Instant::now)
             }
@@ -765,6 +1047,79 @@ mod tests {
         // SAFETY: flight has landed and fence reached 7.
         assert_eq!(unsafe { (&raw const bop_word).read_volatile() }, 0x1234_5678);
         assert_eq!(title_buf[0], 0xCAFE_BABE);
+        assert!(!host.has_in_flight());
+    }
+
+    /// `VICTORY_PREP_BESIDE`: a list held behind the flight in the air (it
+    /// waits for the value the flight writes at its end) is run by the
+    /// thread that submitted it, which lands the flight itself: when the
+    /// submission returns, the flight has landed and the held list is in
+    /// the air, with no landing by `victory-flight` in between.
+    #[test]
+    fn prep_beside_lands_the_flight_for_work_held_behind_it() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, false);
+        let _beside = BesideGuard::new(true);
+        let (q, f) = make_queue_and_fence();
+        let mut bop_word: u64 = 0;
+        let bop = (&raw mut bop_word) as usize;
+
+        let mut gate = Gate::hold(host);
+        let first = Arc::new(host.new_list().expect("host list"));
+        first.defer_write(bop as *mut u8, Written::Value(0x1234_5678), 8);
+        first.close();
+        host.execute_flight1(vec![first], vec![]);
+        assert!(host.has_in_flight());
+
+        // The held list: it waits for the flight's bottom-of-pipe value.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        let saw_value = Arc::new(AtomicBool::new(false));
+        let saw = saw_value.clone();
+        let second = Arc::new(host.new_list().expect("host list"));
+        second.defer_wait(crate::hold::ValueWait {
+            address: bop as u64,
+            bytes: 8,
+            comparison: 3,
+            reference: 0x1234_5678,
+            mask: u64::MAX,
+        });
+        second.defer_after(move || {
+            flag.store(true, Ordering::Release);
+            // SAFETY: the word outlives the flights.
+            if unsafe { (bop as *const u64).read_volatile() } == 0x1234_5678 {
+                saw.store(true, Ordering::Release);
+            }
+        });
+        second.close();
+
+        let before = beside_counts();
+        // The gate opens while the submitting thread waits for the flight.
+        let opener = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            gate.open();
+        });
+        crate::queue::submit_segment_for_test(q, second);
+        opener.join().expect("the gate's thread");
+        // The call returned: the first flight landed on this thread and the
+        // held list was given to the GPU.
+        // SAFETY: the flight has landed.
+        assert_eq!(unsafe { (&raw const bop_word).read_volatile() }, 0x1234_5678);
+        assert_eq!(
+            beside_counts()[5],
+            before[5] + 1,
+            "the submitting thread landed the flight its held work waited for"
+        );
+        queue_signal(q, f, 3);
+        assert!(wait_fence(f, 3, Duration::from_secs(5)), "the held list ran");
+        assert!(ran.load(Ordering::Acquire), "its work after it ran");
+        assert!(
+            saw_value.load(Ordering::Acquire),
+            "it ran after the flight's bottom-of-pipe write"
+        );
+        host.finish_flight_now();
         assert!(!host.has_in_flight());
     }
 

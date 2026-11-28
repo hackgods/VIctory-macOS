@@ -288,7 +288,11 @@ impl CopySpans {
         let changed = if !disjoint_spans {
             was_empty || outer_changed
         } else {
-            was_empty || (span_grew && (self.dirty || !self.covers(from, to)))
+            // Page bounds never tighten while a range reaches the page, but
+            // spans are clamped to the copy's first start and last end, so a
+            // range can sit inside the page bounds ("nothing grew") yet outside
+            // every span. Re-make the spans whenever none holds the new range.
+            was_empty || (span_grew && self.dirty) || !self.covers(from, to)
         };
         if changed {
             self.dirty = true;

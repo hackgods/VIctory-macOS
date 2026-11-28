@@ -2361,7 +2361,16 @@ impl Host {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marked, memory) = step {
+                    // mac: `VICTORY_FLIGHTS_WITH=writes`: an aliased copy's
+                    // unmarked range is noted now, for its copy-back below
+                    // to tell the other trackers, not when the submission
+                    // was prepared (`Shadow::writing`): a submission prepared
+                    // beside the one before noted it there, and that one's
+                    // finish took it.
+                    if !*marked && shadow.is_aliased() && unwaited::flights::with_writes() {
+                        shadow.writing(*address, *len, false);
+                    }
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
@@ -4078,6 +4087,12 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len, marked, _) => {
+                    // mac: `VICTORY_FLIGHTS_WITH=writes`: nothing in an
+                    // aliased copy (no snapshot to fill; the range is noted
+                    // at this submission's finish, `Host::finish`).
+                    if shadow.is_aliased() && unwaited::flights::with_writes() {
+                        continue;
+                    }
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {

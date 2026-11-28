@@ -48,6 +48,11 @@
 //! one left does not (two, in turn), and finish it first when a texture's
 //! memory could meet what it writes or lands ([`Host::beside_texture_reads`]);
 //! a fill and a step of ours that read title memory follow the same rule.
+//! With `writes` too (E3), a declaration of what shaders write in an aliased
+//! copy is made beside it: such a copy keeps no snapshot, and its declared
+//! range is noted for its copy-back when its own submission is finished
+//! (`Host::finish`), not when it is prepared, where the finish of the one
+//! left would take it.
 
 use super::*;
 
@@ -82,9 +87,13 @@ pub(crate) fn on() -> bool {
 #[cfg(test)]
 pub(in crate::host) static FORCED_ALIAS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Turns `writes` on for the tests (with [`FORCED_ALIAS`]).
+#[cfg(test)]
+pub(in crate::host) static FORCED_WRITES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The names of `VICTORY_FLIGHTS_WITH` this build has (bits of
-/// `crate::flights::WITH`): `alias`.
-const BUILT: u32 = 1;
+/// `crate::flights::WITH`): `alias`, `writes`.
+const BUILT: u32 = 0b11;
 
 /// mac: `VICTORY_FLIGHTS_WITH=<list>` (`notes/overlap-stages-design.md` §6),
 /// read once: the overlap line's increments taken, as bits of
@@ -120,6 +129,13 @@ fn with() -> u32 {
                  another address too"
             );
         }
+        if taken & 2 != 0 {
+            tracing::info!(
+                "VICTORY_FLIGHTS_WITH=writes: a declaration of what shaders write in an aliased copy does not finish \
+                 the submission left (no snapshot to keep, nothing to flush); its range is noted for its copy-back \
+                 when its own submission is finished"
+            );
+        }
         taken
     })
 }
@@ -131,6 +147,18 @@ pub(crate) fn with_alias() -> bool {
         return on();
     }
     on() && with() & 1 != 0
+}
+
+/// mac: whether a declaration of what shaders write in an aliased copy is
+/// made beside the submission left and noted at its own finish
+/// (`VICTORY_FLIGHTS_WITH=alias,writes`, E3 of
+/// `notes/overlap-stages-design.md`).
+pub(crate) fn with_writes() -> bool {
+    #[cfg(test)]
+    if FORCED_WRITES.load(Relaxed) {
+        return with_alias();
+    }
+    on() && with() & 2 != 0
 }
 
 /// The GPU is asked whether it has run the submission left every this many
@@ -191,6 +219,9 @@ static ON_ALIASED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// of them, those that finished it first as a texture's memory is in what it
 /// may write, and as one is shown at another address too.
 static UPLOADS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// With `VICTORY_FLIGHTS_WITH=writes`: declarations in aliased copies made
+/// while it ran, which no longer finish it.
+static WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// What the submission left may write or will write once it is finished,
 /// read from it under the submission lock when first needed.
@@ -476,6 +507,12 @@ impl Host {
             Step::Copy(..) | Step::Move(..) => Some(Why::Copy),
             Step::Host(_) => Some(Why::Host),
             &Step::Own(_, at, len) => (len > 0 && b.footprint().meets(at, len).is_some()).then_some(Why::Host),
+            // mac: `VICTORY_FLIGHTS_WITH=writes`: in an aliased copy nothing
+            // of the one left is touched (`Host::finish` notes the range).
+            Step::GpuWrite(copy, ..) if copy.is_aliased() && with_writes() => {
+                WRITES.fetch_add(1, Relaxed);
+                None
+            }
             Step::GpuWrite(..) => Some(Why::Write),
             Step::Memory(_) => Some(Why::Memory),
             &Step::Fill(_, src, len) => b.footprint().meets(src, len).is_some().then_some(Why::Fill),
@@ -625,10 +662,16 @@ fn uploads_line(frames: f64) -> String {
         return String::new();
     }
     let [made, reached, twice] = UPLOADS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    let writes = WRITES.swap(0, Relaxed) as f64 / frames;
     format!(
         "; VICTORY_FLIGHTS_WITH=alias: {made:.1}/frame texture uploads made while it ran, {reached:.1} of them \
          finished it first as a texture's memory is in what it may write, {twice:.1} as a texture's memory is shown \
-         at another address too"
+         at another address too{}",
+        if with_writes() {
+            format!("; writes: {writes:.1}/frame declarations in aliased copies made while it ran, not finishing it")
+        } else {
+            String::new()
+        }
     )
 }
 

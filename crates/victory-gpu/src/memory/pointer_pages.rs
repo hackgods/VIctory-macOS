@@ -73,6 +73,13 @@ fn level() -> u8 {
 /// null page holds nothing on the console either (guess: such reads are the
 /// lanes of empty slots, which read zeros there too). Its writes are still
 /// dropped.
+///
+/// `VICTORY_NULL_PAGE=1` (unset or `0`: off) turns on this alone, without
+/// the copies of `=1`. Upstream VIctory-macOS PR #634 (7a489245) makes the
+/// same exemption, on by default there (`VICTORY_NULL_PAGE=0` turns it off).
+/// The frame line then counts the reads let pass ([`note_null_read`]) and the
+/// MB of views that went back into title memory only because of it
+/// ([`note_spared`]).
 pub(crate) fn null_page_free() -> bool {
     #[cfg(test)]
     if NULL_FREE.load(Ordering::Relaxed) {
@@ -80,12 +87,53 @@ pub(crate) fn null_page_free() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        let on = level() >= 2;
+        let alone = crate::switch::on("VICTORY_NULL_PAGE");
+        let on = level() >= 2 || alone;
         if on {
-            tracing::info!("VICTORY_POINTER_PAGES=2: reads of the null page are no miss (the list's writes are not withheld for them)");
+            let by = if alone { "VICTORY_NULL_PAGE=1" } else { "VICTORY_POINTER_PAGES=2" };
+            tracing::info!("{by}: reads of the null page are no miss (the list's writes are not withheld for them)");
         }
         on
     })
+}
+
+/// Null-page reads [`null_page_free`] let pass since the last
+/// [`take_null`] (the lists' own count, after their run).
+static NULL_READS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a list's miss check let a null-page read pass since the last
+/// [`take_spared`] (checks run one submission at a time).
+static SPARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Bytes of views that went back into title memory since the last
+/// [`take_null`] that would have been kept without [`null_page_free`].
+static SPARED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// A list read the null page and [`null_page_free`] let it pass.
+pub(crate) fn note_null_read() {
+    NULL_READS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A miss check let a null-page read pass (`super::has_missed`).
+pub(crate) fn note_spared_check() {
+    SPARED.store(true, Ordering::Relaxed);
+}
+
+/// Whether a miss check let a null-page read pass since the last call.
+pub(crate) fn take_spared() -> bool {
+    SPARED.swap(false, Ordering::Relaxed)
+}
+
+/// `bytes` of views went back into title memory that the frame would have
+/// kept without [`null_page_free`] (`crate::host`).
+pub(crate) fn note_spared(bytes: u64) {
+    SPARED_BYTES.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Null-page reads let pass, and bytes of views no longer kept for them,
+/// since the last call.
+pub(crate) fn take_null() -> (u64, u64) {
+    (NULL_READS.swap(0, Ordering::Relaxed), SPARED_BYTES.swap(0, Ordering::Relaxed))
 }
 
 /// `VICTORY_POINTER_PAGES=3` (includes 2): also, a read of memory no one

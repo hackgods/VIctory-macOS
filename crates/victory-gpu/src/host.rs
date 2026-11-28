@@ -2370,20 +2370,32 @@ impl Host {
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
+        // mac (`VICTORY_NULL_PAGE=1`): ranges that would be withheld if
+        // null-page reads were a miss (indices into `back`).
+        let spared = crate::memory::spared_withholding();
+        let mut spared_at = Vec::new();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
+            let spared = spared && !deferred.missed.is_empty();
             for step in &deferred.copies {
                 if let Step::GpuWrite(shadow, address, len, _, memory) = step {
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
-                    match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                    let i = match index.get(&key) {
+                        Some(&i) => {
+                            back[i].3 &= goes_back;
+                            i
+                        }
                         None => {
                             index.insert(key, back.len());
                             back.push((shadow.clone(), *address, *len, goes_back));
+                            back.len() - 1
                         }
+                    };
+                    if spared && *memory {
+                        spared_at.push(i);
                     }
                 }
             }
@@ -2399,6 +2411,12 @@ impl Host {
         for b in back.iter_mut().filter(|b| b.3) {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
+        }
+        if !spared_at.is_empty() {
+            spared_at.sort_unstable();
+            spared_at.dedup();
+            let bytes: usize = spared_at.iter().filter(|&&i| back[i].3).map(|&i| back[i].2).sum();
+            crate::memory::pointer_pages::note_spared(bytes as u64);
         }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.

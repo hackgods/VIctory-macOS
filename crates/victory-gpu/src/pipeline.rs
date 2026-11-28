@@ -1282,7 +1282,7 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(windows)]
-mod builder;
+pub(crate) mod builder;
 #[cfg(windows)]
 pub(crate) mod host;
 #[cfg(windows)]

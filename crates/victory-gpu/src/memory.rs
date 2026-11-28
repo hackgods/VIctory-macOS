@@ -645,7 +645,9 @@ fn nowhere(entry: usize, blocks: &[usize]) -> bool {
 /// using title memory (the acceleration-structure builder's first), the
 /// first dispatch of each program using title memory marks pages in a
 /// bitmap of its own, and a line per program says what it was handed and
-/// what it read with no copy.
+/// what it read with no copy. `n` 0: the builder's first frame itself, from
+/// when all its pipelines are made until that frame ends, the first three
+/// dispatches of each program.
 fn probe_frame() -> Option<u64> {
     static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("VICTORY_MEMORY_PROBE").ok().and_then(|v| v.trim().parse().ok()))
@@ -655,7 +657,7 @@ fn probe_frame() -> Option<u64> {
 static BUILDER_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MISS_NEVER);
 
 /// The programs probed this frame.
-static PROBED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+static PROBED: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
 
 /// What Windows and the runtime have at page `at`, for the probe's lines.
 fn describe((at, span): (u64, u64)) -> String {
@@ -703,15 +705,24 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
     use std::sync::atomic::Ordering::Relaxed;
     let n = probe_frame()?;
     let first = BUILDER_FRAME.load(Relaxed);
-    if first == MISS_NEVER || FRAMES.load(Relaxed) != first + n {
+    let (wanted, each) = match n {
+        0 => (first == MISS_NEVER && crate::pipeline::builder::runs(), 3),
+        _ => (first != MISS_NEVER && FRAMES.load(Relaxed) == first + n, 1),
+    };
+    if !wanted {
         return None;
     }
     {
         let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
-        let probed = probed.get_or_insert_with(HashSet::new);
-        if probed.len() >= 60 || !probed.insert(name.to_owned()) {
+        let probed = probed.get_or_insert_with(HashMap::new);
+        if probed.len() >= 60 && !probed.contains_key(name) {
             return None;
         }
+        let count = probed.entry(name.to_owned()).or_default();
+        if *count >= each {
+            return None;
+        }
+        *count += 1;
     }
     let bitmap = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
     let gpu = bitmap.gpu();

@@ -351,6 +351,13 @@ fn add(c: C, n: u64) {
     COUNTS[c as usize].fetch_add(n, Ordering::Relaxed);
 }
 
+/// mac: the bytes of aliased memory told to the other trackers so far,
+/// since the last frame line ([`noted`]; tests).
+#[cfg(test)]
+pub(crate) fn noted_bytes() -> u64 {
+    COUNTS[C::WrittenBytes as usize].load(Ordering::Relaxed)
+}
+
 /// A submission asked for `bytes` of aliased memory in `ranges` ranges of
 /// `regions` regions, and brought `copies` host copies up to date with
 /// `copied` bytes (`crate::host`'s batch).

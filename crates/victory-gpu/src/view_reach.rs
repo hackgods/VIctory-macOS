@@ -32,8 +32,12 @@ static DEEP: [[[AtomicU64; 2]; 2]; 2] =
     [const { [const { [const { AtomicU64::new(0) }; 2] }; 2] }; 2];
 /// Per kind: views counted, and the deepest start seen.
 static SEEN: [[AtomicU64; 2]; 2] = [const { [const { AtomicU64::new(0) }; 2] }; 2];
-/// Root view slots whose raw view was cut at 2^27 elements, per buffer kind.
+/// Root view slots whose raw view was cut short of their copy, per buffer
+/// kind (`crate::descriptor::host::raw_view_most`).
 static CLAMPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Root views bound with their offset past their raw view's end (the shader
+/// reads zeros there under D3DMetal), per buffer kind.
+static PAST_END: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A view of `kind` starting `offset` bytes into its host buffer, a pool
 /// aliased zero-copy or not (`aliased`).
@@ -51,10 +55,22 @@ pub(crate) fn note(kind: Kind, offset: u64, aliased: bool) {
     }
 }
 
+/// The most bytes a root view's raw view of a copy of `bytes` bytes holds.
+fn root_view_bytes(bytes: u64) -> u64 {
+    bytes.min(crate::descriptor::host::raw_view_most(crate::descriptor::host::raw_views_long()) * 4)
+}
+
 /// A root view slot made over a copy of `bytes` bytes (`aliased`: a pool).
 pub(crate) fn note_root_view(bytes: u64, aliased: bool) {
-    if bytes / 4 > 1 << 27 {
+    if root_view_bytes(bytes) < bytes & !3 {
         CLAMPED[usize::from(aliased)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A root view bound `offset` bytes into a copy of `bytes` bytes.
+pub(crate) fn note_root_bind(offset: u64, bytes: u64, aliased: bool) {
+    if offset >= root_view_bytes(bytes & !3) {
+        PAST_END[usize::from(aliased)].fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -66,7 +82,8 @@ pub(crate) fn log() {
         "buffer views deep into their host buffer, since the start: table views {} made, \
          >=1 GiB in {} on copies + {} on aliased pools, >=2 GiB in {} + {}, deepest {} MB; \
          root views {} bound, offset >=1 GiB {} + {}, >=2 GiB {} + {}, deepest {} MB; \
-         root view slots cut at 2^27 elements (copy over 512 MiB) {} + {}",
+         root view slots cut short of their copy {} + {}, root views bound past their view's end \
+         {} + {}",
         SEEN[0][0].load(Ordering::Relaxed),
         d(0, 0, 0),
         d(0, 1, 0),
@@ -81,6 +98,8 @@ pub(crate) fn log() {
         mb(1),
         CLAMPED[0].load(Ordering::Relaxed),
         CLAMPED[1].load(Ordering::Relaxed),
+        PAST_END[0].load(Ordering::Relaxed),
+        PAST_END[1].load(Ordering::Relaxed),
     );
 }
 
@@ -102,9 +121,20 @@ mod tests {
             "a pool's 2 GiB in"
         );
         assert!(SEEN[0][1].load(Ordering::Relaxed) >= 2 * GIB + 64);
+        let most =
+            crate::descriptor::host::raw_view_most(crate::descriptor::host::raw_views_long()) * 4;
         let clamped = CLAMPED[1].load(Ordering::Relaxed);
-        note_root_view(512 << 20, true);
-        note_root_view((512 << 20) + 4, true);
-        assert!(CLAMPED[1].load(Ordering::Relaxed) > clamped);
+        note_root_view(most, true);
+        note_root_view(most + 8, true);
+        assert!(
+            CLAMPED[1].load(Ordering::Relaxed) > clamped,
+            "a copy longer than a view holds"
+        );
+        let past = PAST_END[1].load(Ordering::Relaxed);
+        note_root_bind(most + 4, most + 8, true);
+        assert!(
+            PAST_END[1].load(Ordering::Relaxed) > past,
+            "bound past its view's end"
+        );
     }
 }

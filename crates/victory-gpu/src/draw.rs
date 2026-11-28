@@ -1346,6 +1346,11 @@ impl State {
             shadow.offset(address),
             shadow.zero_copy(),
         );
+        crate::view_reach::note_root_bind(
+            shadow.offset(address),
+            shadow.range().1,
+            shadow.zero_copy(),
+        );
         let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
             not_run("a root view 4 GiB or more into its copy");
             return None;

@@ -1275,7 +1275,7 @@ impl HostHeap {
         let (first, elements) = match buffer {
             Some(_) => (
                 first / 4,
-                (bytes / 4).clamp(1, raw_view_most(crate::under_wine())) as u32,
+                (bytes / 4).clamp(1, raw_view_most(raw_views_long())) as u32,
             ),
             // A null view still names its size.
             None => (0, 1),
@@ -3934,8 +3934,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 /// viewcount: 6,258 root view slots cut at 2^27 elements, 72,062 binds 1 GiB
 /// or more in), whose reads past 512 MiB were zeros. So under Wine a raw view
 /// holds up to 2 GiB.
-fn raw_view_most(wine: bool) -> u64 {
-    if wine { (2 << 30) / 4 - 1 } else { 1 << 27 }
+pub(crate) fn raw_view_most(long: bool) -> u64 {
+    if long { (2 << 30) / 4 - 1 } else { 1 << 27 }
+}
+
+/// Whether raw views hold up to 2 GiB ([`raw_view_most`]): under Wine,
+/// unless `VICTORY_RAW_VIEWS_512MIB=1` keeps them at 2^27 elements, as before
+/// (for an A/B of the play build).
+pub(crate) fn raw_views_long() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::under_wine() && !crate::switch::on("VICTORY_RAW_VIEWS_512MIB"))
 }
 
 #[cfg(test)]

@@ -2662,10 +2662,12 @@ fn released() -> std::sync::MutexGuard<'static, Released> {
     RELEASED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether [`release_idle`] runs: `VICTORY_RELEASE_COPIES=0` turns it off.
+/// Whether [`release_idle`] runs. Upstream `VICTORY_RELEASE_COPIES=0` turns
+/// it off; mac: on this line it is off unless set (`=1`), so that a run with
+/// it is a clean A/B.
 fn release_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RELEASE_COPIES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_RELEASE_COPIES"))
 }
 
 /// Whether `copy`, one of the copies of `[start, start + len)`, can go:

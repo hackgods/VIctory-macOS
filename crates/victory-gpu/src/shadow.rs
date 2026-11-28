@@ -2662,14 +2662,6 @@ fn released() -> std::sync::MutexGuard<'static, Released> {
     RELEASED.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether [`release_idle`] runs. Upstream `VICTORY_RELEASE_COPIES=0` turns
-/// it off; mac: on this line it is off unless set (`=1`), so that a run with
-/// it is a clean A/B.
-fn release_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_RELEASE_COPIES"))
-}
-
 /// Whether `copy`, one of the copies of `[start, start + len)`, can go:
 /// nothing but the table that found it and the page tables' own layouts
 /// (`tables` of them) holds it, no submission's writes to it are still to
@@ -2691,10 +2683,31 @@ fn idle(copy: &Arc<Shadow>, tables: usize, frame: u64) -> bool {
 /// once the last layout naming it is rewritten. Host copies of title memory
 /// grew to 7.6 GB in 20 minutes of the world on a 16 GB Mac, and none ever
 /// went while the title kept its buffers. Returns the copies and bytes.
-pub(crate) fn release_idle(frame: u64, want: u64) -> (usize, u64) {
-    if want == 0 || !release_enabled() {
-        return (0, 0);
-    }
+///
+/// mac: `ram` is what the host textures give up for Wine's count of free
+/// memory; how much goes here, if any, is up to `VICTORY_RELEASE_COPIES`
+/// ([`crate::release_copies`]), which also writes a line every 5 s.
+pub(crate) fn release_idle(frame: u64, ram: u64) -> (usize, u64) {
+    let want = crate::release_copies::want(ram);
+    let (count, bytes) = if want == 0 { (0, 0) } else { release(frame, want) };
+    crate::release_copies::after(count, bytes, || released().remade, held_releasable);
+    (count, bytes)
+}
+
+/// The copies [`release_idle`] may give up when idle (not aliased), and
+/// their bytes.
+fn held_releasable() -> (usize, u64) {
+    let map = buffers_read();
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    map.values()
+        .filter_map(|e| e.shadow.as_ref())
+        .chain(loose.values())
+        .filter(|c| !c.aliased)
+        .fold((0, 0), |(n, b), c| (n + 1, b + c.len))
+}
+
+/// [`release_idle`] for `want` bytes.
+fn release(frame: u64, want: u64) -> (usize, u64) {
     let tables = crate::memory::tables();
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {

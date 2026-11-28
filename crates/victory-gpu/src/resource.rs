@@ -1850,6 +1850,18 @@ pub(crate) fn evict_heap_uav() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_EVICT_HEAP_UAV").is_some_and(|v| v != "0"))
 }
 
+/// The presented frame [`evict_unused`] last ran in.
+#[cfg(windows)]
+static EVICTED_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether the next [`evict_unused`] does its pass (the first submission
+/// after a present): it gives up textures, which the heap sync after it
+/// then sees gone.
+#[cfg(windows)]
+pub(crate) fn evict_due() -> bool {
+    EVICTED_FRAME.load(std::sync::atomic::Ordering::Relaxed) != crate::queue::presented()
+}
+
 /// Once per presented frame, before a submission (`Host::execute`, one at a
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
@@ -1857,9 +1869,8 @@ pub(crate) fn evict_heap_uav() -> bool {
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
-    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
     let frame = crate::queue::presented();
-    if LAST.swap(frame, Relaxed) == frame {
+    if EVICTED_FRAME.swap(frame, Relaxed) == frame {
         return;
     }
     let over = crate::host::video_memory().map_or(0, |[(used, budget), _]| {

@@ -297,3 +297,34 @@ void main() {
     );
     crate::shadow::unregister(buf as usize, p as u64);
 }
+
+/// While a flight lands beside a heap sync, a write of ours into a
+/// shader-visible heap's memory is noticed (the sync is made again after
+/// the landing); a write elsewhere is not.
+#[test]
+fn a_landing_beside_a_heap_sync_notices_writes_into_heap_memory() {
+    if crate::host::host().is_none() {
+        return;
+    }
+    let (_, title_heap, _heap_host) = view_heap(8);
+    let _mode = ModeGuard::new(true, false);
+    let p = crate::watch::tests::pool(1);
+    assert!(!crate::descriptor::landing_beside(true));
+    drop(crate::watch::writing(p, 16));
+    assert!(
+        !crate::descriptor::landing_beside(false),
+        "a write outside the heaps is not noticed"
+    );
+    crate::descriptor::landing_beside(true);
+    drop(crate::watch::writing(title_heap.start as usize, 32));
+    assert!(
+        crate::descriptor::landing_beside(false),
+        "a write into a heap's memory is"
+    );
+    drop(crate::watch::writing(title_heap.start as usize, 32));
+    assert!(
+        !crate::descriptor::landing_beside(false),
+        "and nothing is noted while no landing runs beside a sync"
+    );
+    crate::watch::tests::free(p);
+}

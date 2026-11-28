@@ -345,6 +345,45 @@ pub(crate) fn sync_heaps() {
     });
 }
 
+/// Set while a flight lands beside a heap sync (`crate::host::flight`), and
+/// whether a write of ours into title memory reached a shader-visible heap
+/// meanwhile ([`note_title_write`]): the sync may have read the page before
+/// it, and is made again.
+#[cfg(windows)]
+static LANDING_BESIDE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static LANDING_WROTE_HEAP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A landing starts beside a heap sync (`true`) or has ended (`false`);
+/// ended, whether it wrote a shader-visible heap's memory.
+#[cfg(windows)]
+pub(crate) fn landing_beside(on: bool) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    LANDING_BESIDE.store(on, SeqCst);
+    if on {
+        LANDING_WROTE_HEAP.store(false, SeqCst);
+        false
+    } else {
+        LANDING_WROTE_HEAP.swap(false, SeqCst)
+    }
+}
+
+/// Our own write into title memory `[at, at + len)` (`crate::watch::writing`):
+/// noted if it reaches a shader-visible heap while a flight lands beside a
+/// heap sync.
+#[cfg(windows)]
+pub(crate) fn note_title_write(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::SeqCst;
+    if !LANDING_BESIDE.load(SeqCst) {
+        return;
+    }
+    let (from, to) = (at as u64, at.saturating_add(len) as u64);
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    if heaps.iter().any(|&(start, end, _)| start < to && from < end) {
+        LANDING_WROTE_HEAP.store(true, SeqCst);
+    }
+}
+
 /// Whether [`sync_heaps`] would find pages to read: a shader-visible heap
 /// with its host heap holds pages written since its last sync. Takes no
 /// tracker's lock; a write racing the answer is found by the next asking.

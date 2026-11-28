@@ -1099,6 +1099,8 @@ impl Drop for Writing {
 /// `kernel_will_write`) around the title's kernel reads into its own
 /// memory and DirectStorage's writes to addresses.
 pub fn writing(at: usize, len: usize) -> Writing {
+    #[cfg(windows)]
+    crate::descriptor::note_title_write(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
@@ -1239,6 +1241,8 @@ pub(crate) fn notify_written(at: usize, len: usize) {
     if len == 0 {
         return;
     }
+    #[cfg(windows)]
+    crate::descriptor::note_title_write(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
     let mut g = guards();
     if g.holders.range(first..last).next().is_none()

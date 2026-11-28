@@ -2615,14 +2615,22 @@ impl Host {
         crate::resource::evict_unused();
         // The first shader writing through a heap may run in this
         // submission: unordered views left null are made again first.
+        // `VICTORY_LAND_BESIDE`: the heap sync was made beside the landing
+        // of the flight before (`flight::Host::land_beside_locked`), after
+        // the title asked for this submission as here; a remake rewrites
+        // views, and the sync follows it as ever.
+        let mut synced = flight::take_heaps_synced();
         if crate::bindless::take_remake() {
             crate::descriptor::remake_unordered();
+            synced = false;
         }
         // Descriptors the title copied into its heaps itself, before the
         // heaps' views are brought up to date below.
         #[cfg(feature = "diagnostics")]
         let syncing = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::SyncHeapsUs);
-        crate::descriptor::sync_heaps();
+        if !synced {
+            crate::descriptor::sync_heaps();
+        }
         #[cfg(feature = "diagnostics")]
         drop(syncing);
         // Textures heap-indexing shaders may read, uploaded first by a list

@@ -80,6 +80,74 @@ pub(crate) fn prep_beside_enabled() -> bool {
 #[cfg(test)]
 static TEST_PREP_BESIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Whether a flight lands on a second thread beside the next submission's
+/// heap sync (`VICTORY_LAND_BESIDE=1`, with `VICTORY_PREP_BESIDE=1`; off by
+/// default).
+///
+/// Once the GPU has run the flight, its landing (copy-back, the work after
+/// it, bottom-of-pipe writes, the title's signals, in that order as ever)
+/// needs nothing of the next submission, and the next submission's heap
+/// sync needs nothing of the landing but the heap memory it may write. So
+/// the thread that submits makes the heap sync while a texture worker lands
+/// the flight, waits for both, and goes on with the rest of the preparation
+/// (eviction, uploads, list steps, refreshes), which does follow the
+/// landing. The sync is the one the preparation makes, at the same point of
+/// the title's work (after it asked for the submission); the GPU runs
+/// nothing meanwhile, so no descriptor is written into a heap in use. A
+/// landing that writes a shader-visible heap's memory (shaders wrote
+/// descriptors) is noticed (`crate::descriptor::note_title_write`) and the
+/// sync made again after it. Not in the first submission of a frame, whose
+/// eviction pass comes before the sync, nor before a view remake.
+pub(crate) fn land_beside_enabled() -> bool {
+    #[cfg(test)]
+    match TEST_LAND_BESIDE.load(Ordering::Acquire) {
+        1 => return false,
+        2 => return prep_beside_enabled(),
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = prep_beside_enabled() && std::env::var_os("VICTORY_LAND_BESIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("VICTORY_LAND_BESIDE=1: a flight lands on a second thread beside the next heap sync");
+        }
+        on
+    })
+}
+
+#[cfg(test)]
+static TEST_LAND_BESIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: `VICTORY_LAND_BESIDE` on or off until dropped.
+#[cfg(test)]
+pub(crate) struct LandGuard(u8);
+
+#[cfg(test)]
+impl LandGuard {
+    pub(crate) fn new(on: bool) -> Self {
+        Self(TEST_LAND_BESIDE.swap(if on { 2 } else { 1 }, Ordering::AcqRel))
+    }
+}
+
+#[cfg(test)]
+impl Drop for LandGuard {
+    fn drop(&mut self) {
+        TEST_LAND_BESIDE.store(self.0, Ordering::Release);
+    }
+}
+
+thread_local! {
+    /// The heaps were synced beside the landing of the flight before, for
+    /// the submission this thread prepares next ([`take_heaps_synced`]).
+    static HEAPS_SYNCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the heap sync of the submission this thread is about to prepare
+/// was made beside a landing ([`Host::land_beside_locked`]); cleared.
+pub(super) fn take_heaps_synced() -> bool {
+    HEAPS_SYNCED.with(|s| s.replace(false))
+}
+
 /// Tests: `VICTORY_PREP_BESIDE` on or off until dropped (under a
 /// [`ModeGuard`], which serializes the tests that set modes).
 #[cfg(test)]
@@ -106,10 +174,13 @@ impl Drop for BesideGuard {
 /// flights landed by the thread whose held work waited for them, `[6]`
 /// microseconds landings waited for the GPU (with or without the switch),
 /// `[7]` times a copy's pages under a heap's unordered views were made
-/// again (`crate::bindless::written_pages`).
-static BESIDE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// again (`crate::bindless::written_pages`), `[8]` flights landed on a
+/// second thread beside a heap sync (`VICTORY_LAND_BESIDE`), `[9]` heap
+/// syncs made again as the landing wrote heap memory, `[10]` microseconds
+/// of landings and `[11]` of heap syncs that ran beside each other.
+static BESIDE: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 /// [`BESIDE`] since the start (tests).
-static BESIDE_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static BESIDE_TOTAL: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
 
 fn beside(i: usize, n: u64) {
     BESIDE[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -118,7 +189,7 @@ fn beside(i: usize, n: u64) {
 
 /// [`BESIDE_TOTAL`] (tests).
 #[cfg(test)]
-pub(crate) fn beside_counts() -> [u64; 8] {
+pub(crate) fn beside_counts() -> [u64; 12] {
     BESIDE_TOTAL.each_ref().map(|a| a.load(Ordering::Relaxed))
 }
 
@@ -137,7 +208,8 @@ pub(super) fn log_beside(frames: f64, refreshed: u64) {
         "prepared beside a flight per frame (VICTORY_PREP_BESIDE={}): {:.1} goes beside a flight still on the GPU, \
          {:.1} found it finished; refreshes copied {:.2} MB beside it and {:.2} MB after its landing, left {:.2} MB \
          asked for in ranges it may write ({:.1} copies' written pages made again); {:.1} ms; {:.1} flights landed by \
-         the thread whose held work waited for them; landings still waited {:.1} ms for the GPU",
+         the thread whose held work waited for them; landings still waited {:.1} ms for the GPU; {:.1} flights landed on \
+         a second thread (VICTORY_LAND_BESIDE={}): {:.1} ms of landing beside {:.1} ms of heap sync, {:.1} syncs made again",
         u8::from(prep_beside_enabled()),
         per(b[0]),
         per(b[1]),
@@ -148,6 +220,11 @@ pub(super) fn log_beside(frames: f64, refreshed: u64) {
         per(b[4]) / 1e3,
         per(b[5]),
         per(b[6]) / 1e3,
+        per(b[8]),
+        u8::from(land_beside_enabled()),
+        per(b[10]) / 1e3,
+        per(b[11]) / 1e3,
+        per(b[9]),
     );
 }
 
@@ -470,8 +547,9 @@ impl Host {
         self.prepare_beside_locked(&segments);
         // Wait-Before-Prep: drain Flight N-1 completely before Flight N
         // touches any shared Shadow, descriptor heap, upload staging pool, or
-        // Mark buffer.
-        self.finish_flight_locked(&mut submitted, None, None);
+        // Mark buffer (`VICTORY_LAND_BESIDE`: but for the heap sync, made
+        // beside the landing).
+        self.land_beside_locked(&mut submitted);
 
         let prep = {
             let run_refs: Vec<&HostList> = segments.iter().map(|s| &**s).collect();
@@ -811,7 +889,13 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         crate::resource::life::note(0, crate::resource::life::RAN, flight.fence_value, 0);
+        self.land(flight, gpu_duration);
+        true
+    }
 
+    /// The landing of `flight`, which the GPU has run: copy-back, the work
+    /// after it, bottom-of-pipe writes, then the title's signals.
+    fn land(&self, flight: InFlight, gpu_duration: std::time::Duration) {
         {
             let run_refs: Vec<&HostList> = flight
                 .uploads
@@ -849,6 +933,105 @@ impl Host {
             crate::fence::let_go(fence as This);
         }
         state.active = false;
+    }
+
+    /// `VICTORY_LAND_BESIDE`: lands the flight in the air on a texture
+    /// worker while this thread makes the heap sync of the submission it
+    /// prepares next ([`land_beside_enabled`]); the preparation then skips
+    /// its sync ([`take_heaps_synced`]). Falls back to
+    /// [`Host::finish_flight_locked`] where that does not hold. Called
+    /// under `Host::submitted`.
+    pub(super) fn land_beside_locked(&self, submitted: &mut u64) -> bool {
+        if !land_beside_enabled() || crate::resource::evict_due() {
+            return self.finish_flight_locked(submitted, None, None);
+        }
+        let Some(flight) = self
+            .flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .in_flight
+            .take()
+        else {
+            return false;
+        };
+        let gpu_done = if flight.waited {
+            // SAFETY: plain fence completion query.
+            if unsafe { self.fence.GetCompletedValue() } < flight.fence_value {
+                let asked = std::time::Instant::now();
+                self.wait_for(flight.fence_value);
+                let now = std::time::Instant::now();
+                beside(6, (now - asked).as_micros() as u64);
+                now
+            } else {
+                std::time::Instant::now()
+            }
+        } else {
+            std::time::Instant::now()
+        };
+        let gpu_duration = gpu_done.saturating_duration_since(flight.launched);
+        #[cfg(test)]
+        super::tests::native_call_group(flight.waited);
+        let mark = self.mark();
+        let split_failed = if flight.split_count > 0 {
+            let pool = self.split_marks.lock().unwrap_or_else(|e| e.into_inner());
+            pool.as_deref().is_some_and(|marks| {
+                marks
+                    .iter()
+                    .take(flight.split_count)
+                    .any(|m| !m.saw(flight.fence_value))
+            })
+        } else {
+            false
+        };
+        if flight.waited
+            && let Some(mark) = mark
+            && (!mark.saw(flight.fence_value) || split_failed)
+            // SAFETY: a plain query.
+            && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
+        {
+            self.lost(submitted, mark);
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::resource::life::note(0, crate::resource::life::RAN, flight.fence_value, 0);
+
+        // The flight goes to the worker; without workers it lands here.
+        let flight = std::sync::Mutex::new(Some(flight));
+        let (landing_us, sync_us) = (AtomicU64::new(0), AtomicU64::new(0));
+        crate::descriptor::landing_beside(true);
+        let ran = crate::texture::beside(
+            || {
+                // As on the thread that submits: what the landing calls
+                // must not wait for the submission lock that thread holds.
+                let _holding = Holding::enter();
+                let at = std::time::Instant::now();
+                if let Some(flight) = flight.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    self.land(flight, gpu_duration);
+                }
+                landing_us.store(at.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            },
+            || {
+                let at = std::time::Instant::now();
+                crate::descriptor::sync_heaps();
+                sync_us.store(at.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+            },
+        );
+        let wrote_heap = crate::descriptor::landing_beside(false);
+        if !ran {
+            if let Some(flight) = flight.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                self.land(flight, gpu_duration);
+            }
+            return true;
+        }
+        beside(8, 1);
+        beside(10, landing_us.into_inner());
+        beside(11, sync_us.into_inner());
+        if wrote_heap {
+            // Shaders wrote descriptors into heap memory, and the sync may
+            // have read those pages before the copy-back: once more.
+            crate::descriptor::sync_heaps();
+            beside(9, 1);
+        }
+        HEAPS_SYNCED.with(|s| s.set(true));
         true
     }
 }
@@ -1158,6 +1341,93 @@ mod tests {
             landed_by_submitter,
             "the submitting thread landed the flight its held work waited for"
         );
+    }
+
+    /// `VICTORY_LAND_BESIDE`: the flight before lands on another thread while
+    /// the submitting thread makes its heap sync, and everything the landing
+    /// owes is there, in its order, when the submission returns: the shader's
+    /// write in title memory before the work after it, that before the
+    /// bottom-of-pipe write, and the title's signal after all.
+    #[test]
+    fn land_beside_lands_on_another_thread_in_the_same_order() {
+        let Some(host) = host() else {
+            return;
+        };
+        let _mode = ModeGuard::new(true, false);
+        let _beside = BesideGuard::new(true);
+        let _land = LandGuard::new(true);
+        let (q, f) = make_queue_and_fence();
+        let mut on_another_thread = false;
+        for attempt in 1..=20u64 {
+            let title = Box::leak(Box::new([0u32; 16]));
+            let title_addr = title.as_mut_ptr() as u64;
+            let shadow = crate::shadow::find(title_addr, 64).expect("shadow");
+            let (src_buf, src_ptr) = host.upload_buffer(64).expect("upload buffer");
+            // SAFETY: mapped 64-byte upload buffer.
+            unsafe { src_ptr.cast::<u32>().write_volatile(0xCAFE_BABE) };
+            let word = Box::leak(Box::new(0u64));
+            let bop = std::ptr::from_mut(word) as usize;
+
+            let mut gate = Gate::hold(host);
+            let first = Arc::new(host.new_list().expect("host list"));
+            // SAFETY: open host list, valid D3D12 buffers.
+            unsafe {
+                first
+                    .list
+                    .CopyBufferRegion(&shadow.buffer, shadow.offset(title_addr), &src_buf, 0, 4);
+            }
+            first.keep(&src_buf);
+            shadow.gpu_writes(&first, title_addr, 4, false);
+            let submitter = std::thread::current().id();
+            let after_thread = Arc::new(std::sync::Mutex::new(None));
+            let (thread, saw_copy, saw_no_bop) = (
+                after_thread.clone(),
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicBool::new(false)),
+            );
+            let (copy_flag, bop_flag) = (saw_copy.clone(), saw_no_bop.clone());
+            let title_ptr = title_addr as usize;
+            first.defer_after(move || {
+                *thread.lock().unwrap() = Some(std::thread::current().id());
+                // SAFETY: never freed.
+                unsafe {
+                    copy_flag.store((title_ptr as *const u32).read_volatile() == 0xCAFE_BABE, Ordering::Release);
+                    bop_flag.store((bop as *const u64).read_volatile() == 0, Ordering::Release);
+                }
+            });
+            first.defer_write(bop as *mut u8, Written::Value(0x1234_5678), 8);
+            first.close();
+            host.execute_flight1(vec![first], vec![]);
+            queue_signal(q, f, attempt);
+
+            let before = beside_counts();
+            let opener = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                gate.open();
+            });
+            let second = Arc::new(host.new_list().expect("host list"));
+            second.close();
+            host.execute_flight1(vec![second], vec![]);
+            opener.join().expect("the gate's thread");
+            // The first flight has landed, whoever landed it.
+            // SAFETY: never freed.
+            unsafe {
+                assert_eq!((title_ptr as *const u32).read_volatile(), 0xCAFE_BABE, "copy-back");
+                assert_eq!((bop as *const u64).read_volatile(), 0x1234_5678, "bottom-of-pipe write");
+            }
+            assert!(saw_copy.load(Ordering::Acquire), "copy-back before the work after it");
+            assert!(saw_no_bop.load(Ordering::Acquire), "the work after it before the bottom-of-pipe write");
+            assert!(wait_fence(f, attempt, Duration::from_secs(5)), "the signal behind it");
+            let landed_beside = beside_counts()[8] > before[8];
+            let ran_on = (*after_thread.lock().unwrap()).expect("the work after it ran");
+            host.finish_flight_now();
+            if landed_beside {
+                assert_ne!(ran_on, submitter, "landed on a worker");
+                on_another_thread = true;
+                break;
+            }
+        }
+        assert!(on_another_thread, "a flight landed beside the heap sync");
     }
 
     /// `Host::quiet()` drains any active Flight-1 work cleanly before

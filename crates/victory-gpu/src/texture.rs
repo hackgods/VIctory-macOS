@@ -622,6 +622,20 @@ pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     }
 }
 
+/// Runs `there` on a texture worker while the calling thread runs `here`,
+/// and returns once both are done; false, with neither run, where there
+/// are no workers.
+pub(crate) fn beside(there: impl FnOnce() + Send, here: impl FnOnce()) -> bool {
+    let Some(pool) = workers() else {
+        return false;
+    };
+    pool.in_place_scope(|scope| {
+        scope.spawn(|_| there());
+        here();
+    });
+    true
+}
+
 /// [`Staging::refresh`] of each of `work`, those whose memory may have
 /// changed on several threads at once (reading title memory and detiling
 /// cost ~6 ms of frame a MB on one thread in a new shot, run evict5).

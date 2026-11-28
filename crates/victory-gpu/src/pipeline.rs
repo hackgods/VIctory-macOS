@@ -523,12 +523,13 @@ fn may_limit_threads(threads: Option<[u32; 3]>) -> bool {
 }
 
 /// The host pipeline of compute pipeline `p` whose lanes past a dispatch's
-/// count of threads leave at once (`emit::Options::thread_limits`), made on
-/// the first dispatch counted in threads that ends in a part of a group
-/// (`draw::State::dispatch_x`): its shader translated again, so programs
-/// no such dispatch reaches keep their translation. None where the program
-/// cannot leave them (a group barrier, 32-lane halves passing values) or
-/// that translation or pipeline fails; asked once per shader.
+/// count of threads do not run (`emit::Options::thread_limits`: they leave
+/// at once, or stay outside EXEC where the program's lanes wait for each
+/// other), made on the first dispatch counted in threads that ends in a
+/// part of a group (`draw::State::dispatch_x`): its shader translated
+/// again, so programs no such dispatch reaches keep their translation.
+/// None where the program has no such form (literal halves, or a refusal)
+/// or that translation or pipeline fails; asked once per shader.
 #[cfg(windows)]
 pub(crate) fn thread_limited(p: &host::HostPipeline) -> Option<&'static host::HostPipeline> {
     type Made = HashMap<[u8; 32], Option<&'static host::HostPipeline>>;

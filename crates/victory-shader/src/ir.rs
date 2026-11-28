@@ -49,6 +49,11 @@ pub struct Program {
     /// hardware or a called fetch routine set up (user SGPRs, system values,
     /// vertex inputs).
     pub inputs: Vec<(Reg, Value)>,
+    /// A compute program run by dispatches counted in threads
+    /// ([`Options::thread_counts`](crate::emit::Options)): EXEC on entry is a
+    /// lane mask of its own, the threads the dispatch launches, not every
+    /// lane. The translator sets it and structures the program again.
+    pub thread_counts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -288,6 +293,7 @@ pub fn build_bounded(
         wave64,
         blocks,
         inputs,
+        thread_counts: false,
     })
 }
 
@@ -754,6 +760,21 @@ fn effects(
     vgprs: u16,
     m0_max: Option<u8>,
 ) -> Result<Option<Effects>, ShaderError> {
+    effects_with(inst, fields, name, lanes, vgprs, m0_max, true)
+}
+
+/// [`effects`], with the old values of the VGPRs a vector instruction
+/// writes among its reads only where `old` asks for them (mac: `walk`
+/// tells the operands apart from them).
+fn effects_with(
+    inst: &Instruction,
+    fields: &Fields,
+    name: &'static str,
+    lanes: u8,
+    vgprs: u16,
+    m0_max: Option<u8>,
+    old: bool,
+) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
     }
@@ -1016,7 +1037,9 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
         // Lanes disabled in EXEC keep the old value.
-        r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        if old {
+            r.extend(w.iter().filter(|(w, _)| matches!(w, Reg::V(_))).cloned());
+        }
     }
     let mut seen: RegSet = [0; REGS.div_ceil(64)];
     r.retain(|&(reg, _)| {

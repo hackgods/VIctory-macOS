@@ -29,6 +29,9 @@ const ORDER: Mac = Mac {
     wide_loads: false,
     bvh_miss: false,
     lds_rounds: false,
+    descriptor_as_data: false,
+    whole_wave: false,
+    whole_wave_no_lds: false,
 };
 
 /// `v_mov_b32 v<dst>, <k>`.

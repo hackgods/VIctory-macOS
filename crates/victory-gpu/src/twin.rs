@@ -16,8 +16,13 @@
 //! shortcut: uses the lists do not name (shaders indexing the heap
 //! themselves) move nothing; a whole twin is copied for any use of either
 //! plane, also when the next pass overwrites all of it; console 24-bit
-//! depth gets no twin. Upgrade when a frame trace shows such a use, or the
-//! copies (counted on the frame-rate line) cost.
+//! depth gets no twin; a copy a list owes only because it cannot know which
+//! side the lists before it left newer is the submission's with
+//! `VICTORY_DEPTH_NO_TWIN` (from ScarlettMac 4921b7e6). Upgrade when a
+//! frame trace shows such a use, or the copies (counted on the frame-rate
+//! line) cost. The twin itself cannot go: the host makes no unordered view
+//! of a depth-stencil resource, in any format, so the two uses cannot share
+//! one texture.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::Relaxed};
@@ -78,12 +83,37 @@ struct Route {
 }
 
 /// A depth texture's use in one list: the side its first use needs (made
-/// newer at submission, `at_submission`) and the side the list left newer
-/// (`None`: unchanged from where it started).
+/// newer at submission, `at_submission`), the side a later use needed while
+/// the list had written nothing yet (the prelude's to make newer too, with
+/// [`no_twin`]), and the side the list left newer (`None`: unchanged from
+/// where it started).
 pub(crate) struct Use {
     first: u8,
+    late: Option<u8>,
     last: Option<u8>,
     depth: Arc<HostTexture>,
+}
+
+/// From ScarlettMac 4921b7e6, `VICTORY_DEPTH_NO_TWIN=1`: the copy between a
+/// depth texture and its twin that a list owes only because it cannot know
+/// which side the lists before it left newer is the submission's, which
+/// knows and copies nothing when neither side is stale. The twin itself stays: the host makes no unordered
+/// view of a depth-stencil resource, in any format.
+///
+/// Off by default: the copies a list makes itself are as they were, one per
+/// use that needs the other side.
+fn no_twin() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_DEPTH_NO_TWIN").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!(
+                "VICTORY_DEPTH_NO_TWIN: nothing is copied between a depth texture and its twin \
+                 while neither side is stale"
+            );
+        }
+        on
+    })
 }
 
 /// The twin's plane formats for a console depth format (resource or
@@ -338,25 +368,41 @@ pub(crate) fn route(list: &HostList, depth: &Arc<HostTexture>, twin: &Twin, want
 
 impl Use {
     pub(crate) fn new(depth: &Arc<HostTexture>, side: u8, writes: bool) -> Self {
-        Use { first: side, last: writes.then_some(side), depth: depth.clone() }
+        Use { first: side, late: None, last: writes.then_some(side), depth: depth.clone() }
     }
 
     /// A later use in the list needing `side`: whether a copy must be
     /// recorded first (true: into the depth texture).
     pub(crate) fn again(&mut self, side: u8, writes: bool) -> Option<bool> {
-        again(self.first, &mut self.last, side, writes)
+        again(self.first, &mut self.late, &mut self.last, side, writes, no_twin())
     }
 }
 
-/// [`Use::again`] on its first side and the side it left newer.
-fn again(first: u8, last: &mut Option<u8>, side: u8, writes: bool) -> Option<bool> {
+/// [`Use::again`] on its first side, the side it owes the prelude, the side
+/// it left newer, and whether a copy the list cannot decide is the prelude's
+/// ([`no_twin`]).
+fn again(
+    first: u8,
+    late: &mut Option<u8>,
+    last: &mut Option<u8>,
+    side: u8,
+    writes: bool,
+    lazy: bool,
+) -> Option<bool> {
     // Unchanged since the list's start: only the first use's side is
     // known to be current there.
     let current = match *last {
         None => first == side,
         Some(newer) => newer == BOTH || newer == side,
     };
-    let copy = (!current).then_some(side == DEPTH);
+    let mut copy = (!current).then_some(side == DEPTH);
+    if copy.is_some() && last.is_none() && lazy {
+        // Nothing written in the list yet, so `side` is as the list found
+        // it: the prelude knows which side the lists before left newer, and
+        // copies nothing when `side` is that one.
+        *late = late.or(Some(side));
+        copy = None;
+    }
     if copy.is_some() {
         *last = Some(BOTH);
     }
@@ -369,11 +415,15 @@ fn again(first: u8, last: &mut Option<u8>, side: u8, writes: bool) -> Option<boo
 /// Where a list's uses leave a twin's newer side, from `newer` before it:
 /// the copy its prelude makes first (true: into the depth texture), and the
 /// newer side after the list.
-fn submitted(first: u8, last: Option<u8>, newer: u8) -> (Option<bool>, u8) {
-    let copy = match (first, newer) {
-        (DEPTH, TWIN) => Some(true),
-        (TWIN, DEPTH) => Some(false),
-        _ => None,
+fn submitted(first: u8, late: Option<u8>, last: Option<u8>, newer: u8) -> (Option<bool>, u8) {
+    // The sides the list needs as it found them: its first use's, and one a
+    // later use owed the prelude (`again`).
+    let copy = if newer == DEPTH && (first == TWIN || late == Some(TWIN)) {
+        Some(false)
+    } else if newer == TWIN && (first == DEPTH || late == Some(DEPTH)) {
+        Some(true)
+    } else {
+        None
     };
     let start = if copy.is_some() { BOTH } else { newer };
     (copy, last.unwrap_or(start))
@@ -386,7 +436,7 @@ pub(crate) fn at_submission<'a>(uses: impl Iterator<Item = &'a Use>) -> Vec<(Arc
     let mut copies = Vec::new();
     for u in uses {
         let Some(Some(twin)) = u.depth.twin.get() else { continue };
-        let (to_depth, after) = submitted(u.first, u.last, twin.newer.load(Relaxed));
+        let (to_depth, after) = submitted(u.first, u.late, u.last, twin.newer.load(Relaxed));
         twin.newer.store(after, Relaxed);
         if let Some(to_depth) = to_depth {
             copies.push((u.depth.clone(), to_depth));
@@ -572,21 +622,120 @@ mod tests {
         // List 1: unordered write first (the prelude copies the depth side
         // over, newer since the last frame), a read (copy back now), a
         // write again.
+        let mut late = None;
         let mut last = Some(TWIN);
-        assert_eq!(again(TWIN, &mut last, DEPTH, false), Some(true));
+        assert_eq!(again(TWIN, &mut late, &mut last, DEPTH, false, false), Some(true));
         assert_eq!(last, Some(BOTH));
-        assert_eq!(again(TWIN, &mut last, TWIN, true), None);
-        assert_eq!(submitted(TWIN, last, DEPTH), (Some(false), TWIN));
+        assert_eq!(again(TWIN, &mut late, &mut last, TWIN, true, false), None);
+        assert_eq!(submitted(TWIN, late, last, DEPTH), (Some(false), TWIN));
         // List 2 only reads: its prelude copies into the depth texture.
-        assert_eq!(submitted(DEPTH, None, TWIN), (Some(true), BOTH));
+        assert_eq!(submitted(DEPTH, None, None, TWIN), (Some(true), BOTH));
         // List 3 renders to it: nothing to copy, the depth side is newer.
-        assert_eq!(submitted(DEPTH, Some(DEPTH), BOTH), (None, DEPTH));
+        assert_eq!(submitted(DEPTH, None, Some(DEPTH), BOTH), (None, DEPTH));
         // A list that starts reading the depth side, unchanged since, does
         // not know the twin is current: a use of the twin copies.
+        let mut late = None;
         let mut last = None;
-        assert_eq!(again(DEPTH, &mut last, DEPTH, false), None);
-        assert_eq!(again(DEPTH, &mut last, TWIN, true), Some(false));
+        assert_eq!(again(DEPTH, &mut late, &mut last, DEPTH, false, false), None);
+        assert_eq!(again(DEPTH, &mut late, &mut last, TWIN, true, false), Some(false));
         assert_eq!(last, Some(TWIN));
+    }
+
+    /// `VICTORY_DEPTH_NO_TWIN`: a copy a list owes only because it cannot
+    /// know which side the lists before it left newer moves to the prelude,
+    /// which copies nothing when neither side is stale.
+    #[test]
+    fn a_copy_the_list_cannot_decide_is_the_preludes() {
+        // A read of the depth side, then the twin, with nothing written in
+        // between: the twin's side is as the list found it.
+        let mut late = None;
+        let mut last = None;
+        assert_eq!(again(DEPTH, &mut late, &mut last, TWIN, false, true), None);
+        assert_eq!((late, last), (Some(TWIN), None));
+        // The prelude copies into the twin only if the depth side is newer;
+        // when the lists before left the twin newer, the depth side is the
+        // stale one and the copy goes the other way. Both the same: nothing.
+        assert_eq!(submitted(DEPTH, late, last, DEPTH), (Some(false), BOTH));
+        assert_eq!(submitted(DEPTH, late, last, TWIN), (Some(true), BOTH));
+        assert_eq!(submitted(DEPTH, late, last, BOTH), (None, BOTH));
+        // Off, the list copies itself, as before.
+        let mut late = None;
+        let mut last = None;
+        assert_eq!(again(DEPTH, &mut late, &mut last, TWIN, false, false), Some(false));
+        assert_eq!((late, last), (None, Some(BOTH)));
+        // A use the list wrote the other side before copies in the list: the
+        // prelude does not know of that write, so it cannot make the copy.
+        let mut late = None;
+        let mut last = Some(DEPTH);
+        assert_eq!(again(DEPTH, &mut late, &mut last, TWIN, true, true), Some(false));
+        assert_eq!(late, None);
+        // A copy always runs from the side the lists before left newer: one
+        // per submission, never two.
+        for &newer in &[BOTH, DEPTH, TWIN] {
+            for &first in &[DEPTH, TWIN] {
+                let mut late = None;
+                let mut last = None;
+                let other = if first == DEPTH { TWIN } else { DEPTH };
+                let _ = again(first, &mut late, &mut last, other, false, true);
+                let (copy, _) = submitted(first, late, last, newer);
+                if let Some(to_depth) = copy {
+                    assert_eq!(to_depth, newer == TWIN, "a copy runs from the newer side");
+                }
+            }
+        }
+    }
+
+    /// `VICTORY_DEPTH_NO_TWIN` unset: the same copies as before the flag, in
+    /// every state a list can be in.
+    #[test]
+    fn without_the_flag_the_same_copies_are_made() {
+        // The decision as it was, `late` and the flag aside.
+        fn was_again(first: u8, last: &mut Option<u8>, side: u8, writes: bool) -> Option<bool> {
+            let current = match *last {
+                None => first == side,
+                Some(newer) => newer == BOTH || newer == side,
+            };
+            let copy = (!current).then_some(side == DEPTH);
+            if copy.is_some() {
+                *last = Some(BOTH);
+            }
+            if writes {
+                *last = Some(side);
+            }
+            copy
+        }
+        fn was_submitted(first: u8, last: Option<u8>, newer: u8) -> (Option<bool>, u8) {
+            let copy = match (first, newer) {
+                (DEPTH, TWIN) => Some(true),
+                (TWIN, DEPTH) => Some(false),
+                _ => None,
+            };
+            let start = if copy.is_some() { BOTH } else { newer };
+            (copy, last.unwrap_or(start))
+        }
+        for first in [DEPTH, TWIN] {
+            for newer in [BOTH, DEPTH, TWIN] {
+                for last in [None, Some(BOTH), Some(DEPTH), Some(TWIN)] {
+                    for side in [DEPTH, TWIN] {
+                        for writes in [false, true] {
+                            let (mut then, mut now) = (last, last);
+                            let mut late = None;
+                            assert_eq!(
+                                again(first, &mut late, &mut now, side, writes, false),
+                                was_again(first, &mut then, side, writes),
+                                "a list's copy differs: first={first} side={side} writes={writes}"
+                            );
+                            assert_eq!((late, now), (None, then));
+                            assert_eq!(
+                                submitted(first, None, last, newer),
+                                was_submitted(first, last, newer),
+                                "a prelude's copy differs: first={first} newer={newer} last={last:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A list that writes a depth texture through its twin and then reads

@@ -16,6 +16,9 @@
 //! libraries recording into title lists. Planned:
 //! `present` (swap chain).
 
+// mac: `VICTORY_AB`, one switch flipped while the game runs; plain std,
+// so its tests run everywhere.
+mod ab;
 #[cfg(windows)]
 mod ambient;
 #[cfg(windows)]
@@ -60,8 +63,16 @@ pub mod dxgi;
 pub mod external;
 pub mod fence;
 // mac: plain std, so its tests run everywhere.
+#[cfg(windows)]
+mod heap_worker;
 #[cfg(any(windows, test))]
 mod flights;
+// mac: `VICTORY_FLICKER_WATCH`; plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod flicker;
+// mac: `VICTORY_PLACED_AT_ONCE=read`; plain std, so its tests run everywhere.
+#[cfg(any(windows, test))]
+mod placed_read;
 pub mod frame;
 // Plain std, so its tests run everywhere.
 #[cfg(any(windows, test))]
@@ -99,6 +110,9 @@ mod ranges;
 mod ray_skip;
 #[cfg(any(windows, test))]
 mod recent;
+// Its rules are plain std, so their tests run everywhere.
+#[cfg(any(windows, test))]
+mod release_copies;
 // The capture format is plain std: read, and tested, everywhere.
 pub mod replay;
 pub mod resource;
@@ -109,6 +123,8 @@ mod sampler;
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
+#[cfg(any(windows, test))]
+mod snapshot_spans;
 pub mod signature;
 mod mac_switches;
 mod switch;
@@ -128,6 +144,10 @@ mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
+// mac: whether a reserved buffer tiled from CPU-visible memory is that
+// memory, and the nearest alternatives (ignored by default).
+#[cfg(all(windows, test))]
+mod tile_probe;
 
 /// mac: the title's descriptor stores report the slots they write
 /// (`VICTORY_HEAP_REPORTS`, `descriptor::reports`): what the launcher and

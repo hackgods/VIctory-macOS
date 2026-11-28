@@ -308,30 +308,180 @@ pub(super) fn merge_rows(elements: &mut Vec<SigElement>, keep: &KeptOutputs) {
 /// (or none) are named, and none where a row holds anything else.
 pub(crate) fn idle_clip(p: &crate::ir::Program, io: &crate::io::Io, outputs: &[SigElement]) -> Vec<(u32, u8)> {
     use crate::io::Target;
-    use crate::gfx10::Fields;
-    // A value that is, for every lane, a constant that is not negative: one
-    // a `v_mov_b32` gives, a VGPR nothing set on entry (lowered as zero:
-    // `Lower::inputs`), or a phi of such values (itself among them).
-    fn idle(p: &crate::ir::Program, io: &crate::io::Io, v: crate::ir::Value, seen: &mut Vec<crate::ir::Value>) -> bool {
+    use crate::gfx10::{Fields, Operand};
+    use crate::ir::{Reg, Value};
+    // The EXEC halves an instruction reads (the high one in wave64 only).
+    fn exec_of(p: &crate::ir::Program, i: &crate::ir::Inst) -> Vec<Option<Value>> {
+        let halves: &[u8] = if p.wave64 { &[126, 127] } else { &[126] };
+        halves.iter().map(|&h| i.read(Reg::S(h))).collect()
+    }
+    // The value of EXEC half `half` an SGPR holds, where an
+    // `s_*_saveexec_*` saved it there or an `s_mov_b*` copied it.
+    fn saved(p: &crate::ir::Program, half: Reg, v: Value) -> Option<Value> {
+        let j = p.blocks.iter().flat_map(|b| &b.insts).find(|j| j.writes.iter().any(|w| w.1 == v))?;
+        let name = j.name();
+        if !(name.contains("saveexec") || name.starts_with("s_mov_b")) {
+            return None;
+        }
+        // The halves in order: the SGPR's place among those written is the
+        // EXEC half's place.
+        let place = j.writes.iter().filter(|w| matches!(w.0, Reg::S(n) if n < 106)).position(|w| w.1 == v)?;
+        (half == Reg::S(126 + u8::try_from(place).ok()?)).then(|| j.read(half)).flatten()
+    }
+    // The EXEC half value an `s_mov_b*` to EXEC sets back from where it was
+    // saved, if `e` is one.
+    fn restored(p: &crate::ir::Program, half: Reg, e: Value) -> Option<Value> {
+        let i = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.write(half) == Some(e))?;
+        if !i.name().starts_with("s_mov_b") {
+            return None;
+        }
+        let srcs: Vec<Value> = i.reads.iter().filter(|r| matches!(r.0, Reg::S(n) if n < 106)).map(|r| r.1).collect();
+        let src = match srcs[..] {
+            [s] => s,
+            [lo, hi] => if half == Reg::S(126) { lo } else { hi },
+            _ => return None,
+        };
+        saved(p, half, src)
+    }
+    // `e` with every restore of a saved EXEC replaced by what was saved,
+    // and a phi whose values are all one such value by that value.
+    fn plain(p: &crate::ir::Program, half: Reg, e: Value) -> Value {
+        fn walk(p: &crate::ir::Program, half: Reg, mut e: Value, depth: u32) -> Value {
+            for _ in 0..64 {
+                if let Some(before) = restored(p, half, e) {
+                    e = before;
+                    continue;
+                }
+                let Some(phi) = p.blocks.iter().flat_map(|b| &b.phis).find(|f| f.value == e) else { break };
+                if depth >= 8 {
+                    break;
+                }
+                let mut args = phi.args.iter().map(|&a| walk(p, half, a, depth + 1));
+                let Some(first) = args.next() else { break };
+                if !args.all(|a| a == first) {
+                    break;
+                }
+                e = first;
+            }
+            e
+        }
+        walk(p, half, e, 0)
+    }
+    // Whether the lanes on in EXEC half `e` are all on in `of`: the same
+    // value (restores of a saved EXEC are what was saved), or one made from
+    // such by an instruction that only turns lanes off (`v_cmpx_*`,
+    // `s_and_saveexec_*`, an `s_and_*` of EXEC).
+    fn within(p: &crate::ir::Program, half: Reg, e: Value, of: Value) -> bool {
+        let of = plain(p, half, of);
+        let mut e = plain(p, half, e);
+        for _ in 0..64 {
+            if e == of {
+                return true;
+            }
+            let Some(i) = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.write(half) == Some(e)) else {
+                return false;
+            };
+            let name = i.name();
+            // An EXEC this one's lanes are all on in: EXEC before a compare
+            // or an `s_and_saveexec_*`, or an operand of an `s_and_*` (the
+            // first of an `s_andn2_*`), where that is EXEC or a saved one.
+            let operands: &[Operand] = match &i.fields {
+                Fields::Sop { src, .. } if name.starts_with("s_and_b") => src,
+                Fields::Sop { src, .. } if name.starts_with("s_andn2_b") => &src[..src.len().min(1)],
+                _ => &[],
+            };
+            let Reg::S(h) = half else { return false };
+            let before = if name.starts_with("v_cmpx_") || name.starts_with("s_and_saveexec_") {
+                i.read(half)
+            } else {
+                operands.iter().find_map(|o| match *o {
+                    Operand::Scalar { code: 126, .. } => i.read(half),
+                    Operand::Scalar { code, .. } if code < 106 => i.read(Reg::S(code + (h - 126))).and_then(|s| saved(p, half, s)),
+                    _ => None,
+                })
+            };
+            let Some(before) = before else { return false };
+            e = plain(p, half, before);
+        }
+        false
+    }
+    // Whether the lanes on in EXEC `e` are all on in EXEC `of`.
+    fn inside(p: &crate::ir::Program, e: &[Option<Value>], of: &[Option<Value>]) -> bool {
+        e.len() == of.len()
+            && e.iter().zip(of).zip([Reg::S(126), Reg::S(127)]).all(|((&e, &of), h)| match (e, of) {
+                (Some(e), Some(of)) => within(p, h, e, of),
+                _ => false,
+            })
+    }
+    // A value that is, in every lane on in the export's EXEC (`exec`), a
+    // constant that is not negative: one a `v_mov_b32` gives, a VGPR nothing
+    // set on entry (lowered as zero: `Lower::inputs`), or a phi of such
+    // values (itself among them). Lanes off in a `v_mov_b32`'s EXEC keep the
+    // register's old value (`ir`), so unless the export's lanes are all on
+    // there, what those lanes keep must be such a value too ([`kept`]).
+    fn idle(p: &crate::ir::Program, io: &crate::io::Io, exec: &[Option<Value>], v: Value, seen: &mut Vec<Value>) -> bool {
         if seen.contains(&v) {
             return true;
         }
         seen.push(v);
         if let Some(phi) = p.blocks.iter().flat_map(|b| &b.phis).find(|f| f.value == v) {
-            return seen.len() < 64 && phi.args.iter().all(|&a| idle(p, io, a, seen));
+            return seen.len() < 64 && phi.args.iter().all(|&a| idle(p, io, exec, a, seen));
         }
-        if p.inputs.iter().any(|i| i.1 == v && matches!(i.0, crate::ir::Reg::V(_))) {
+        if p.inputs.iter().any(|i| i.1 == v && matches!(i.0, Reg::V(_))) {
             return !io.inputs.iter().any(|i| i.0 == v);
         }
         let inst = p.blocks.iter().flat_map(|b| &b.insts).find(|i| i.writes.iter().any(|w| w.1 == v));
         inst.is_some_and(|i| match &i.fields {
             Fields::Valu(f) if i.name() == "v_mov_b32" && f.neg == 0 && f.abs == 0 => {
+                let here = exec_of(p, i);
                 f.src.first().and_then(|&o| super::scalar_constant(o)).is_some_and(|bits| bits <= 0x7F80_0000)
+                    && (inside(p, exec, &here)
+                        || i.writes.iter().find(|w| w.1 == v).is_none_or(|&(reg, _)| {
+                            i.read(reg).is_none_or(|old| kept(p, io, exec, &here, reg, old, &mut Vec::new(), seen))
+                        }))
             }
             _ => false,
         })
     }
-    let idle = |v: crate::ir::Value| idle(p, io, v, &mut Vec::new());
+    // Whether `v` (of VGPR `reg`) is [`idle`] in the lanes off in EXEC
+    // `off`: writes under that EXEC or a narrower one do not reach them, so
+    // those lanes keep what the register held before.
+    #[allow(clippy::too_many_arguments)]
+    fn kept(
+        p: &crate::ir::Program,
+        io: &crate::io::Io,
+        exec: &[Option<Value>],
+        off: &[Option<Value>],
+        reg: Reg,
+        v: Value,
+        walked: &mut Vec<Value>,
+        seen: &mut Vec<Value>,
+    ) -> bool {
+        // (`walked` holds what this walk passed, `seen` what `idle` checks:
+        // a value whose other lanes do not matter here may matter there.)
+        if walked.contains(&v) {
+            return true;
+        }
+        if walked.len() >= 256 {
+            return false;
+        }
+        if let Some(phi) = p.blocks.iter().flat_map(|b| &b.phis).find(|f| f.value == v) {
+            walked.push(v);
+            return phi.args.iter().all(|&a| kept(p, io, exec, off, reg, a, walked, seen));
+        }
+        if let Some(d) = p.blocks.iter().flat_map(|b| &b.insts).find(|d| d.write(reg) == Some(v))
+            && let Some(before) = d.read(reg)
+            && inside(p, &exec_of(p, d), off)
+        {
+            walked.push(v);
+            return kept(p, io, exec, off, reg, before, walked, seen);
+        }
+        idle(p, io, exec, v, seen)
+    }
+    let idle = |x: &crate::io::Export, v: Value| {
+        let exec = exec_of(p, &p.blocks[x.site.0].insts[x.site.1]);
+        idle(p, io, &exec, v, &mut Vec::new())
+    };
     // The distance channels in the order the position exports carry them.
     let mut dists: Vec<&SigElement> = outputs.iter().filter(|e| matches!(e.kind, 6 | 7) && e.row.is_some()).collect();
     dists.sort_by_key(|e| (e.kind, e.index));
@@ -358,7 +508,7 @@ pub(crate) fn idle_clip(p: &crate::ir::Program, io: &crate::io::Io, outputs: &[S
                 };
                 if let Some(v) = x.values[ch] {
                     writes += 1;
-                    all_idle &= idle(v);
+                    all_idle &= idle(x, v);
                 }
             }
             if writes == 0 || !all_idle {

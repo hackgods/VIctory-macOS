@@ -1004,8 +1004,13 @@ impl HostTexture {
     pub(crate) fn note_state(&self, state: u32) {
         const RENDER_TARGET_UNORDERED_DEPTH_WRITE: u32 = 0x4 | 0x8 | 0x10;
         if state & RENDER_TARGET_UNORDERED_DEPTH_WRITE != 0 {
-            self.gpu_written.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.gpu_written.store(true, std::sync::atomic::Ordering::Release);
         }
+    }
+
+    /// Whether a list has moved this host texture into a GPU write state.
+    pub(crate) fn is_gpu_written(&self) -> bool {
+        self.gpu_written.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A heap slot views it for unordered access.
@@ -1329,11 +1334,14 @@ pub(crate) fn castable(format: u32) -> Vec<u32> {
         .collect()
 }
 
-/// [`castable`] under D3DMetal: Metal views a block-compressed texture only
-/// in its own compression, sRGB on or off, and aborts the process on any
-/// other view (a BC7 view of BC5 memory in Series 1.0.2.1's world, M1 Max),
-/// so a block format keeps only its sRGB partner. Memory the title reuses in
-/// another block format gets its own host texture instead (`takes`).
+/// [`castable`] under D3DMetal with `VICTORY_METAL_BC_CASTS=1`
+/// (`crate::mac_switches::metal_bc_casts`): Metal views a block-compressed
+/// texture only in its own compression, sRGB on or off, and aborts the
+/// process on any other view (a BC7 view of BC5 memory in Series 1.0.2.1's
+/// world, M1 Max), so a block format keeps only its sRGB partner. Memory the
+/// title reuses in another block format gets its own host texture instead
+/// (`takes`). From VIctory-macOS #499.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn castable_metal(format: u32) -> Vec<u32> {
     const SRGB_PAIRS: [u32; 8] = [71, 72, 74, 75, 77, 78, 98, 99];
     let mut c = castable(format);
@@ -1469,7 +1477,7 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut texture: Option<ID3D12Resource> = None;
     let mut castable_formats = match () {
         () if d.flags & DEPTH != 0 => Vec::new(),
-        () if crate::shader_cache::under_wine() => castable_metal(d.format),
+        () if crate::mac_switches::metal_bc_casts(crate::under_wine) => castable_metal(d.format),
         () => castable(d.format),
     };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
@@ -1828,8 +1836,6 @@ pub(crate) fn evict_due() -> bool {
 /// time, the last one has run): gives up host textures fed from title memory
 /// that the title has not used for [`IDLE_MS`], and past [`BUDGET_HIGH`] of
 /// the card's budget the least recently used ones until [`BUDGET_LOW`].
-/// Host copies of title memory nothing asked for in as long go too
-/// ([`crate::shadow::release_stale`]).
 #[cfg(windows)]
 pub(crate) fn evict_unused() {
     use std::sync::atomic::Ordering::Relaxed;
@@ -1849,7 +1855,6 @@ pub(crate) fn evict_unused() {
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
-    crate::shadow::release_stale(frame);
 }
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
@@ -1921,6 +1926,44 @@ fn ram_excess(available: u64, total: u64, marks: RamMarks) -> u64 {
     }
 }
 
+/// From ScarlettMac 4921b7e6, `VICTORY_TEXTURE_TRIM=1`: a card budget larger
+/// than the computer's whole memory is read as the computer's memory
+/// ([`one_memory`]), so host textures fed from title memory are given up
+/// under RAM pressure ([`RAM_LOW`]) instead of never. Under D3DMetal on a 24
+/// GB M5 Pro the card offered 38139 MB against 19070 MB non-local, which read
+/// as a card of its own: nothing was given up while host textures grew to
+/// 7.2 GB and the system swapped (ScarlettMac). Where both segments offer
+/// one budget (this 48 GB M4 Pro: 40201 MB each) the memory is unified
+/// already and the switch changes nothing. Off by default.
+#[cfg(windows)]
+fn texture_trim() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_TEXTURE_TRIM").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!(
+                "VICTORY_TEXTURE_TRIM: a card budget above the computer's memory is the \
+                 computer's memory, so host textures are given up under RAM pressure"
+            );
+        }
+        on
+    })
+}
+
+/// The computer's memory in MB, 0 if the system does not say.
+#[cfg(windows)]
+fn physical_mb() -> f64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data, its length set as the call asks.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a valid out pointer.
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0.0;
+    }
+    m.ullTotalPhys as f64 / 1e6
+}
+
 /// The shares of the computer's memory that [`ram_excess`] works to:
 /// below `low` free it gives up, until `free` would be.
 #[cfg(windows)]
@@ -1982,7 +2025,8 @@ fn ram_marks_from(low: Option<&str>, free: Option<&str>) -> RamMarks {
 /// Whether the host card's memory is the computer's own, logged once: its
 /// architecture's UMA, or its local and non-local segments offering one
 /// and the same budget (D3DMetal reports no UMA on Apple silicon, and both
-/// segments as the same 12713 MB on a 16 GB Mac).
+/// segments as the same 12713 MB on a 16 GB Mac), or with
+/// `VICTORY_TEXTURE_TRIM=1` a budget above the computer's memory.
 #[cfg(windows)]
 fn unified() -> bool {
     static UNIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2009,22 +2053,28 @@ fn unified() -> bool {
     }
     .is_ok()
         && a.UMA.as_bool();
-    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other));
+    // The computer's memory, for the rule that a card's budget larger than
+    // it is the computer's own ([`texture_trim`]): none without the switch.
+    let physical = if texture_trim() { physical_mb() } else { 0.0 };
+    let unified = *UNIFIED.get_or_init(|| one_memory(uma, local, other, physical));
     tracing::info!(
         unified,
         uma,
         local_mb = local,
         non_local_mb = other,
+        physical_mb = physical,
         "host card memory unified with the computer's: host textures also kept under its free memory"
     );
     unified
 }
 
-/// [`unified`]'s rule: the architecture says so, or both segments' budgets
-/// (MB) are one.
+/// [`unified`]'s rule: the architecture says so, both segments' budgets
+/// (MB) are one, or the card's budget is more than the computer's whole
+/// memory (`physical` in MB, 0 to leave that rule out): a card of its own
+/// cannot offer more memory than the computer has.
 #[cfg(windows)]
-fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
-    uma || (local > 0.0 && local == non_local)
+fn one_memory(uma: bool, local: f64, non_local: f64, physical: f64) -> bool {
+    uma || (local > 0.0 && local == non_local) || (physical > 0.0 && local > physical)
 }
 
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
@@ -2072,7 +2122,10 @@ fn evict(frame: u64, now: u64, over: u64) -> (u64, u64) {
     // Read through the heap since the last pass: used (a slot's read mark is
     // reported as new only once, so its first read alone stamped it; run
     // evict1 gave up and made again hundreds of textures a frame).
-    let read = crate::descriptor::read_textures(&crate::shadow::reads_since());
+    let slots = crate::shadow::reads_since();
+    // mac: the slots read, for `VICTORY_PLACED_AT_ONCE=read`.
+    crate::placed_read::note_reads(&slots);
+    let read = crate::descriptor::read_textures(&slots);
     evict_among(&candidates(), &read, frame, now, over)
 }
 
@@ -2230,10 +2283,32 @@ fn hand_out_resource(
         // Another texture's copy-back pending there no longer lands.
         crate::texback::replaced(resource.data() as usize);
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+        LIVE_TEXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(at);
         let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
         map.entry(resource.data() as u64).or_default().push(at);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
+}
+
+/// Live title textures (by raw pointer), for fast [`hold`] checks from
+/// background threads before `Resource::drop` frees the allocation.
+#[cfg(windows)]
+static LIVE_TEXTURES: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Holds title texture `this` alive for work on a background thread. Returns
+/// `None` if `this` is not a live texture or is already being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    if this.is_null() {
+        return None;
+    }
+    // `Resource::drop` removes `this` under `LIVE_TEXTURES` before freeing it.
+    let live = LIVE_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    (live.contains(&(this as usize)) && crate::object::try_add_ref(this)).then_some(Held(this))
 }
 
 /// Title textures with a host copy, by the console memory they start at.
@@ -2244,6 +2319,32 @@ fn hand_out_resource(
 #[cfg(windows)]
 static TEXTURES_AT: std::sync::Mutex<std::collections::BTreeMap<u64, Vec<usize>>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// A live reference to a title resource, taken under the lookup table's lock
+/// so the title cannot free it while the caller uses it.
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+// SAFETY: owns a COM reference to a live `Resource`; only atomic refcounts and
+// locked/immutable fields are accessed across threads.
+#[cfg(windows)]
+unsafe impl Send for Held {}
+
+#[cfg(windows)]
+impl Held {
+    // mac: upstream's accessor; nothing here reads it.
+    #[allow(dead_code)]
+    pub(crate) fn get(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_ref(self.0);
+    }
+}
 
 /// For a texture made for a placed view (`texture_at`): a title texture
 /// the GPU writes (render target, depth or unordered access) at the same
@@ -2315,6 +2416,10 @@ impl Drop for Resource {
         }
         crate::bindless::forget(std::ptr::from_ref::<Resource>(self) as usize);
         if self.desc.dimension != BUFFER {
+            LIVE_TEXTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&(std::ptr::from_ref::<Resource>(self) as usize));
             let mut map = TEXTURES_AT.lock().unwrap_or_else(|e| e.into_inner());
             let at = self.data() as u64;
             if let Some(list) = map.get_mut(&at) {
@@ -2560,6 +2665,27 @@ fn written_twin(address: u64, desc: &ResourceDesc) -> Option<This> {
         );
     }
     Some(twin)
+}
+
+/// mac: whether [`texture_at`] finds a resource for `address` and `desc`
+/// whose host texture is made, without making either
+/// (`VICTORY_FLICKER_WATCH`). A placed view of a written title texture
+/// (`VICTORY_PLACED_TWIN`) counts as not made.
+#[cfg(windows)]
+pub(crate) fn placed_made(address: u64, desc: &[u32; 14]) -> bool {
+    let mut desc = *desc;
+    (desc[1], desc[13]) = (0, 0);
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, desc)).is_some_and(|&r| current(r as This) && made(resource(r as This)).is_some())
+}
+
+/// mac: width, height, mip levels and format of a resource description
+/// as words (`VICTORY_FLICKER_WATCH`).
+#[cfg(windows)]
+pub(crate) fn desc_size(desc: &[u32; 14]) -> (u64, u32, u16, u32) {
+    // SAFETY: 56 bytes in the description's layout.
+    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
+    (d.width, d.height, d.mip_levels, d.format)
 }
 
 /// The resource for a texture placed at `address` with the resource
@@ -3016,17 +3142,23 @@ mod tests {
         }
     }
 
-    /// Unified: by the architecture, or by one budget for both segments.
+    /// Unified: by the architecture, by one budget for both segments, or
+    /// (`VICTORY_TEXTURE_TRIM=1`) by a budget above the computer's memory.
     #[cfg(windows)]
     #[test]
     fn one_budget_for_both_segments_is_one_memory() {
-        assert!(one_memory(true, 8192.0, 16384.0));
+        assert!(one_memory(true, 8192.0, 16384.0, 0.0));
         assert!(
-            one_memory(false, 12713.0, 12713.0),
+            one_memory(false, 12713.0, 12713.0, 0.0),
             "D3DMetal on a 16 GB Mac"
         );
-        assert!(!one_memory(false, 8192.0, 16384.0), "a card of its own");
-        assert!(!one_memory(false, 0.0, 0.0));
+        assert!(!one_memory(false, 8192.0, 16384.0, 0.0), "a card of its own");
+        assert!(!one_memory(false, 0.0, 0.0, 0.0));
+        // D3DMetal on a 24 GB M5 Pro, `VICTORY_TEXTURE_TRIM=1`: the card's
+        // 38139 MB is more than the machine has.
+        assert!(one_memory(false, 38139.0, 19070.0, 24576.0));
+        assert!(!one_memory(false, 38139.0, 19070.0, 0.0), "the rule left out: as before");
+        assert!(!one_memory(false, 8188.0, 24576.0, 24576.0), "a card of its own, smaller than the memory");
     }
 
     /// Below [`RAM_LOW`] of the computer's memory free, what is given up
@@ -3242,12 +3374,16 @@ mod tests {
     }
 
     /// Under D3DMetal a block format casts only to its sRGB partner; other
-    /// formats keep the whole list.
+    /// formats keep the whole list (VIctory-macOS #499).
     #[test]
     fn metal_casts_block_formats_only_to_their_srgb_partner() {
         assert_eq!(castable_metal(98), vec![99]);
         assert_eq!(castable_metal(72), vec![71]);
-        assert!(castable_metal(83).is_empty() && castable_metal(95).is_empty() && castable_metal(80).is_empty());
+        assert!(
+            castable_metal(83).is_empty()
+                && castable_metal(95).is_empty()
+                && castable_metal(80).is_empty()
+        );
         assert_eq!(castable_metal(42), castable(42));
     }
 

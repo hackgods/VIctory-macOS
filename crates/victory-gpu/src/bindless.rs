@@ -420,6 +420,28 @@ impl Viewed {
     fn ranges(&self) -> Vec<Hull> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
     }
+
+    /// Snapshot of distinct title texture resources currently viewed by this
+    /// heap, for the background heap worker.
+    pub(crate) fn texture_resources(&self) -> Vec<usize> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .keys()
+            .copied()
+            .collect()
+    }
+
+    /// Whether any title-written texture is currently viewed by this heap.
+    pub(crate) fn has_textures(&self) -> bool {
+        !self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .textures
+            .is_empty()
+    }
 }
 
 impl Seen {
@@ -477,15 +499,23 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn uploads(
+///
+/// mac: `before` is told what is to be brought up before any of its title
+/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`).
+pub(crate) fn uploads_after(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]),
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
+    // mac: two, used in turn with flights' `alias`, else the first only: a
+    // submission prepared while the one before still runs takes the list
+    // and staging that one is not using (`crate::texture::upload_slot`).
+    static LISTS: [Mutex<Holder>; 2] = [const { Mutex::new(Holder(None)) }; 2];
+    let slot = crate::texture::upload_slot();
+    let mut guard = LISTS[slot].lock().unwrap_or_else(|e| e.into_inner());
+    crate::texture::recycle_in(slot);
     match &guard.0 {
-        // Closed by the last submission, which has run.
+        // Closed by the last submission of the slot, which has run.
         Some(list) => list.reset(),
         // Made open.
         None => {
@@ -513,39 +543,44 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
+    let worker_on = crate::heap_worker::on();
     let mut done = std::collections::HashSet::new();
-    for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
-                continue;
-            }
-            // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
-                continue;
-            };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
-                continue;
-            }
-            // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
-                continue;
-            }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
+    if !worker_on {
+        for viewed in heaps {
+            let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+            for &r in inner.textures.keys() {
+                if !done.insert(r) {
+                    continue;
+                }
+                // Not made (given up, or never read): nothing to bring up.
+                let Some(texture) = crate::resource::made_copy(r as This) else {
+                    continue;
+                };
+                // Only what shaders read lately (the eviction pass's stamps):
+                // the heaps view thousands of textures a frame never reads, and
+                // bringing each up whenever its pages change re-uploaded about
+                // 4 GB in 30-46 world frames (runs evict2, noevict1).
+                // shortcut: a texture read again after a gap is brought up after
+                // the submission that read it, which can see bytes one refresh
+                // old (a slot the title rewrites is made fresh anyway); upload on
+                // the mark itself if that shows.
+                if !texture.used_recently() {
+                    continue;
+                }
+                // Its contents are the host's since a host copy wrote it.
+                if texture.host_written.load(Relaxed) {
+                    continue;
+                }
+                if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+                    && staged.insert(Arc::as_ptr(&staging))
+                {
+                    work.push((staging, texture));
+                }
             }
         }
     }
+    // mac: before their title memory is read.
+    before(&work);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
@@ -557,13 +592,81 @@ pub(crate) fn uploads(
             UPLOADED.fetch_add(1, Relaxed);
         }
     }
+    let ready = if worker_on {
+        let ready = crate::heap_worker::take_ready();
+        for item in ready.iter_uploads() {
+            let still_made = crate::resource::made_copy(item.resource as This)
+                .is_some_and(|c| Arc::ptr_eq(&c, &item.copy));
+            if !still_made {
+                crate::heap_worker::STATS[5].fetch_add(1, Relaxed);
+                continue;
+            }
+            if let Some(p) = &item.publish {
+                let key_matches =
+                    crate::descriptor::view_and_key(p.handle).is_some_and(|(_, k)| k == p.key);
+                if !key_matches {
+                    crate::heap_worker::STATS[4].fetch_add(1, Relaxed);
+                    if item.upload.is_some()
+                        && !item.copy.host_written.load(Relaxed)
+                        && !item.copy.is_gpu_written()
+                    {
+                        item.staging.invalidate();
+                    }
+                    continue;
+                }
+            }
+            if let Some(upload) = &item.upload {
+                if item.copy.host_written.load(Relaxed) || item.copy.is_gpu_written() {
+                    crate::heap_worker::STATS[5].fetch_add(1, Relaxed);
+                } else if staged.insert(Arc::as_ptr(&item.staging)) {
+                    readable.extend(crate::texture::record_upload(
+                        list,
+                        &item.copy,
+                        &item.staging,
+                        upload,
+                    ));
+                    item.staging.mark_uploaded_once();
+                    recorded = true;
+                    #[cfg(feature = "diagnostics")]
+                    UPLOADED.fetch_add(1, Relaxed);
+                }
+            }
+            if let Some(p) = &item.publish
+                && let Some(host) = crate::descriptor::heap(p.heap as This).made_host()
+            {
+                let shown = host.publish(p.index, p.handle, p.key);
+                crate::heap_worker::STATS[if shown { 3 } else { 4 }].fetch_add(1, Relaxed);
+            }
+        }
+        if !heaps.is_empty() {
+            crate::descriptor::kick_worker_heaps();
+        }
+        (!ready.is_empty() && recorded).then_some(ready)
+    } else {
+        None
+    };
     if !readable.is_empty() {
         // SAFETY: an open list; the barriers name live textures.
         unsafe { list.list.ResourceBarrier(&readable) };
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads(guard))
+    recorded.then(|| {
+        crate::texture::slot_given(slot);
+        Uploads {
+            list: guard,
+            worker: Mutex::new(ready),
+        }
+    })
+}
+
+/// [`uploads_after`] with nothing told first (tests).
+#[cfg(test)]
+pub(crate) fn uploads(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> Option<Uploads> {
+    uploads_after(heaps, textures, &mut |_| {})
 }
 
 /// The upload list, used under its lock only.
@@ -573,11 +676,25 @@ pub(crate) struct Holder(Option<HostList>);
 unsafe impl Send for Holder {}
 
 /// The upload list of a submission, ours until it has run.
-pub(crate) struct Uploads(std::sync::MutexGuard<'static, Holder>);
+pub(crate) struct Uploads {
+    list: std::sync::MutexGuard<'static, Holder>,
+    worker: Mutex<Option<crate::heap_worker::ReadyDrain>>,
+}
 
 impl Uploads {
     pub(crate) fn list(&self) -> &HostList {
-        self.0.0.as_ref().expect("made before it is handed out")
+        self.list.0.as_ref().expect("made before it is handed out")
+    }
+
+    /// Whether it holds uploads the background heap worker staged.
+    pub(crate) fn has_worker(&self) -> bool {
+        self.worker.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+
+    /// Returns worker-owned staging chunks immediately once the submission's
+    /// GPU fence has completed.
+    pub(crate) fn release_worker(&self) {
+        drop(self.worker.lock().unwrap_or_else(|e| e.into_inner()).take());
     }
 }
 
@@ -595,10 +712,15 @@ impl Uploads {
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
+///
+/// mac: while the submission before still runs beside this one (flights),
+/// also the clean copies its landing may tell (`crate::flights::asked`).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
+        if crate::flights::asked(crate::watch::clean_bit(*bit), beside, *address as usize, *len as usize) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -639,11 +761,14 @@ pub(crate) fn refresh_slot(
     index: u32,
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
+    // mac: as in [`refresh`], asked before the lock.
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if crate::flights::asked(crate::watch::clean_bit(shadow.dirty_bit()), beside, *address as usize, *len as usize) {
         add(shadow, *address as usize, *len as usize);
     }
 }
@@ -651,20 +776,30 @@ pub(crate) fn refresh_slot(
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier. Computed heap indices do not name ordinary write steps.
 pub(crate) fn widened_writes(viewed: &Viewed) -> Vec<(Arc<Shadow>, usize, usize)> {
+    let mut out = Vec::new();
+    widened_writes_into(viewed, &mut out);
+    out
+}
+
+/// [`widened_writes`] added to `out` (with `VICTORY_WIDENED_IN_PLACE=1` the
+/// list's buffer, kept from barrier to barrier: the world's heaps have tens
+/// of thousands). From VIctory-macOS #520.
+pub(crate) fn widened_writes_into(viewed: &Viewed, out: &mut Vec<(Arc<Shadow>, usize, usize)>) {
     if !crate::under_wine() {
-        return Vec::new();
+        return;
     }
-    viewed
-        .inner
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ranges
-        .iter()
-        .filter(|((_, address, end, uav), _)| *uav && address < end)
-        .map(|((_, address, end, _), (_, shadow))| {
-            (shadow.clone(), *address as usize, (end - address) as usize)
-        })
-        .collect()
+    out.extend(
+        viewed
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ranges
+            .iter()
+            .filter(|((_, address, end, uav), _)| *uav && address < end)
+            .map(|((_, address, end, _), (_, shadow))| {
+                (shadow.clone(), *address as usize, (end - address) as usize)
+            }),
+    );
 }
 
 /// mac: with `VICTORY_CENSUS_FAST=1`, [`widened_writes`] without walking
@@ -1234,6 +1369,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     /// slot 1, let the title `write` (after recording, before submitting),
     /// submit, check the output's host copy.
     fn rounds(src: This, dst: This, tex: This, write: impl Fn(u32, u8)) {
+        let _serial = crate::heap_worker::serial();
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
@@ -1284,5 +1420,125 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(v, base + i as u32 + u32::from(texel), "round {round}, dword {i}");
             }
         }
+    }
+
+    /// With `VICTORY_HEAP_WORKER=1`:
+    /// - a placed bindless texture `A` stays null until the worker stages it
+    ///   and `Host::execute` publishes it atomically ahead of the dispatch;
+    /// - a bindless texture `B` whose `host_written` flips before submission
+    ///   has its staged CPU upload skipped so host-written contents are kept;
+    /// - a table-bound texture `C` (`Step::Texture`) uploads synchronously in
+    ///   the very first submission without waiting for the worker.
+    #[test]
+    fn worker_upload_publishes_atomically_and_skips_host_written() {
+        // mac: the rule these asserts are about, whatever the suite's
+        // environment (`VICTORY_PLACED_AT_ONCE`).
+        let _rule = crate::mac_switches::tests::PlacedHere::new(crate::mac_switches::PlacedAtOnce::Off);
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let _worker = crate::heap_worker::EnableForTest::new();
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 16, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            S_OK
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let slot = |i: u64| title_heap.start + 32 * i;
+        let heap_host = title_heap.host().expect("host view heap");
+
+        let pool = crate::watch::tests::pool(2);
+        let addr_a = pool as u64;
+        let addr_b = (pool + PAGE_BYTES) as u64;
+        // SAFETY: two dedicated pool pages.
+        unsafe {
+            std::ptr::write_bytes(addr_a as *mut u8, 0x33, PAGE_BYTES);
+            std::ptr::write_bytes(addr_b as *mut u8, 0x77, PAGE_BYTES);
+        }
+        let placed_res = [3u32, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, LINEAR, 0, 0];
+        let mut desc_a = [0u32; 16];
+        (desc_a[0], desc_a[1], desc_a[2], desc_a[5]) = (28, 4, 0x1688, 1);
+        (desc_a[10], desc_a[11]) = (addr_a as u32, (addr_a >> 32) as u32);
+        let mut desc_b = desc_a;
+        (desc_b[10], desc_b[11]) = (addr_b as u32, (addr_b >> 32) as u32);
+
+        let src = resource(1, 256, 1, 0, 1);
+        let dst = resource(1, 256, 1, 0, 1);
+        let tex_c = resource(3, 4, 1, 28, LINEAR);
+        let (src_bytes, _) = crate::resource::buffer_bytes(src).unwrap();
+        let (dst_bytes, _) = crate::resource::buffer_bytes(dst).unwrap();
+        let (c_bytes, c_desc) = crate::resource::texture_memory(tex_c).unwrap();
+        let c_size = crate::resource::texture_layout(&c_desc).unwrap().planes[0].layout.size as usize;
+        // SAFETY: owned buffers/texture memory.
+        unsafe {
+            std::ptr::write_bytes(src_bytes, 0, 256);
+            std::ptr::write_bytes(c_bytes.cast_mut(), 0x55, c_size);
+        }
+
+        let srv: [u32; 10] = [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0];
+        let uav: [u32; 10] = [39, 1, 0, 0, 64, 0, 0, 0, 1, 0];
+        crate::descriptor::create_srv(null, src, &srv, slot(0));
+        crate::descriptor::create_uav(null, dst, null, &uav, slot(1));
+        crate::descriptor::create_placed_srv(null, &placed_res, &desc_a, slot(2));
+        crate::descriptor::create_placed_srv(null, &placed_res, &desc_b, slot(3));
+        assert!(!heap_host.kept(2) && !heap_host.kept(3), "placed views stay null before worker");
+
+        // Stage A and B on the worker pass, then flip B to `host_written` before submission.
+        _worker.step_heap(title_heap);
+        assert!(crate::heap_worker::has_ready());
+        assert!(!heap_host.kept(2), "not published until Host::execute");
+        let res_b = crate::resource::texture_at(addr_b, &placed_res).unwrap();
+        let copy_b = crate::resource::made_copy(res_b).unwrap();
+        let uploads_b_before = crate::texture::uploads(res_b);
+        copy_b.host_written.store(true, Relaxed);
+
+        // Also attach table-bound texture C synchronously on this list.
+        let copy_c = crate::resource::host_copy(tex_c).unwrap();
+        let (root, pso) = compile();
+        let list = host.new_list().unwrap();
+        crate::texture::upload(&list, tex_c, &copy_c.texture);
+        // SAFETY: open list, live objects.
+        unsafe {
+            list.list.SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+            list.list.SetComputeRootSignature(&root);
+            list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+            list.list.SetPipelineState(&pso);
+            list.list.Dispatch(4, 1, 1);
+        }
+        list.defer_heap(&heap_host.viewed);
+        list.close();
+        host.execute(&[&list]);
+
+        // A was published and read 0x33 in that exact submission.
+        assert!(heap_host.kept(2), "slot 2 published at submission");
+        let out = crate::shadow::find(dst_bytes as u64, 256).unwrap();
+        let words = out.read_host(dst_bytes as u64, 4);
+        assert_eq!(words, [0x33, 0x33, 0x33, 0x33], "shader saw A's uploaded texels");
+        // B's CPU upload was skipped because `host_written` flipped before submission.
+        assert_eq!(
+            crate::texture::uploads(res_b),
+            uploads_b_before,
+            "host_written texture upload was skipped"
+        );
+        // Table-bound texture C uploaded synchronously in the first submission.
+        assert_eq!(
+            crate::texture::uploads(tex_c),
+            1,
+            "table-bound texture uploaded synchronously"
+        );
+
+        crate::object::release_ref(heap);
+        crate::object::release_ref(src);
+        crate::object::release_ref(dst);
+        crate::object::release_ref(tex_c);
+        crate::watch::tests::free(pool);
     }
 }

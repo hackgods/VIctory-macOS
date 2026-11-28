@@ -29,8 +29,10 @@ cargo xtask policy            # asset check
 
 - **Use fixed views, so runs can be compared:**
   - the prison checkpoint, with a picture at the end;
-  - the boat save;
+  - the boat save: the opening cutscene (30 to 90 s after the first world frame) and the driving scene with the water running (180 to 270 s) are very different, so measure and name them apart;
   - the prison yard at 5 min 20 s into the opening.
-- **Count frames a minute** in a fixed window. Close other apps. To claim a speed-up under 15%, run with and without in turns (A B A B). A switch that changes how shaders are translated rebuilds hundreds of pipelines each time it flips, so test it in blocks instead: one warm-up run, then three of each.
+- **Count frames a minute** in a fixed window. Close other apps. To claim a speed-up under 15%, run with and without in turns (A B A B). A switch that changes how shaders are translated rebuilds hundreds of pipelines each time it flips, so test it in blocks instead: one warm-up run, then three of each. A run-time switch can also be compared within one run: `VICTORY_AB=<SWITCH>:<seconds>` flips it every few seconds (an A/A run, `VICTORY_AB=none:10`, gave 0.0%, and a switch with a known 36% cost showed 36%).
+- **Expect a slow state in some runs.** About 1 boat run in 3 gets slower partway through whatever the switches (GPU submissions wait 3 to 4 times longer), and the first boat run after a new build is often slow. Take three runs a side at the boat and report the spread.
+- **Don't build while the game boots.** Background builds slowed the game's start several times over here, so scripted key presses missed the start screens and runs never reached the world.
 - **Measure GPU changes with frame replay,** without starting the game: one recorded frame replays in seconds. See [docs/replay.md](docs/replay.md) and `tools/macos/replay.sh`. Recordings contain game shaders, so keep them local and never commit them.
 - **Look at the picture first, speed second.**

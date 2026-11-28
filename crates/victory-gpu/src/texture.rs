@@ -64,6 +64,9 @@ pub(crate) struct Staging {
     tracked: Option<crate::watch::Tracked>,
     /// True once real readable title memory has been uploaded at least once.
     uploaded_once: std::sync::atomic::AtomicBool,
+    /// Forces a refresh on the next pass even when a tracker reports clean
+    /// (e.g. a pre-staged worker upload was discarded before reaching the GPU).
+    force_refresh: std::sync::atomic::AtomicBool,
     /// Last `crate::queue::presented()` frame on which an untracked check ran.
     checked_frame: std::sync::atomic::AtomicU64,
     /// Per subresource, the bytes of the texture's memory it lies in (from
@@ -148,8 +151,9 @@ struct Buffers {
     /// (bytes, buffer, mapping), oldest first.
     free: std::collections::VecDeque<(u64, ID3D12Resource, usize)>,
     free_bytes: u64,
-    /// Taken by the submission being prepared.
-    used: Vec<(u64, ID3D12Resource, usize)>,
+    /// Taken by the submissions of each upload slot ([`upload_slot`]), the
+    /// last of them prepared there.
+    used: [Vec<(u64, ID3D12Resource, usize)>; 2],
     /// The bytes of buffers submissions needed lately.
     lately: crate::recent::Peak,
 }
@@ -160,9 +164,34 @@ unsafe impl Send for Buffers {}
 static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     free: std::collections::VecDeque::new(),
     free_bytes: 0,
-    used: Vec::new(),
+    used: [Vec::new(), Vec::new()],
     lately: crate::recent::Peak::new(),
 });
+
+/// mac: the upload slot whose staging the uploads being made take
+/// ([`recycle_in`]), and the slot the next uploads take. Always 0 but with
+/// flights' `alias` (`VICTORY_FLIGHTS_WITH=alias`), where a submission
+/// prepared while the one before still runs on the GPU takes the slot that
+/// one's upload list and staging are not in: the two are used in turn,
+/// each by the next submission that records uploads (`crate::bindless`).
+static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NEXT_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The upload slot the next uploads take.
+pub(crate) fn upload_slot() -> usize {
+    if crate::host::unwaited::flights::with_alias() {
+        NEXT_SLOT.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// The uploads of `slot` went to the GPU: the next take the other.
+pub(crate) fn slot_given(slot: usize) {
+    if crate::host::unwaited::flights::with_alias() {
+        NEXT_SLOT.store(slot ^ 1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Free staging buffers kept at least, and at most: between them, what any
 /// submission needed lately. A big texture that changes again has its
@@ -179,14 +208,23 @@ const KEPT_BYTES_MAX: u64 = 256 << 20;
 /// only when the lists using it are done: each keeps its own reference
 /// (`record_upload`). The big textures' read buffers that no refresh used
 /// lately go too, one a call.
+#[cfg(test)]
 pub(crate) fn recycle() {
+    recycle_in(0);
+}
+
+/// [`recycle`] for the uploads of upload slot `slot` ([`upload_slot`]): the
+/// buffers and chunks of the last submission that recorded uploads there,
+/// which has run, are free again, and the slot's staging is taken from now.
+pub(crate) fn recycle_in(slot: usize) {
+    SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
     let now = std::time::Instant::now();
     let mut big = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
     let freed = big.trim(now);
     drop(big);
     drop(freed);
     {
-        let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = CHUNKS[slot].lock().unwrap_or_else(|e| e.into_inner());
         let c = &mut *c;
         let needed = c.current + usize::from(c.used > 0);
         let kept = c.lately.begin(now, needed).min(CHUNKS_KEPT);
@@ -195,9 +233,9 @@ pub(crate) fn recycle() {
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
-    let needed: u64 = b.used.iter().map(|e| e.0).sum();
+    let needed: u64 = b.used[slot].iter().map(|e| e.0).sum();
     let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
-    for e in b.used.drain(..) {
+    for e in b.used[slot].drain(..) {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
@@ -229,7 +267,7 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         }
     };
     let made = (e.1.clone(), e.2 as *mut u8);
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used[SLOT.load(std::sync::atomic::Ordering::Relaxed)].push(e);
     Some(made)
 }
 
@@ -250,12 +288,16 @@ struct Chunks {
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
-    all: Vec::new(),
-    current: 0,
-    used: 0,
-    lately: crate::recent::Peak::new(),
-});
+/// mac: one pool per upload slot ([`upload_slot`]; the second is used only
+/// with flights' `alias`).
+static CHUNKS: [Mutex<Chunks>; 2] = [const {
+    Mutex::new(Chunks {
+        all: Vec::new(),
+        current: 0,
+        used: 0,
+        lately: crate::recent::Peak::new(),
+    })
+}; 2];
 
 const CHUNK: u64 = 32 << 20;
 /// Chunks kept between submissions at most (more are made while one needs
@@ -269,7 +311,7 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
     if size > CHUNK {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
-    let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = CHUNKS[SLOT.load(std::sync::atomic::Ordering::Relaxed)].lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some((buffer, data)) = c.all.get(c.current) {
             let at = c.used.next_multiple_of(512);
@@ -597,17 +639,29 @@ pub(crate) type Upload = (ID3D12Resource, u64, Vec<Sub>);
 /// slice) if only those were.
 pub(crate) type Sub = (u32, Option<std::ops::Range<u32>>);
 
-/// The texture workers: up to a quarter of the CPUs (four at most), none
-/// where that is fewer than two.
+/// The texture workers: a quarter of the CPUs, four at most, unless
+/// `VICTORY_TEXTURE_WORKERS` asks for another count (from ScarlettMac
+/// 4921b7e6, `crate::mac_switches::texture_workers`); none where that is
+/// fewer than two, the work then running on the submitting thread. The same
+/// threads run the parallel refreshes and copy-backs of buffer copies and
+/// the placed views' slots ([`in_parallel`]).
 fn workers() -> Option<&'static rayon::ThreadPool> {
     static WORKERS: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
     WORKERS
         .get_or_init(|| {
-            let threads = std::thread::available_parallelism()
-                .map_or(4, |n| n.get() / 4)
-                .clamp(1, 4);
-            if threads < 2 {
-                return None;
+            // 16 when the count cannot be had: a quarter of that is the four
+            // the uploads ran on then.
+            let cpus = std::thread::available_parallelism().map_or(16, |n| n.get());
+            let asked = std::env::var("VICTORY_TEXTURE_WORKERS").ok();
+            let threads = crate::mac_switches::texture_workers(asked.as_deref(), cpus)?;
+            if let Some(asked) = &asked {
+                tracing::info!(
+                    threads,
+                    asked,
+                    cpus,
+                    "VICTORY_TEXTURE_WORKERS: the worker threads that read, hash and detile changed textures and \
+                     split buffer refreshes and copy-backs, the submitting thread not among them"
+                );
             }
             match rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
@@ -624,9 +678,10 @@ fn workers() -> Option<&'static rayon::ThreadPool> {
         .as_ref()
 }
 
-/// Runs `f(i)` for each `i` below `n` on up to a quarter of the CPUs (four
-/// at most: the title's own threads need the rest). Reuse the workers and
-/// their thread-local scratch across submissions.
+/// Runs `f(i)` for each `i` below `n` on the workers ([`workers`]: a quarter
+/// of the CPUs, four at most, or the count `VICTORY_TEXTURE_WORKERS` asks
+/// for; the title's own threads need the rest). Reuse the workers and their
+/// thread-local scratch across submissions.
 pub(crate) fn in_parallel(n: usize, f: impl Fn(usize) + Sync) {
     if n > 1
         && let Some(pool) = workers()
@@ -655,11 +710,50 @@ pub(crate) fn refresh_all(work: &[(Arc<Staging>, Arc<crate::resource::HostTextur
     out
 }
 
+/// Outcome of a background-worker texture refresh ([`Staging::refresh_for_worker`]).
+pub(crate) enum WorkerRefresh {
+    /// Title memory changed and was detiled into worker-owned staging space.
+    Uploaded(Upload),
+    /// Title memory is readable and unchanged since the last detile.
+    Unchanged,
+    /// Title memory is currently unmapped/unreadable or staging allocation failed.
+    Unreadable,
+}
+
 impl Staging {
+    /// Bytes required in a staging buffer for this texture.
+    pub(crate) fn size_bytes(&self) -> u64 {
+        self.size
+    }
+
+    /// mac: the title memory a refresh may read (start, bytes).
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
+    }
+
+    /// Marks that real readable title memory reached a submitted GPU upload.
+    pub(crate) fn mark_uploaded_once(&self) {
+        self.uploaded_once
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Marks staging state dirty again when a pre-staged worker upload was
+    /// discarded before reaching the GPU.
+    pub(crate) fn invalidate(&self) {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        last.valid = false;
+        last.uploaded = false;
+        last.states.clear();
+        self.force_refresh
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Whether its memory may have changed since it was last detiled (an
     /// untracked texture always may).
     pub(crate) fn maybe_changed(&self) -> bool {
-        self.tracked.as_ref().is_none_or(|t| !t.clean())
+        self.force_refresh
+            .load(std::sync::atomic::Ordering::Acquire)
+            || self.tracked.as_ref().is_none_or(|t| !t.clean())
     }
 
     /// A staging buffer with the texture memory detiled into it if it
@@ -673,6 +767,168 @@ impl Staging {
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
         preparing[3].fetch_add(read as u64, Relaxed);
         buffer
+    }
+
+    /// Refreshes title memory on the background heap worker without touching
+    /// `CHUNKS`/`BUFFERS` (allocates exclusively through `alloc`) and without
+    /// entering `workers()` (no rayon work-stealing contention or deadlock).
+    pub(crate) fn refresh_for_worker(
+        &self,
+        alloc: &mut dyn FnMut(u64) -> Option<(ID3D12Resource, u64, *mut u8)>,
+    ) -> WorkerRefresh {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let forced = self
+            .force_refresh
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
+        if let Some(t) = &self.tracked {
+            let last = &mut *guard;
+            let whole = forced || !last.uploaded;
+            let (copy, zero) = if whole {
+                let _ = t.take_split(start, start + size);
+                (vec![(start, start + size)], Vec::new())
+            } else {
+                if t.clean() {
+                    return WorkerRefresh::Unchanged;
+                }
+                let (copy, zero) = t.take_split(start, start + size);
+                (copy, zero)
+            };
+            let untracked = t.untracked(start, start + size);
+            if copy.is_empty() && zero.is_empty() && untracked.is_empty() {
+                return WorkerRefresh::Unchanged;
+            }
+            let page = crate::watch::PAGE;
+            for &(f, e) in &copy {
+                for p in f / page..e.div_ceil(page) {
+                    last.unmapped.remove(&p);
+                }
+            }
+            for &(f, e) in &zero {
+                for p in f / page..e.div_ceil(page) {
+                    last.unmapped.insert(p);
+                }
+            }
+            let n = self.footprints.len();
+            last.states.resize(n, TrackedSubresource::Unknown);
+            let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+            let overlaps = |runs: &[(usize, usize)], a: usize, b: usize| {
+                runs.iter().any(|&(f, e)| f - start < b && a < e - start)
+            };
+            let touched: Vec<usize> = (0..n)
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    let dirty_untracked = overlaps(&untracked, a, b);
+                    if !overlaps(&copy, a, b) && !overlaps(&zero, a, b) && !dirty_untracked {
+                        return false;
+                    }
+                    dirty_untracked
+                        || !(last.states[i] == TrackedSubresource::AllZero
+                            && all_pages_unmapped(&last.unmapped, start + a, start + b))
+                })
+                .collect();
+            if touched.is_empty() {
+                return WorkerRefresh::Unchanged;
+            }
+            let mut scratch = Scratch::take(size);
+            let read = &mut scratch.0[..size];
+            let mut done: Vec<(usize, usize)> = Vec::new();
+            for &i in &touched {
+                let (a, b) = span(i);
+                if !done.contains(&(a, b)) {
+                    read_span_skipping_unmapped(read, start, a, b, &last.unmapped, |off, dst| {
+                        crate::host::copy_mapped(
+                            dst.as_mut_ptr(),
+                            self.memory.wrapping_add(off),
+                            dst.len(),
+                            false,
+                        );
+                    });
+                    done.push((a, b));
+                }
+            }
+            let fresh: Vec<Sub> = touched
+                .into_iter()
+                .filter(|&i| {
+                    let (a, b) = span(i);
+                    let (a0, b0) = (start + a, start + b);
+                    if !untracked.iter().any(|&(f, e)| f < b0 && a0 < e)
+                        && copy
+                            .iter()
+                            .any(|&(f, e)| f.max(a0).next_multiple_of(page) + page <= e.min(b0))
+                    {
+                        last.states[i] = TrackedSubresource::Unknown;
+                        return true;
+                    }
+                    if all_pages_unmapped(&last.unmapped, a0, b0)
+                        || read[a..b].iter().all(|&x| x == 0)
+                    {
+                        let prev =
+                            std::mem::replace(&mut last.states[i], TrackedSubresource::AllZero);
+                        return forced || prev != TrackedSubresource::AllZero;
+                    }
+                    let hash = blake3::hash(&read[a..b]);
+                    let prev =
+                        std::mem::replace(&mut last.states[i], TrackedSubresource::Hashed(hash));
+                    forced || prev != TrackedSubresource::Hashed(hash)
+                })
+                .map(|i| (i as u32, None))
+                .collect::<Vec<Sub>>();
+            if fresh.is_empty() {
+                return WorkerRefresh::Unchanged;
+            }
+            let buffer = self.detile_into(read, &fresh, alloc);
+            let Some((b, at)) = buffer else {
+                for &(i, _) in &fresh {
+                    last.states[i as usize] = TrackedSubresource::Unknown;
+                }
+                self.force_refresh
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return WorkerRefresh::Unreadable;
+            };
+            last.uploaded = true;
+            return WorkerRefresh::Uploaded((b, at, fresh));
+        }
+        if guard.comparing {
+            return WorkerRefresh::Unchanged;
+        }
+        let memory = self.memory.expose_provenance();
+        let read = move |at: usize, to: &mut [u8]| {
+            crate::host::read_into(
+                std::ptr::with_exposed_provenance(memory.wrapping_add(at)),
+                to,
+            )
+        };
+        let runs = COMPARE_SCRATCH.with_borrow_mut(|scratch| {
+            scratch.resize(COMPARE_CHUNK, 0);
+            read_changed(&mut guard, size, scratch, read)
+        });
+        let last = &mut *guard;
+        let Some(runs) = runs else {
+            return WorkerRefresh::Unreadable;
+        };
+        if runs.is_empty() {
+            return WorkerRefresh::Unchanged;
+        }
+        let n = self.footprints.len();
+        let span = |i: usize| self.spans.get(i).copied().unwrap_or((0, size));
+        let fresh: Vec<Sub> = (0..n)
+            .filter(|&i| {
+                let (a, b) = span(i);
+                touches(&runs, a, b)
+            })
+            .map(|i| (i as u32, None))
+            .collect::<Vec<Sub>>();
+        if fresh.is_empty() {
+            return WorkerRefresh::Unchanged;
+        }
+        let Some((b, at)) = self.detile_into(&last.read, &fresh, alloc) else {
+            last.valid = false;
+            return WorkerRefresh::Unreadable;
+        };
+        last.uploaded = true;
+        WorkerRefresh::Uploaded((b, at, fresh))
     }
 
     /// Returns the bytes of title memory read, and the buffer it detiled
@@ -699,15 +955,37 @@ impl Staging {
         let size = self.layout.size as usize;
         let start = self.memory as usize;
         let mut guard = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let forced = self
+            .force_refresh
+            .swap(false, std::sync::atomic::Ordering::AcqRel);
         if let Some(t) = &self.tracked {
             let last = &mut *guard;
             // Most refreshes find nothing: the tracker's dense bit says so
             // without its lock (123,000 refreshes a frame, run evict3).
-            if t.clean() {
-                return (0, None);
-            }
-            let (copy, zero) = t.take_split(start, start + size);
-            let untracked = t.untracked(start, start + size);
+            // mac: VIctory-macOS #415 with `VICTORY_UNMAPPED_SPLIT=1` only
+            // ([`split_unmapped`]); off, the changed runs are taken whole and
+            // every touched subresource is read and hashed, as before.
+            let split = split_unmapped();
+            let take = || if split { t.take_split(start, start + size) } else { (t.take(start, start + size), Vec::new()) };
+            // VIctory-macOS #417: after a background upload was dropped as
+            // stale (`invalidate`, `VICTORY_HEAP_WORKER=1` only), the whole
+            // memory again, its changes taken.
+            let (copy, zero) = if forced {
+                let _ = take();
+                (vec![(start, start + size)], Vec::new())
+            } else {
+                if t.clean() {
+                    return (0, None);
+                }
+                take()
+            };
+            // mac: VIctory-macOS #416 with `VICTORY_DIRTY_ROWS=1` only
+            // ([`dirty_rows_enabled`]): the parts of the range on memory the
+            // tracker does not follow count as changed too, own pages detile
+            // only their rows, and a refresh with no staging space gives its
+            // pages back. Off, as before.
+            let rows_on = dirty_rows_enabled();
+            let untracked = if rows_on { t.untracked(start, start + size) } else { Vec::new() };
             if copy.is_empty() && zero.is_empty() && untracked.is_empty() {
                 return (0, None);
             }
@@ -782,7 +1060,7 @@ impl Staging {
                 .filter(|r| r.0 < r.1)
                 .collect();
             changed.sort_unstable();
-            let use_rows = dirty_rows_enabled();
+            let use_rows = rows_on;
             type Band = Option<(std::ops::Range<u32>, std::ops::Range<usize>)>;
             let plan: Vec<(usize, Band)> = touched
                 .into_iter()
@@ -862,8 +1140,8 @@ impl Staging {
                     None => {
                         let (a, b) = span(i);
                         let (a0, b0) = (start + a, start + b);
-                        let state = if all_pages_unmapped(&last.unmapped, a0, b0)
-                            || read[a..b].iter().all(|&x| x == 0)
+                        let state = if split
+                            && (all_pages_unmapped(&last.unmapped, a0, b0) || read[a..b].iter().all(|&x| x == 0))
                         {
                             TrackedSubresource::AllZero
                         } else {
@@ -879,8 +1157,11 @@ impl Staging {
             }
             let buffer = detile(self, read, &fresh);
             if buffer.is_none() {
-                let taken: Vec<(usize, usize)> = copy.iter().chain(&zero).copied().collect();
-                t.retry(&taken);
+                // mac: with `VICTORY_DIRTY_ROWS=1` only (#416).
+                if rows_on {
+                    let taken: Vec<(usize, usize)> = copy.iter().chain(&zero).copied().collect();
+                    t.retry(&taken);
+                }
                 for &(i, _) in &fresh {
                     last.states[i as usize] = TrackedSubresource::Unknown;
                 }
@@ -988,7 +1269,7 @@ impl Staging {
     }
 
     /// Detiles `subresources` of `tiled` into staging space returned by
-    /// `alloc`.
+    /// `alloc` (VIctory-macOS #417: the background uploader's own space).
     fn detile_into(
         &self,
         tiled: &[u8],
@@ -1420,6 +1701,7 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
         memory,
         tracked: crate::watch::track(memory as usize, layout_size, true),
         uploaded_once: std::sync::atomic::AtomicBool::new(false),
+        force_refresh: std::sync::atomic::AtomicBool::new(false),
         checked_frame: std::sync::atomic::AtomicU64::new(u64::MAX),
         spans,
         last: Mutex::default(),
@@ -1430,16 +1712,74 @@ pub(crate) fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<St
     Some(s)
 }
 
-/// Whether tracked writes into a subresource that owns a changed page detile
-/// and upload only the touched rows (`VICTORY_DIRTY_ROWS=0` falls back to
-/// detiling the whole subresource).
+#[cfg(test)]
+thread_local! {
+    /// Tests of VIctory-macOS #415's path: [`split_unmapped`] on for this
+    /// thread, whatever the environment says.
+    static SPLIT_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// mac: whether a tracked texture's refresh takes the changed runs on pages
+/// with nothing mapped apart (VIctory-macOS #415, 46c23ca3): they read as
+/// zeros with no kernel copy tried, a subresource left all zeros over them
+/// is not read, hashed or detiled again, and an all-zero one is not hashed.
+/// `VICTORY_UNMAPPED_SPLIT=1`; off by default.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh. The pages known to
+/// be unmapped stay known on both sides and leave the set as on side on,
+/// when a take reports them written.
+fn split_unmapped() -> bool {
+    #[cfg(test)]
+    if SPLIT_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_UNMAPPED_SPLIT");
+        if on {
+            tracing::info!(
+                "VICTORY_UNMAPPED_SPLIT=1: tracked texture refreshes zero unmapped pages without a copy and skip subresources left all zeros"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_UNMAPPED_SPLIT", a, |v| crate::switch::value_is_on(Some(std::ffi::OsStr::new(v))))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests of VIctory-macOS #416's path: [`dirty_rows_enabled`] on for
+    /// this thread, whatever the environment says.
+    pub(crate) static ROWS_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// mac: whether tracked writes into a subresource that owns a changed page
+/// detile and upload only the touched rows, with the other #416 parts
+/// (VIctory-macOS #416, bfe988b4; on by default there, `VICTORY_DIRTY_ROWS=0`
+/// off): `VICTORY_DIRTY_ROWS=1`, off by default.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh: either way the
+/// host texture ends whole.
 fn dirty_rows_enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| dirty_rows_from_env(std::env::var_os("VICTORY_DIRTY_ROWS").as_deref()))
+    #[cfg(test)]
+    if ROWS_IN_TEST.get() {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = dirty_rows_from_env(std::env::var_os("VICTORY_DIRTY_ROWS").as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_DIRTY_ROWS=1: tracked texture writes detile and upload only the rows of the pages written"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_DIRTY_ROWS", a, |v| dirty_rows_from_env(Some(std::ffi::OsStr::new(v))))
 }
 
 fn dirty_rows_from_env(value: Option<&std::ffi::OsStr>) -> bool {
-    value.is_none_or(|v| v != "0")
+    crate::switch::value_is_on(value)
 }
 
 /// Opt-in (`VICTORY_TEXTURE_ONCE_PER_FRAME=1`): check already-uploaded
@@ -1447,9 +1787,15 @@ fn dirty_rows_from_env(value: Option<&std::ffi::OsStr>) -> bool {
 /// command-list submission (~35x/frame in GTA VI under Rosetta/Wine where
 /// watch tracking is off). Newly created or not-yet-readable textures are
 /// still checked on every submission until their first real upload lands.
+///
+/// mac: `VICTORY_AB` (`crate::ab`) flips it per refresh: a frame stamp left
+/// from side on is of an earlier frame, so the first check of a frame runs.
 fn once_per_frame() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"))
+    let a = *ON.get_or_init(|| crate::switch::on("VICTORY_TEXTURE_ONCE_PER_FRAME"));
+    crate::ab::flag("VICTORY_TEXTURE_ONCE_PER_FRAME", a, |v| {
+        crate::switch::value_is_on(Some(std::ffi::OsStr::new(v)))
+    })
 }
 
 fn skip_same_frame(
@@ -1485,15 +1831,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn dirty_rows_switch_defaults_on_and_honors_zero() {
+    fn dirty_rows_switch_is_off_unless_set() {
+        // mac: off by default here (on by default in #416).
         use std::ffi::OsStr;
-        assert!(dirty_rows_from_env(None));
+        assert!(!dirty_rows_from_env(None));
         assert!(dirty_rows_from_env(Some(OsStr::new("1"))));
         assert!(!dirty_rows_from_env(Some(OsStr::new("0"))));
     }
 
     #[test]
     fn single_page_write_in_bc7_mip_uploads_only_touched_block_rows() {
+        // mac: #416's path is behind `VICTORY_DIRTY_ROWS`.
+        ROWS_IN_TEST.set(true);
         let Some(_host) = host() else {
             return; // no host GPU here
         };
@@ -2204,6 +2553,8 @@ pub(crate) mod tests {
     /// remapping a subresource reads and uploads the new bytes.
     #[test]
     fn tracked_refresh_skips_fallbacks_and_redundant_zero_uploads() {
+        // mac: #415's path is behind `VICTORY_UNMAPPED_SPLIT`.
+        SPLIT_IN_TEST.set(true);
         let page = crate::watch::PAGE;
         let mut mem = PlaceholderPages::new(2);
         mem.map(0, 0x42);
@@ -2266,6 +2617,11 @@ pub(crate) mod tests {
     /// unmapped—then reads both pages once the tail is mapped.
     #[test]
     fn tracked_refresh_partial_subresource_reads_mapped_prefix_and_zeroes_tail() {
+        // mac: #415's path is behind `VICTORY_UNMAPPED_SPLIT`.
+        SPLIT_IN_TEST.set(true);
+        // and #416's form of this test reads the rows of the page mapped alone
+        // (`VICTORY_DIRTY_ROWS`).
+        ROWS_IN_TEST.set(true);
         let page = crate::watch::PAGE;
         let mut mem = PlaceholderPages::new(2);
         mem.map(0, 0x33);

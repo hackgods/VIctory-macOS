@@ -54,9 +54,12 @@ pub(crate) fn lock_writers(wine: bool) -> [bool; 2] {
 /// says whether; asked once), where a frame's CPU part is the cost.
 /// `VICTORY_QUICK_SYNC=0`: neither, as before; `maps` or `views`: that part
 /// alone; `1`: both, anywhere. Neither changes what a slot shows.
-pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
+///
+/// mac: `VICTORY_AB=VICTORY_QUICK_SYNC` (`crate::ab`) flips the views part
+/// only (read once a heap sync pass); the maps are how a census is made.
+pub(crate) fn quick_sync(wine: impl Fn() -> bool) -> [bool; 2] {
     static ON: OnceLock<[bool; 2]> = OnceLock::new();
-    *ON.get_or_init(|| {
+    let [maps, views] = *ON.get_or_init(|| {
         let value = std::env::var("VICTORY_QUICK_SYNC").ok();
         let [maps, views] = quick(value.as_deref(), wine());
         tracing::info!(
@@ -65,7 +68,8 @@ pub(crate) fn quick_sync(wine: impl FnOnce() -> bool) -> [bool; 2] {
             "VICTORY_QUICK_SYNC: the heap census in hash maps, buffer shader views of a heap sync made from one lookup"
         );
         [maps, views]
-    })
+    });
+    [maps, crate::ab::flag("VICTORY_QUICK_SYNC", views, |v| quick(Some(v), wine())[1])]
 }
 
 /// [`quick_sync`]'s rule: census maps, views.
@@ -163,6 +167,82 @@ pub(crate) fn lds_rounds() -> bool {
     })
 }
 
+/// Whether the halves' walk also opens regions holding whole-wave code, and
+/// a first-lane read under a narrowed EXEC is handed over across the halves
+/// (`victory_shader::emit::Options::halves_whole_wave`; `notes/far-ray.md`):
+/// only with `VICTORY_HALVES_WHOLE_WAVE=1`, and only where
+/// `VICTORY_HALVES_EXCHANGE=1` and `VICTORY_HALVES_WALK=1` are on. The
+/// title's ray bin offsets (`sr_tracing:CS_GenerateRayBinOffsets`,
+/// `9d1d228b02e56a96`) and shader bin offsets
+/// (`shader_binning_utils:CS_GenerateShaderBinOffsets`, `8dd8d739047fe557`)
+/// then count over the whole console wave instead of each half alone, and
+/// one-wave groups whose LDS raced between the halves behind an early-out
+/// or `if` (`sr_tracing:CS_RayBudgeting_Cull_RayBinning`, `03e3e26783a5799b`,
+/// the ray pre-passes, particle emitters, reductions) get barriers instead.
+/// Exact where it applies; a program it does not make exact stays as it was.
+pub(crate) fn whole_wave() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = setting(std::env::var("VICTORY_HALVES_WHOLE_WAVE").ok().as_deref(), false);
+        if on {
+            tracing::info!(
+                "VICTORY_HALVES_WHOLE_WAVE=1: the halves' walk opens regions with whole-wave code, and first-lane reads under a narrowed EXEC are handed over, where that is exact"
+            );
+        }
+        on
+    })
+}
+
+/// Whether the program `container` keeps the LDS part of
+/// `VICTORY_HALVES_WHOLE_WAVE=1` (the walk opening the code round unsynced
+/// one-wave LDS, which barriers then order; `notes/far-ray.md`):
+/// `VICTORY_HALVES_WHOLE_WAVE_LDS` unset or empty is every program (as
+/// before the list came), `0` none, a comma list of 16-digit shader hashes
+/// those programs only. The list to test (28 November) is the ray chain:
+/// `03e3e26783a5799b` (`CS_RayBudgeting_Cull_RayBinning`) and the six
+/// `CS_RayPrePass_*` (`fd8393c7f4e0e3da`, `7168dd781ca7efb9`,
+/// `d2b169b82f67ec5b`, `edb8e66237fc38e6`, `049459e0c78e0d50`,
+/// `11276d0c8bbe180a`): runs with the whole part showed a growing GPU cost
+/// in three of five boat runs.
+pub(crate) fn whole_wave_lds_for(container: &[u8]) -> bool {
+    match whole_wave_lds_rule() {
+        None => true,
+        Some(only) => only.contains(&blake3::hash(container).to_hex()[..16].to_owned()),
+    }
+}
+
+fn whole_wave_lds_rule() -> &'static Option<Vec<String>> {
+    static RULE: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let rule = whole_wave_lds(std::env::var("VICTORY_HALVES_WHOLE_WAVE_LDS").ok().as_deref());
+        if let Some(only) = &rule {
+            tracing::info!(
+                programs = ?only,
+                "VICTORY_HALVES_WHOLE_WAVE_LDS: the whole-wave walk orders one-wave LDS in these programs only"
+            );
+        }
+        rule
+    })
+}
+
+/// `VICTORY_HALVES_WHOLE_WAVE_LDS`'s rule: `None` is every program (unset,
+/// empty or unreadable: today's behaviour), `Some` the programs listed
+/// (`0`: none).
+fn whole_wave_lds(value: Option<&str>) -> Option<Vec<String>> {
+    let value = value.unwrap_or_default().trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value == "0" {
+        return Some(Vec::new());
+    }
+    let hashes: Vec<String> = value.split(',').map(|h| h.trim().to_ascii_lowercase()).collect();
+    hashes
+        .iter()
+        .all(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then_some(hashes)
+}
+
 /// Whether a size query on a writable image asks for level 0 in every
 /// program (`victory_shader::emit::Options::uav_size_level0`): only with
 /// `VICTORY_UAV_SIZE_LEVEL0=1`. D3DMetal answers the undefined level DXC
@@ -256,6 +336,9 @@ pub(crate) fn walk() -> bool {
 /// first has run on the GPU before the copy is made. `0`, `keep` and
 /// anything else leave it off (the diagnostics of `crate::host` read the
 /// same variable).
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); what a list records reads
+/// its title list's side ([`copy_order_split_at`]).
 pub(crate) fn copy_order_split() -> Option<usize> {
     #[cfg(test)]
     if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) > 0 {
@@ -278,6 +361,19 @@ pub(crate) fn copy_order_split() -> Option<usize> {
     })
 }
 
+/// mac: [`copy_order_split`] on `VICTORY_AB` side `b` (`crate::ab`): side
+/// B is off where A splits, else every range, or `=<value>` by the rule.
+pub(crate) fn copy_order_split_at(b: bool) -> Option<usize> {
+    let a = copy_order_split();
+    crate::ab::value_at(
+        "VICTORY_COPY_ORDER",
+        b,
+        a,
+        |a| if a.is_some() { None } else { Some(usize::MAX) },
+        |v| copy_order(Some(v)),
+    )
+}
+
 /// `VICTORY_COPY_ORDER`'s rule for the split: `split` is every read range,
 /// `split:<bytes>` those of at most `bytes` (1 or more); anything else is
 /// off.
@@ -295,6 +391,9 @@ fn copy_order(value: Option<&str>) -> Option<usize> {
 /// leaves each a dispatch of its own (to tell the two steps apart in a
 /// run). Off by default: each clamp is a dispatch of ours just before its
 /// draw, about 4,200 a world frame, each between two draws.
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); lists read their title
+/// list's side ([`batch_clamps_at`]).
 pub(crate) fn batch_clamps() -> [bool; 2] {
     static ON: OnceLock<[bool; 2]> = OnceLock::new();
     *ON.get_or_init(|| {
@@ -307,6 +406,19 @@ pub(crate) fn batch_clamps() -> [bool; 2] {
         }
         [hoist, batch]
     })
+}
+
+/// mac: [`batch_clamps`] on `VICTORY_AB` side `b` (`crate::ab`), a title
+/// list's from its reset: side B is off where A hoists, else both, or
+/// `=<value>` by the rule.
+pub(crate) fn batch_clamps_at(b: bool) -> [bool; 2] {
+    crate::ab::value_at(
+        "VICTORY_BATCH_CLAMPS",
+        b,
+        batch_clamps(),
+        |a| if a[0] { [false, false] } else { [true, true] },
+        |v| clamps(Some(v)),
+    )
 }
 
 /// `VICTORY_BATCH_CLAMPS`'s rule: hoisted, batched. `1` is both, `hoist`
@@ -327,12 +439,16 @@ fn clamps(value: Option<&str>) -> [bool; 2] {
 /// pipeline sync, copy, clear or immediate write, not at its dispatches.
 /// Off by default: each indirect dispatch has a clamp of ours just before
 /// it, about 960 a frame at the prison.
-pub(crate) fn dispatch_clamps() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| {
+///
+/// mac: on `VICTORY_AB` side `b` (`crate::ab`; false is the switch as set),
+/// a title list's from its reset: asked for on that side (the opposite of
+/// side A's asking, or `=<value>`), and only where that side hoists
+/// ([`batch_clamps_at`]: a toggle of the draws' clamps takes these along).
+pub(crate) fn dispatch_clamps_at(b: bool) -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    let asked = *ASKED.get_or_init(|| {
         let asked = dispatch_rule(std::env::var("VICTORY_DISPATCH_CLAMPS").ok().as_deref());
-        let on = asked && batch_clamps()[0];
-        if on {
+        if asked && batch_clamps()[0] {
             tracing::info!(
                 batch = batch_clamps()[1],
                 "VICTORY_DISPATCH_CLAMPS: the clamps of a run of indirect dispatches go to the host list before it too (a run ends at the title's next barrier)"
@@ -340,8 +456,9 @@ pub(crate) fn dispatch_clamps() -> bool {
         } else if asked {
             tracing::warn!("VICTORY_DISPATCH_CLAMPS=1 does nothing without VICTORY_BATCH_CLAMPS=1 or hoist");
         }
-        on
-    })
+        asked
+    });
+    crate::ab::flag_at("VICTORY_DISPATCH_CLAMPS", b, asked, |v| dispatch_rule(Some(v))) && batch_clamps_at(b)[0]
 }
 
 /// Whether every BVH node test misses without reading the node
@@ -436,6 +553,52 @@ fn census_rule(value: Option<&str>) -> bool {
     value.map(str::trim) == Some("1")
 }
 
+/// From ScarlettMac 4921b7e6: whether a submission's refresh of a buffer
+/// range none of whose pages the title wrote since the host copy took them
+/// is left out (`VICTORY_SYNC_EPOCH=1`, `crate::shadow::Shadow::synced`):
+/// `Shadow::update` would copy nothing there, and asking costs the copy's
+/// locks and a place in the submission's batch. Off (unset, `0`, or
+/// anything else): every request is refreshed, as before. Nothing with
+/// `VICTORY_FLIGHTS=1`, where refreshes are asked for while the submission
+/// before still runs and its copy-back can still change title memory.
+///
+/// mac: `VICTORY_AB=VICTORY_SYNC_EPOCH` (`crate::ab`) flips it per range
+/// asked; refused with `VICTORY_FLIGHTS=1` ([`ab_blocked`]).
+pub(crate) fn sync_epoch(flights: impl FnOnce() -> bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let asked = epoch(std::env::var("VICTORY_SYNC_EPOCH").ok().as_deref());
+        let on = asked && !flights();
+        if on {
+            tracing::info!(
+                "VICTORY_SYNC_EPOCH=1: a refresh of a buffer range no page of changed since the copy took it is left out"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_SYNC_EPOCH=1 does nothing with VICTORY_FLIGHTS=1");
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_SYNC_EPOCH", a, |v| epoch(Some(v)))
+}
+
+/// [`sync_epoch`]'s rule: `1` turns it on; every other value leaves it off.
+fn epoch(value: Option<&str>) -> bool {
+    setting(value, false)
+}
+
+/// From ScarlettMac 4921b7e6: `VICTORY_TEXTURE_WORKERS`'s rule
+/// (`crate::texture`'s worker threads): a count of 2 or more, at most the
+/// CPUs, asks for that many; anything else (and unset) leaves the quarter
+/// of the CPUs, four at most, as before. `None` where that is fewer than
+/// two: the work runs on the submitting thread.
+pub(crate) fn texture_workers(value: Option<&str>, cpus: usize) -> Option<usize> {
+    let threads = match value.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(asked) if asked >= 2 => asked.min(cpus.max(1)),
+        _ => (cpus / 4).clamp(1, 4),
+    };
+    (threads >= 2).then_some(threads)
+}
+
 /// Whether a heap sync pass also holds the census updates of the slots
 /// `HostHeap::mirror` and `HostHeap::make_null` make in it, and enters them
 /// a batch at a time (`crate::bindless::Pass`, `crate::census_fast::Hold`)
@@ -460,9 +623,293 @@ pub(crate) fn census_batch() -> bool {
     })
 }
 
+/// Whether block-compressed host textures are made castable only to their
+/// sRGB partner (`crate::resource::castable_metal`, VIctory-macOS #499):
+/// Metal views block-compressed memory only in its own compression and
+/// aborts the process (SIGABRT `0x80000101`) on a view in another; Series
+/// 1.0.2.1 reuses BC5 memory as BC7 in the world. Such memory then gets its
+/// own host texture, as on hosts that refuse castable lists, and a copy that
+/// asked for a same-family cast (BC5 UNORM as SNORM) no longer finds it in the
+/// list. Only with `VICTORY_METAL_BC_CASTS=1` and under Wine (`wine`, asked
+/// only then), read once (at the first colour host texture).
+pub(crate) fn metal_bc_casts(wine: impl FnOnce() -> bool) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = bc_casts_rule(std::env::var("VICTORY_METAL_BC_CASTS").ok().as_deref());
+        let on = asked && wine();
+        if on {
+            tracing::info!(
+                "VICTORY_METAL_BC_CASTS=1: block-compressed host textures are castable only to their sRGB partner; \
+                 memory viewed in another compression gets its own host texture"
+            );
+        } else if asked {
+            tracing::warn!("VICTORY_METAL_BC_CASTS=1 does nothing outside Wine");
+        }
+        on
+    })
+}
+
+/// Whether a list's buffer barriers take the UAV writes since the last one
+/// into its widened history in place (`crate::host::widened_in_place`,
+/// VIctory-macOS #520): the old way copies the whole history and the new
+/// writes into a list made for `crate::widened::sync` at every barrier that
+/// has widened RGB32 views to refresh (about 90,000 writes and 2 MB in
+/// hackgods' world frames, 50 to 90 ms a frame of growing and freeing heap
+/// blocks), and makes the list of a barrier's expanded writes again each
+/// time. In place, the buffers stay with the list, and keep their room from
+/// one use to the next. The same writes reach `sync` in the same order.
+/// Only with `VICTORY_WIDENED_IN_PLACE=1`, read once (at the first barrier).
+///
+/// This is side A of `VICTORY_AB` (`crate::ab`); a host list reads its
+/// title list's side from its reset to its close ([`widened_in_place_at`]).
+pub(crate) fn widened_in_place() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = in_place_rule(std::env::var("VICTORY_WIDENED_IN_PLACE").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_WIDENED_IN_PLACE=1: buffer barriers take new UAV writes into the widened history without copying it"
+            );
+        }
+        on
+    })
+}
+
+/// mac: [`widened_in_place`] on `VICTORY_AB` side `b` (`crate::ab`).
+pub(crate) fn widened_in_place_at(b: bool) -> bool {
+    crate::ab::flag_at("VICTORY_WIDENED_IN_PLACE", b, widened_in_place(), |v| in_place_rule(Some(v)))
+}
+
+/// From VIctory-macOS #436 (82587a26): whether a write snapshot keeps only
+/// the bytes each declared GPU write newly covers
+/// (`crate::snapshot_spans::Spans`), instead of merging overlapping
+/// declarations into one segment copied again whenever it grows. Only for
+/// unmarked writes (marked ones keep no snapshot). Only with
+/// `VICTORY_SNAPSHOT_SPANS=1`, read once.
+///
+/// mac: `VICTORY_AB=VICTORY_SNAPSHOT_SPANS` (`crate::ab`): a snapshot keeps
+/// the form its first capture took until copy-back empties it
+/// (`crate::shadow::Shadow::writing`), so a flip changes the next ones.
+pub(crate) fn snapshot_spans() -> bool {
+    #[cfg(test)]
+    if tests::SPANS_HERE.with(std::cell::Cell::get) {
+        return true;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = spans_rule(std::env::var("VICTORY_SNAPSHOT_SPANS").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_SNAPSHOT_SPANS=1: write snapshots copy only the bytes no earlier declaration of the submission took (VIctory-macOS #436)"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_SNAPSHOT_SPANS", a, |v| spans_rule(Some(v)))
+}
+
+/// `VICTORY_SNAPSHOT_SPANS`'s rule: on only for `1`.
+fn spans_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// From VIctory-macOS #452 (18f33b86): whether a title copy made while a
+/// submission is prepared (not into memory shown at two addresses) makes
+/// only the pending refreshes whose queued ranges reach its window, leaving
+/// the others queued until the submission's flush (`crate::host`,
+/// `Batch::title_copied`). Off: every title copy makes all pending
+/// refreshes first, as before. Only with `VICTORY_FLUSH_OVERLAPPING=1`, read
+/// once.
+///
+/// mac: `VICTORY_AB=VICTORY_FLUSH_OVERLAPPING` (`crate::ab`): a submission's
+/// batch takes the side once, when it is made.
+pub(crate) fn flush_overlapping() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let on = overlapping_rule(std::env::var("VICTORY_FLUSH_OVERLAPPING").ok().as_deref());
+        if on {
+            tracing::info!(
+                "VICTORY_FLUSH_OVERLAPPING=1: a title copy makes only the pending refreshes it can change (VIctory-macOS #452)"
+            );
+        }
+        on
+    });
+    crate::ab::flag("VICTORY_FLUSH_OVERLAPPING", a, |v| overlapping_rule(Some(v)))
+}
+
+/// `VICTORY_FLUSH_OVERLAPPING`'s rule: on only for `1`.
+fn overlapping_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// `VICTORY_METAL_BC_CASTS`'s rule: on only for `1`.
+fn bc_casts_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// `VICTORY_WIDENED_IN_PLACE`'s rule: on only for `1`.
+fn in_place_rule(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+/// What a heap sync does with a slot it finds rewritten with a view of a
+/// placed texture (`VICTORY_PLACED_AT_ONCE`, notes/flicker.md). Without it
+/// the slot is left null until a shader has read it: one submission of
+/// zeros for the draws that pick it by index, an object black for a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacedAtOnce {
+    /// Unset, empty or `0`: as before.
+    Off,
+    /// `1`: the slot is made at once when the texture's host texture is
+    /// made already (making the view then makes no texture).
+    Made,
+    /// `keep`: as `1`, and a slot that held a host view keeps it until a
+    /// shader has read the slot (the old texture for that submission
+    /// instead of zeros; the title moving a texture leaves the same texels).
+    Keep,
+    /// `all`: every such slot is made at once, its texture made if it is
+    /// not yet (the host textures the null rule spares: memory).
+    All,
+    /// `read`: as `keep`, and a slot a shader read through the heap in the
+    /// last `VICTORY_PLACED_READ_FRAMES` frames is made at once as with
+    /// `all` (`crate::placed_read`).
+    Read,
+}
+
+impl PlacedAtOnce {
+    /// Whether a view whose host texture is made is made at once.
+    pub(crate) fn made(self) -> bool {
+        self != PlacedAtOnce::Off
+    }
+
+    /// Whether a slot left for later keeps the host view it held (`keep`,
+    /// and `read` for the slots it does not make at once).
+    pub(crate) fn keeps(self) -> bool {
+        matches!(self, PlacedAtOnce::Keep | PlacedAtOnce::Read)
+    }
+}
+
+/// `VICTORY_PLACED_AT_ONCE`'s rule.
+fn placed_rule(value: Option<&str>) -> PlacedAtOnce {
+    match value.map(str::trim) {
+        Some("1") => PlacedAtOnce::Made,
+        Some("keep") => PlacedAtOnce::Keep,
+        Some("all") => PlacedAtOnce::All,
+        Some("read") => PlacedAtOnce::Read,
+        _ => PlacedAtOnce::Off,
+    }
+}
+
+/// `VICTORY_PLACED_AT_ONCE`, read once ([`PlacedAtOnce`]).
+///
+/// mac: `VICTORY_AB=VICTORY_PLACED_AT_ONCE` (`crate::ab`): side B is off
+/// where A is on, else `all`, or `=<value>`; read once a slot a heap sync
+/// makes. A slot made either way stays valid the other way: a view made at
+/// once stays until the slot is rewritten, a slot left null is made when a
+/// shader reads it.
+pub(crate) fn placed_at_once() -> PlacedAtOnce {
+    #[cfg(test)]
+    if let Some(mode) = tests::PLACED_HERE.with(std::cell::Cell::get) {
+        return mode;
+    }
+    static ON: OnceLock<PlacedAtOnce> = OnceLock::new();
+    let a = *ON.get_or_init(|| {
+        let mode = placed_rule(std::env::var("VICTORY_PLACED_AT_ONCE").ok().as_deref());
+        match mode {
+            PlacedAtOnce::Off => {}
+            PlacedAtOnce::Made => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=1: heap slots rewritten with views of placed textures whose host texture is made are made at once, not left null until read"
+            ),
+            PlacedAtOnce::Keep => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=keep: as =1, and a slot that showed a view keeps it until a shader reads the slot, not null"
+            ),
+            PlacedAtOnce::All => tracing::info!(
+                "VICTORY_PLACED_AT_ONCE=all: every heap slot rewritten with a view of a placed texture is made at once, its texture made if need be"
+            ),
+            // Its line is `crate::placed_read`'s, with the window.
+            PlacedAtOnce::Read => {}
+        }
+        mode
+    });
+    crate::ab::value(
+        "VICTORY_PLACED_AT_ONCE",
+        a,
+        |a| if a.made() { PlacedAtOnce::Off } else { PlacedAtOnce::All },
+        |v| placed_rule(Some(v)),
+    )
+}
+
+/// Which views a record names whole instead of through the view table
+/// (`crate::descriptor::inline`, after fxceless's fork):
+/// `VICTORY_VIEW_INLINE=1`, constant buffer views; `all`, also views of
+/// placed memory. Unset or `0`: every view is a table entry, as before.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewInline {
+    Off,
+    Constants,
+    All,
+}
+
+/// `VICTORY_VIEW_INLINE`'s rule.
+fn view_inline_rule(value: Option<&str>) -> ViewInline {
+    match value.map(str::trim) {
+        Some("1") => ViewInline::Constants,
+        Some("all") => ViewInline::All,
+        _ => ViewInline::Off,
+    }
+}
+
+/// `VICTORY_VIEW_INLINE`, read once ([`ViewInline`]).
+pub(crate) fn view_inline() -> ViewInline {
+    static ON: OnceLock<ViewInline> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let mode = view_inline_rule(std::env::var("VICTORY_VIEW_INLINE").ok().as_deref());
+        match mode {
+            ViewInline::Off => {}
+            ViewInline::Constants => tracing::info!(
+                "VICTORY_VIEW_INLINE=1: constant buffer views are named whole in their records, not entries of the view table"
+            ),
+            ViewInline::All => tracing::info!(
+                "VICTORY_VIEW_INLINE=all: constant buffer views and views of placed memory are named whole in their records, not entries of the view table"
+            ),
+        }
+        mode
+    })
+}
+
+#[cfg(test)]
+mod view_inline_tests {
+    use super::{ViewInline, view_inline_rule};
+
+    #[test]
+    fn views_are_entries_unless_the_switch_says_otherwise() {
+        assert_eq!(view_inline_rule(None), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("0")), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("yes")), ViewInline::Off);
+        assert_eq!(view_inline_rule(Some("1")), ViewInline::Constants);
+        assert_eq!(view_inline_rule(Some(" all ")), ViewInline::All);
+    }
+}
+
 #[cfg(test)]
 mod census_tests {
-    use super::census_rule;
+    use super::{bc_casts_rule, census_rule, in_place_rule};
+
+    #[test]
+    fn metal_bc_casts_are_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("2")] {
+            assert!(!bc_casts_rule(off), "{off:?}");
+        }
+        assert!(bc_casts_rule(Some("1")) && bc_casts_rule(Some(" 1 ")));
+    }
+
+    #[test]
+    fn widened_in_place_is_off_unless_it_is_1() {
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("2")] {
+            assert!(!in_place_rule(off), "{off:?}");
+        }
+        assert!(in_place_rule(Some("1")) && in_place_rule(Some(" 1 ")));
+    }
 
     #[test]
     fn the_census_switch_is_off_unless_it_is_1() {
@@ -471,6 +918,32 @@ mod census_tests {
         }
         assert!(census_rule(Some("1")));
         assert!(census_rule(Some(" 1 ")));
+    }
+
+    #[test]
+    fn placed_views_at_once_are_off_by_default() {
+        use super::{PlacedAtOnce, placed_rule};
+        for off in [None, Some(""), Some("0"), Some("yes"), Some("true"), Some("2"), Some("Keep")] {
+            assert_eq!(placed_rule(off), PlacedAtOnce::Off, "{off:?}");
+            assert!(!placed_rule(off).made());
+        }
+        assert_eq!(placed_rule(Some(" 1 ")), PlacedAtOnce::Made);
+        assert_eq!(placed_rule(Some("keep")), PlacedAtOnce::Keep);
+        assert_eq!(placed_rule(Some("all")), PlacedAtOnce::All);
+        assert_eq!(placed_rule(Some(" read ")), PlacedAtOnce::Read);
+        assert!(
+            [PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All, PlacedAtOnce::Read].iter().all(|m| m.made())
+        );
+        // `read` keeps a slot's old view where it does not make it at once.
+        assert_eq!(
+            [PlacedAtOnce::Off, PlacedAtOnce::Made, PlacedAtOnce::Keep, PlacedAtOnce::All, PlacedAtOnce::Read]
+                .map(PlacedAtOnce::keeps),
+            [false, false, true, false, true]
+        );
+        // Read once; the tests never set it.
+        if std::env::var_os("VICTORY_PLACED_AT_ONCE").is_none() {
+            assert_eq!(super::placed_at_once(), PlacedAtOnce::Off);
+        }
     }
 
     #[test]
@@ -503,6 +976,104 @@ mod clamp_tests {
         }
         assert!(dispatch_rule(Some("1")));
         assert!(dispatch_rule(Some(" 1 ")));
+    }
+}
+
+/// mac: `VICTORY_AB` (`crate::ab`): side B of each switch read here. The
+/// tests set none of these switches, so side A is each one's default.
+#[cfg(test)]
+mod ab_tests {
+    use super::*;
+
+    /// Runs `f` with `VICTORY_AB=<toggle>` on side `b` on this thread.
+    fn with(toggle: &str, b: bool, f: impl FnOnce()) {
+        crate::ab::force(Some(crate::ab::parse(toggle).unwrap()), b);
+        f();
+        crate::ab::force(None, false);
+    }
+
+    fn unset(names: &[&str]) -> bool {
+        names.iter().all(|n| std::env::var_os(n).is_none())
+    }
+
+    #[test]
+    fn on_off_switches_read_the_opposite_or_the_value_on_side_b() {
+        if !unset(&["VICTORY_FLUSH_OVERLAPPING", "VICTORY_SNAPSHOT_SPANS", "VICTORY_SYNC_EPOCH", "VICTORY_WIDENED_IN_PLACE"]) {
+            return;
+        }
+        assert!(!flush_overlapping() && !snapshot_spans() && !sync_epoch(|| false) && !widened_in_place());
+        with("VICTORY_FLUSH_OVERLAPPING:10", true, || assert!(flush_overlapping()));
+        with("VICTORY_FLUSH_OVERLAPPING:10", false, || assert!(!flush_overlapping(), "side A: as set"));
+        with("VICTORY_FLUSH_OVERLAPPING=0:10", true, || assert!(!flush_overlapping(), "=0 on side B: off (A/A)"));
+        with("VICTORY_SNAPSHOT_SPANS:10", true, || {
+            assert!(snapshot_spans());
+            assert!(!flush_overlapping(), "another switch keeps side A");
+        });
+        with("VICTORY_SYNC_EPOCH:10", true, || assert!(sync_epoch(|| false)));
+        // A list's side, not the side now.
+        with("VICTORY_WIDENED_IN_PLACE:10", false, || {
+            assert!(widened_in_place_at(true) && !widened_in_place_at(false));
+        });
+    }
+
+    #[test]
+    fn quick_sync_flips_only_its_views() {
+        if !unset(&["VICTORY_QUICK_SYNC"]) {
+            return;
+        }
+        let a = quick_sync(|| true);
+        with("VICTORY_QUICK_SYNC:10", true, || assert_eq!(quick_sync(|| true), [a[0], !a[1]]));
+        with("VICTORY_QUICK_SYNC=views:10", true, || assert_eq!(quick_sync(|| true), [a[0], true]));
+        with("VICTORY_QUICK_SYNC=0:10", true, || assert_eq!(quick_sync(|| true), [a[0], false]));
+    }
+
+    #[test]
+    fn placed_views_are_made_at_once_on_side_b_where_side_a_leaves_them() {
+        if !unset(&["VICTORY_PLACED_AT_ONCE"]) {
+            return;
+        }
+        assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+        with("VICTORY_PLACED_AT_ONCE:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::All));
+        with("VICTORY_PLACED_AT_ONCE=keep:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Keep));
+        with("VICTORY_PLACED_AT_ONCE=read:10", true, || assert_eq!(placed_at_once(), PlacedAtOnce::Read));
+    }
+
+    #[test]
+    fn clamps_flip_per_list_and_take_the_dispatch_clamps_along() {
+        if !unset(&["VICTORY_BATCH_CLAMPS", "VICTORY_DISPATCH_CLAMPS"]) {
+            return;
+        }
+        assert_eq!(batch_clamps_at(false), [false, false]);
+        with("VICTORY_BATCH_CLAMPS:10", false, || {
+            assert_eq!(batch_clamps_at(true), [true, true], "a list on side B");
+            assert_eq!(batch_clamps_at(false), [false, false], "a list on side A");
+            assert!(!dispatch_clamps_at(true), "dispatch clamps not asked for: off on both sides");
+        });
+        with("VICTORY_BATCH_CLAMPS=hoist:10", false, || assert_eq!(batch_clamps_at(true), [true, false]));
+        // Dispatch clamps asked for on side B only hoist where side B hoists.
+        with("VICTORY_DISPATCH_CLAMPS:10", false, || {
+            assert!(!dispatch_clamps_at(true), "side A does not hoist the draws' clamps");
+        });
+    }
+
+    #[test]
+    fn the_copy_order_split_flips_per_list() {
+        if !unset(&["VICTORY_COPY_ORDER"]) || tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+            return;
+        }
+        assert_eq!(copy_order_split_at(false), None);
+        with("VICTORY_COPY_ORDER:10", false, || {
+            // (Another test may force the split on meanwhile: then both are.)
+            if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                assert_eq!(copy_order_split_at(true), Some(usize::MAX));
+                assert_eq!(copy_order_split_at(false), None);
+            }
+        });
+        with("VICTORY_COPY_ORDER=split:4096:10", false, || {
+            if tests::FORCED_COPY_ORDER.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                assert_eq!(copy_order_split_at(true), Some(4096));
+            }
+        });
     }
 }
 
@@ -556,6 +1127,32 @@ fn setting(value: Option<&str>, default: bool) -> bool {
     }
 }
 
+/// mac: why `VICTORY_AB` (`crate::ab`) cannot flip switch `name` in this
+/// run (side B's `value`, if given), asked at the first present: a side
+/// the switch's own rules refuse would measure nothing, or a picture the
+/// line never runs with.
+#[cfg(windows)]
+pub(crate) fn ab_blocked(name: &str, value: Option<&str>) -> Option<String> {
+    let _ = value;
+    match name {
+        "VICTORY_SYNC_EPOCH" if crate::host::unwaited::flights::on() => {
+            Some("VICTORY_SYNC_EPOCH does nothing with VICTORY_FLIGHTS=1".to_owned())
+        }
+        "VICTORY_DISPATCH_CLAMPS" if !batch_clamps()[0] => {
+            Some("VICTORY_DISPATCH_CLAMPS does nothing without VICTORY_BATCH_CLAMPS=1 or hoist".to_owned())
+        }
+        // `crate::alias` turns the aliasing on only with the split: off on
+        // side B, commands before a title copy into aliased memory would
+        // read its new bytes.
+        "VICTORY_COPY_ORDER" if crate::alias::enabled() && copy_order_split_at(true).is_none() => Some(
+            "VICTORY_ALIAS_BUFFERS is on, which needs VICTORY_COPY_ORDER=split on both sides \
+             (side B may be =split:<bytes>)"
+                .to_owned(),
+        ),
+        _ => None,
+    }
+}
+
 /// The cache key `build` for translations made with these settings. A
 /// setting that is off adds nothing, so the entries made without it stay
 /// the ones read.
@@ -605,7 +1202,122 @@ pub(crate) fn key(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{copy_order, heap_locks, heap_sync_pause, heap_sync_threads, key, quick, setting, uav_size, writers};
+    use super::{
+        copy_order, epoch, heap_locks, heap_sync_pause, heap_sync_threads, key, overlapping_rule, quick, setting,
+        spans_rule, texture_workers, uav_size, whole_wave_lds, writers,
+    };
+
+    thread_local! {
+        /// `snapshot_spans` is on for this thread's snapshots ([`SpansHere`]).
+        pub(crate) static SPANS_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// While it lives, `snapshot_spans` is on for snapshots this thread
+    /// starts, as with `VICTORY_SNAPSHOT_SPANS=1` (other threads' tests keep
+    /// the default form).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct SpansHere;
+
+    impl SpansHere {
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn new() -> Self {
+            SPANS_HERE.with(|on| on.set(true));
+            SpansHere
+        }
+    }
+
+    impl Drop for SpansHere {
+        fn drop(&mut self) {
+            SPANS_HERE.with(|on| on.set(false));
+        }
+    }
+
+    thread_local! {
+        /// `placed_at_once` on this thread, whatever the environment says
+        /// ([`PlacedHere`]).
+        pub(crate) static PLACED_HERE: std::cell::Cell<Option<super::PlacedAtOnce>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// While it lives, `placed_at_once` is `mode` on this thread: for tests
+    /// that assert what a heap sync does with a placed view under one rule,
+    /// so that `VICTORY_PLACED_AT_ONCE` set for the suite (or `=read`'s
+    /// history, one per process, filled by other tests) does not change it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) struct PlacedHere(Option<super::PlacedAtOnce>);
+
+    impl PlacedHere {
+        #[cfg_attr(not(windows), allow(dead_code))]
+        pub(crate) fn new(mode: super::PlacedAtOnce) -> Self {
+            PlacedHere(PLACED_HERE.with(|here| here.replace(Some(mode))))
+        }
+    }
+
+    impl Drop for PlacedHere {
+        fn drop(&mut self) {
+            PLACED_HERE.with(|here| here.set(self.0));
+        }
+    }
+
+    #[test]
+    fn a_placed_rule_pinned_here_holds_on_this_thread_only() {
+        use super::{PlacedAtOnce, placed_at_once};
+        let outside = placed_at_once();
+        {
+            let _read = PlacedHere::new(PlacedAtOnce::Read);
+            assert_eq!(placed_at_once(), PlacedAtOnce::Read);
+            {
+                let _off = PlacedHere::new(PlacedAtOnce::Off);
+                assert_eq!(placed_at_once(), PlacedAtOnce::Off);
+            }
+            assert_eq!(placed_at_once(), PlacedAtOnce::Read, "the outer pin is back");
+            assert_eq!(std::thread::spawn(placed_at_once).join().unwrap(), outside, "other threads keep theirs");
+        }
+        assert_eq!(placed_at_once(), outside);
+    }
+
+    #[test]
+    fn flushing_only_overlapping_refreshes_is_on_only_when_asked_for() {
+        assert!(overlapping_rule(Some("1")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("yes")] {
+            assert!(!overlapping_rule(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn snapshot_spans_are_on_only_when_asked_for() {
+        assert!(spans_rule(Some("1")));
+        assert!(spans_rule(Some(" 1 ")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on")] {
+            assert!(!spans_rule(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn texture_workers_are_a_quarter_of_the_cpus_unless_asked_for() {
+        for off in [None, Some(""), Some("0"), Some("1"), Some("many")] {
+            assert_eq!(texture_workers(off, 18), Some(4), "{off:?}");
+            assert_eq!(texture_workers(off, 14), Some(3), "{off:?}");
+            assert_eq!(texture_workers(off, 8), Some(2), "{off:?}");
+            assert_eq!(texture_workers(off, 4), None, "{off:?}");
+            assert_eq!(texture_workers(off, 1), None, "{off:?}");
+        }
+        assert_eq!(texture_workers(Some("6"), 18), Some(6));
+        assert_eq!(texture_workers(Some(" 6 "), 14), Some(6));
+        assert_eq!(texture_workers(Some("64"), 14), Some(14));
+        assert_eq!(texture_workers(Some("2"), 18), Some(2));
+        // Two asked for on a one-CPU machine: none, as before.
+        assert_eq!(texture_workers(Some("2"), 1), None);
+    }
+
+    #[test]
+    fn the_epoch_skip_is_on_only_when_asked_for() {
+        assert!(epoch(Some("1")));
+        // Unset, `0`, or a word: every request refreshes, as the bench needs.
+        for off in [None, Some(""), Some("0"), Some("2"), Some("on"), Some("yes")] {
+            assert!(!epoch(off), "{off:?}");
+        }
+    }
 
     /// How many tests have the copy-order split forced on right now.
     pub(crate) static FORCED_COPY_ORDER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -652,6 +1364,18 @@ pub(crate) mod tests {
         assert_eq!(uav_size(Some("07F451A14B13FECB, 11eeb27c2d15980d")), (false, two));
         // A list with a wrong entry is no list: nothing is turned on.
         assert_eq!(uav_size(Some("07f451a14b13fecb,1")), (false, vec![]));
+    }
+
+    #[test]
+    fn the_whole_wave_lds_list_is_every_program_unless_it_names_some() {
+        assert_eq!(whole_wave_lds(None), None);
+        assert_eq!(whole_wave_lds(Some("")), None);
+        assert_eq!(whole_wave_lds(Some(" ")), None);
+        assert_eq!(whole_wave_lds(Some("0")), Some(vec![]));
+        let two = vec!["03e3e26783a5799b".to_owned(), "fd8393c7f4e0e3da".to_owned()];
+        assert_eq!(whole_wave_lds(Some("03E3E26783A5799B, fd8393c7f4e0e3da")), Some(two));
+        // A list with a wrong entry is no list: every program, as unset.
+        assert_eq!(whole_wave_lds(Some("03e3e26783a5799b,1")), None);
     }
 
     #[test]

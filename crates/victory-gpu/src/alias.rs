@@ -273,8 +273,10 @@ pub fn enabled() -> bool {
         // With flights the next submission is prepared while the one left
         // on the GPU still writes: its texture uploads can read aliased
         // memory those shaders are writing, which host copies only see when
-        // the copy-back lands (`crate::host::unwaited::flights`).
-        let flights = crate::host::unwaited::flights::on();
+        // the copy-back lands (`crate::host::unwaited::flights`). mac:
+        // unless `VICTORY_FLIGHTS_WITH=alias` checks the uploads against
+        // what that one may write first (`Host::beside_texture_reads`).
+        let flights = crate::host::unwaited::flights::on() && !crate::host::unwaited::flights::with_alias();
         let on = decide_enabled(asked, rosetta, warp) && split.is_some() && !flights;
         if on {
             tracing::info!(
@@ -300,7 +302,8 @@ pub fn enabled() -> bool {
                     "WARP draws in software, its buffers are not the GPU's memory"
                 } else if flights {
                     "VICTORY_FLIGHTS is on: the next submission is prepared while the one on the GPU still writes \
-                     aliased memory, and its texture uploads could read those writes half done"
+                     aliased memory, and its texture uploads could read those writes half done \
+                     (VICTORY_FLIGHTS_WITH=alias checks them)"
                 } else {
                     "VICTORY_COPY_ORDER is not split: without its cuts every command of a submission would read the \
                      bytes of the submission's last title copy into aliased memory, also the commands before the copy"
@@ -346,6 +349,13 @@ static TOTALS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 fn add(c: C, n: u64) {
     COUNTS[c as usize].fetch_add(n, Ordering::Relaxed);
+}
+
+/// mac: the bytes of aliased memory told to the other trackers so far,
+/// since the last frame line ([`noted`]; tests).
+#[cfg(test)]
+pub(crate) fn noted_bytes() -> u64 {
+    COUNTS[C::WrittenBytes as usize].load(Ordering::Relaxed)
 }
 
 /// A submission asked for `bytes` of aliased memory in `ranges` ranges of
@@ -729,6 +739,34 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
     alias_locked(base, len, preserve_contents)
 }
 
+/// Mac, log only (upstream VIctory-macOS PR #598, 11387edd): whether the
+/// buffer D3DMetal mapped for an alias starts inside a 16 KiB host page.
+/// D3DMetal places buffers inside bigger ones at 256-byte steps once small
+/// ones are alive (an M1 Max probe there: 47 of 48 mid-page). The remap
+/// below maps whole pages from the page holding `gpu_mem`, so the GPU would
+/// then see the title's bytes shifted by the offset, and the title's last
+/// `offset` bytes would share memory past the buffer. Warns at the 1st, 2nd,
+/// 4th, ... such buffer; none means this Mac is not hit.
+fn note_mid_page(gpu_mem: *mut u8, base: usize, len: usize) {
+    const HOST_PAGE: usize = 16 << 10;
+    let offset = gpu_mem as usize % HOST_PAGE;
+    if offset == 0 {
+        return;
+    }
+    static MID_PAGE: AtomicU64 = AtomicU64::new(0);
+    let n = MID_PAGE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            n,
+            offset = format_args!("{offset:#x}"),
+            base = format_args!("{base:#x}"),
+            len,
+            aliased = TOTALS[0].load(Ordering::Relaxed),
+            "an aliased title buffer's D3DMetal buffer starts inside a 16 KiB page: the GPU sees its bytes shifted (upstream #598)"
+        );
+    }
+}
+
 /// [`alias_region`], under [`LOCK`].
 fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
     let Some(zeroed) = supported() else {
@@ -751,6 +789,7 @@ fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
         tracing::warn!(base = format_args!("{base:#x}"), len, "no host buffer to alias title memory onto; keeping plain memory");
         return false;
     };
+    note_mid_page(gpu_mem, base, len);
     // SAFETY: `base` and `gpu_mem` are `len`-byte owned mappings.
     unsafe {
         if preserve_contents {

@@ -791,7 +791,16 @@ impl<'a> Lanes<'a> {
             } else {
                 lo
             };
-            self.masks.insert((lo, hi), Bool::TRUE);
+            // Every lane, or under a dispatch counted in threads the lanes
+            // it launches (the lowering gives each lane its bit; after
+            // LakshanSivakumar/Native-Victory-macOS 0ae6cfcd).
+            let on = if p.thread_counts {
+                let born = self.born(lo);
+                self.b.atom(Atom::Lane(lo), born)
+            } else {
+                Bool::TRUE
+            };
+            self.masks.insert((lo, hi), on);
             self.active.insert(lo);
         }
         let mut execs: Vec<Vec<Option<Bool>>> =

@@ -118,6 +118,7 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() {
+        let _inside = crate::flights::threads::Inside::enter();
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
         let mut held = held();
@@ -163,7 +164,11 @@ static HELD: std::sync::Mutex<Holding> = std::sync::Mutex::new(crate::hold::Held
 
 #[cfg(windows)]
 fn held() -> std::sync::MutexGuard<'static, Holding> {
-    HELD.lock().unwrap_or_else(|e| e.into_inner())
+    // mac: its wait, per thread (E1, `crate::flights::threads`).
+    let at = std::time::Instant::now();
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    crate::flights::threads::add(crate::flights::threads::Spent::Held, at.elapsed().as_micros() as u64);
+    held
 }
 
 /// Runs held work that may run now (`why` for the frame line).
@@ -215,7 +220,9 @@ fn pump(held: &mut Holding, why: Why) {
         // One host submission, or with `VICTORY_COPY_ORDER=split` one more
         // for each title copy in the piece that changes what its earlier
         // lists read: the part before it has run when the copy is made.
-        for part in crate::host::copy_order_parts(segments) {
+        let parts = crate::host::copy_order_parts(segments);
+        crate::host::joined::count_run(parts.len(), 0);
+        for part in parts {
             let at = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
@@ -251,6 +258,48 @@ fn pump(held: &mut Holding, why: Why) {
         }
         finished
     };
+    // mac: `VICTORY_COALESCE_PIECES=1` (VIctory-macOS #419): ready heads of
+    // every queue join one piece (`crate::hold::joined`).
+    type Joined = (std::sync::Arc<crate::host::HostList>, bool);
+    let leaves = |s: &std::sync::Arc<crate::host::HostList>, wait: &crate::hold::ValueWait| s.leaves(wait);
+    // What each list does on the CPU, asked once a pump.
+    let flags = std::cell::RefCell::new(Vec::<(usize, crate::hold::joined::JoinFlags)>::new());
+    let flags_of = |s: &std::sync::Arc<crate::host::HostList>| {
+        let key = std::sync::Arc::as_ptr(s) as usize;
+        if let Some(&(_, f)) = flags.borrow().iter().find(|(k, _)| *k == key) {
+            return f;
+        }
+        let f = s.join_flags();
+        flags.borrow_mut().push((key, f));
+        f
+    };
+    let cap = crate::hold::joined::cap();
+    let can_join = |piece: &[Joined], next: &std::sync::Arc<crate::host::HostList>| {
+        piece.len() < cap
+            && crate::hold::joined::may_join(
+                piece.iter().fold(Default::default(), |all, (s, _)| flags_of(s).merge(all)),
+                flags_of(next),
+            )
+    };
+    let mut run_joined = |queue: Option<usize>, segments: Vec<Joined>| {
+        let queue = queue.unwrap_or(unwaited::MIXED);
+        let parts = crate::host::joined::copy_order_parts(segments);
+        let barriers = parts.iter().map(|(_, b)| b.iter().filter(|&&b| b).count()).sum();
+        crate::host::joined::count_run(parts.len(), barriers);
+        for (part, barriers) in parts {
+            let at = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::PumpExecutes, 1);
+            let done = host.execute_title_with(queue, part, &barriers);
+            ran.set(ran.get() + at.elapsed());
+            done.into_iter().for_each(crate::list::recycle);
+        }
+    };
+    let joining = crate::hold::joined::on().then_some(crate::hold::Joining {
+        leaves: &leaves,
+        can_join: &can_join,
+        run: &mut run_joined,
+    });
     let pumped = held.pump(&mut crate::hold::World {
         read: &read,
         fence: &fence,
@@ -258,7 +307,9 @@ fn pump(held: &mut Holding, why: Why) {
         signal: &mut signal,
         owed: &mut owed,
         ahead: unwaited::prewarms(),
+        joining,
     });
+    crate::host::joined::count(&pumped);
     let ran = ran.get();
     if pumped.segments > 0 || pumped.unknown > 0 {
         let mut a = account();
@@ -406,6 +457,8 @@ fn account_frame(frame: u64) {
     }
     tracing::info!(
         frame,
+        // mac: with `VICTORY_AB` only (`crate::ab`): the frame's side.
+        ab = crate::ab::label(),
         submissions = a.submissions,
         pieces = a.pieces,
         segments = a.segments,
@@ -483,6 +536,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     {
+        let _inside = crate::flights::threads::Inside::enter();
         let mut held = held();
         if held.holds_work(this as usize) {
             crate::fence::keep(fence);
@@ -516,6 +570,7 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
     }
     #[cfg(windows)]
     if crate::host::host().is_some() && crate::fence::value(fence) < value {
+        let _inside = crate::flights::threads::Inside::enter();
         let mut held = held();
         held.push(this as usize, Item::FenceWait(fence as usize, value));
         pump(&mut held, Why::Wait);
@@ -586,6 +641,29 @@ static FRAMES: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
+}
+
+/// mac: the last presented frame, for `VICTORY_KEYS=menu:` (victory-hle's
+/// input thread): its number (high 40 bits) and the draws run on the host
+/// since the frame before (low 24 bits, saturated), in one word so a reader
+/// never pairs one frame's number with another frame's draws.
+static LAST_FRAME: AtomicU64 = AtomicU64::new(0);
+const LAST_FRAME_DRAWS: u64 = (1 << 24) - 1;
+
+/// mac: notes frame `frame`'s draws (`drawn`: the host's draws so far).
+#[cfg(windows)]
+fn note_last_frame(frame: u64, drawn: u64) {
+    static DRAWN: AtomicU64 = AtomicU64::new(0);
+    let draws = drawn.saturating_sub(DRAWN.swap(drawn, Ordering::Relaxed));
+    LAST_FRAME.store((frame << 24) | draws.min(LAST_FRAME_DRAWS), Ordering::Relaxed);
+}
+
+/// mac: frames the title presented so far and the draws the last of them
+/// ran on the host (the frame line's count, per frame); (0, 0) before the
+/// first. One atomic load, no lock: cheap to ask at any rate.
+pub fn last_presented() -> (u64, u64) {
+    let word = LAST_FRAME.load(Ordering::Relaxed);
+    (word >> 24, word & LAST_FRAME_DRAWS)
 }
 
 /// Every plane's resources. Only the start of a plane description is
@@ -726,6 +804,8 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    #[cfg(windows)]
+    let _inside = crate::flights::threads::Inside::enter();
     // What may run before the frame is shown does.
     // shortcut: PresentX does not wait behind work the queue still holds (it
     // shows the frame as far as it ran); the frame line names such work.
@@ -734,6 +814,13 @@ extern "system" fn present(
     #[cfg(windows)]
     unwaited::settle(unwaited::By::Present);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // mac: the frame's draws, for `VICTORY_KEYS=menu:` (`last_presented`).
+    #[cfg(windows)]
+    note_last_frame(frame, crate::draw::drawn());
+    // mac: `VICTORY_AB` (`crate::ab`): the frame's lines name the side its
+    // work ran on, and the side may flip here for the frames after.
+    #[cfg(windows)]
+    crate::ab::present(frame, crate::draw::drawn, crate::mac_switches::ab_blocked);
     #[cfg(windows)]
     account_frame(frame);
     #[cfg(windows)]

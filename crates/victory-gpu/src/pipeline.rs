@@ -76,6 +76,10 @@ pub(crate) struct Shader {
     spilled: OnceLock<[u8; 32]>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// How it is translated, if not as this run's settings say: the BVH
+    /// builder's own forms under `VICTORY_BVH_BUILDER=1` ([`builder`]).
+    #[cfg(windows)]
+    options: Option<victory_shader::emit::Options>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -189,7 +193,19 @@ impl Shader {
             spilled: OnceLock::new(),
             #[cfg(windows)]
             translated: OnceLock::new(),
+            #[cfg(windows)]
+            options: None,
         }
+    }
+
+    /// A shader of its own (not shared by hash with other pipelines),
+    /// translated as `options` say: the BVH builder's forms ([`builder`]).
+    #[cfg(windows)]
+    fn own(stage: &'static str, bytes: &[u8], options: victory_shader::emit::Options) -> Arc<Shader> {
+        Arc::new(Shader {
+            options: Some(options),
+            ..Shader::new(stage, bytes)
+        })
     }
 
     #[cfg(all(test, windows))]
@@ -222,7 +238,7 @@ impl Shader {
                     {
                         *container = crate::read_file(&spill_path(dir, full)).unwrap_or_default();
                     }
-                    let done = translate(&container);
+                    let done = translate(&container, self.options);
                     // After the translation, not before: if it panics, the
                     // bytes are still there for the next try.
                     let keep = link_mesh_outputs() && done.0.as_ref().is_ok_and(|t| {
@@ -311,8 +327,14 @@ fn thread_cpu_since(then: (u64, u64)) -> (u64, u64) {
 
 /// The translation, and whether it came from the cache.
 #[cfg(windows)]
-fn translate(container: &[u8]) -> (Result<Translated, String>, bool) {
-    let (host, cached) = crate::shader_cache::host_shader(container);
+fn translate(
+    container: &[u8],
+    options: Option<victory_shader::emit::Options>,
+) -> (Result<Translated, String>, bool) {
+    let (host, cached) = match options {
+        Some(options) => crate::shader_cache::host_shader_with(container, options),
+        None => crate::shader_cache::host_shader(container),
+    };
     (host.and_then(|host| with_resources(container, host)), cached)
 }
 
@@ -438,6 +460,7 @@ impl Shader {
             container: Mutex::new(Vec::new()),
             spilled: OnceLock::new(),
             translated: cell,
+            options: self.options,
         })
     }
 }
@@ -552,12 +575,17 @@ struct Pipeline {
     /// ([`builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// A builder pipeline's form for dispatches counted in threads
+    /// (`VICTORY_BVH_BUILDER=1`, [`builder::forms`]); None otherwise.
+    #[cfg(windows)]
+    threads: Option<builder::ThreadForm>,
     /// What its programs are to the ambient stand-in ([`crate::ambient`]):
     /// bits, 0 for nothing (always while the stand-in is off).
     #[cfg(windows)]
     ambient: u8,
     /// Which ray pass `VICTORY_RAY_SKIP` leaves out it is
-    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off).
+    /// ([`ray_pass_left_out`]): bits, 0 for none (always while it is off,
+    /// unless `VICTORY_AB` flips it: then what either side leaves out).
     #[cfg(windows)]
     ray_pass: u8,
 }
@@ -598,6 +626,48 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// How a dispatch counted in threads (`DispatchX` with flag 0x20) runs
+/// with the title pipeline.
+#[cfg(windows)]
+pub(crate) enum Counted<'a> {
+    /// As groups, as before: the pipeline has no forms of the builder's
+    /// (`VICTORY_BVH_BUILDER` off, or not the builder's).
+    Groups,
+    /// From this pipeline, in groups of this size.
+    Form(&'a host::HostPipeline, [u32; 3]),
+    /// Not at all: the builder pipeline's form for it is refused.
+    Missing(String),
+}
+
+/// How a dispatch counted in threads runs with the title pipeline.
+#[cfg(windows)]
+pub(crate) fn counted<'a>(this: This) -> Counted<'a> {
+    let Some(t) = (!this.is_null()).then(|| pipeline(this).threads.as_ref()).flatten() else {
+        return Counted::Groups;
+    };
+    match make::ready(&t.pending) {
+        Some(p) => Counted::Form(p, t.group),
+        None => Counted::Missing(format!(
+            "a DispatchX counted in threads with compute {}, whose form for it is not made",
+            pipeline(this).shaders.first().map_or("?", |s| s.hash.as_str())
+        )),
+    }
+}
+
+/// The BVH builder runs no more in this run (`builder::trip`).
+#[cfg(windows)]
+pub(crate) fn stop_builder(why: String) {
+    builder::trip(why);
+}
+
+/// The host GPU ended a submission before it finished: under
+/// `VICTORY_BVH_BUILDER=1` the builder stops if it ran this frame or the
+/// last (`builder::submission_lost`).
+#[cfg(windows)]
+pub(crate) fn submission_lost() {
+    builder::submission_lost();
+}
+
 /// Whether a dispatch with the title pipeline is held back: it is the
 /// acceleration-structure builder's, which does not run this frame
 /// ([`builder::runs`]).
@@ -611,12 +681,19 @@ pub(crate) fn held_back(this: This) -> bool {
 /// acceleration-structure builder does not run this frame
 /// ([`builder::runs`]), so there is nothing to trace against. Counted
 /// there when it is.
+///
+/// mac: on `VICTORY_AB` side `b` (`crate::ab`), the recording list's: the
+/// parts that side leaves out.
 #[cfg(windows)]
-pub(crate) fn ray_pass_left_out(this: This) -> bool {
+pub(crate) fn ray_pass_left_out(this: This, b: bool) -> bool {
     if this.is_null() {
         return false;
     }
     let kind = pipeline(this).ray_pass;
+    if kind == 0 {
+        return false;
+    }
+    let kind = kind & crate::ray_skip::parts_at(b);
     if kind == 0 || builder::runs() {
         return false;
     }
@@ -627,8 +704,11 @@ pub(crate) fn ray_pass_left_out(this: This) -> bool {
 /// [`ray_pass_left_out`], asked ahead and not counted (mac: hoisted clamps
 /// of indirect dispatches, `crate::list`).
 #[cfg(windows)]
-pub(crate) fn ray_pass_is_left_out(this: This) -> bool {
-    !this.is_null() && pipeline(this).ray_pass != 0 && !builder::runs()
+pub(crate) fn ray_pass_is_left_out(this: This, b: bool) -> bool {
+    !this.is_null() && {
+        let kind = pipeline(this).ray_pass;
+        kind != 0 && (kind & crate::ray_skip::parts_at(b)) != 0
+    } && !builder::runs()
 }
 
 /// What the title pipeline's programs are to the ambient stand-in
@@ -649,6 +729,13 @@ pub fn note_title_dll(file: &str, base: usize, size: usize) {
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
     make::waiting()
+}
+
+/// mac: [`making`] for victory-hle (`VICTORY_KEYS=menu:`): the frame line's
+/// "being made" count, one atomic load.
+#[cfg(windows)]
+pub fn waiting() -> u64 {
+    making()
 }
 
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
@@ -807,17 +894,28 @@ fn hand_out(
     let builder = !code.is_empty() && builder::created_by_builder(code);
     #[cfg(not(windows))]
     let _ = code;
+    // Mac (`VICTORY_BVH_BUILDER=1`): a builder compute pipeline runs from
+    // forms of its own (`builder::forms`); otherwise from the shared shaders.
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(
-        shaders.clone(),
-        graphics,
-        skip_hashes(),
-    ));
+    let forms = (builder && graphics.is_none())
+        .then(|| builder::forms(&shaders, code))
+        .flatten();
+    #[cfg(windows)]
+    let (host, threads) = match forms {
+        Some(f) => (f.plain, Some(f.threads)),
+        None => (
+            Arc::new(make::Pending::new(shaders.clone(), graphics, skip_hashes())),
+            None,
+        ),
+    };
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
     if builder {
-        builder::note(&host);
+        builder::note(&host, threads.is_some());
+        if let Some(t) = &threads {
+            builder::note_threads(t);
+        }
     }
     #[cfg(windows)]
     let ambient = crate::ambient::role(shaders.iter().map(|s| s.hash.as_str()));
@@ -835,6 +933,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        threads,
         #[cfg(windows)]
         ambient,
         #[cfg(windows)]
@@ -1457,3 +1557,5 @@ mod tests {
 
 #[cfg(all(test, windows))]
 mod depth_bounds_test;
+#[cfg(all(test, windows))]
+mod thread_dispatch_tests;

@@ -220,6 +220,26 @@ pub fn halves_walk() -> bool {
     crate::mac_switches::walk()
 }
 
+/// From ScarlettMac 4921b7e6: whether a descriptor's dwords a program only
+/// reads as numbers come from the descriptor's source instead of stopping
+/// the program (`victory_shader::emit::Options::descriptor_as_data`; the
+/// host then fills a buffer's record count into the view addresses,
+/// `descriptor::host`): only with `VICTORY_DESCRIPTOR_AS_DATA=1`, off by
+/// default.
+pub fn descriptor_as_data() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = crate::switch::on("VICTORY_DESCRIPTOR_AS_DATA");
+        if on {
+            tracing::info!(
+                "VICTORY_DESCRIPTOR_AS_DATA=1: a program reading a descriptor's dwords as numbers \
+                 is translated where the descriptor's source answers them"
+            );
+        }
+        on
+    })
+}
+
 /// Whether, with half-local reads, the Mac port's hand-over across the
 /// halves comes before them (`victory_shader::emit::Options::halves_across`,
 /// `VICTORY_HALVES_ACROSS=1`; the rule is in `mac_switches`).
@@ -233,6 +253,14 @@ pub fn halves_across() -> bool {
 /// `VICTORY_HALVES_LDS_ROUNDS=1`; the rule is in `mac_switches`).
 pub fn halves_lds_rounds() -> bool {
     crate::mac_switches::lds_rounds()
+}
+
+/// Whether the halves' walk also opens regions holding whole-wave code, and
+/// a first-lane read under a narrowed EXEC is handed over
+/// (`victory_shader::emit::Options::halves_whole_wave`,
+/// `VICTORY_HALVES_WHOLE_WAVE=1`; the rule is in `mac_switches`).
+pub fn halves_whole_wave() -> bool {
+    crate::mac_switches::whole_wave()
 }
 
 /// Whether programs run in either of those ways here: asked for, on a host
@@ -383,6 +411,46 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     } else {
         key
     };
+    // And descriptor dwords read as data (`VICTORY_DESCRIPTOR_AS_DATA=1`):
+    // a program it translates is refused without it. Off, nothing.
+    let key = if options.descriptor_as_data {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"descriptor as data");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
+    // And the whole-wave walk and first-lane hand-over
+    // (`VICTORY_HALVES_WHOLE_WAVE=1`); off, it adds nothing.
+    let key = if options.halves_whole_wave {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"halves whole wave");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
+    // And that switch without its LDS part (`VICTORY_HALVES_WHOLE_WAVE_LDS`);
+    // off, it adds nothing.
+    let key = if options.halves_whole_wave_no_lds {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"halves whole wave no lds");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
+    // And the form for dispatches counted in threads (the BVH builder's,
+    // `VICTORY_BVH_BUILDER=1`); off, it adds nothing.
+    let key = if options.thread_counts {
+        let mut h = blake3::Hasher::new();
+        h.update(&key);
+        h.update(b"thread counts");
+        *h.finalize().as_bytes()
+    } else {
+        key
+    };
     if key == *build {
         return build;
     }
@@ -395,6 +463,21 @@ pub(crate) fn translation_build(options: victory_shader::emit::Options) -> &'sta
     let kept: &'static [u8; 32] = Box::leak(Box::new(key));
     keys.push(kept);
     kept
+}
+
+/// How the BVH builder's own forms are translated under
+/// `VICTORY_BVH_BUILDER=1` (`crate::pipeline::builder`): as this run's
+/// settings say, but with no half of a console wave answering on its own
+/// (`VICTORY_HALVES_LOCAL` and `VICTORY_HALVES_SHARED_LDS` off), so that a
+/// read across the halves is handed over exactly or the program is refused;
+/// `thread_counts` for the form of dispatches counted in threads.
+pub(crate) fn exact_options(thread_counts: bool) -> victory_shader::emit::Options {
+    victory_shader::emit::Options {
+        halves_local: false,
+        halves_shared_lds: false,
+        thread_counts,
+        ..runtime_options()
+    }
 }
 
 pub(crate) fn runtime_options() -> victory_shader::emit::Options {
@@ -431,15 +514,34 @@ pub(crate) fn runtime_options() -> victory_shader::emit::Options {
         wide_loads: crate::mac_switches::wide_loads(),
         bvh_miss: crate::mac_switches::bvh_miss(),
         lds_rounds: crate::mac_switches::lds_rounds(),
+        descriptor_as_data: descriptor_as_data(),
+        halves_whole_wave: crate::mac_switches::whole_wave(),
+        // Per program (`host_shader_with`, `VICTORY_HALVES_WHOLE_WAVE_LDS`).
+        halves_whole_wave_no_lds: false,
+        // Only for the BVH builder's pipelines, which ask for it
+        // (`crate::pipeline::builder`).
+        thread_counts: false,
     }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one, and whether it came from there.
 pub fn host_shader(container: &[u8]) -> (Result<HostShader, String>, bool) {
-    let mut options = runtime_options();
+    host_shader_with(container, runtime_options())
+}
+
+/// [`host_shader`] made from `options` instead of this run's (cached under
+/// their own key): the BVH builder's own forms (`crate::pipeline::builder`).
+pub(crate) fn host_shader_with(
+    container: &[u8],
+    options: victory_shader::emit::Options,
+) -> (Result<HostShader, String>, bool) {
+    let mut options = options;
     // One program at a time, if the switch lists hashes (mac).
     options.uav_size_level0 = crate::mac_switches::uav_size_level0_for(container);
+    // The whole-wave switch's LDS part, if a list leaves this program out.
+    options.halves_whole_wave_no_lds =
+        options.halves_whole_wave && !crate::mac_switches::whole_wave_lds_for(container);
     let translate =
         |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
     let build = translation_build(options);
@@ -758,6 +860,48 @@ mod tests {
         let on = victory_shader::emit::Options { bvh_miss: true, ..off };
         assert_ne!(translation_build(off), translation_build(on));
         assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { bvh_miss: false, ..off }));
+    }
+
+    /// `VICTORY_DESCRIPTOR_AS_DATA` changes the translation, so the cache
+    /// keys on it; off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_descriptor_as_data() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { descriptor_as_data: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        let bvh = victory_shader::emit::Options { bvh_miss: true, ..off };
+        assert_ne!(translation_build(bvh), translation_build(victory_shader::emit::Options { descriptor_as_data: true, ..bvh }));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { descriptor_as_data: false, ..off }));
+    }
+
+    /// `VICTORY_HALVES_WHOLE_WAVE` changes translations, so the cache keys on
+    /// it; off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_halves_whole_wave() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { halves_whole_wave: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { halves_whole_wave: false, ..off }));
+    }
+
+    /// The whole-wave switch without its LDS part is another translation,
+    /// so the cache keys on it; off, the key is the one without it.
+    #[test]
+    fn the_cache_keys_on_halves_whole_wave_no_lds() {
+        let on = victory_shader::emit::Options { halves_whole_wave: true, ..Default::default() };
+        let no_lds = victory_shader::emit::Options { halves_whole_wave_no_lds: true, ..on };
+        assert_ne!(translation_build(on), translation_build(no_lds));
+        assert_eq!(translation_build(on), translation_build(victory_shader::emit::Options { halves_whole_wave_no_lds: false, ..on }));
+    }
+
+    /// The form for dispatches counted in threads (`Options::thread_counts`)
+    /// is another translation, so the cache keys on it; off, nothing changes.
+    #[test]
+    fn the_cache_keys_on_thread_counts() {
+        let off = victory_shader::emit::Options::default();
+        let on = victory_shader::emit::Options { thread_counts: true, ..off };
+        assert_ne!(translation_build(off), translation_build(on));
+        assert_eq!(translation_build(off), translation_build(victory_shader::emit::Options { thread_counts: false, ..off }));
     }
 
     fn shader() -> HostShader {

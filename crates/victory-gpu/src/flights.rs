@@ -1,5 +1,6 @@
 //! mac: the plain arithmetic of the flights (`crate::host::unwaited::flights`,
-//! `VICTORY_FLIGHTS=1`): plain std, so its tests run everywhere.
+//! `VICTORY_FLIGHTS=1`) and of their frame lines: plain std, so its tests
+//! run everywhere.
 
 /// Title memory as ranges `[from, to)`: after [`Spans::join`], in order,
 /// none touching the next.
@@ -37,10 +38,59 @@ impl Spans {
         self.0.get(at).is_some_and(|r| r.0 < to)
     }
 
+    /// Whether they hold nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The ranges, in order (joined).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.0.iter().copied()
+    }
+
     #[cfg(test)]
     fn ranges(&self) -> &[(usize, usize)] {
         &self.0
     }
+}
+
+/// What the landing of the submission left (its finish) may change in title
+/// memory, as the next submission's preparation beside it sees it.
+#[derive(Debug, Default)]
+pub(crate) struct Landing {
+    /// It runs programs that use title memory: all of it.
+    pub(crate) every: bool,
+    /// Title memory it may write or lands in (joined).
+    pub(crate) spans: Spans,
+    /// The pages that show a page of `spans` at another address (joined): a
+    /// write or a landing there marks the trackers here too.
+    pub(crate) others: Spans,
+}
+
+impl Landing {
+    /// Whether `[at, at + len)` is in what it may write or lands in.
+    pub(crate) fn reaches(&self, at: usize, len: usize) -> bool {
+        self.every || self.spans.touches(at, len)
+    }
+
+    /// Whether a tracker over `[at, at + len)` may be told at its landing
+    /// that the memory changed: what it reaches, and its pages' other
+    /// addresses.
+    pub(crate) fn tells(&self, at: usize, len: usize) -> bool {
+        self.reaches(at, len) || self.others.touches(at, len)
+    }
+}
+
+/// mac: whether a submission's ask to bring `[at, at + len)` of a host copy
+/// up to date goes into its refreshes. A copy the title wrote since the copy
+/// took it does (`clean` false). A clean one does only while the submission
+/// before still runs beside it (`beside`) and its landing may tell the copy
+/// ([`Landing::tells`]): then the ask is held and made once that one is
+/// finished, when its copy-back has told the copy what changed. Before, a
+/// clean copy asked for before that finish was left out, and the next
+/// submission read it one submission old.
+pub(crate) fn asked(clean: bool, beside: Option<&Landing>, at: usize, len: usize) -> bool {
+    !clean || beside.is_some_and(|l| l.tells(at, len))
 }
 
 /// What the `bytes` (1 to 8) at `address` will hold once `writes` are made
@@ -77,9 +127,218 @@ pub(crate) fn after_writes(writes: &[(usize, Option<u64>, usize)], address: usiz
     seen
 }
 
+/// mac: the names `VICTORY_FLIGHTS_WITH=<list>` takes, each building on the
+/// ones before it (`notes/overlap-stages-design.md` §6).
+pub(crate) const WITH: [&str; 6] = ["alias", "writes", "copies", "ring", "relay", "present"];
+
+/// `VICTORY_FLIGHTS_WITH`'s rule: of the comma list `value`, the names taken
+/// (bit `i` for [`WITH`]`[i]`), and a line for each one refused: unknown, not
+/// in this build (`built`, the bits it has), asked without every name before
+/// it, or refused by `refuse(i)` for a reason of its own.
+pub(crate) fn with_names(value: &str, built: u32, refuse: impl Fn(usize) -> Option<&'static str>) -> (u32, Vec<String>) {
+    let mut asked = 0u32;
+    let mut refused = Vec::new();
+    for name in value.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        match WITH.iter().position(|w| w.eq_ignore_ascii_case(name)) {
+            Some(i) => asked |= 1 << i,
+            None => refused.push(format!("{name}: not a name it takes ({})", WITH.join(","))),
+        }
+    }
+    let mut taken = 0u32;
+    for (i, name) in WITH.iter().enumerate().filter(|&(i, _)| asked & 1 << i != 0) {
+        let why = if built & 1 << i == 0 {
+            Some("not in this build".to_owned())
+        } else if taken != (1 << i) - 1 {
+            Some(format!("it needs {} first", WITH[..i].join(",")))
+        } else {
+            refuse(i).map(str::to_owned)
+        };
+        match why {
+            Some(why) => refused.push(format!("{name}: {why}")),
+            None => taken |= 1 << i,
+        }
+    }
+    (taken, refused)
+}
+
+/// mac: E1 of `notes/overlap-stages-design.md` (lines only): per thread that
+/// calls us, the microseconds inside our queue calls (the outermost one),
+/// waiting for the held-work lock and waiting for the submission lock, since
+/// the last frame line. A thread takes its slot once, without a lock; past
+/// [`threads::SLOTS`] threads share the last one (id 0).
+pub(crate) mod threads {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+    use std::time::Instant;
+
+    pub(crate) const SLOTS: usize = 16;
+
+    /// What a thread's time went on.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Spent {
+        Inside = 1,
+        Held = 2,
+        Lock = 3,
+    }
+
+    /// Per slot: the thread's id, then microseconds by [`Spent`].
+    static TABLE: [[AtomicU64; 4]; SLOTS] = [const { [const { AtomicU64::new(0) }; 4] }; SLOTS];
+    static CLAIMED: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static SLOT: Cell<usize> = const { Cell::new(usize::MAX) };
+        static DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    /// The thread's id as the table shows it (the Windows thread id).
+    pub(crate) fn id() -> u64 {
+        #[cfg(windows)]
+        // SAFETY: a plain query.
+        return u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() });
+        #[cfg(not(windows))]
+        {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            thread_local!(static ID: u64 = NEXT.fetch_add(1, Relaxed));
+            ID.with(|i| *i)
+        }
+    }
+
+    fn slot() -> usize {
+        SLOT.with(|s| {
+            if s.get() == usize::MAX {
+                let i = CLAIMED.fetch_add(1, Relaxed).min(SLOTS - 1);
+                TABLE[i][0].store(if i < SLOTS - 1 { id() } else { 0 }, Relaxed);
+                s.set(i);
+            }
+            s.get()
+        })
+    }
+
+    pub(crate) fn add(spent: Spent, us: u64) {
+        TABLE[slot()][spent as usize].fetch_add(us, Relaxed);
+    }
+
+    /// Times the thread's outermost call of ours while it lives.
+    pub(crate) struct Inside(Option<Instant>);
+
+    impl Inside {
+        pub(crate) fn enter() -> Inside {
+            let outermost = DEPTH.with(|d| {
+                d.set(d.get() + 1);
+                d.get() == 1
+            });
+            Inside(outermost.then(Instant::now))
+        }
+    }
+
+    impl Drop for Inside {
+        fn drop(&mut self) {
+            DEPTH.with(|d| d.set(d.get() - 1));
+            if let Some(at) = self.0 {
+                add(Spent::Inside, at.elapsed().as_micros() as u64);
+            }
+        }
+    }
+
+    /// Since the last call, per thread with anything: its id and the
+    /// microseconds inside, held, lock (then zero).
+    pub(crate) fn take() -> Vec<(u64, [u64; 3])> {
+        (0..CLAIMED.load(Relaxed).min(SLOTS))
+            .filter_map(|i| {
+                let us = [1, 2, 3].map(|k| TABLE[i][k].swap(0, Relaxed));
+                (us != [0; 3]).then(|| (TABLE[i][0].load(Relaxed), us))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clean copy asked for beside the submission left stays in the
+    /// refreshes where that one's landing may tell it (what it writes or
+    /// lands in, and those pages' other addresses), so that it is made after
+    /// the finish; elsewhere, and with nothing beside, it is left out as
+    /// before. A copy the title wrote is always asked for.
+    #[test]
+    fn a_clean_copy_the_landing_may_tell_is_kept_for_after_it() {
+        let mut landing = Landing::default();
+        landing.spans.add(0x1_0000, 0x2_0000);
+        landing.others.add(0x9_0000, 0xa_0000);
+        landing.spans.join();
+        landing.others.join();
+        // Clean: kept only where the landing may tell it.
+        assert!(asked(true, Some(&landing), 0x1_8000, 0x100), "in what it lands in");
+        assert!(asked(true, Some(&landing), 0x9_ff00, 0x1000), "a page shown there too");
+        assert!(!asked(true, Some(&landing), 0x2_0000, 0x1000), "next to it");
+        assert!(!asked(true, Some(&landing), 0x1_8000, 0), "nothing asked");
+        assert!(!asked(true, None, 0x1_8000, 0x100), "nothing beside: as before");
+        // Written by the title: always.
+        assert!(asked(false, None, 0x5_0000, 0x10));
+        assert!(asked(false, Some(&landing), 0x5_0000, 0x10));
+        // Title-memory programs: all of it.
+        let every = Landing { every: true, ..Landing::default() };
+        assert!(asked(true, Some(&every), 0x5_0000, 0x10));
+    }
+
+    /// `VICTORY_FLIGHTS_WITH`: names in their order, each needing those
+    /// before it; unknown, unbuilt and otherwise refused names named.
+    #[test]
+    fn flights_with_takes_each_name_after_the_ones_before_it() {
+        let none = |_: usize| None;
+        assert_eq!(with_names("", 1, none), (0, vec![]));
+        assert_eq!(with_names(" alias , ", 1, none), (1, vec![]));
+        assert_eq!(with_names("ALIAS", 1, none).0, 1);
+        let (taken, refused) = with_names("alias,writes", 1, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["writes: not in this build"]);
+        let (taken, refused) = with_names("writes", 0b11, none);
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["writes: it needs alias first"]);
+        assert_eq!(with_names("writes,alias", 0b11, none), (0b11, vec![]));
+        let (taken, refused) = with_names("alias,copies", 0b111, none);
+        assert_eq!(taken, 1);
+        assert_eq!(refused, ["copies: it needs alias,writes first"]);
+        let (taken, refused) = with_names("alias,bogus", 1, none);
+        assert_eq!(taken, 1);
+        assert!(refused[0].starts_with("bogus: not a name"), "{refused:?}");
+        let (taken, refused) = with_names("alias,writes", 0b11, |i| (i == 0).then_some("the heap worker"));
+        assert_eq!(taken, 0);
+        assert_eq!(refused, ["alias: the heap worker", "writes: it needs alias first"]);
+    }
+
+    /// E1's table: each thread its own slot, only the outermost call timed,
+    /// the waits added as they come, zero after a take.
+    #[test]
+    fn each_thread_counts_its_outermost_call_and_its_waits() {
+        use threads::{Inside, Spent, add, id, take};
+        let ids: Vec<u64> = (0..2u64)
+            .map(|k| {
+                std::thread::spawn(move || {
+                    let outer = Inside::enter();
+                    {
+                        let _inner = Inside::enter();
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    drop(outer);
+                    add(Spent::Held, 1000 * (k + 1));
+                    add(Spent::Lock, 7);
+                    id()
+                })
+                .join()
+                .unwrap()
+            })
+            .collect();
+        assert_ne!(ids[0], ids[1]);
+        let seen = take();
+        for (k, me) in ids.iter().enumerate() {
+            let &(_, [inside, held, lock]) = seen.iter().find(|(i, _)| i == me).expect("the thread's slot");
+            assert!((20_000..1_000_000).contains(&inside), "once, not twice: {inside}");
+            assert_eq!((held, lock), (1000 * (k as u64 + 1), 7));
+        }
+        assert!(take().iter().all(|(i, _)| !ids.contains(i)), "zero after a take");
+    }
 
     #[test]
     fn spans_join_where_they_touch_and_find_what_they_share() {

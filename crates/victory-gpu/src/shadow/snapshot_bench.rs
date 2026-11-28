@@ -1,5 +1,7 @@
-//! Capture time for repeated declarations on one 64 MiB shadow. Run this
-//! test alone, in release, with `--ignored --nocapture --test-threads=1`.
+//! From VIctory-macOS #436 (82587a26): capture time for repeated
+//! declarations on one 64 MiB shadow, with segments (the default) and with
+//! spans (`VICTORY_SNAPSHOT_SPANS`). Run this test alone, in release, under
+//! Wine, with `--ignored --nocapture --test-threads=1`.
 
 use super::{find, register, unregister};
 use crate::watch::{PAGE, tests};
@@ -12,43 +14,44 @@ fn growing_write_ranges() {
     const SIZE: usize = 64 * MIB;
     let p = tests::pool(SIZE / PAGE);
     register(p, p as u64, SIZE as u64);
-    let copy = find(p as u64, SIZE as u64).expect("host buffer");
+    let Some(copy) = find(p as u64, SIZE as u64) else {
+        unregister(p, p as u64);
+        return; // no host GPU here
+    };
     assert!(!copy.aliased, "this measures snapshots, not zero-copy");
     // Gives the host mapping known bytes and pays first-touch costs before timing.
     copy.update(p, SIZE);
 
-    let growing: Vec<_> = (0..=16)
-        .map(|i| ((16 - i) * MIB, (32 + 2 * i) * MIB))
-        .collect();
+    let growing: Vec<_> = (0..=16).map(|i| ((16 - i) * MIB, (32 + 2 * i) * MIB)).collect();
     let disjoint = [(0, 16 * MIB), (32 * MIB, 16 * MIB)];
-    for (name, ranges) in [
-        ("one", &[(0, SIZE)][..]),
-        ("growing", growing.as_slice()),
-        ("disjoint", &disjoint[..]),
-    ] {
-        let mut times = Vec::new();
-        for round in 0..11 {
-            let start = Instant::now();
-            for &(offset, bytes) in ranges {
-                copy.writing(p + offset, bytes, false);
+    for spans in [false, true] {
+        let _spans = spans.then(crate::mac_switches::tests::SpansHere::new);
+        for (name, ranges) in [("one", &[(0, SIZE)][..]), ("growing", growing.as_slice()), ("disjoint", &disjoint[..])] {
+            let mut times = Vec::new();
+            for round in 0..11 {
+                let start = Instant::now();
+                for &(offset, bytes) in ranges {
+                    copy.writing(p + offset, bytes, false);
+                }
+                let elapsed = start.elapsed();
+                // Copy-back and returning buffers to the pool are outside the
+                // timer. A changed byte must reach title memory each round.
+                let at = p + ranges[0].0 + 5;
+                let value = round + 1;
+                copy.write_host(at as u64, &[value]);
+                for &(offset, bytes) in ranges {
+                    copy.copy_back(p + offset, bytes);
+                }
+                // SAFETY: the test owns this pool; copy-back has returned.
+                assert_eq!(unsafe { (at as *const u8).read_volatile() }, value);
+                if round >= 2 {
+                    times.push(elapsed.as_micros());
+                }
             }
-            let elapsed = start.elapsed();
-            // Copy-back and returning buffers to the pool are outside the timer.
-            // A changed byte must reach title memory on each iteration.
-            let at = p + ranges[0].0 + 5;
-            let value = round + 1;
-            copy.write_host(at as u64, &[value]);
-            for &(offset, bytes) in ranges {
-                copy.copy_back(p + offset, bytes);
-            }
-            // SAFETY: the test owns this pool; copy-back has returned.
-            assert_eq!(unsafe { (at as *const u8).read_volatile() }, value);
-            if round >= 2 {
-                times.push(elapsed.as_micros());
-            }
+            times.sort_unstable();
+            let form = if spans { "spans" } else { "segments" };
+            eprintln!("{form} {name}: median {} us (9 warm captures)", times[4]);
         }
-        times.sort_unstable();
-        eprintln!("{name}: median {} us (9 warm captures)", times[4]);
     }
     unregister(p, p as u64);
     drop(copy);

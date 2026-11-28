@@ -2438,6 +2438,34 @@ fn image_atomic_adds_of_64_bits_apply_once() {
     }
 }
 
+/// The lower half has a texel per lane and finishes early. Only the upper
+/// half contends for a single texel when the remaining lanes take turns.
+#[test]
+fn image_atomic_adds_finish_when_only_the_upper_half_contends() {
+    let mut words = atomics64_prologue();
+    words.extend([
+        vop1(0x001, 1, 129),        // v_mov_b32 v1, 1: add one
+        vop1(0x001, 2, 128),        // v_mov_b32 v2, 0: high dword
+        0x13 << 25 | 3 << 17 | 144, // v_min_u32 v3, 16, v0
+        vop1(0x001, 4, 128),        // v_mov_b32 v4, 0: y
+    ]);
+    words.extend(image_atomic(0x11, 1, 3, 8, 3, false));
+    words.push(S_ENDPGM);
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((texels, locks, label, _)) = locked_atomics64(&words, true, false, (32, 1), 1) else {
+        eprintln!("no SM 6.6 device; skipped");
+        return;
+    };
+    let mut want = [0; 32];
+    want[..16].fill(1);
+    want[16] = 16;
+    assert_eq!(texels[..], want, "{label}: each lane adds once");
+    assert!(
+        locks.iter().all(|&word| word == 0),
+        "{label}: lock words and give-up count"
+    );
+}
+
 /// The adds of [`image_atomic_adds_of_64_bits_apply_once`] where 2,048
 /// groups meet on one lock, 20 times in each form. A lane that waits out
 /// its bound goes on without the lock and can lose its add: with a bound of

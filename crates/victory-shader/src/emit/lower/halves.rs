@@ -110,7 +110,15 @@ impl Lower<'_> {
     /// Why a program in halves cannot run: LDS a group of one console wave
     /// shares without barriers, split across two host waves (unless asked
     /// to run it so, [`Local::lds`]).
+    ///
+    /// Mac ([`Mac::whole_wave`]): such a group's LDS blocks are places for
+    /// the walk to open, so that barriers can order them there
+    /// ([`super::exchange::want_lds`]).
     pub(super) fn halves_lds(x: &Parts, group: u32, lds_dwords: u32) -> Option<Why> {
+        let lds_part = x.mac.whole_wave && !x.mac.whole_wave_no_lds;
+        if lds_part && lds_dwords > 0 && group > HALF && group <= 64 {
+            super::exchange::want_lds(x.p);
+        }
         (lds_dwords > 0 && group > HALF && group <= 64 && !x.halves_local.lds)
             .then_some("LDS one console wave64 shares without barriers, on a host of 32-lane waves")
     }

@@ -67,6 +67,12 @@ pub(crate) fn as_holder<R>(holds: bool, f: impl FnOnce() -> R) -> R {
 }
 
 pub(crate) mod unwaited;
+// mac: `VICTORY_COALESCE_PIECES` (VIctory-macOS #419).
+pub(crate) mod joined;
+// mac: `VICTORY_WIDENED_IN_PLACE` (VIctory-macOS #520).
+mod widened_in_place;
+// mac: `VICTORY_FREE_LOCKS=1` (halfwave50 issue #7).
+mod free_locks;
 
 /// What the end of a submission ([`Host::finish`]) needs from its start:
 /// how long the host GPU was waited for, the list the device was removed
@@ -100,6 +106,9 @@ pub(crate) struct Host {
     mark: OnceLock<Option<Mark>>,
     /// Extra marks for native calls before the final call of a split submission.
     split_marks: Mutex<Option<Vec<Mark>>>,
+    /// mac: barrier lists put between segments of a piece joined across
+    /// queues (`VICTORY_COALESCE_PIECES`, [`joined`]).
+    joined_barriers: Mutex<Vec<joined::BarrierList>>,
     event: HANDLE,
     rtvs: ID3D12DescriptorHeap,
     rtv_size: u32,
@@ -409,6 +418,7 @@ fn create() -> windows::core::Result<Host> {
             submitted: Mutex::new(0),
             mark: OnceLock::new(),
             split_marks: Mutex::new(Some(Vec::new())),
+            joined_barriers: Mutex::new(Vec::new()),
             event,
             rtvs,
             rtv_size,
@@ -1247,6 +1257,11 @@ pub(crate) struct HostList {
     /// and ordered events written since the last barrier.
     widened_writes: Mutex<Vec<WidenedWrite>>,
     widened_pending: Mutex<Vec<WidenedEvent>>,
+    /// mac: with `VICTORY_WIDENED_IN_PLACE=1`, the writes taken from
+    /// `widened_pending` that no barrier widened yet (heap events expanded),
+    /// kept from barrier to barrier and use to use (`widened_in_place`).
+    /// Empty without the switch.
+    widened_new: Mutex<Vec<WidenedWrite>>,
     /// Exact source shadows whose buffers widening commands read. Their COM
     /// objects alone do not keep an arena slice out of the reuse pool.
     widened_sources: Mutex<Vec<std::sync::Arc<crate::shadow::Shadow>>>,
@@ -1297,6 +1312,9 @@ pub(crate) struct HostList {
     /// Clamps of the list after it recorded here but not yet run
     /// (`crate::indirect`, batches): recorded where the run of clamps ends.
     pub(crate) clamp_batch: Mutex<Option<crate::indirect::Pending>>,
+    /// mac: the `VICTORY_AB` side (`crate::ab`) of the title list it records
+    /// for, taken at that list's reset ([`HostList::ab`]).
+    ab: std::sync::atomic::AtomicBool,
     /// The texts of the markers `note_op` set, in order (for device-removed
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
@@ -1715,6 +1733,7 @@ impl Host {
                 rebind: false.into(),
                 widened_writes: Mutex::default(),
                 widened_pending: Mutex::default(),
+                widened_new: Mutex::default(),
                 widened_sources: Mutex::default(),
                 widened_ready: Mutex::default(),
                 widened_states: Mutex::default(),
@@ -1730,6 +1749,7 @@ impl Host {
                 orders: Default::default(),
                 hoisted: Mutex::default(),
                 clamp_batch: Mutex::new(None),
+                ab: false.into(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
@@ -1801,6 +1821,9 @@ impl Host {
     /// submission lock.
     fn lost(&self, submitted: &mut u64, mark: &Mark) {
         let lost = LOST[0].fetch_add(1, Ordering::Relaxed) + 1;
+        // Mac (`VICTORY_BVH_BUILDER=1`): a lock-up while the BVH builder
+        // runs stops it.
+        crate::pipeline::submission_lost();
         // A lane that held a lock of an emulated 64-bit atomic when the GPU
         // ended its shader never frees it (`victory_shader::emit`, "Atomic
         // locks"): free them all before anything else runs.
@@ -1904,13 +1927,15 @@ impl Host {
 
     /// Runs closed lists and waits for them.
     pub(crate) fn execute(&self, runs: &[&HostList]) {
-        self.run(runs, None);
+        self.run(runs, None, &[]);
     }
 
     /// [`Host::execute`]. `title`: the lists are the title's own, held so
     /// (with the queue they are of), and may be left to the host GPU
     /// without waiting for it ([`unwaited`]): whether they were.
-    fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>) -> bool {
+    /// `barriers`: mac, of a piece joined across queues ([`joined`], else
+    /// empty): whether a UAV barrier goes before each of `runs`.
+    fn run(&self, runs: &[&HostList], title: Option<(usize, &[std::sync::Arc<HostList>])>, barriers: &[bool]) -> bool {
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         // The one before, if the host GPU was not waited for, is finished
@@ -1994,11 +2019,22 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        // mac: with flights' `alias`, the one left is finished first where
+        // their memory could meet what it writes.
         let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
+            .then(|| {
+                crate::bindless::uploads_after(&heaps, &textures, &mut |work| {
+                    self.beside_texture_reads(&mut submitted, &mut beside, work)
+                })
+            })
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
+        // mac: the barriers of a joined piece, by run (an upload list first
+        // has none).
+        let barrier_lists = self.joined_barriers(barriers.iter().filter(|&&b| b).count());
+        let barriers: Vec<bool> = uploads.as_ref().map(|_| false).into_iter().chain(barriers.iter().copied()).collect();
+        let mut barrier_lists = barrier_lists.into_iter();
         let runs: Vec<&HostList> = uploads
             .as_ref()
             .map(|u| u.list())
@@ -2033,11 +2069,11 @@ impl Host {
         let gpu_timing = false;
         let split_preludes = !gpu_timing && split_uav_srv_prelude();
         let mut native_boundaries = Vec::new();
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(3 * runs.len());
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
-        let mut batch = Batch::default();
-        for list in runs {
+        let mut batch = Batch { overlap_only: crate::mac_switches::flush_overlapping(), ..Batch::default() };
+        for (i, list) in runs.iter().enumerate() {
             // Its first title copy opens a list the copy-order split cut.
             batch.cut = list.after_copy();
             self.poll_beside(&mut submitted, &mut beside);
@@ -2048,6 +2084,12 @@ impl Host {
                 list.run_deferred(&mut batch, None);
             }
             firsts.push(lists.len());
+            if barriers.get(i).copied().unwrap_or(false)
+                && !lists.is_empty()
+                && let Some(barrier) = barrier_lists.next()
+            {
+                lists.push(barrier);
+            }
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::PreludeUs);
             if let Some((prelude, uav_to_srv)) = list.prelude(split_preludes) {
@@ -2151,8 +2193,12 @@ impl Host {
         // (Not a submission cut at a deferred UAV-to-SRV prelude,
         // `VICTORY_GPU_SPLIT_UAV_SRV_PRELUDE`: its native calls and their
         // marks are the waited path's below.)
+        // mac: not with uploads the background heap worker staged
+        // (VIctory-macOS #417, `VICTORY_HEAP_WORKER=1`): their staging space
+        // goes back to the worker when the submission has run.
         if let Some(title) = title
             && native_boundaries.is_empty()
+            && !uploads.as_ref().is_some_and(crate::bindless::Uploads::has_worker)
             && unwaited::may(groups.len(), traced)
         {
             SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(aside).as_micros() as u64, Ordering::Relaxed);
@@ -2211,6 +2257,22 @@ impl Host {
                 // SAFETY: a plain query.
                 && unsafe { self.device.GetDeviceRemovedReason() }.is_ok()
             {
+                // Mac: which programs the ended submission ran (the first
+                // twenty such submissions), so that a page fault or a lock-up
+                // names its suspects.
+                static NAMED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if NAMED.fetch_add(1, Ordering::Relaxed) < 20 {
+                    let pipelines: std::collections::BTreeSet<String> = runs
+                        .iter()
+                        .flat_map(|l| l.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                        .collect();
+                    tracing::warn!(
+                        lists = runs.len(),
+                        frame = crate::frame::current(),
+                        ?pipelines,
+                        "the host GPU ended this submission: its programs"
+                    );
+                }
                 self.lost(&mut submitted, mark);
             }
             #[cfg(feature = "diagnostics")]
@@ -2273,6 +2335,10 @@ impl Host {
             }
             let _ = (i, started);
         }
+        // The GPU fence has completed: return worker-owned staging chunks now.
+        if let Some(u) = &uploads {
+            u.release_worker();
+        }
         let _ = &firsts;
         let gpu = prepared.elapsed();
         SUBMISSION_US[0].fetch_add((prepared - started).saturating_sub(aside).as_micros() as u64, Ordering::Relaxed);
@@ -2316,6 +2382,12 @@ impl Host {
                 removed_during(runs, removed_in)
             ));
         }
+        // mac: `VICTORY_FLICKER_WATCH=1`: lists whose indirect records ran
+        // past the budget.
+        if crate::flicker::on() {
+            let words: Vec<u32> = runs.iter().filter_map(|l| l.budget_word()).collect();
+            crate::flicker::log_budgets(crate::queue::presented(), &words);
+        }
         // What shaders wrote goes back before the bottom-of-pipe writes,
         // which tell the title the GPU is done; each range once per
         // submission, however many dispatches declared it (the world's
@@ -2341,24 +2413,46 @@ impl Host {
             .collect();
         crate::memory::note_submission(missed.contains(&true));
         let withholding = crate::memory::withholding();
+        // mac (`VICTORY_NULL_PAGE=1`): ranges that would be withheld if
+        // null-page reads were a miss (indices into `back`).
+        let spared = crate::memory::spared_withholding();
+        let mut spared_at = Vec::new();
         for (list, &missed) in runs.iter().zip(&missed) {
             let deferred = list.deferred();
             let missed = missed || withholding && !deferred.missed.is_empty();
+            let spared = spared && !deferred.missed.is_empty();
             for step in &deferred.copies {
-                if let Step::GpuWrite(shadow, address, len, _, memory) = step {
+                if let Step::GpuWrite(shadow, address, len, marked, memory) = step {
+                    // mac: `VICTORY_FLIGHTS_WITH=writes`: an aliased copy's
+                    // unmarked range is noted now, for its copy-back below
+                    // to tell the other trackers, not when the submission
+                    // was prepared (`Shadow::writing`): a submission prepared
+                    // beside the one before noted it there, and that one's
+                    // finish took it.
+                    if !*marked && shadow.is_aliased() && unwaited::flights::with_writes() {
+                        shadow.writing(*address, *len, false);
+                    }
                     let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
                     // A range both kinds declare is withheld whole.
                     let goes_back = !(missed && *memory);
-                    match index.get(&key) {
-                        Some(&i) => back[i].3 &= goes_back,
+                    let i = match index.get(&key) {
+                        Some(&i) => {
+                            back[i].3 &= goes_back;
+                            i
+                        }
                         None => {
                             index.insert(key, back.len());
                             back.push((shadow.clone(), *address, *len, goes_back));
+                            back.len() - 1
                         }
+                    };
+                    if spared && *memory {
+                        spared_at.push(i);
                     }
                 }
             }
         }
+        back.iter().for_each(|b| unwaited::lines::declared(&b.0));
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -2371,6 +2465,12 @@ impl Host {
             let copy = std::sync::Arc::as_ptr(&b.0) as usize;
             b.3 = !held.iter().any(|&(c, a, n)| c == copy && a < b.1 + b.2 && b.1 < a + n);
         }
+        if !spared_at.is_empty() {
+            spared_at.sort_unstable();
+            spared_at.dedup();
+            let bytes: usize = spared_at.iter().filter(|&&i| back[i].3).map(|&i| back[i].2).sum();
+            crate::memory::pointer_pages::note_spared(bytes as u64);
+        }
         // Pages shaders marked first: the copy-backs below end what the
         // copies keep for them.
         let withheld: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = back
@@ -2382,6 +2482,8 @@ impl Host {
         // Texture views left null that shaders read: made for what follows.
         let read = crate::shadow::take_reads();
         if !read.is_empty() {
+            // mac: `VICTORY_PLACED_AT_ONCE=read` keeps when slots were read.
+            crate::placed_read::note_reads(&read);
             crate::descriptor::make_read(&read);
         }
         // Lanes that gave up waiting for a 64-bit atomic's lock: their
@@ -2398,6 +2500,7 @@ impl Host {
                 );
             }
         }
+        free_locks::after_submission(gave_up);
         let total_back_bytes: usize = back
             .iter()
             .filter(|b| b.3)
@@ -2475,6 +2578,7 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+                unwaited::lines::word(at, bytes);
             }
         }
         // The submission has run and the next waits for our lock. Host
@@ -2718,6 +2822,19 @@ impl Host {
 }
 
 impl HostList {
+    /// mac: the `VICTORY_AB` side (`crate::ab`; false: A) the switches read
+    /// while it records: its title list's, from that list's reset, which
+    /// it takes when it becomes the list's current one (`crate::list`).
+    /// Lists of ours: always A.
+    pub(crate) fn ab(&self) -> bool {
+        self.ab.load(Ordering::Relaxed)
+    }
+
+    /// mac: [`HostList::ab`] from now on.
+    pub(crate) fn set_ab(&self, b: bool) {
+        self.ab.store(b, Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -2899,6 +3016,7 @@ impl HostList {
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.widened_new.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_sources.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -3131,6 +3249,11 @@ impl HostList {
     /// After the title's buffer/UAV barrier, widen the shadow ranges written
     /// before it so later SRVs in this submission see the UAV output.
     pub(crate) fn sync_widened(&self) {
+        // mac: `VICTORY_WIDENED_IN_PLACE=1`, without copying the history
+        // (on the list's `VICTORY_AB` side, the same from reset to close).
+        if crate::mac_switches::widened_in_place_at(self.ab()) {
+            return self.sync_widened_in_place();
+        }
         let mut pending = self.widened_pending.lock().unwrap_or_else(|e| e.into_inner());
         let events = std::mem::take(&mut *pending);
         let mut expanded = Vec::new();
@@ -3191,7 +3314,8 @@ impl HostList {
         if writes.is_empty() {
             return;
         }
-        let Some(views) = crate::widened::sync(self, &writes, synced, &ready) else {
+        crate::widened::count_history(false, writes.len());
+        let Some(views) = crate::widened::sync(self, &writes[..synced], &writes[synced..], &ready) else {
             return;
         };
         self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).extend(sampled);
@@ -3232,7 +3356,14 @@ impl HostList {
     /// Returns widened buffers to common so the CPU can refresh them before
     /// the next submission.
     fn widen_close(&self) {
-        self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        // mac: with `VICTORY_WIDENED_IN_PLACE=1` the buffers keep their room
+        // for the list's next use, but not a peak's.
+        if crate::mac_switches::widened_in_place_at(self.ab()) {
+            self.empty_widened();
+        } else {
+            self.widened_writes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.widened_new.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
         self.widened_pending.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.widened_ready.lock().unwrap_or_else(|e| e.into_inner()).clear();
         let states = std::mem::take(&mut *self.widened_states.lock().unwrap_or_else(|e| e.into_inner()));
@@ -3456,7 +3587,7 @@ impl HostList {
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.refreshed.insert(key) {
             // What the commands read, for the order of title copies.
-            if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+            if crate::mac_switches::copy_order_split_at(self.ab()).is_some_and(|longest| len <= longest) {
                 deferred.reads.insert(address, address.saturating_add(len), 0);
             }
             deferred
@@ -3476,7 +3607,7 @@ impl HostList {
     /// The title records a copy into `[dst, dst + len)` in this list
     /// (noted with `VICTORY_COPY_ORDER=split`, for [`copy_order_parts`]).
     pub(crate) fn title_copies(&self, dst: usize, len: usize) {
-        if len > 0 && crate::mac_switches::copy_order_split().is_some() {
+        if len > 0 && crate::mac_switches::copy_order_split_at(self.ab()).is_some() {
             self.deferred().copied.push((dst, len));
         }
     }
@@ -3742,6 +3873,19 @@ impl HostList {
         *self.budget_from.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// mac: the list's own budget word as it is now, if this recording
+    /// zeroed and charged it (not one it shares with the list before it,
+    /// which reads that one): read once the list has run
+    /// (`VICTORY_FLICKER_WATCH`).
+    fn budget_word(&self) -> Option<u32> {
+        if self.budget_from.lock().unwrap_or_else(|e| e.into_inner()).is_some() || !self.deferred().budget_zeroed {
+            return None;
+        }
+        let (_, data) = self.budget.get()?.as_ref()?;
+        // SAFETY: a mapped word of a live buffer; the list has run.
+        Some(unsafe { (*data as *const u32).read_volatile() })
+    }
+
     /// The work charged so far to the budget the list's indirect executions
     /// charge, as its word is now (read when the list is not running).
     #[cfg(test)]
@@ -3759,7 +3903,7 @@ impl HostList {
     /// into them recorded here keeps its order with the draw
     /// (`VICTORY_COPY_ORDER=split`).
     pub(crate) fn note_hoisted_read(&self, address: usize, len: usize) {
-        if crate::mac_switches::copy_order_split().is_some_and(|longest| len <= longest) {
+        if crate::mac_switches::copy_order_split_at(self.ab()).is_some_and(|longest| len <= longest) {
             self.deferred().reads.insert(address, address.saturating_add(len), 0);
         }
     }
@@ -3985,7 +4129,9 @@ impl HostList {
                     if batch.rewritten(dst, src, len) {
                         continue;
                     }
+                    batch.in_title_copy = true;
                     batch.title_copied(dst, len);
+                    batch.in_title_copy = false;
                     crate::alias::title_copy(dst, len, std::mem::take(&mut batch.cut));
                     if matches!(step, Step::Move(..)) {
                         move_mapped(dst as *mut u8, src as *const u8, len);
@@ -4032,6 +4178,12 @@ impl HostList {
                     continue;
                 }
                 Step::GpuWrite(shadow, address, len, marked, _) => {
+                    // mac: `VICTORY_FLIGHTS_WITH=writes`: nothing in an
+                    // aliased copy (no snapshot to fill; the range is noted
+                    // at this submission's finish, `Host::finish`).
+                    if shadow.is_aliased() && unwaited::flights::with_writes() {
+                        continue;
+                    }
                     // The shaders start from the title's data, which a
                     // snapshot must hold (marked ranges keep none).
                     if !marked {
@@ -4091,7 +4243,12 @@ pub(crate) fn take_copy_splits() -> u64 {
 pub(crate) fn copy_order_parts(
     lists: Vec<std::sync::Arc<HostList>>,
 ) -> Vec<Vec<std::sync::Arc<HostList>>> {
-    if lists.len() < 2 || crate::mac_switches::copy_order_split().is_none() {
+    // mac: with `VICTORY_AB` flipping the split (`crate::ab`), from what
+    // each list noted on its own side: a list recorded without it noted
+    // nothing, and is not split at.
+    if lists.len() < 2
+        || (crate::mac_switches::copy_order_split().is_none() && !crate::ab::names("VICTORY_COPY_ORDER"))
+    {
         return vec![lists];
     }
     // One list's lock at a time (a title may submit a list twice). Most
@@ -4193,10 +4350,6 @@ struct Batch {
     /// reaches by its bytes only the copies that can hold them, not
     /// every copy flushed.
     extents: victory_formats::extents::Extents,
-    /// As `extents`, for the copies whose refreshes are still pending: a
-    /// title copy flushes only the ones its bytes can be in (from
-    /// pragyaangaur/VIctory-macOS 3da303b, #533).
-    pending_extents: victory_formats::extents::Extents,
     /// Aliased memory asked for (`crate::alias`), by copy: never copied,
     /// counted once per submission for the frame line.
     zero_copy: AddressMap<crate::ranges::Ranges>,
@@ -4206,6 +4359,77 @@ struct Batch {
     /// The list being prepared starts after a copy-order cut and has not
     /// made a title copy yet (`crate::alias::title_copy`).
     cut: bool,
+    /// mac: from VIctory-macOS #452 (`VICTORY_FLUSH_OVERLAPPING=1`): a title
+    /// copy not into memory shown twice flushes only the pending refreshes
+    /// its window can change ([`Batch::title_copied`]).
+    overlap_only: bool,
+    /// mac: a title copy's step is running: its refresh batches count
+    /// inside it ([`REFRESH_CLOCK`]).
+    in_title_copy: bool,
+}
+
+/// For the frame line, since the last one: title copies (not into memory
+/// shown twice), those into memory shown twice; refreshes of copies made
+/// before title copies (copies, ranges, bytes, µs); copies' refreshes a
+/// title copy left queued (`VICTORY_FLUSH_OVERLAPPING`); refreshes made by
+/// every other flush (copies, ranges, bytes, µs).
+static FLUSHES: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
+
+/// The frame line's part for the refresh flushes (`frames` since the last
+/// one): where the submission's refreshes were made, always.
+fn flush_line(frames: f64) -> String {
+    let [copies, twice, at, at_ranges, at_bytes, at_us, kept, other, other_ranges, other_bytes, other_us] =
+        FLUSHES.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!(
+        "; refresh flushes: {copies:.0} title copies ({twice:.0} into memory shown twice) flushed {at:.0} copies' \
+         refreshes ({at_ranges:.0} ranges, {:.1} MB, {:.1} ms) and left {kept:.0} queued; other flushes {other:.0} \
+         copies' refreshes ({other_ranges:.0} ranges, {:.1} MB, {:.1} ms){}",
+        at_bytes / 1e6,
+        at_us / 1e3,
+        other_bytes / 1e6,
+        other_us / 1e3,
+        if crate::mac_switches::flush_overlapping() { " (VICTORY_FLUSH_OVERLAPPING)" } else { "" }
+    )
+}
+
+/// mac: the refresh batches by the clock, since the last frame line:
+/// [`Batch::flush_work`]'s wall microseconds on the submitting thread
+/// outside a title copy's step and inside one ([`Batch::in_title_copy`]),
+/// and the refreshes' own microseconds summed over the threads that made
+/// them (what the line's "copies" ms holds of them).
+static REFRESH_CLOCK: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The frame line's part for [`REFRESH_CLOCK`] (`frames` since the last
+/// one), always, at the end of the line. `copies_ms`, the line's "copies"
+/// ms a frame, is thread time: the refreshes' microseconds on every worker
+/// of a parallel batch ([`Batch::flush_made`]) plus each title copy step's
+/// own time, which holds the wall time of the batch made before the copy.
+/// So the copies' wall time on the submitting thread is `copies_ms` less
+/// the refreshes' thread time, plus the batches made outside title copies.
+fn refresh_clock_line(frames: f64, copies_ms: f64) -> String {
+    let [outside, inside, thread] =
+        REFRESH_CLOCK.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames.max(1.0));
+    format!(
+        "; copies by the clock: {:.1} ms on the submitting thread, {:.1} ms of it in refresh batches ({inside:.1} ms \
+         of those inside title copies), whose refreshes took {thread:.1} ms of thread time",
+        (copies_ms - thread + outside).max(0.0),
+        outside + inside,
+    )
+}
+
+/// `VICTORY_SYNC_EPOCH` since the last frame line: ranges of copies with
+/// changed pages that were not current yet (asked), those of them left out
+/// because none of their pages changed, and the bytes those asked for.
+static EPOCH: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The frame line's part for `VICTORY_SYNC_EPOCH` (`frames` since the last
+/// one), empty with the switch off.
+fn epoch_line(frames: f64) -> String {
+    if !crate::mac_switches::sync_epoch(unwaited::flights::on) {
+        return String::new();
+    }
+    let [asked, left, bytes] = EPOCH.each_ref().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames.max(1.0));
+    format!("; sync epoch: {left:.0} of {asked:.0} ranges asked left out unchanged ({:.1} MB)", bytes / 1e6)
 }
 
 /// How far apart a copy's pending ranges may be and still be done as one,
@@ -4237,8 +4461,15 @@ impl Batch {
         }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        // mac: but while the submission left still runs beside this one, a
+        // clean copy its landing may tell stays, for after its finish
+        // (`crate::flights::asked`, `unwaited::flights::landing`).
+        let clean = shadow.clean();
+        if !unwaited::flights::with_landing(|beside| crate::flights::asked(clean, beside, address, len)) {
             return;
+        }
+        if clean {
+            unwaited::flights::kept_clean();
         }
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.
@@ -4255,18 +4486,30 @@ impl Batch {
             }
             return;
         }
-        let i = match self.pending.get(&key) {
-            Some(&i) => i,
-            None => {
-                let (start, len) = shadow.range();
-                self.pending_extents
-                    .flushed(key, start as usize, (start + len) as usize);
-                self.refreshes.push((shadow.clone(), Default::default()));
-                let i = self.refreshes.len() - 1;
-                self.pending.insert(key, i);
-                i
+        // From ScarlettMac 4921b7e6 (`VICTORY_SYNC_EPOCH=1`): a range no
+        // page of which the title wrote since the copy took it is left out,
+        // decided here, where `clean` above decides for the whole copy.
+        // The refresh it would get at the next flush copies the same
+        // nothing: every step of the submission that writes title memory
+        // flushes first (`title_copied`, `title_written`; with
+        // `VICTORY_FLUSH_OVERLAPPING` a title copy only what it can change,
+        // and the rest reads the same bytes later), the submission
+        // before has been finished and copied back (no flights), and its
+        // pages stay in the changed set until a take, so what the title's
+        // threads write meanwhile is for the next submission either way.
+        // Not entered in `current`: a later list asks again, as cheaply.
+        if crate::mac_switches::sync_epoch(unwaited::flights::on) {
+            EPOCH[0].fetch_add(1, Ordering::Relaxed);
+            if shadow.synced(address, len) {
+                EPOCH[1].fetch_add(1, Ordering::Relaxed);
+                EPOCH[2].fetch_add(len as u64, Ordering::Relaxed);
+                return;
             }
-        };
+        }
+        let i = *self.pending.entry(key).or_insert_with(|| {
+            self.refreshes.push((shadow.clone(), Default::default()));
+            self.refreshes.len() - 1
+        });
         for (from, to) in todo {
             self.refreshes[i].1.insert(from, to, JOIN);
         }
@@ -4291,49 +4534,17 @@ impl Batch {
         if crate::watch::aliased(at, len) {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::AliasedCopies, 1);
+            FLUSHES[1].fetch_add(1, Ordering::Relaxed);
             return self.title_written();
         }
+        FLUSHES[0].fetch_add(1, Ordering::Relaxed);
         let (from, to) = touched(at, at.saturating_add(len));
-        if from >= to {
-            return;
-        }
-        // Flush only pending refreshes whose ranges overlap the destination
-        // window; disjoint copies stay queued so they coalesce across lists.
-        // The index reaches the copies whose memory can hold the window's
-        // bytes; the rest are left queued without a look.
-        let mut overlapping = Vec::new();
-        let mut stale = 0;
-        for key in self.pending_extents.overlapping(from, to) {
-            let Some(&i) = self.pending.get(&key) else {
-                stale += 1;
-                continue;
-            };
-            let (_, ranges) = &self.refreshes[i];
-            if !ranges.iter().any(|(r_from, r_to)| r_from < to && r_to > from) {
-                continue;
-            }
-            let (shadow, ranges) = self.refreshes.swap_remove(i);
-            self.pending.remove(&key);
-            if let Some((moved, _)) = self.refreshes.get(i) {
-                self.pending
-                    .insert(std::sync::Arc::as_ptr(moved) as usize, i);
-            }
-            overlapping.push((shadow, ranges));
-        }
-        // The entries of the copies flushed above name nothing pending any
-        // more; once they outnumber the live ones, filing the live ones
-        // again costs less than walking past the dead ones.
-        if stale > self.refreshes.len() {
-            self.pending_extents.clear();
-            for (shadow, _) in &self.refreshes {
-                let (start, len) = shadow.range();
-                let key = std::sync::Arc::as_ptr(shadow) as usize;
-                self.pending_extents
-                    .flushed(key, start as usize, (start + len) as usize);
-            }
-        }
-        if !overlapping.is_empty() {
-            self.flush_work(overlapping);
+        if self.overlap_only {
+            self.flush_overlapping(from, to);
+        } else {
+            self.pending.clear();
+            let work = std::mem::take(&mut self.refreshes);
+            self.flush_work(work, true);
         }
         // Only the copies whose memory the bytes can be in: the rest
         // hold nothing of the window, and what a no-op remove would
@@ -4345,25 +4556,72 @@ impl Batch {
         }
     }
 
+    /// From VIctory-macOS #452 (18f33b86, `VICTORY_FLUSH_OVERLAPPING`): before
+    /// a title copy whose window (`touched`) is `[from, to)`, only the
+    /// pending refreshes of copies whose queued ranges reach into it are
+    /// made. The others read bytes the title copy does not change (memory
+    /// shown at two addresses never comes here), so they read the same
+    /// bytes later: they stay queued and join what later lists ask of the
+    /// same copies, made together at the submission's flush (fewer, longer
+    /// ranges, one take each, in parallel there). What the title's threads
+    /// write meanwhile is for later submissions either way.
+    fn flush_overlapping(&mut self, from: usize, to: usize) {
+        let mut overlapping = Vec::new();
+        let mut i = 0;
+        while i < self.refreshes.len() {
+            let (shadow, ranges) = &self.refreshes[i];
+            let (start, len) = shadow.range();
+            let (start, end) = (start as usize, start.saturating_add(len) as usize);
+            let reaches = start < to && end > from && ranges.iter().any(|(a, b)| a < to && b > from);
+            if !reaches {
+                i += 1;
+                continue;
+            }
+            let (shadow, ranges) = self.refreshes.swap_remove(i);
+            self.pending.remove(&(std::sync::Arc::as_ptr(&shadow) as usize));
+            // The last entry moved into `i`: its index changes.
+            if let Some((moved, _)) = self.refreshes.get(i) {
+                self.pending.insert(std::sync::Arc::as_ptr(moved) as usize, i);
+            }
+            overlapping.push((shadow, ranges));
+        }
+        FLUSHES[6].fetch_add(self.refreshes.len() as u64, Ordering::Relaxed);
+        self.flush_work(overlapping, true);
+    }
+
     /// Does the refreshes; returns the bytes copied.
     fn flush(&mut self) -> usize {
         self.pending.clear();
-        self.pending_extents.clear();
         let work = std::mem::take(&mut self.refreshes);
-        self.flush_work(work)
+        self.flush_work(work, false)
     }
 
-    /// Runs `work` refreshes, recording their covered ranges into `current`
-    /// and `extents`; returns the bytes copied.
+    /// Does the refreshes `work` (taken out of `refreshes`, with `pending`
+    /// told); `at_copy`: before a title copy (the frame line's count).
+    /// Returns the bytes copied.
     fn flush_work(
         &mut self,
         work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>,
+        at_copy: bool,
     ) -> usize {
         if work.is_empty() {
             return 0;
         }
+        let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        let _timed = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::FlushUs);
+        let _timed = crate::watch::Timed(started, crate::copystat::C::FlushUs);
+        let counted_at = if at_copy { 2 } else { 7 };
+        FLUSHES[counted_at].fetch_add(work.len() as u64, Ordering::Relaxed);
+        FLUSHES[counted_at + 1].fetch_add(work.iter().map(|(_, r)| r.iter().count() as u64).sum(), Ordering::Relaxed);
+        let total = self.flush_made(work);
+        FLUSHES[counted_at + 2].fetch_add(total as u64, Ordering::Relaxed);
+        FLUSHES[counted_at + 3].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        REFRESH_CLOCK[usize::from(self.in_title_copy)].fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        total
+    }
+
+    /// [`Batch::flush_work`]'s refreshes.
+    fn flush_made(&mut self, work: Vec<(std::sync::Arc<crate::shadow::Shadow>, crate::ranges::Ranges)>) -> usize {
         let total_requested: usize = work
             .iter()
             .flat_map(|(_, ranges)| ranges.iter())
@@ -4412,6 +4670,7 @@ impl Batch {
                     }
                     PREPARING[0].fetch_add(us, Ordering::Relaxed);
                     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                    REFRESH_CLOCK[2].fetch_add(us, Ordering::Relaxed);
                     total += copied;
                     let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                     let (_, have) = match self.current.entry(key) {
@@ -4455,6 +4714,7 @@ impl Batch {
                 }
                 PREPARING[0].fetch_add(us, Ordering::Relaxed);
                 PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+                REFRESH_CLOCK[2].fetch_add(us, Ordering::Relaxed);
                 total += copied;
                 let (from, to) = taken(from, to, (start as usize, (start + len) as usize));
                 // The copy's memory joins the index as its first range
@@ -5192,10 +5452,15 @@ impl Meter {
             frames: self.frames,
             drawn: crate::draw::drawn(),
         };
-        let Some(caption_rates) = self.caption_window.sample(next, Duration::from_secs(1)) else {
+        // mac: at a `VICTORY_AB` flip (`crate::ab`) the frame line's window
+        // ends, so that no line mixes the two sides.
+        let flipped = crate::ab::take_flip();
+        let caption_rates = self.caption_window.sample(next, Duration::from_secs(1));
+        if caption_rates.is_none() && !flipped {
             return;
-        };
-        if let Some(report) = self.report_window.sample(next, Duration::from_secs(5)) {
+        }
+        let report_every = if flipped { Duration::ZERO } else { Duration::from_secs(5) };
+        if let Some(report) = self.report_window.sample(next, report_every) {
             let FrameRates { frames: report_frames, fps, ms, draws } = report;
             let [cpu, gpu] = SUBMISSION_US.each_ref().map(|counter| {
                 counter.swap(0, Ordering::Relaxed) as f64 / 1000.0 / report_frames
@@ -5212,6 +5477,21 @@ impl Meter {
             let zero_copy = crate::alias::frame_line(report_frames);
             // mac: the guard lock's waits and the protection calls, always.
             let guards = crate::watch::frame_line(report_frames);
+            // From ScarlettMac 4921b7e6: with `VICTORY_SYNC_EPOCH=1` only.
+            let epoch = epoch_line(report_frames);
+            // mac: write snapshots and their copy-back compares, always
+            // (`VICTORY_SNAPSHOT_SPANS`, from VIctory-macOS #436).
+            let snapshots = crate::shadow::snapshot_line(report_frames);
+            // mac: where the refreshes were made (`VICTORY_FLUSH_OVERLAPPING`,
+            // from VIctory-macOS #452), always.
+            let flushes = flush_line(report_frames);
+            // mac: the copies' wall time against their thread time, always.
+            let refresh_clock = refresh_clock_line(report_frames, copy_ms);
+            // mac: what the marked pages' copy-back compared and wrote, always.
+            let marked = crate::shadow::marked_back_line(report_frames);
+            // mac: the queues' pieces, joined or not (`VICTORY_COALESCE_PIECES`,
+            // from VIctory-macOS #419), always.
+            let pieces = joined::frame_line(report_frames);
             let dropped = crate::draw::take_dropped() as f64 / report_frames;
             let indirect = crate::list::take_indirect() as f64 / report_frames;
             let [records, counted] =
@@ -5236,15 +5516,22 @@ impl Meter {
                  {hoists:.0} lists cut for them; {batched:.0} of them in {batches:.0} batches; \
                  {for_dispatches:.0} clamps of indirect dispatches, {dispatches_hoisted:.0} of them \
                  in the list before, {dispatch_hoists:.0} lists cut at one, {dispatches_batched:.0} \
-                 batched){zero_copy}{guards}",
-                making = crate::pipeline::making()
+                 batched){zero_copy}{guards}{epoch}{snapshots}{flushes}{pieces}{refresh_clock}{marked}{ab}",
+                 making = crate::pipeline::making(),
+                 ab = crate::ab::label().map_or(String::new(), |side| format!("; ab={side}"))
             );
             unwaited::log(report_frames);
             crate::ray_skip::log(report_frames);
             crate::texback::log(report_frames);
             crate::physical_runs::log(report_frames);
+            // mac: widened views and their barrier history copies.
+            crate::widened::log(report_frames);
             // mac: the heap locks' waits (`VICTORY_HEAP_LOCKS`).
             crate::descriptor::slots::log(report_frames);
+            // mac: `VICTORY_PLACED_AT_ONCE=read`'s counts.
+            crate::placed_read::log(report_frames);
+            // mac: the view table and its lock (`VICTORY_VIEW_INLINE`), always.
+            crate::descriptor::log_views(report_frames);
             crate::bindless::log_held(report_frames);
             crate::descriptor::pool::log(report_frames);
             crate::descriptor::reports::log(report_frames);
@@ -5299,6 +5586,7 @@ impl Meter {
                 log_gpu_times(report_frames);
                 crate::copystat::log(report_frames);
                 crate::bindless::log(report_frames);
+                crate::heap_worker::log(report_frames);
                 crate::shadow::log_views(report_frames);
                 crate::shadow::log_lookups(report_frames);
                 let [n, bytes] = [0, 1].map(|i| crate::list::READ_BACKS[i].swap(0, Ordering::Relaxed));
@@ -5327,6 +5615,7 @@ impl Meter {
                 }
             }
         }
+        let Some(caption_rates) = caption_rates else { return };
         if self.caption.is_none() {
             // The window's own text, read without a message.
             let mut buffer = vec![0u16; 512];
@@ -6218,11 +6507,47 @@ mod batch {
         done(pb, Some(b));
     }
 
-    /// A non-aliased title copy flushes only overlapping pending refreshes,
-    /// invalidates their destination coverage, and leaves disjoint pending
-    /// shadows queued so subsequent `add`s coalesce until final `flush()`.
+    /// From VIctory-macOS #452 (`VICTORY_FLUSH_OVERLAPPING`): the same, with
+    /// only overlapping refreshes made before a title copy: the disjoint
+    /// copy's refresh waits for the submission's flush, once.
     #[test]
-    fn selective_title_copy_flushes_only_overlapping_pending_shadows() {
+    fn overlapping_title_copy_refreshes_its_destination_and_defers_the_rest() {
+        let Some((pa, a)) = plain(4) else {
+            return; // no host GPU here
+        };
+        let (pb, b) = plain(4).expect("second host buffer");
+        fill(pa, PAGE, 0x12);
+        fill(pa + PAGE, PAGE, 0x34);
+        fill(pb, 4 * PAGE, 0x56);
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        let list = super::host().unwrap().new_list().unwrap();
+        list.defer_move((pa + PAGE) as *mut u8, pa as *const u8, 2 * PAGE);
+        list.run_deferred(&mut batch, None);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(
+            batch.flush(),
+            2 * PAGE + 4 * PAGE,
+            "the overlapping copy's destination and the disjoint copy, deferred"
+        );
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
+        assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
+        batch.add(&a, pa, 4 * PAGE);
+        batch.add(&b, pb, 4 * PAGE);
+        assert_eq!(batch.flush(), 0, "both copies are now current");
+        done(pa, Some(a));
+        done(pb, Some(b));
+    }
+
+    /// From VIctory-macOS #452: a title copy flushes only the pending
+    /// refreshes that reach its window, the overlapping copy holds the
+    /// bytes from before it, the others stay queued (their places in
+    /// `pending` kept right) and take later asks of the same copies.
+    #[test]
+    fn a_title_copy_flushes_only_overlapping_pending_refreshes() {
         let Some((pa, a)) = plain(4) else {
             return; // no host GPU here
         };
@@ -6231,77 +6556,44 @@ mod batch {
         fill(pa, 4 * PAGE, 0x11);
         fill(pb, 4 * PAGE, 0x22);
         fill(pc, 2 * PAGE, 0x33);
-
-        let mut batch = Batch::default();
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
         batch.add(&a, pa, 4 * PAGE);
         batch.add(&b, pb, 4 * PAGE);
         batch.add(&c, pc, 2 * PAGE);
-        assert_eq!(batch.refreshes.len(), 3);
-        assert_eq!(batch.pending.len(), 3);
-
-        // Copy into `a` (overlapping) while `b` and `c` are disjoint.
-        let src = [0xAAu8; 64];
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (3, 3));
+        let src = [0xaau8; 64];
         title_copy(&mut batch, pa + PAGE, src.as_ptr() as usize, src.len());
-
-        // `a` was flushed before the copy, while `b` and `c` stayed queued.
-        assert_eq!(
-            batch.refreshes.len(),
-            2,
-            "disjoint shadows remain queued across title_copied"
-        );
-        assert_eq!(batch.pending.len(), 2);
-        assert_eq!(
-            a.read_host(pa as u64, 1)[0],
-            0x1111_1111,
-            "overlapping shadow was flushed before title copy"
-        );
-        assert_eq!(
-            b.read_host(pb as u64, 1)[0],
-            0,
-            "disjoint shadow was not prematurely flushed"
-        );
-        assert_eq!(
-            c.read_host(pc as u64, 1)[0],
-            0,
-            "second disjoint shadow was not prematurely flushed"
-        );
-
-        // Subsequent adds for `b` and `c` coalesce into their still-pending
-        // entries; `a` queues only the invalidated destination window.
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (2, 2), "the disjoint ones stay queued");
+        for (i, (copy, _)) in batch.refreshes.iter().enumerate() {
+            assert_eq!(batch.pending[&(Arc::as_ptr(copy) as usize)], i, "their places");
+        }
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1111_1111, "made before the copy");
+        assert_eq!(b.read_host(pb as u64, 1)[0], 0, "not made yet");
+        assert_eq!(c.read_host(pc as u64, 1)[0], 0, "not made yet");
+        // Later lists ask again: `b` and `c` join their queued refreshes,
+        // `a` asks for the window the copy wrote.
         batch.add(&a, pa, 4 * PAGE);
         batch.add(&b, pb, 4 * PAGE);
         batch.add(&c, pc, 2 * PAGE);
-        assert_eq!(batch.refreshes.len(), 3);
-        assert_eq!(batch.pending.len(), 3);
-
-        let dest_len = if crate::watch::fault_tracking() {
-            PAGE
-        } else {
-            src.len()
-        };
-        assert_eq!(
-            batch.flush(),
-            dest_len + 4 * PAGE + 2 * PAGE,
-            "final flush copies only `a`'s destination plus the two deferred disjoint shadows once"
-        );
-        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0xAAAA_AAAA);
+        assert_eq!((batch.refreshes.len(), batch.pending.len()), (3, 3));
+        let window = if crate::watch::fault_tracking() { PAGE } else { src.len() };
+        assert_eq!(batch.flush(), window + 4 * PAGE + 2 * PAGE, "each once");
+        assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0xaaaa_aaaa);
         assert_eq!(b.read_host(pb as u64, 1)[0], 0x2222_2222);
         assert_eq!(c.read_host(pc as u64, 1)[0], 0x3333_3333);
-
         batch.add(&a, pa, 4 * PAGE);
         batch.add(&b, pb, 4 * PAGE);
         batch.add(&c, pc, 2 * PAGE);
-        assert_eq!(batch.flush(), 0, "all three shadows are current after final flush");
-
+        assert_eq!(batch.flush(), 0, "all three current");
         done(pa, Some(a));
         done(pb, Some(b));
         done(pc, Some(c));
     }
 
-    /// An aliased title copy still falls back to flushing every pending
-    /// shadow conservatively, even disjoint ones.
+    /// From VIctory-macOS #452: a title copy into memory shown at two
+    /// addresses still makes every pending refresh first, disjoint or not.
     #[test]
-    fn aliased_title_copy_still_flushes_pending_disjoint_shadows() {
+    fn a_title_copy_into_memory_shown_twice_still_flushes_everything() {
         let (a, _b) = crate::watch::tests::twin_views(2);
         let Some((pd, d)) = plain(2) else {
             return; // no host GPU here
@@ -6309,18 +6601,12 @@ mod batch {
         fill(pd, 2 * PAGE, 0x44);
         let src = crate::watch::tests::pool(1);
         fill(src, PAGE, 0x55);
-
-        let mut batch = Batch::default();
+        let mut batch = Batch { overlap_only: true, ..Batch::default() };
         batch.add(&d, pd, 2 * PAGE);
         assert_eq!(batch.refreshes.len(), 1);
         title_copy(&mut batch, a, src, PAGE);
-        assert_eq!(
-            batch.refreshes.len(),
-            0,
-            "aliased copy must conservatively flush pending disjoint shadows"
-        );
+        assert_eq!(batch.refreshes.len(), 0, "made before the copy");
         assert_eq!(d.read_host(pd as u64, 1)[0], 0x4444_4444);
-
         done(pd, Some(d));
         done(src, None);
     }
@@ -6874,6 +7160,58 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
             pixels,
             "a draw on the new queue runs whole"
         );
+    }
+
+    /// Background heap-worker staging runs concurrently with `Host::quiet()` /
+    /// `HostHeap::new()` and `Host::execute()` without deadlock or lock
+    /// inversion (verifies Issue #31 compatibility).
+    #[test]
+    fn worker_concurrent_with_quiet_heap_creation_does_not_deadlock() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _worker = crate::heap_worker::EnableForTest::new();
+        let null = std::ptr::null();
+        let heap_desc: [u32; 8] = [0, 32, 1, 0, 0, 0, 0, 0];
+        let mut heap = null;
+        let heap_iid = crate::object::guid(
+            0x8efb471d,
+            0x616c,
+            0x4f49,
+            [0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51],
+        );
+        assert_eq!(
+            crate::descriptor::create_heap(null, heap_desc.as_ptr().cast(), &heap_iid, &mut heap),
+            0
+        );
+        let title_heap = crate::descriptor::heap(heap);
+        let _ = title_heap.host().expect("host view heap");
+        let pool = crate::watch::tests::pool(1);
+        // SAFETY: dedicated pool page.
+        unsafe { std::ptr::write_bytes(pool as *mut u8, 0x22, crate::watch::PAGE) };
+        let placed_res = [3u32, 0, 0, 0, 4, 0, 1, 1 | 1 << 16, 28, 1, 0, 0x100, 0, 0];
+        let mut desc = [0u32; 16];
+        (desc[0], desc[1], desc[2], desc[5]) = (28, 4, 0x1688, 1);
+        (desc[10], desc[11]) = (pool as u32, (pool >> 32) as u32);
+        for i in 0..8u64 {
+            crate::descriptor::create_placed_srv(null, &placed_res, &desc, title_heap.start + 32 * i);
+        }
+        assert!(crate::heap_worker::kick(title_heap));
+        let quiet_thread = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let _q = host.quiet();
+                let _ = crate::descriptor::host::HostHeap::new(false, 64);
+            }
+        });
+        let list = host.new_list().unwrap();
+        for _ in 0..4 {
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+        }
+        quiet_thread.join().unwrap();
+        crate::object::release_ref(heap);
+        crate::watch::tests::free(pool);
     }
 }
 

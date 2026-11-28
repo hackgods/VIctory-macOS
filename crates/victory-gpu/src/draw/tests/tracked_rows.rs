@@ -113,6 +113,8 @@ fn check_rows(address: usize, mixed: bool) {
 
 #[test]
 fn mixed_pages_and_deferred_rows_reach_the_sampled_texture() {
+    // mac: #416's path is behind `VICTORY_DIRTY_ROWS`.
+    crate::texture::ROWS_IN_TEST.set(true);
     if crate::host::host().is_none() {
         return;
     }
@@ -238,6 +240,8 @@ fn check_block_rows(address: usize, mixed: bool) {
 
 #[test]
 fn block_compressed_rows_keep_their_block_alignment_across_pages() {
+    // mac: #416's path is behind `VICTORY_DIRTY_ROWS`.
+    crate::texture::ROWS_IN_TEST.set(true);
     if crate::host::host().is_none() {
         return;
     }

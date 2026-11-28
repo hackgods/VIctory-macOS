@@ -25,6 +25,29 @@ use crate::{HleExport, HleModule};
 // macOS port: input switches of our own (`VICTORY_INPUT_*`), off by default.
 #[path = "gameinput_mac.rs"]
 mod mac;
+// macOS port: `VICTORY_KEYS=menu:<key>`, presses at the start screens by state.
+#[cfg(any(windows, test))]
+#[path = "gameinput_menu.rs"]
+mod menu;
+
+/// A `VICTORY_KEYS` key: a letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`,
+/// `Up`, `Down`, `Left`, `Right` (the stand-in pad's table maps them to
+/// buttons).
+#[cfg(any(windows, test))]
+fn virtual_key(name: &str) -> Option<u8> {
+    Some(match name.trim() {
+        "Enter" => 0x0D,
+        "Esc" => 0x1B,
+        "Tab" => 0x09,
+        "Back" => 0x08,
+        "Up" => 0x26,
+        "Down" => 0x28,
+        "Left" => 0x25,
+        "Right" => 0x27,
+        k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase(),
+        _ => return None,
+    })
+}
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -1233,6 +1256,8 @@ mod host {
         refocus: super::mac::Refocus,
         /// macOS port: `VICTORY_INPUT_WATCH`.
         watch: super::mac::Watch,
+        /// macOS port: `VICTORY_PAD_REARM`.
+        rearm: super::mac::PadRearm,
     }
 
     fn key_state(vk: u8) -> KeyState {
@@ -1250,20 +1275,25 @@ mod host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
             if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
                 self.watch.pad(slot, None, now());
-                return None;
+                return self.rearm.pad(slot, Some(None), now());
+            }
+            // macOS port: XInput is not asked while `VICTORY_PAD_REARM`
+            // re-arms its reads; the slot reports what the watchdog says.
+            if !self.rearm.may_ask(now()) {
+                return self.rearm.pad(slot, None, now());
             }
             let mut state = XINPUT_STATE::default();
             // SAFETY: room for the state.
             if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
                 self.watch.pad(slot, None, now());
-                return None;
+                return self.rearm.pad(slot, Some(None), now());
             }
             self.empty_until[slot] = None;
             let pad = convert(&state.Gamepad);
             let packet = state.dwPacketNumber;
             self.watch.pad(slot, Some((pad, packet)), now());
-            Some(pad)
+            self.rearm.pad(slot, Some(Some((pad, packet))), now())
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
@@ -1300,6 +1330,12 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            self.watch.rumble(slot, low, high, now());
+            // macOS port: `VICTORY_PAD_RUMBLE=0` drops it; not while
+            // `VICTORY_PAD_REARM` re-arms XInput.
+            if super::mac::rumble_dropped() || !self.rearm.rumble(slot, low, high, now()) {
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1318,43 +1354,64 @@ mod host {
     fn scripted() -> Vec<u8> {
         // macOS port: `<seconds>:<key>[:<seconds held>]`; a key is held
         // 0.2 s unless the entry says how long (a stick direction needs
-        // seconds at a frame or two per second).
-        static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8, Duration)>)> = LazyLock::new(|| {
+        // seconds at a frame or two per second). `menu:<key>[:<every>
+        // [:<draws>]]` presses at the start screens by what the frames show
+        // (`menu`), alone or with timed entries.
+        type Script = (Instant, Vec<(Duration, u8, Duration)>, Mutex<Vec<super::menu::State>>);
+        static SCRIPT: LazyLock<Script> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
+            let mut menus = Vec::new();
+            for entry in list.split(',').filter(|e| e.trim().starts_with("menu:")) {
+                match super::menu::parse(entry, super::virtual_key) {
+                    Some(menu) => menus.push(super::menu::State::new(menu)),
+                    None => tracing::warn!(entry, "VICTORY_KEYS: a menu entry that does not parse; left out"),
+                }
+            }
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let (key, held) = match key.split_once(':') {
-                    Some((key, held)) => (key, Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?),
+                    Some((key, held)) => (
+                        key,
+                        Duration::try_from_secs_f64(held.trim().parse().ok()?).ok()?,
+                    ),
                     None => (key, Duration::from_millis(200)),
                 };
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = super::virtual_key(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
                     held,
                 ))
             });
-            (Instant::now(), keys.collect())
+            (Instant::now(), keys.collect(), Mutex::new(menus))
         });
-        let (start, keys) = &*SCRIPT;
+        let (start, keys, menus) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<u8> = keys
+            .iter()
             .filter(|&&(at, _, held)| (at..at + held).contains(&now))
             .map(|&(_, vk, _)| vk)
-            .collect()
+            .collect();
+        let mut menus = lock(menus);
+        if !menus.is_empty() {
+            let (frames, draws) = victory_gpu::queue::last_presented();
+            let waiting = victory_gpu::pipeline::waiting();
+            let sample = super::menu::Sample {
+                frames,
+                draws,
+                waiting,
+            };
+            for menu in menus.iter_mut() {
+                let (held, event) = menu.step(now.as_secs_f64(), sample);
+                if let Some(event) = event {
+                    tracing::info!("{}", menu.line(&event));
+                }
+                if held && !down.contains(&menu.menu.key) {
+                    down.push(menu.menu.key);
+                }
+            }
+        }
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
@@ -1835,7 +1892,10 @@ mod tests {
         }
         hub.poll();
 
-        assert_eq!(current(hub, GAMEPAD_KIND, FALLBACK), Err(DEVICE_DISCONNECTED));
+        assert_eq!(
+            current(hub, GAMEPAD_KIND, FALLBACK),
+            Err(DEVICE_DISCONNECTED)
+        );
         let r = current(hub, GAMEPAD_KIND, 1).unwrap();
         assert_eq!(
             pad(r),

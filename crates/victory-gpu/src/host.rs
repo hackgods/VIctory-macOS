@@ -71,6 +71,8 @@ pub(crate) mod unwaited;
 pub(crate) mod joined;
 // mac: `VICTORY_WIDENED_IN_PLACE` (VIctory-macOS #520).
 mod widened_in_place;
+// mac: `VICTORY_FREE_LOCKS=1` (halfwave50 issue #7).
+mod free_locks;
 
 /// What the end of a submission ([`Host::finish`]) needs from its start:
 /// how long the host GPU was waited for, the list the device was removed
@@ -2454,6 +2456,7 @@ impl Host {
                 );
             }
         }
+        free_locks::after_submission(gave_up);
         let total_back_bytes: usize = back
             .iter()
             .filter(|b| b.3)

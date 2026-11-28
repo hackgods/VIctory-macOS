@@ -2685,6 +2685,37 @@ pub(crate) mod tests {
         unsafe { *(b.data as *mut u32).add((bit / 32) as usize) |= 1 << (bit % 32) };
     }
 
+    /// Lock word `index` of the emulated 64-bit atomics in the bitmap of
+    /// shaders that use title memory (`memory`) or of the others, as a
+    /// pointer into the mapped buffer.
+    fn lock_at(memory: bool, index: u32) -> *mut u32 {
+        assert!(index < victory_shader::emit::ATOMIC_LOCKS);
+        let b = bitmap(memory).expect("a host GPU");
+        // SAFETY: a lock word of the mapped bitmap.
+        unsafe { (b.data as *mut u32).add((victory_shader::emit::ATOMIC_LOCKS_AT / 4 + index) as usize) }
+    }
+
+    /// Sets lock word `index` (see [`lock_at`]), as a shader's lane does
+    /// when it takes the lock. The caller holds the submission lock.
+    pub(crate) fn set_lock_word(memory: bool, index: u32, value: u32) {
+        // SAFETY: a lock word; no submission runs.
+        unsafe { *lock_at(memory, index) = value };
+    }
+
+    /// Lock word `index` (see [`lock_at`]).
+    pub(crate) fn lock_word(memory: bool, index: u32) -> u32 {
+        // SAFETY: a lock word; no submission runs.
+        unsafe { *lock_at(memory, index) }
+    }
+
+    /// Adds `lanes` to the give-up count of the bitmap, as lanes that waited
+    /// out their bound do. The caller holds the submission lock.
+    pub(crate) fn add_gave_up(memory: bool, lanes: u32) {
+        let b = bitmap(memory).expect("a host GPU");
+        // SAFETY: the count dword of the mapped bitmap; no submission runs.
+        unsafe { *(b.data as *mut u32).add((victory_shader::emit::ATOMIC_LOCKS_GAVE_UP_AT / 4) as usize) += lanes };
+    }
+
     /// After a submission the host GPU ended, every lock word of the
     /// emulated 64-bit atomics is free again, and the written pages and read
     /// marks before them and the give-up count after them stay as they were

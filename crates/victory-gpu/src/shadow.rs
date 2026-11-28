@@ -654,6 +654,12 @@ impl Shadow {
         shadow
     }
 
+    /// Whether this is title memory itself (a pool aliased zero-copy), not
+    /// a copy of it (`crate::view_reach`).
+    pub(crate) fn zero_copy(&self) -> bool {
+        self.aliased
+    }
+
     #[cfg(test)]
     pub(crate) fn is_aliased(&self) -> bool {
         self.aliased

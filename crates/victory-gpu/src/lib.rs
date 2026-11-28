@@ -108,6 +108,8 @@ mod texture;
 #[cfg(windows)]
 mod twin;
 #[cfg(windows)]
+mod view_reach;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod widened;

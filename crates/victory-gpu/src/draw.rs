@@ -1341,6 +1341,11 @@ impl State {
             not_run("a root view outside title buffers");
             return None;
         };
+        crate::view_reach::note(
+            crate::view_reach::Kind::Root,
+            shadow.offset(address),
+            shadow.zero_copy(),
+        );
         let Some(offset) = u32::try_from(shadow.offset(address)).ok() else {
             not_run("a root view 4 GiB or more into its copy");
             return None;
@@ -1380,6 +1385,7 @@ impl State {
         let index = self.root_run.1;
         self.root_run.1 += 1;
         ROOT_VIEW_SLOTS.fetch_add(1, Ordering::Relaxed);
+        crate::view_reach::note_root_view(shadow.range().1, shadow.zero_copy());
         host.raw_view_at(index, Some(&shadow.buffer), 0, shadow.range().1 & !3, uav);
         if uav {
             host.set_mark(index, shadow.mark_entry(shadow.range().0));

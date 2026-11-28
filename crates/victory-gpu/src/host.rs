@@ -5712,6 +5712,7 @@ impl Meter {
                 making = crate::pipeline::making()
             );
             crate::ray_skip::log(report_frames);
+            crate::view_reach::log();
             crate::ambient_estimate::log(report_frames);
             overlap::log(report_frames);
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

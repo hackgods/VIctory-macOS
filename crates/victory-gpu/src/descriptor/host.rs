@@ -3187,6 +3187,11 @@ fn buffer_srv(
         return None;
     };
     buffer.FirstElement = shadow.offset(start) / element;
+    crate::view_reach::note(
+        crate::view_reach::Kind::Table,
+        shadow.offset(start),
+        shadow.zero_copy(),
+    );
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {
         #[cfg(feature = "diagnostics")]
@@ -3319,6 +3324,11 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement = shadow.offset(start) / element;
+    crate::view_reach::note(
+        crate::view_reach::Kind::Table,
+        shadow.offset(start),
+        shadow.zero_copy(),
+    );
     buffer.CounterOffsetInBytes = 0;
     let (first, count) = (buffer.FirstElement, buffer.NumElements);
     if !in_buffer(&shadow.buffer, first, count, element) {

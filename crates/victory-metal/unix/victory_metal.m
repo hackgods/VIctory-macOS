@@ -351,6 +351,375 @@ static NTSTATUS vm_turns(void *args) {
     }
 }
 
+/* Objects the Windows side holds by handle: no-copy buffers, shared
+ * events and runs not waited for yet. Guarded by `lock`. */
+static NSMutableDictionary<NSNumber *, id> *objects;
+static uint64_t next_handle = 1;
+
+static uint64_t keep(id object) {
+    if (!objects) objects = [NSMutableDictionary new];
+    uint64_t h = next_handle++;
+    objects[@(h)] = object;
+    return h;
+}
+
+static id<MTLBuffer> held_buffer(uint64_t handle) {
+    id o = objects[@(handle)];
+    return [o conformsToProtocol:@protocol(MTLBuffer)] ? o : nil;
+}
+
+static id<MTLSharedEvent> held_event(uint64_t handle) {
+    id o = objects[@(handle)];
+    return [o conformsToProtocol:@protocol(MTLSharedEvent)] ? o : nil;
+}
+
+static NTSTATUS vm_wrap(void *args) {
+    struct vm_wrap *w = args;
+    if (!w || w->size != sizeof(*w)) return STATUS_INVALID_PARAMETER;
+    uint64_t page = (uint64_t)getpagesize();
+    if (!w->length || w->address % page || w->length % page) {
+        set_error(w->error, @"the range must be whole pages");
+        return STATUS_INVALID_PARAMETER;
+    }
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        if (!ensure_open(w->error)) {
+            pthread_mutex_unlock(&lock);
+            return STATUS_UNSUCCESSFUL;
+        }
+        MTLResourceOptions options = MTLResourceStorageModeShared;
+        if (w->flags & VM_WRAP_UNTRACKED) options |= MTLResourceHazardTrackingModeUntracked;
+        uint64_t t0 = now_ns();
+        id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:(void *)(uintptr_t)w->address
+                                                         length:w->length
+                                                        options:options
+                                                    deallocator:nil];
+        w->wrap_ns = now_ns() - t0;
+        if (!buffer) {
+            pthread_mutex_unlock(&lock);
+            set_error(w->error, @"newBufferWithBytesNoCopy returned nil");
+            return STATUS_UNSUCCESSFUL;
+        }
+        if ((uint64_t)(uintptr_t)buffer.contents != w->address || buffer.length != w->length) {
+            pthread_mutex_unlock(&lock);
+            set_error(w->error, @"the buffer is not the memory it was made over");
+            return STATUS_UNSUCCESSFUL;
+        }
+        w->gpu_address = buffer.gpuAddress;
+        w->handle = keep(buffer);
+        pthread_mutex_unlock(&lock);
+        return STATUS_SUCCESS;
+    }
+}
+
+static NTSTATUS vm_release(void *args) {
+    struct vm_release *r = args;
+    if (!r || r->size != sizeof(*r)) return STATUS_INVALID_PARAMETER;
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        BOOL known = objects[@(r->handle)] != nil;
+        [objects removeObjectForKey:@(r->handle)];
+        pthread_mutex_unlock(&lock);
+        if (!known) {
+            set_error(r->error, @"no such handle");
+            return STATUS_INVALID_PARAMETER;
+        }
+        return STATUS_SUCCESS;
+    }
+}
+
+static NTSTATUS vm_event(void *args) {
+    struct vm_event *e = args;
+    if (!e || e->size != sizeof(*e)) return STATUS_INVALID_PARAMETER;
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        if (!ensure_open(e->error)) {
+            pthread_mutex_unlock(&lock);
+            return STATUS_UNSUCCESSFUL;
+        }
+        if (e->op == VM_EVENT_NEW) {
+            id<MTLSharedEvent> made = [device newSharedEvent];
+            if (made) e->handle = keep(made);
+            pthread_mutex_unlock(&lock);
+            if (!made) set_error(e->error, @"newSharedEvent returned nil");
+            return made ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        }
+        id<MTLSharedEvent> event = held_event(e->handle);
+        pthread_mutex_unlock(&lock);
+        if (!event) {
+            set_error(e->error, @"no such event");
+            return STATUS_INVALID_PARAMETER;
+        }
+        switch (e->op) {
+        case VM_EVENT_SIGNAL:
+            event.signaledValue = e->value;
+            return STATUS_SUCCESS;
+        case VM_EVENT_VALUE:
+            e->value = event.signaledValue;
+            return STATUS_SUCCESS;
+        case VM_EVENT_WAIT: {
+            /* Spins for 2 ms (the latency is what gets measured), then
+             * sleeps between looks. */
+            uint64_t t0 = now_ns();
+            while (event.signaledValue < e->value) {
+                uint64_t t = now_ns() - t0;
+                if (t > e->timeout_ns) {
+                    e->waited_ns = t;
+                    set_error(e->error, [NSString stringWithFormat:@"the event stayed at %llu, below %llu",
+                                                                   event.signaledValue, e->value]);
+                    return STATUS_UNSUCCESSFUL;
+                }
+                if (t > 2000000) usleep(50);
+            }
+            e->waited_ns = now_ns() - t0;
+            return STATUS_SUCCESS;
+        }
+        default:
+            set_error(e->error, @"unknown event op");
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+}
+
+/* The op kernels, made the first time a run needs them. Holds `lock`. */
+static id<MTLComputePipelineState> write_pipeline, check_pipeline, copy_pipeline;
+
+static NSString *const ops_source =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "struct op_args { uint value; uint words; };\n"
+     "kernel void write_words(device uint *out [[buffer(0)]], constant op_args &a [[buffer(1)]],\n"
+     "                        uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {\n"
+     "    for (uint k = i; k < a.words; k += n) out[k] = a.value + k;\n"
+     "}\n"
+     "kernel void check_words(device const uint *in [[buffer(0)]], constant op_args &a [[buffer(1)]],\n"
+     "                        device atomic_uint *res [[buffer(2)]],\n"
+     "                        uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {\n"
+     "    uint bad = 0, first = 0xffffffffu;\n"
+     "    for (uint k = i; k < a.words; k += n)\n"
+     "        if (in[k] != a.value + k) { bad++; first = min(first, k); }\n"
+     "    if (bad) {\n"
+     "        atomic_fetch_add_explicit(&res[0], bad, memory_order_relaxed);\n"
+     "        atomic_fetch_min_explicit(&res[1], first, memory_order_relaxed);\n"
+     "    }\n"
+     "}\n"
+     "kernel void copy_words(device uint *out [[buffer(0)]], constant op_args &a [[buffer(1)]],\n"
+     "                       device const uint *in [[buffer(2)]],\n"
+     "                       uint i [[thread_position_in_grid]], uint n [[threads_per_grid]]) {\n"
+     "    for (uint k = i; k < a.words; k += n) out[k] = in[k];\n"
+     "}\n";
+
+static BOOL ensure_ops(char *error) {
+    if (copy_pipeline) return YES;
+    if (!ensure_open(error)) return NO;
+    NSError *failure = nil;
+    id<MTLLibrary> library = [device newLibraryWithSource:ops_source options:nil error:&failure];
+    if (!library) {
+        set_error(error, [NSString stringWithFormat:@"ops library: %@", failure]);
+        return NO;
+    }
+    write_pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"write_words"]
+                                                           error:&failure];
+    check_pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"check_words"]
+                                                           error:&failure];
+    copy_pipeline = [device newComputePipelineStateWithFunction:[library newFunctionWithName:@"copy_words"]
+                                                          error:&failure];
+    if (!write_pipeline || !check_pipeline || !copy_pipeline) {
+        write_pipeline = check_pipeline = copy_pipeline = nil;
+        set_error(error, [NSString stringWithFormat:@"ops pipelines: %@", failure]);
+        return NO;
+    }
+    return YES;
+}
+
+/* A run on its way: its command buffer, the results of its checks, and
+ * the caller's ops they go back into. */
+@interface VMRun : NSObject
+@property(nonatomic, strong) id<MTLCommandBuffer> commands;
+@property(nonatomic, strong) id<MTLBuffer> results;
+@property(nonatomic) struct vm_op *ops;
+@property(nonatomic) uint32_t count;
+/* What its ops use, kept alive here: the command buffer does not retain. */
+@property(nonatomic, strong) NSMutableArray *used;
+@end
+@implementation VMRun
+@end
+
+/* Small shared buffers for checks' results, reused across runs. Guarded
+ * by `lock`. */
+#define RESULTS_BYTES 4096
+static NSMutableArray<id<MTLBuffer>> *results_pool;
+
+static id<MTLBuffer> take_results(NSUInteger bytes) {
+    if (bytes <= RESULTS_BYTES && results_pool.count) {
+        id<MTLBuffer> b = results_pool.lastObject;
+        [results_pool removeLastObject];
+        return b;
+    }
+    return [device newBufferWithLength:bytes > RESULTS_BYTES ? bytes : RESULTS_BYTES
+                               options:MTLResourceStorageModeShared];
+}
+
+static void give_results(id<MTLBuffer> b) {
+    if (b.length != RESULTS_BYTES) return;
+    pthread_mutex_lock(&lock);
+    if (!results_pool) results_pool = [NSMutableArray new];
+    if (results_pool.count < 16) [results_pool addObject:b];
+    pthread_mutex_unlock(&lock);
+}
+
+/* Waits for a run and writes its results back. */
+static NTSTATUS finish_run(VMRun *run, uint64_t *wait_ns, uint64_t *gpu_ns, char *error) {
+    uint64_t t0 = now_ns();
+    [run.commands waitUntilCompleted];
+    *wait_ns = now_ns() - t0;
+    *gpu_ns = (uint64_t)((run.commands.GPUEndTime - run.commands.GPUStartTime) * 1e9);
+    if (run.commands.status != MTLCommandBufferStatusCompleted) {
+        set_error(error, [NSString stringWithFormat:@"command buffer: %@", run.commands.error]);
+        return STATUS_UNSUCCESSFUL;
+    }
+    const uint32_t *res = run.results.contents;
+    for (uint32_t i = 0; i < run.count; i++)
+        if (run.ops[i].kind == VM_OP_CHECK) {
+            run.ops[i].mismatches = res[2 * i];
+            run.ops[i].first_bad = res[2 * i + 1];
+        }
+    give_results(run.results);
+    run.results = nil;
+    run.used = nil;
+    return STATUS_SUCCESS;
+}
+
+static void dispatch_op(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline,
+                        uint32_t value, uint32_t words) {
+    uint32_t a[2] = {value, words};
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBytes:a length:sizeof(a) atIndex:1];
+    NSUInteger threads = words < (1u << 20) ? words : (1u << 20);
+    [encoder dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+}
+
+/* Records one op into `encoder`, or says what is wrong with it. */
+static NSString *encode_op(id<MTLComputeCommandEncoder> encoder, VMRun *run, uint32_t i) {
+    struct vm_op *op = &run.ops[i];
+    id<MTLBuffer> buffer = held_buffer(op->buffer);
+    if (!buffer) return [NSString stringWithFormat:@"op %u: no such buffer", i];
+    if (op->offset % 4 || !op->words || op->words > (1u << 31) ||
+        op->offset + (uint64_t)op->words * 4 > buffer.length)
+        return [NSString stringWithFormat:@"op %u: the range is outside the buffer or unaligned", i];
+    [run.used addObject:buffer];
+    [encoder setBuffer:buffer offset:(NSUInteger)op->offset atIndex:0];
+    switch (op->kind) {
+    case VM_OP_WRITE:
+        dispatch_op(encoder, write_pipeline, op->value, op->words);
+        break;
+    case VM_OP_CHECK:
+        [encoder setBuffer:run.results offset:(NSUInteger)i * 8 atIndex:2];
+        dispatch_op(encoder, check_pipeline, op->value, op->words);
+        break;
+    case VM_OP_COPY: {
+        id<MTLBuffer> source = held_buffer(op->other);
+        if (!source || op->other_value % 4 || op->other_value + (uint64_t)op->words * 4 > source.length)
+            return [NSString stringWithFormat:@"op %u: no such source, or the range is outside it", i];
+        [run.used addObject:source];
+        [encoder setBuffer:source offset:(NSUInteger)op->other_value atIndex:2];
+        dispatch_op(encoder, copy_pipeline, 0, op->words);
+        break;
+    }
+    default:
+        return [NSString stringWithFormat:@"op %u: unknown kind %u", i, op->kind];
+    }
+    return nil;
+}
+
+static NTSTATUS vm_run(void *args) {
+    struct vm_run *r = args;
+    if (!r || r->size != sizeof(*r)) return STATUS_INVALID_PARAMETER;
+    if (!r->count || !r->ops) {
+        set_error(r->error, @"no ops");
+        return STATUS_INVALID_PARAMETER;
+    }
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        if (!ensure_ops(r->error)) {
+            pthread_mutex_unlock(&lock);
+            return STATUS_UNSUCCESSFUL;
+        }
+        uint64_t t0 = now_ns();
+        VMRun *run = [VMRun new];
+        run.ops = (struct vm_op *)(uintptr_t)r->ops;
+        run.count = r->count;
+        run.results = take_results((NSUInteger)r->count * 8);
+        run.used = [NSMutableArray new];
+        uint32_t *res = run.results.contents;
+        for (uint32_t i = 0; i < r->count; i++) {
+            res[2 * i] = 0;
+            res[2 * i + 1] = 0xffffffffu;
+        }
+        run.commands = [queue commandBufferWithUnretainedReferences];
+        [run.used addObject:run.results];
+        id<MTLComputeCommandEncoder> encoder = nil;
+        BOOL encoded = NO;
+        NSString *bad = nil;
+        for (uint32_t i = 0; i < r->count && !bad; i++) {
+            uint32_t kind = run.ops[i].kind;
+            if (kind == VM_OP_WAIT_EVENT || kind == VM_OP_SIGNAL_EVENT || kind == VM_OP_SPLIT) {
+                [encoder endEncoding];
+                encoder = nil;
+                encoded = NO;
+                if (kind == VM_OP_SPLIT) continue;
+                id<MTLSharedEvent> event = held_event(run.ops[i].other);
+                if (event) [run.used addObject:event];
+                if (!event) {
+                    bad = [NSString stringWithFormat:@"op %u: no such event", i];
+                } else if (kind == VM_OP_WAIT_EVENT) {
+                    [run.commands encodeWaitForEvent:event value:run.ops[i].other_value];
+                } else {
+                    [run.commands encodeSignalEvent:event value:run.ops[i].other_value];
+                }
+                continue;
+            }
+            if (!encoder) encoder = [run.commands computeCommandEncoder];
+            /* One op after another, as a D3D12 UAV barrier between them
+             * would have it. */
+            if (encoded) [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            bad = encode_op(encoder, run, i);
+            encoded = YES;
+        }
+        [encoder endEncoding];
+        if (bad) {
+            pthread_mutex_unlock(&lock);
+            set_error(r->error, bad);
+            return STATUS_INVALID_PARAMETER;
+        }
+        [run.commands commit];
+        r->encode_ns = now_ns() - t0;
+        if (!r->wait) r->handle = keep(run);
+        pthread_mutex_unlock(&lock);
+        if (!r->wait) return STATUS_SUCCESS;
+        return finish_run(run, &r->wait_ns, &r->gpu_ns, r->error);
+    }
+}
+
+static NTSTATUS vm_wait(void *args) {
+    struct vm_wait *w = args;
+    if (!w || w->size != sizeof(*w)) return STATUS_INVALID_PARAMETER;
+    @autoreleasepool {
+        pthread_mutex_lock(&lock);
+        id o = objects[@(w->handle)];
+        VMRun *run = [o isKindOfClass:[VMRun class]] ? o : nil;
+        if (run) [objects removeObjectForKey:@(w->handle)];
+        pthread_mutex_unlock(&lock);
+        if (!run) {
+            set_error(w->error, @"no such run");
+            return STATUS_INVALID_PARAMETER;
+        }
+        /* Outside the lock: the run may wait for an event a later call
+         * signals. */
+        return finish_run(run, &w->wait_ns, &w->gpu_ns, w->error);
+    }
+}
+
 /* Wine looks this table up by name; the order is enum vm_call's. */
 __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_funcs[] = {
     vm_noop,
@@ -358,6 +727,11 @@ __attribute__((visibility("default"))) const unixlib_entry_t __wine_unix_call_fu
     vm_fill,
     vm_submit_empty,
     vm_turns,
+    vm_wrap,
+    vm_release,
+    vm_event,
+    vm_run,
+    vm_wait,
 };
 _Static_assert(sizeof(__wine_unix_call_funcs) / sizeof(__wine_unix_call_funcs[0]) == VM_CALLS,
                "one entry per call");

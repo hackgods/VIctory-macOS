@@ -38,7 +38,9 @@ mod abi;
 mod bridge;
 
 #[cfg(windows)]
-pub use bridge::{Bridge, CallError, Device, FillTimes, OpenError, TurnsTimes};
+pub use bridge::{
+    Bridge, CallError, Device, FillTimes, Op, OpenError, RunTimes, Started, TurnsTimes, Wrapped,
+};
 
 /// The variable that names the anchor DLL, as the process sees it.
 pub const BRIDGE_VAR: &str = "VICTORY_METAL_BRIDGE";

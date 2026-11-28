@@ -284,6 +284,273 @@ impl Bridge {
     }
 }
 
+/// A no-copy buffer over memory the Windows side owns, kept by the unixlib
+/// until [`Bridge::release`].
+#[derive(Debug, Clone, Copy)]
+pub struct Wrapped {
+    /// The unixlib's handle for it.
+    pub handle: u64,
+    /// The buffer's GPU address (what a shader's pointer to it holds).
+    pub gpu_address: u64,
+    /// How long `newBufferWithBytesNoCopy` took.
+    pub wrap: Duration,
+}
+
+/// Where the time of a [`Bridge::run`] went, by the unixlib's clock.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunTimes {
+    /// Recording and committing the command buffer.
+    pub encode: Duration,
+    /// From the commit (or the [`Bridge::wait`] call) to the end of the
+    /// wait for completion.
+    pub wait: Duration,
+    /// What the GPU reports between the command buffer's start and end.
+    pub gpu: Duration,
+}
+
+/// One step of a [`Bridge::run`]: compute work over wrapped buffers, or an
+/// event the command buffer waits for or signals. Offsets are bytes, 4-byte
+/// aligned; `words` is at most 2^31.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy)]
+pub struct Op(abi::Op);
+
+impl Op {
+    fn new(kind: u32) -> Self {
+        Self(abi::Op {
+            kind,
+            first_bad: u32::MAX,
+            ..Default::default()
+        })
+    }
+
+    /// Word `k` of `words` words at `offset` of `buffer` becomes `value + k`.
+    pub fn write(buffer: u64, offset: u64, words: u32, value: u32) -> Self {
+        let mut op = Self::new(abi::OP_WRITE);
+        (op.0.buffer, op.0.offset, op.0.words, op.0.value) = (buffer, offset, words, value);
+        op
+    }
+
+    /// Counts the words of that range that are not `value + k`
+    /// ([`Op::mismatches`], [`Op::first_bad`]).
+    pub fn check(buffer: u64, offset: u64, words: u32, value: u32) -> Self {
+        let mut op = Self::write(buffer, offset, words, value);
+        op.0.kind = abi::OP_CHECK;
+        op
+    }
+
+    /// Copies `words` words from `source` at `from` to `buffer` at `offset`.
+    pub fn copy(buffer: u64, offset: u64, source: u64, from: u64, words: u32) -> Self {
+        let mut op = Self::write(buffer, offset, words, 0);
+        op.0.kind = abi::OP_COPY;
+        (op.0.other, op.0.other_value) = (source, from);
+        op
+    }
+
+    /// The GPU waits until `event` is at least `value`.
+    pub fn wait_event(event: u64, value: u64) -> Self {
+        let mut op = Self::new(abi::OP_WAIT_EVENT);
+        (op.0.other, op.0.other_value) = (event, value);
+        op
+    }
+
+    /// The GPU sets `event` to `value` once the ops before are done.
+    pub fn signal_event(event: u64, value: u64) -> Self {
+        let mut op = Self::new(abi::OP_SIGNAL_EVENT);
+        (op.0.other, op.0.other_value) = (event, value);
+        op
+    }
+
+    /// Ends the compute encoder; the next op opens a new one.
+    pub fn split() -> Self {
+        Self::new(abi::OP_SPLIT)
+    }
+
+    /// For a check that ran: how many words differed.
+    pub fn mismatches(&self) -> u32 {
+        self.0.mismatches
+    }
+
+    /// For a check that ran: the lowest word index that differed, if any.
+    pub fn first_bad(&self) -> Option<u32> {
+        (self.0.first_bad != u32::MAX).then_some(self.0.first_bad)
+    }
+}
+
+/// A run committed and not waited for yet ([`Bridge::start`]). Its ops get
+/// their results when it is waited for; dropping it waits too.
+pub struct Started<'a> {
+    bridge: &'a Bridge,
+    handle: u64,
+    encode: Duration,
+    _ops: std::marker::PhantomData<&'a mut [Op]>,
+}
+
+impl Started<'_> {
+    /// Waits for the GPU and writes the results back into the ops.
+    pub fn wait(self) -> Result<RunTimes, CallError> {
+        let encode = self.encode;
+        let handle = self.handle;
+        let bridge = self.bridge;
+        std::mem::forget(self);
+        let mut times = bridge.wait(handle)?;
+        times.encode = encode;
+        Ok(times)
+    }
+}
+
+impl Drop for Started<'_> {
+    fn drop(&mut self) {
+        let _ = self.bridge.wait(self.handle);
+    }
+}
+
+impl Bridge {
+    /// Wraps `[address, address + length)` in one no-copy buffer, kept until
+    /// [`Bridge::release`]. Both have to be on 4 KiB page boundaries, and
+    /// the memory has to stay committed while the buffer lives. With
+    /// `untracked` Metal does not order work on it across encoders.
+    pub fn wrap(
+        &self,
+        address: *mut u8,
+        length: usize,
+        untracked: bool,
+    ) -> Result<Wrapped, CallError> {
+        let mut w: abi::Wrap = abi::block(|w: &mut abi::Wrap, n| w.size = n);
+        w.address = address as u64;
+        w.length = length as u64;
+        w.flags = if untracked { abi::WRAP_UNTRACKED } else { 0 };
+        // SAFETY: a block of the call's own layout, with its size set. The
+        // memory is the caller's; the unixlib only records it.
+        let status = unsafe { self.call(abi::WRAP, (&raw mut w).cast()) };
+        if status != 0 {
+            return Err(failed(status, &w.error));
+        }
+        Ok(Wrapped {
+            handle: w.handle,
+            gpu_address: w.gpu_address,
+            wrap: Duration::from_nanos(w.wrap_ns),
+        })
+    }
+
+    /// Lets a buffer or event handle go.
+    pub fn release(&self, handle: u64) -> Result<(), CallError> {
+        let mut r: abi::Release = abi::block(|r: &mut abi::Release, n| r.size = n);
+        r.handle = handle;
+        // SAFETY: a block of the call's own layout, with its size set.
+        let status = unsafe { self.call(abi::RELEASE, (&raw mut r).cast()) };
+        if status != 0 {
+            return Err(failed(status, &r.error));
+        }
+        Ok(())
+    }
+
+    fn event_call(
+        &self,
+        op: u32,
+        handle: u64,
+        value: u64,
+        timeout: Duration,
+    ) -> Result<abi::Event, CallError> {
+        let mut e: abi::Event = abi::block(|e: &mut abi::Event, n| e.size = n);
+        (e.op, e.handle, e.value) = (op, handle, value);
+        e.timeout_ns = timeout.as_nanos().min(u64::MAX.into()) as u64;
+        // SAFETY: a block of the call's own layout, with its size set.
+        let status = unsafe { self.call(abi::EVENT, (&raw mut e).cast()) };
+        if status != 0 {
+            return Err(failed(status, &e.error));
+        }
+        Ok(e)
+    }
+
+    /// A new shared event (`MTLSharedEvent`) at value 0.
+    pub fn event(&self) -> Result<u64, CallError> {
+        Ok(self
+            .event_call(abi::EVENT_NEW, 0, 0, Duration::ZERO)?
+            .handle)
+    }
+
+    /// Sets `event` to `value` from the CPU.
+    pub fn signal(&self, event: u64, value: u64) -> Result<(), CallError> {
+        self.event_call(abi::EVENT_SIGNAL, event, value, Duration::ZERO)
+            .map(drop)
+    }
+
+    /// Waits on the CPU until `event` is at least `value`, at most
+    /// `timeout`; how long it took.
+    pub fn wait_for(
+        &self,
+        event: u64,
+        value: u64,
+        timeout: Duration,
+    ) -> Result<Duration, CallError> {
+        Ok(Duration::from_nanos(
+            self.event_call(abi::EVENT_WAIT, event, value, timeout)?
+                .waited_ns,
+        ))
+    }
+
+    /// The value `event` is at now.
+    pub fn value(&self, event: u64) -> Result<u64, CallError> {
+        Ok(self
+            .event_call(abi::EVENT_VALUE, event, 0, Duration::ZERO)?
+            .value)
+    }
+
+    fn run_call(&self, ops: &mut [Op], wait: bool) -> Result<abi::Run, CallError> {
+        let mut r: abi::Run = abi::block(|r: &mut abi::Run, n| r.size = n);
+        r.count = u32::try_from(ops.len()).expect("ops");
+        r.ops = ops.as_mut_ptr() as u64;
+        r.wait = wait.into();
+        // SAFETY: a block of the call's own layout; `Op` is `vm_op`
+        // (transparent), and the ops stay borrowed until the run is waited
+        // for (here, or through `Started`).
+        let status = unsafe { self.call(abi::RUN, (&raw mut r).cast()) };
+        if status != 0 {
+            return Err(failed(status, &r.error));
+        }
+        Ok(r)
+    }
+
+    /// Records `ops` into one command buffer, commits it and waits for it;
+    /// checks write their results into their ops.
+    pub fn run(&self, ops: &mut [Op]) -> Result<RunTimes, CallError> {
+        let r = self.run_call(ops, true)?;
+        Ok(RunTimes {
+            encode: Duration::from_nanos(r.encode_ns),
+            wait: Duration::from_nanos(r.wait_ns),
+            gpu: Duration::from_nanos(r.gpu_ns),
+        })
+    }
+
+    /// As [`Bridge::run`], without waiting: the run goes on while the
+    /// caller works (and, say, signals an event it waits for).
+    pub fn start<'a>(&'a self, ops: &'a mut [Op]) -> Result<Started<'a>, CallError> {
+        let r = self.run_call(ops, false)?;
+        Ok(Started {
+            bridge: self,
+            handle: r.handle,
+            encode: Duration::from_nanos(r.encode_ns),
+            _ops: std::marker::PhantomData,
+        })
+    }
+
+    fn wait(&self, run: u64) -> Result<RunTimes, CallError> {
+        let mut w: abi::Wait = abi::block(|w: &mut abi::Wait, n| w.size = n);
+        w.handle = run;
+        // SAFETY: a block of the call's own layout, with its size set.
+        let status = unsafe { self.call(abi::WAIT, (&raw mut w).cast()) };
+        if status != 0 {
+            return Err(failed(status, &w.error));
+        }
+        Ok(RunTimes {
+            wait: Duration::from_nanos(w.wait_ns),
+            gpu: Duration::from_nanos(w.gpu_ns),
+            ..Default::default()
+        })
+    }
+}
+
 fn failed(status: i32, error: &[u8]) -> CallError {
     let mut message = abi::text(error);
     if message.is_empty() && status == STATUS_INVALID_PARAMETER {

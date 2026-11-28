@@ -171,7 +171,7 @@ impl Viewed {
     /// host (`made`) or left without a host view.
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = crate::spin::lock(&self.inner);
         if let Some(old) = inner.slots.remove(&index) {
             inner.count(index, &old, false);
         }
@@ -210,7 +210,7 @@ impl Viewed {
             };
             entries.push((index, entry));
         }
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut inner = crate::spin::lock(&self.inner);
         for (index, entry) in entries {
             if let Some(old) = inner.slots.remove(&index) {
                 inner.count(index, &old, false);
@@ -260,7 +260,11 @@ impl Viewed {
     /// (shader resource, unordered access): copy, start, bytes.
     #[cfg(any(test, feature = "diagnostics"))]
     fn ranges(&self) -> Vec<Hull> {
-        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hulls.values().cloned().collect()
+        crate::spin::lock(&self.inner)
+            .hulls
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Snapshot of distinct title texture resources currently viewed by this

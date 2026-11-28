@@ -325,10 +325,32 @@ const STRIPE_RUN: usize = 64;
 /// Stripes of [`Made`] with `VICTORY_SLOT_STRIPES`: the runs of slots take
 /// them in turn.
 const STRIPES: usize = 256;
+/// Stripes of [`Made`] with `VICTORY_SLOT_HASH`, as a power of two: slots
+/// are spread over them by a multiplicative hash of their index.
+const HASHED_STRIPES_LOG: u32 = 14;
 
 #[cfg(test)]
 thread_local! {
     static TEST_SLOT_STRIPES: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static TEST_SLOT_HASH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether a host heap's slots are spread over 2^14 locks by a hash of
+/// their index (`VICTORY_SLOT_HASH=1`; off by default; with it, stripes are
+/// on). Runs of 64 neighbours share a stripe of [`STRIPES`]: a draw reads a
+/// table's slots in a row, and title threads walking tables that lie in one
+/// run take turns at its lock. Hashed, neighbours and slots a fixed stride
+/// apart take different locks. Based on halfwave50's heap locks
+/// (VIctory-macOS-halfwave50 main-mac, descriptor/slots.rs `lock_of`:
+/// 16,384 locks by `index * 0x9E3779B1`; their note: 512 locks by the low
+/// bits had threads walking a heap in step in each other's way).
+fn slot_hash() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_SLOT_HASH.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SLOT_HASH"))
 }
 
 /// Whether a host heap's slots are made under one lock per run of slots
@@ -359,6 +381,8 @@ fn slot_stripes() -> bool {
 struct Made {
     keys: Box<[AtomicU64]>,
     locks: Box<[Mutex<()>]>,
+    /// The slots' stripes by a hash of their index (`VICTORY_SLOT_HASH`).
+    hashed: bool,
 }
 
 /// The slot locks a [`Made`] guard holds, by stripe.
@@ -369,21 +393,33 @@ struct MadeGuard<'a> {
 
 impl Made {
     fn new(count: usize) -> Made {
-        let stripes = if slot_stripes() { STRIPES } else { 1 };
+        let hashed = slot_hash();
+        let stripes = if hashed {
+            1 << HASHED_STRIPES_LOG
+        } else if slot_stripes() {
+            STRIPES
+        } else {
+            1
+        };
         Made {
             keys: (0..count).map(|_| AtomicU64::new(0)).collect(),
             locks: (0..stripes).map(|_| Mutex::new(())).collect(),
+            hashed,
         }
     }
 
     fn stripe(&self, index: usize) -> usize {
-        (index / STRIPE_RUN) % self.locks.len()
+        if self.hashed {
+            ((index as u32).wrapping_mul(0x9E37_79B1) >> (32 - HASHED_STRIPES_LOG)) as usize
+        } else {
+            (index / STRIPE_RUN) % self.locks.len()
+        }
     }
 
     /// The stripes `stripes` (ascending, distinct) locked.
     fn take(&self, stripes: impl Iterator<Item = usize>) -> MadeGuard<'_> {
         let held = stripes
-            .map(|s| (s, self.locks[s].lock().unwrap_or_else(|e| e.into_inner())))
+            .map(|s| (s, crate::spin::lock(&self.locks[s])))
             .collect();
         MadeGuard { made: self, held }
     }
@@ -1347,7 +1383,7 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Kept) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let mut kept = crate::spin::lock(&self.kept);
         // A slot that held nothing and gets nothing is left alone (no page).
         if let Some(slot) = kept.slot(index as usize, resource.is_some()) {
             let old_widened = slot.as_ref().and_then(|(_, source)| match source {
@@ -1391,7 +1427,7 @@ impl HostHeap {
         }
         let mut widened_changes: Vec<(std::sync::Arc<crate::shadow::Widened>, bool)> = Vec::new();
         {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let mut kept = crate::spin::lock(&self.kept);
             for (index, resource) in updates {
                 let Some(slot) = kept.slot(index as usize, resource.is_some()) else {
                     continue;
@@ -2550,7 +2586,7 @@ impl HostHeap {
         let key = self.made.lock(index).get(index as usize)?;
         // A view the host could not make leaves a null view, its record
         // noted all the same; it keeps no resource.
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let kept = crate::spin::lock(&self.kept).get(index as usize).is_some();
         if key == 0 || (!kept && !self.sampler) {
             return Some("null".into());
         }
@@ -2581,7 +2617,7 @@ impl HostHeap {
         // and clearing the descriptor. Mirroring takes made before kept as well.
         let made = self.made.lock_all();
         let slots: Vec<u32> = {
-            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = crate::spin::lock(&self.kept);
             kept.iter()
                 .filter(|&(i, k)| {
                     i < self.count as usize
@@ -2632,7 +2668,7 @@ impl HostHeap {
 
     /// The host textures (raw pointers) slots `slots` view.
     pub(crate) fn textures_at(&self, slots: &[u32]) -> Vec<usize> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        let kept = crate::spin::lock(&self.kept);
         slots
             .iter()
             .filter_map(|&i| kept.get(i as usize).filter(|k| k.1.is_none()))
@@ -2645,7 +2681,7 @@ impl HostHeap {
     pub(crate) fn unmade_placed(&self, index: u32) -> Option<View> {
         let key = self.made.lock(index).get(index as usize)?;
         let view = (key != 0).then(|| view_at(key as u32, (key >> 32) as u32)).flatten()?;
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some();
+        let kept = crate::spin::lock(&self.kept).get(index as usize).is_some();
         (is_placed_texture(&view) && !kept).then(|| (*view).clone())
     }
 
@@ -2703,7 +2739,7 @@ impl HostHeap {
     /// Whether slot `index` holds a host view of a resource (tests).
     #[cfg(test)]
     pub(crate) fn kept(&self, index: u32) -> bool {
-        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).is_some()
+        crate::spin::lock(&self.kept).get(index as usize).is_some()
     }
 }
 
@@ -4041,6 +4077,65 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(one.lock_slots([low, high].into_iter()).held.len(), 1);
     }
 
+    /// With `VICTORY_SLOT_HASH=1` the same holds of hashed stripes: two
+    /// slots whose stripes are named in opposite orders by two threads, a
+    /// third locking one of them, and neighbours on different stripes.
+    #[test]
+    fn hashed_slot_stripes_are_taken_in_ascending_order() {
+        TEST_SLOT_HASH.set(Some(true));
+        let made = Made::new(1 << 16);
+        TEST_SLOT_HASH.set(None);
+        assert!(made.hashed && made.locks.len() == 1 << HASHED_STRIPES_LOG);
+        assert_ne!(
+            made.stripe(100),
+            made.stripe(101),
+            "neighbours on different stripes"
+        );
+        let (mut low, mut high) = (7u32, 8u32);
+        if made.stripe(low as usize) > made.stripe(high as usize) {
+            std::mem::swap(&mut low, &mut high);
+        }
+        assert!(made.stripe(low as usize) < made.stripe(high as usize));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let made = std::sync::Arc::new(made);
+        for order in [[low, high], [high, low], [low, low]] {
+            let (made, done) = (made.clone(), done_tx.clone());
+            std::thread::spawn(move || {
+                for n in 0..20_000u64 {
+                    let mut guard = if order[0] == order[1] {
+                        made.lock(order[0])
+                    } else {
+                        made.lock_slots(order.into_iter())
+                    };
+                    for &i in &order {
+                        guard.set(i as usize, n);
+                        assert_eq!(guard.at(i as usize), n);
+                    }
+                    if n % 64 == 0 {
+                        std::thread::yield_now();
+                    }
+                }
+                done.send(()).unwrap();
+            });
+        }
+        for _ in 0..3 {
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .expect("every thread finishes: no two guards wait for each other");
+        }
+        // A page's guard holds each of its slots' stripes once.
+        let guard = made.lock_slots(0..2048);
+        assert!((0..2048).all(|i| guard.holds(i)));
+        let mut stripes: Vec<usize> = guard.held.iter().map(|&(s, _)| s).collect();
+        let n = stripes.len();
+        stripes.dedup();
+        assert_eq!(stripes.len(), n, "each stripe once");
+        assert!(
+            stripes.windows(2).all(|w| w[0] < w[1]),
+            "in ascending order"
+        );
+    }
+
     /// With `VICTORY_SLOT_STRIPES=1` (and without), eight threads mirror a
     /// heap's slots for draws while others rewrite their records and a heap
     /// sync runs over them, the slots overlapping between threads and
@@ -4098,7 +4193,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         let (root, pso) =
             crate::compute::pipeline(SHADER, windows::core::s!("slot_stripes_eq"), 0, params)
                 .expect("compute pipeline");
-        let run = |striped: bool| -> Vec<[u32; 3]> {
+        // 0: one lock; 1: runs of slots; 2: hashed stripes, spinning first.
+        let run = |mode: u8| -> Vec<[u32; 3]> {
+            let striped = mode > 0;
             let mut title_heap = vec![0u8; (SLOTS as usize + 1) * 32];
             let start = title_heap.as_mut_ptr() as u64;
             let at = move |i: u32| start + u64::from(i) * 32;
@@ -4106,9 +4203,13 @@ void main(uint3 id : SV_DispatchThreadID) {
                 write(at(i), i);
             }
             TEST_SLOT_STRIPES.set(Some(striped));
+            TEST_SLOT_HASH.set(Some(mode == 2));
+            crate::spin::TEST_ON.store(if mode == 2 { 2 } else { 1 }, Ordering::Relaxed);
             let heap = HostHeap::new(false, SLOTS + 1).expect("host heap");
             TEST_SLOT_STRIPES.set(None);
+            TEST_SLOT_HASH.set(None);
             assert_eq!(heap.made.locks.len() > 1, striped);
+            assert_eq!(heap.made.hashed, mode == 2);
             crate::descriptor::create_uav(
                 null,
                 dst,
@@ -4149,7 +4250,7 @@ void main(uint3 id : SV_DispatchThreadID) {
                 assert_eq!(
                     heap.made.lock(i).at(i as usize),
                     key,
-                    "slot {i} striped {striped}"
+                    "slot {i} mode {mode}"
                 );
                 assert_eq!(
                     heap.ready[i as usize].load(Ordering::Acquire),
@@ -4189,12 +4290,15 @@ void main(uint3 id : SV_DispatchThreadID) {
                         };
                         0xF000_0000 + words[4]
                     });
-                    assert_eq!(got, want, "slots {first}.. striped {striped}");
+                    assert_eq!(got, want, "slots {first}.. mode {mode}");
                     got
                 })
                 .collect()
         };
-        assert_eq!(run(true).len(), run(false).len());
+        let (one, runs, hashed) = (run(0), run(1), run(2));
+        crate::spin::TEST_ON.store(0, Ordering::Relaxed);
+        assert_eq!(one.len(), runs.len());
+        assert_eq!(one.len(), hashed.len());
         // SAFETY: plain device health check.
         assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
         drop((src_shadow, dst_shadow));

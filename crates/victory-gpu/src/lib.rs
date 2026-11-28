@@ -94,6 +94,10 @@ pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
 pub mod signature;
+// Everywhere: a host heap's locks (`descriptor::host`) and the census's
+// (`bindless`) take their locks through it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod spin;
 mod switch;
 #[cfg(windows)]
 mod tdr;

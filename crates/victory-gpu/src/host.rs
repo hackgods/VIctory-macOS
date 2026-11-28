@@ -6224,7 +6224,7 @@ static RETIRED: Mutex<Vec<ID3D12Resource>> = Mutex::new(Vec::new());
 /// GPU runs, and a shader that took the old descriptor still reads what it
 /// views.
 pub(crate) fn retire(resource: ID3D12Resource) {
-    RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push(resource);
+    crate::spin::lock(&RETIRED).push(resource);
 }
 
 /// Batched [`retire`] under one hold of the retired-resources lock.
@@ -6232,10 +6232,7 @@ pub(crate) fn retire_all(mut resources: Vec<ID3D12Resource>) {
     if resources.is_empty() {
         return;
     }
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .append(&mut resources);
+    crate::spin::lock(&RETIRED).append(&mut resources);
 }
 
 /// After a submission has run, with none running: the retired resources go.

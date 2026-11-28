@@ -432,8 +432,19 @@ pub(crate) fn log_frame() {
     FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     MISSED_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
     *PREFETCHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *PROBED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     retake_dropped();
     let s = stats(std::mem::take);
+    if s.uses.values().sum::<u64>() > 1000 {
+        // The frame just counted is `FRAMES - 1`.
+        let frame = FRAMES.load(std::sync::atomic::Ordering::Relaxed) - 1;
+        let _ = BUILDER_FRAME.compare_exchange(
+            MISS_NEVER,
+            frame,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     if s.uses.is_empty()
         && s.written
             + s.withheld
@@ -619,6 +630,152 @@ fn region_free(l1: usize) -> bool {
         && misses_told_apart()
         && info.State == MEM_FREE
         && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at + (1 << 28)
+}
+
+/// Whether block-0 bit `entry` of a list's bitmap, read with table blocks
+/// `blocks`, stands for no memory at all: a 256 MiB region with nothing
+/// reserved, or bit 0 once region 0 has a block of its own (shaders mark
+/// bit 0 for addresses past 2^40 too, which no title memory has).
+fn nowhere(entry: usize, blocks: &[usize]) -> bool {
+    region_free(entry) || entry == 0 && misses_told_apart() && blocks.iter().skip(1).any(|&l1| l1 == 0)
+}
+
+/// The per-program probe (`VICTORY_MEMORY_PROBE=<n>`, diagnostics): in the
+/// `n`th frame after the first with more than 1,000 draws and dispatches
+/// using title memory (the acceleration-structure builder's first), the
+/// first dispatch of each program using title memory marks pages in a
+/// bitmap of its own, and a line per program says what it was handed and
+/// what it read with no copy.
+fn probe_frame() -> Option<u64> {
+    static N: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_MEMORY_PROBE").ok().and_then(|v| v.trim().parse().ok()))
+}
+
+/// The frame ([`FRAMES`]) the builder first ran in, [`MISS_NEVER`] before.
+static BUILDER_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MISS_NEVER);
+
+/// The programs probed this frame.
+static PROBED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// What Windows and the runtime have at page `at`, for the probe's lines.
+fn describe(at: u64) -> String {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    let (ago, kept) = crate::watch::last_remap(at as usize / crate::watch::PAGE);
+    let remap = match ago {
+        Some(ago) => format!("mapping changed there {ago} changes ago"),
+        None => format!("no mapping change there among the last {kept} reported"),
+    };
+    format!(
+        "{at:#x} [{}, type {:#x}, protect {:#x}, allocation {:#x} protect {:#x}, run {:#x}+{:#x}; {remap}]",
+        state_of(at),
+        info.Type,
+        info.Protect,
+        info.AllocationBase as usize,
+        info.AllocationProtect,
+        info.BaseAddress as usize,
+        info.RegionSize,
+    )
+}
+
+/// A page bitmap of its own for this dispatch of program `name`, handed
+/// root constants `words`, if the probe wants it ([`probe_frame`]): its
+/// GPU address, bound in place of the list's. What the dispatch writes is
+/// then not copied back (a diagnostic).
+pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, u32)]) -> Option<u64> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = probe_frame()?;
+    let first = BUILDER_FRAME.load(Relaxed);
+    if first == MISS_NEVER || FRAMES.load(Relaxed) != first + n {
+        return None;
+    }
+    {
+        let mut probed = PROBED.lock().unwrap_or_else(|e| e.into_inner());
+        let probed = probed.get_or_insert_with(HashSet::new);
+        if probed.len() >= 60 || !probed.insert(name.to_owned()) {
+            return None;
+        }
+    }
+    let bitmap = Arc::new(PooledBitmap::new(Bitmap::acquire()?));
+    let gpu = bitmap.gpu();
+    let name = name.to_owned();
+    let words: Vec<(u8, u32, u32)> = words.to_vec();
+    // The blocks the constants name, as they are when the dispatch is recorded.
+    let blocks: Vec<(u64, Vec<u32>)> = addresses_in(&words)
+        .filter(|&at| writable(at) && at % 4 == 0)
+        .map(|at| {
+            let len = 160u64.min(crate::watch::PAGE as u64 - at % crate::watch::PAGE as u64) as usize / 4;
+            // SAFETY: committed and readable (`writable`), ending in its page.
+            (at, (0..len).map(|i| unsafe { ((at as usize + 4 * i) as *const u32).read_volatile() }).collect())
+        })
+        .collect();
+    let since = crate::watch::remap_epoch();
+    list.defer_after(move || {
+        let Layout { blocks: table, owner, .. } = &*layout(key);
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts(bitmap.data() as *const u32, BITMAP_WORDS) };
+        let (mut written, mut counts) = (0u64, [0u64; 4]);
+        let mut firsts: [Vec<u64>; 4] = Default::default();
+        for (w, &mark) in marks.iter().enumerate() {
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let (block, page) = (entry / BLOCK, entry % BLOCK);
+                let (kind, at) = match table.get(block).filter(|_| block != 0) {
+                    None if nowhere(entry, table) => (2, (entry as u64) << 28),
+                    None => (3, (entry as u64) << 28),
+                    Some(&l1) => {
+                        let at = (l1 << 28 | page << 16) as u64;
+                        if owner.get(entry).is_some_and(|o| o.is_some()) {
+                            written += 1;
+                            continue;
+                        }
+                        match miss_kind(at, since) {
+                            MissKind::Mapped => (0, at),
+                            MissKind::Unmapped => (1, at),
+                            MissKind::Free => (2, at),
+                        }
+                    }
+                };
+                counts[kind] += 1;
+                if firsts[kind].len() < 6 {
+                    firsts[kind].push(at);
+                }
+            }
+        }
+        let words: Vec<String> = words.iter().map(|(slot, dword, v)| format!("{slot}.{dword}={v:#x}")).collect();
+        let blocks: Vec<String> = blocks
+            .iter()
+            .map(|(at, dwords)| {
+                let dwords: Vec<String> = dwords.iter().map(|d| format!("{d:08x}")).collect();
+                format!("{at:#x}: {}", dwords.join(" "))
+            })
+            .collect();
+        let list_of = |kind: usize| firsts[kind].iter().map(|&at| describe(at)).collect::<Vec<_>>().join(", ");
+        tracing::warn!(
+            "DIAG probe {name}: wrote or read {written} pages with a copy; missed {} mapped ({}), {} reserved ({}), {} free ({}), {} in regions with no block ({}); root constants {}; blocks {}",
+            counts[0],
+            list_of(0),
+            counts[1],
+            list_of(1),
+            counts[2],
+            list_of(2),
+            counts[3],
+            list_of(3),
+            words.join(" "),
+            blocks.join(" | "),
+        );
+    });
+    Some(gpu)
+}
+
+/// Whether the probe is asked for at all.
+pub(crate) fn probing() -> bool {
+    probe_frame().is_some()
 }
 
 /// Whether misses are told apart (`VICTORY_TITLE_MISSES=0`: every page read
@@ -1019,7 +1176,7 @@ fn has_missed(marks: &[u32], l: &Layout, kind: impl Fn(u64) -> MissKind) -> bool
             bits &= bits - 1;
             let (block, page) = (entry / BLOCK, entry % BLOCK);
             let Some(&l1) = l.blocks.get(block).filter(|_| block != 0) else {
-                if block == 0 && region_free(entry) && !free_withholds() {
+                if block == 0 && nowhere(entry, &l.blocks) && !free_withholds() {
                     continue;
                 }
                 return true;
@@ -1099,7 +1256,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 bits &= bits - 1;
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
-                    if block == 0 && !region_free(entry) {
+                    if block == 0 && !nowhere(entry, blocks) {
                         let before = missed_regions_count();
                         note_missed_region(entry);
                         changed |= missed_regions_count() != before;
@@ -1147,7 +1304,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 // Block 0's bits are 256 MiB regions with no block.
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
                     missed.push((entry as u64) << 28);
-                    if block == 0 && region_free(entry) {
+                    if block == 0 && nowhere(entry, blocks) {
                         // Nothing in the whole region: a read at a free
                         // address, whichever page it was.
                         pages += 1;
@@ -1537,6 +1694,18 @@ mod tests {
         let before = crate::shadow::generation();
         prefetch(&[(0, 0, 0x30_0000), (0, 1, 0xff)]);
         assert_eq!(crate::shadow::generation(), before, "nothing mapped there");
+    }
+
+    /// Bit 0 of a list's bitmap is region 0 with no block, or, once region
+    /// 0 has one, an address past 2^40: no memory at all.
+    #[test]
+    fn bit_zero_with_region_zero_named_is_no_memory() {
+        if !misses_told_apart() {
+            return;
+        }
+        assert!(nowhere(0, &[usize::MAX, 7, 0]));
+        // Region 0 holds the process's own low memory: not free.
+        assert!(!nowhere(0, &[usize::MAX, 7]));
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

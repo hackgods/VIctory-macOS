@@ -1701,6 +1701,19 @@ fn note_remap(first: usize, last: usize) {
     remaps.1.push_back((n, first, last));
 }
 
+/// How many reported mapping changes ago the last one that touched page
+/// `page` was, among those kept, and how many are kept (diagnostics).
+pub(crate) fn last_remap(page: usize) -> (Option<u64>, usize) {
+    let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let ago = remaps
+        .1
+        .iter()
+        .rev()
+        .find(|&&(_, first, last)| (first..last).contains(&page))
+        .map(|&(n, _, _)| remaps.0 - n);
+    (ago, remaps.1.len())
+}
+
 /// The number of the last reported mapping change ([`remapped_since`]).
 pub(crate) fn remap_epoch() -> u64 {
     REMAPS.lock().unwrap_or_else(|e| e.into_inner()).0

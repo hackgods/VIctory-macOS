@@ -1134,9 +1134,12 @@ impl State {
             // Root views a shader reads as title memory: the copies holding
             // their addresses go into the page table.
             let mut roots = Vec::new();
+            // The root constants a program using title memory is handed.
+            let mut memory_words = Vec::new();
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
-                let ahead = stage.memory.is_some() && crate::memory::prefetching();
+                let ahead = stage.memory.is_some()
+                    && (crate::memory::prefetching() || crate::memory::probing());
                 let mut constants = Vec::new();
                 for u in &t.host.user_data {
                     if u.root == RootType::Descriptor
@@ -1192,9 +1195,10 @@ impl State {
                         constants.push((u.slot, u.dword, values[u.index as usize]));
                     }
                 }
-                if !constants.is_empty() {
+                if !constants.is_empty() && crate::memory::prefetching() {
                     crate::memory::prefetch(&constants);
                 }
+                memory_words = constants;
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -1316,6 +1320,12 @@ impl State {
                         l.SetGraphicsRootShaderResourceView(param, table);
                     }
                     if let Some(param) = stage.memory_dirty {
+                        let dirty = match &self.memory {
+                            Some((heap, _)) if crate::memory::probing() => {
+                                crate::memory::probe(list, *heap, &p.name, &memory_words).unwrap_or(dirty)
+                            }
+                            _ => dirty,
+                        };
                         list.note_unknown_gpu_write();
                         if compute {
                             l.SetComputeRootUnorderedAccessView(param, dirty);

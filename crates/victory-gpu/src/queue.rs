@@ -387,7 +387,9 @@ fn pump_ready_under_drain(why: Why) -> bool {
                     if !heads.is_empty() {
                         host.prepare_beside(&heads);
                         drop(heads);
-                        if host.finish_flight_now() {
+                        // `VICTORY_LAND_BESIDE`: beside the heap sync of the
+                        // submission this call goes on to prepare.
+                        if host.finish_flight_beside() {
                             host.landed_for_held_work();
                         }
                         // Landed, by this thread or by `victory-flight`
@@ -462,6 +464,10 @@ fn pump_ready_under_drain(why: Why) -> bool {
             a.released.push((kind(queue), waited, why));
         }
     }
+    // A heap sync made beside a landing stands for a submission prepared in
+    // this call only: what the title writes into its heaps after the call
+    // returns is for a later sync.
+    crate::host::forget_heaps_synced();
     moved_any
 }
 

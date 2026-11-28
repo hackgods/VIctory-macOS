@@ -148,6 +148,22 @@ pub(super) fn take_heaps_synced() -> bool {
     HEAPS_SYNCED.with(|s| s.replace(false))
 }
 
+/// The title's call that ran held work returns: a heap sync made beside a
+/// landing in it and not used by a preparation stands for nothing later.
+pub(crate) fn forget_heaps_synced() {
+    HEAPS_SYNCED.with(|s| s.set(false));
+}
+
+/// Whether the refreshes beside a flight run (`VICTORY_BESIDE_REFRESH`, on
+/// unless `"0"`): off, `VICTORY_PREP_BESIDE=1` keeps the landing on the
+/// thread that submits and nothing else. In the world a heap's unordered
+/// views reach nearly every page the next submission refreshes, so the
+/// pass finds little it may copy.
+fn beside_refresh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BESIDE_REFRESH").is_none_or(|v| v != "0"))
+}
+
 /// Tests: `VICTORY_PREP_BESIDE` on or off until dropped (under a
 /// [`ModeGuard`], which serializes the tests that set modes).
 #[cfg(test)]
@@ -702,6 +718,19 @@ impl Host {
         self.prepare_beside_locked(lists);
     }
 
+    /// Lands the flight in the air for held work that waits for it, beside
+    /// the heap sync of the submission the caller prepares next where
+    /// `VICTORY_LAND_BESIDE` allows ([`Host::land_beside_locked`]). Returns
+    /// whether this call landed it.
+    pub(crate) fn finish_flight_beside(&self) -> bool {
+        if !self.has_in_flight() {
+            return false;
+        }
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        let _holding = Holding::enter();
+        self.land_beside_locked(&mut submitted)
+    }
+
     /// The flight in the air was landed by the thread whose held work waited
     /// for it (the frame line).
     pub(crate) fn landed_for_held_work(&self) {
@@ -714,7 +743,7 @@ impl Host {
     /// ([`prep_beside_enabled`]). Called under `Host::submitted`, so the
     /// flight is not landed meanwhile.
     fn prepare_beside_locked(&self, lists: &[Arc<HostList>]) {
-        if !prep_beside_enabled() {
+        if !prep_beside_enabled() || !beside_refresh() {
             return;
         }
         let (fence_value, writes, heaps) = {
@@ -1267,11 +1296,24 @@ mod tests {
     /// is tried again until the submitting thread was the one that landed.
     #[test]
     fn prep_beside_lands_the_flight_for_work_held_behind_it() {
+        held_work_runs_on_the_submitting_thread(false);
+    }
+
+    /// The same with `VICTORY_LAND_BESIDE`: the flight the held work waits
+    /// for lands on a worker beside the heap sync, and the held list still
+    /// runs after its bottom-of-pipe write, launched by the same call.
+    #[test]
+    fn land_beside_lands_the_flight_for_work_held_behind_it() {
+        held_work_runs_on_the_submitting_thread(true);
+    }
+
+    fn held_work_runs_on_the_submitting_thread(land: bool) {
         let Some(host) = host() else {
             return;
         };
         let _mode = ModeGuard::new(true, false);
         let _beside = BesideGuard::new(true);
+        let _land = LandGuard::new(land);
         let (q, f) = make_queue_and_fence();
         let mut landed_by_submitter = false;
         for attempt in 1..=20u64 {
@@ -1319,7 +1361,8 @@ mod tests {
             // list was given to the GPU, whoever landed the flight.
             // SAFETY: the word is never freed.
             assert_eq!(unsafe { (bop as *const u64).read_volatile() }, value);
-            let by_submitter = beside_counts()[5] > before[5];
+            let by_submitter =
+                beside_counts()[5] > before[5] && (!land || beside_counts()[8] > before[8]);
             queue_signal(q, f, attempt);
             assert!(
                 wait_fence(f, attempt, Duration::from_secs(5)),

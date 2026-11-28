@@ -9,7 +9,7 @@
 mod flight;
 #[cfg(test)]
 pub(crate) use flight::{BesideGuard, Gate, ModeGuard, beside_counts};
-pub(crate) use flight::{async_submit_enabled, flight1_enabled, prep_beside_enabled};
+pub(crate) use flight::{async_submit_enabled, flight1_enabled, forget_heaps_synced, prep_beside_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};

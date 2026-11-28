@@ -732,6 +732,34 @@ pub fn alias_region(base: usize, len: usize, preserve_contents: bool) -> bool {
     alias_locked(base, len, preserve_contents)
 }
 
+/// Mac, log only (upstream VIctory-macOS PR #598, 11387edd): whether the
+/// buffer D3DMetal mapped for an alias starts inside a 16 KiB host page.
+/// D3DMetal places buffers inside bigger ones at 256-byte steps once small
+/// ones are alive (an M1 Max probe there: 47 of 48 mid-page). The remap
+/// below maps whole pages from the page holding `gpu_mem`, so the GPU would
+/// then see the title's bytes shifted by the offset, and the title's last
+/// `offset` bytes would share memory past the buffer. Warns at the 1st, 2nd,
+/// 4th, ... such buffer; none means this Mac is not hit.
+fn note_mid_page(gpu_mem: *mut u8, base: usize, len: usize) {
+    const HOST_PAGE: usize = 16 << 10;
+    let offset = gpu_mem as usize % HOST_PAGE;
+    if offset == 0 {
+        return;
+    }
+    static MID_PAGE: AtomicU64 = AtomicU64::new(0);
+    let n = MID_PAGE.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            n,
+            offset = format_args!("{offset:#x}"),
+            base = format_args!("{base:#x}"),
+            len,
+            aliased = TOTALS[0].load(Ordering::Relaxed),
+            "an aliased title buffer's D3DMetal buffer starts inside a 16 KiB page: the GPU sees its bytes shifted (upstream #598)"
+        );
+    }
+}
+
 /// [`alias_region`], under [`LOCK`].
 fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
     let Some(zeroed) = supported() else {
@@ -754,6 +782,7 @@ fn alias_locked(base: usize, len: usize, preserve_contents: bool) -> bool {
         tracing::warn!(base = format_args!("{base:#x}"), len, "no host buffer to alias title memory onto; keeping plain memory");
         return false;
     };
+    note_mid_page(gpu_mem, base, len);
     // SAFETY: `base` and `gpu_mem` are `len`-byte owned mappings.
     unsafe {
         if preserve_contents {

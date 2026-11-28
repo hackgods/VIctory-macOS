@@ -310,6 +310,23 @@ pub(crate) fn note_submission(missed: bool) {
     if missed {
         MISSED_IN.store(FRAMES.load(Relaxed), Relaxed);
     }
+    // Mac (`VICTORY_NULL_PAGE=1`): a list's check let a null-page read pass.
+    if pointer_pages::take_spared() {
+        SPARED_IN.store(FRAMES.load(Relaxed), Relaxed);
+    }
+}
+
+/// Mac (`VICTORY_NULL_PAGE=1`): the last frame in which a list's miss check
+/// let a null-page read pass ([`MISS_NEVER`] if none has).
+static SPARED_IN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(MISS_NEVER);
+
+/// Mac (`VICTORY_NULL_PAGE=1`): whether the writes of lists using title
+/// memory go back now only because null-page reads are no miss: no
+/// [`withholding`], but there would be if they were one (for the frame
+/// line's "MB of views no longer kept").
+pub(crate) fn spared_withholding() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    !withholding() && withheld_in(FRAMES.load(Relaxed), SPARED_IN.load(Relaxed))
 }
 
 /// Whether what lists using title memory wrote stays out of title memory
@@ -389,10 +406,20 @@ pub(crate) fn log_frame() {
     }
     // mac: with `VICTORY_AB` only (`crate::ab`): the frame's side and number.
     let ab = crate::ab::label().map_or(String::new(), |side| format!("; ab={side} frame={}", crate::queue::presented()));
+    // mac: with `VICTORY_NULL_PAGE=1` (or `VICTORY_POINTER_PAGES=2`) only.
+    let null = if pointer_pages::null_page_free() {
+        let (reads, spared) = pointer_pages::take_null();
+        format!(
+            ", {reads} reads of the null page let pass (no miss) and {:.1} MB of views no longer kept for them",
+            spared as f64 / 1e6
+        )
+    } else {
+        String::new()
+    };
     tracing::info!(
         "title memory this frame: {} draws/dispatches ({}), {} page tables, {} pages \
          copied back, {} withheld and {:.1} MB of views kept (their list read memory with no copy), missed {} pages \
-         and {} 256 MiB regions with no copy (first: {}){ab}",
+         and {} 256 MiB regions with no copy (first: {}){null}{ab}",
         s.uses.values().sum::<u64>(),
         uses.join(", "),
         s.tables,
@@ -567,8 +594,10 @@ fn has_missed(marks: &[u32], l: &Layout) -> bool {
             let entry = w * 32 + bits.trailing_zeros() as usize;
             bits &= bits - 1;
             let block = entry / BLOCK;
-            // Mac (`VICTORY_POINTER_PAGES=2`): the null page is no miss.
+            // Mac (`VICTORY_NULL_PAGE=1`, `VICTORY_POINTER_PAGES=2`): the
+            // null page is no miss.
             if pointer_pages::null_page_free() && pointer_pages::is_null_page(&l.blocks, entry, BLOCK) {
+                pointer_pages::note_spared_check();
                 continue;
             }
             // Mac (`VICTORY_POINTER_PAGES=3`): memory no one allocated is no
@@ -672,7 +701,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 match owner.get(entry) {
                     Some(_) if precise.iter().any(|&(a, n)| a < at + (1 << 16) && at < a + n) => {}
                     Some(&Some(k)) => writes.push((k, at)),
-                    _ if null_free && pointer_pages::is_null_page(blocks, entry, BLOCK) => {}
+                    _ if null_free && pointer_pages::is_null_page(blocks, entry, BLOCK) => pointer_pages::note_null_read(),
                     _ if unallocated && pointer_pages::never_allocated(pointer_pages::Missed::Page(at)) => {}
                     _ => {
                         pages += 1;
@@ -870,14 +899,18 @@ mod tests {
         let mut marks = vec![0u32; BITMAP_WORDS];
         marks[BLOCK / 32] = 1 << (BLOCK % 32);
         assert!(has_missed(&marks, &l), "a miss as before");
+        let before = pointer_pages::take_spared();
         pointer_pages::NULL_FREE.store(true, std::sync::atomic::Ordering::Relaxed);
         let free = has_missed(&marks, &l);
+        let noted = pointer_pages::take_spared();
         let next = BLOCK + 1;
         marks[next / 32] |= 1 << (next % 32);
         let other = has_missed(&marks, &l);
         pointer_pages::NULL_FREE.store(false, std::sync::atomic::Ordering::Relaxed);
         assert!(!free, "the null page alone");
         assert!(other, "the page after it");
+        assert!(!before, "a miss counted as one notes nothing");
+        assert!(noted, "the read let pass is noted, for the frame line");
     }
 
     fn gpu_test_lock() -> std::sync::MutexGuard<'static, ()> {

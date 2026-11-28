@@ -151,8 +151,9 @@ struct Buffers {
     /// (bytes, buffer, mapping), oldest first.
     free: std::collections::VecDeque<(u64, ID3D12Resource, usize)>,
     free_bytes: u64,
-    /// Taken by the submission being prepared.
-    used: Vec<(u64, ID3D12Resource, usize)>,
+    /// Taken by the submissions of each upload slot ([`upload_slot`]), the
+    /// last of them prepared there.
+    used: [Vec<(u64, ID3D12Resource, usize)>; 2],
     /// The bytes of buffers submissions needed lately.
     lately: crate::recent::Peak,
 }
@@ -163,9 +164,34 @@ unsafe impl Send for Buffers {}
 static BUFFERS: Mutex<Buffers> = Mutex::new(Buffers {
     free: std::collections::VecDeque::new(),
     free_bytes: 0,
-    used: Vec::new(),
+    used: [Vec::new(), Vec::new()],
     lately: crate::recent::Peak::new(),
 });
+
+/// mac: the upload slot whose staging the uploads being made take
+/// ([`recycle_in`]), and the slot the next uploads take. Always 0 but with
+/// flights' `alias` (`VICTORY_FLIGHTS_WITH=alias`), where a submission
+/// prepared while the one before still runs on the GPU takes the slot that
+/// one's upload list and staging are not in: the two are used in turn,
+/// each by the next submission that records uploads (`crate::bindless`).
+static SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static NEXT_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The upload slot the next uploads take.
+pub(crate) fn upload_slot() -> usize {
+    if crate::host::unwaited::flights::with_alias() {
+        NEXT_SLOT.load(std::sync::atomic::Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// The uploads of `slot` went to the GPU: the next take the other.
+pub(crate) fn slot_given(slot: usize) {
+    if crate::host::unwaited::flights::with_alias() {
+        NEXT_SLOT.store(slot ^ 1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Free staging buffers kept at least, and at most: between them, what any
 /// submission needed lately. A big texture that changes again has its
@@ -182,14 +208,23 @@ const KEPT_BYTES_MAX: u64 = 256 << 20;
 /// only when the lists using it are done: each keeps its own reference
 /// (`record_upload`). The big textures' read buffers that no refresh used
 /// lately go too, one a call.
+#[cfg(test)]
 pub(crate) fn recycle() {
+    recycle_in(0);
+}
+
+/// [`recycle`] for the uploads of upload slot `slot` ([`upload_slot`]): the
+/// buffers and chunks of the last submission that recorded uploads there,
+/// which has run, are free again, and the slot's staging is taken from now.
+pub(crate) fn recycle_in(slot: usize) {
+    SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
     let now = std::time::Instant::now();
     let mut big = SCRATCH_BIG.lock().unwrap_or_else(|e| e.into_inner());
     let freed = big.trim(now);
     drop(big);
     drop(freed);
     {
-        let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut c = CHUNKS[slot].lock().unwrap_or_else(|e| e.into_inner());
         let c = &mut *c;
         let needed = c.current + usize::from(c.used > 0);
         let kept = c.lately.begin(now, needed).min(CHUNKS_KEPT);
@@ -198,9 +233,9 @@ pub(crate) fn recycle() {
     }
     let mut b = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
     let b = &mut *b;
-    let needed: u64 = b.used.iter().map(|e| e.0).sum();
+    let needed: u64 = b.used[slot].iter().map(|e| e.0).sum();
     let kept = (b.lately.begin(now, needed as usize) as u64).clamp(KEPT_BYTES, KEPT_BYTES_MAX);
-    for e in b.used.drain(..) {
+    for e in b.used[slot].drain(..) {
         b.free_bytes += e.0;
         b.free.push_back(e);
     }
@@ -232,7 +267,7 @@ fn staging_buffer(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         }
     };
     let made = (e.1.clone(), e.2 as *mut u8);
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used.push(e);
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).used[SLOT.load(std::sync::atomic::Ordering::Relaxed)].push(e);
     Some(made)
 }
 
@@ -253,12 +288,16 @@ struct Chunks {
 // SAFETY: the mappings are persistent mappings of the upload buffers.
 unsafe impl Send for Chunks {}
 
-static CHUNKS: Mutex<Chunks> = Mutex::new(Chunks {
-    all: Vec::new(),
-    current: 0,
-    used: 0,
-    lately: crate::recent::Peak::new(),
-});
+/// mac: one pool per upload slot ([`upload_slot`]; the second is used only
+/// with flights' `alias`).
+static CHUNKS: [Mutex<Chunks>; 2] = [const {
+    Mutex::new(Chunks {
+        all: Vec::new(),
+        current: 0,
+        used: 0,
+        lately: crate::recent::Peak::new(),
+    })
+}; 2];
 
 const CHUNK: u64 = 32 << 20;
 /// Chunks kept between submissions at most (more are made while one needs
@@ -272,7 +311,7 @@ fn staging_space(size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
     if size > CHUNK {
         return staging_buffer(size).map(|(b, data)| (b, 0, data));
     }
-    let mut c = CHUNKS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = CHUNKS[SLOT.load(std::sync::atomic::Ordering::Relaxed)].lock().unwrap_or_else(|e| e.into_inner());
     loop {
         if let Some((buffer, data)) = c.all.get(c.current) {
             let at = c.used.next_multiple_of(512);
@@ -685,6 +724,11 @@ impl Staging {
     /// Bytes required in a staging buffer for this texture.
     pub(crate) fn size_bytes(&self) -> u64 {
         self.size
+    }
+
+    /// mac: the title memory a refresh may read (start, bytes).
+    pub(crate) fn title_range(&self) -> (usize, usize) {
+        (self.memory as usize, self.layout.size as usize)
     }
 
     /// Marks that real readable title memory reached a submitted GPU upload.

@@ -499,15 +499,23 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
 ///
 /// shortcut: a title copy into texture memory recorded in the same
 /// submission shows from the next one on.
-pub(crate) fn uploads(
+///
+/// mac: `before` is told what is to be brought up before any of its title
+/// memory is read (flights, `VICTORY_FLIGHTS_WITH=alias`).
+pub(crate) fn uploads_after(
     heaps: &[Arc<Viewed>],
     textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+    before: &mut dyn FnMut(&[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)]),
 ) -> Option<Uploads> {
-    static LIST: Mutex<Holder> = Mutex::new(Holder(None));
-    let mut guard = LIST.lock().unwrap_or_else(|e| e.into_inner());
-    crate::texture::recycle();
+    // mac: two, used in turn with flights' `alias`, else the first only: a
+    // submission prepared while the one before still runs takes the list
+    // and staging that one is not using (`crate::texture::upload_slot`).
+    static LISTS: [Mutex<Holder>; 2] = [const { Mutex::new(Holder(None)) }; 2];
+    let slot = crate::texture::upload_slot();
+    let mut guard = LISTS[slot].lock().unwrap_or_else(|e| e.into_inner());
+    crate::texture::recycle_in(slot);
     match &guard.0 {
-        // Closed by the last submission, which has run.
+        // Closed by the last submission of the slot, which has run.
         Some(list) => list.reset(),
         // Made open.
         None => {
@@ -571,6 +579,8 @@ pub(crate) fn uploads(
             }
         }
     }
+    // mac: before their title memory is read.
+    before(&work);
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
     let mut readable = Vec::new();
@@ -641,10 +651,22 @@ pub(crate) fn uploads(
     }
     list.close();
     // A list recording nothing is not run (its reset next time is fine).
-    recorded.then_some(Uploads {
-        list: guard,
-        worker: Mutex::new(ready),
+    recorded.then(|| {
+        crate::texture::slot_given(slot);
+        Uploads {
+            list: guard,
+            worker: Mutex::new(ready),
+        }
     })
+}
+
+/// [`uploads_after`] with nothing told first (tests).
+#[cfg(test)]
+pub(crate) fn uploads(
+    heaps: &[Arc<Viewed>],
+    textures: &[(Arc<crate::texture::Staging>, Arc<crate::resource::HostTexture>)],
+) -> Option<Uploads> {
+    uploads_after(heaps, textures, &mut |_| {})
 }
 
 /// The upload list, used under its lock only.
@@ -690,10 +712,15 @@ impl Uploads {
 ///
 /// Copies the title has not written since they took it are passed by: a
 /// world submission's heaps reach ~9,000 copies, a few of them written.
+///
+/// mac: while the submission before still runs beside this one (flights),
+/// also the clean copies its landing may tell (`crate::flights::asked`).
 pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     for (shadow, address, len, uav, bit) in inner.hulls.values() {
-        if !crate::watch::clean_bit(*bit) {
+        if crate::flights::asked(crate::watch::clean_bit(*bit), beside, *address as usize, *len as usize) {
             let (address, len) = if *uav && shadow.marked() {
                 shadow.page_range(*address, *len)
             } else {
@@ -734,11 +761,14 @@ pub(crate) fn refresh_slot(
     index: u32,
     mut add: impl FnMut(&Arc<Shadow>, usize, usize),
 ) {
+    // mac: as in [`refresh`], asked before the lock.
+    let beside = crate::host::unwaited::flights::landing();
+    let beside = beside.as_deref().map(crate::host::unwaited::flights::Shared::landing);
     let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
     let Some(Seen::Buffer(shadow, address, len, _)) = inner.slots.get(&index) else {
         return;
     };
-    if !crate::watch::clean_bit(shadow.dirty_bit()) {
+    if crate::flights::asked(crate::watch::clean_bit(shadow.dirty_bit()), beside, *address as usize, *len as usize) {
         add(shadow, *address as usize, *len as usize);
     }
 }

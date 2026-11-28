@@ -1982,8 +1982,14 @@ impl Host {
         }
         #[cfg(feature = "diagnostics")]
         let uploading = crate::watch::Timed(std::time::Instant::now(), crate::copystat::C::UploadsUs);
+        // mac: with flights' `alias`, the one left is finished first where
+        // their memory could meet what it writes.
         let uploads = (!heaps.is_empty() || !textures.is_empty())
-            .then(|| crate::bindless::uploads(&heaps, &textures))
+            .then(|| {
+                crate::bindless::uploads_after(&heaps, &textures, &mut |work| {
+                    self.beside_texture_reads(&mut submitted, &mut beside, work)
+                })
+            })
             .flatten();
         #[cfg(feature = "diagnostics")]
         drop(uploading);
@@ -2388,6 +2394,7 @@ impl Host {
                 }
             }
         }
+        back.iter().for_each(|b| unwaited::lines::declared(&b.0));
         // A range overlapping a withheld one of the same copy is withheld
         // too: its copy-back would take the other's bytes along (pages a
         // program using title memory and another both wrote).
@@ -2506,6 +2513,7 @@ impl Host {
         for list in runs {
             for &(at, what, bytes) in &list.deferred().writes {
                 what.write(at as *mut u8, bytes);
+                unwaited::lines::word(at, bytes);
             }
         }
         // The submission has run and the next waits for our lock. Host
@@ -4338,8 +4346,15 @@ impl Batch {
         }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
-        if shadow.clean() {
+        // mac: but while the submission left still runs beside this one, a
+        // clean copy its landing may tell stays, for after its finish
+        // (`crate::flights::asked`, `unwaited::flights::landing`).
+        let clean = shadow.clean();
+        if !unwaited::flights::with_landing(|beside| crate::flights::asked(clean, beside, address, len)) {
             return;
+        }
+        if clean {
+            unwaited::flights::kept_clean();
         }
         // Only what is not current: most lists ask for a copy whole, after
         // a title copy took a few bytes of it.

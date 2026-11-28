@@ -1,0 +1,70 @@
+//! mac: E1 of `notes/overlap-stages-design.md`: lines only, for every run
+//! with `VICTORY_ASYNC_SUBMIT=1` (flights or not), so that the arms of an
+//! overlap A/B can be read side by side. Nothing counted here changes what
+//! runs or when.
+//!
+//! - bottom-of-pipe writes made, and those into aliased memory (a later
+//!   submission in the air could read them on the GPU before we write them);
+//! - shader-write ranges finished, and those on aliased copies (stage 3's
+//!   declarations that need no finish);
+//! - per thread calling us: the time inside our queue calls, and the waits
+//!   for the held-work lock and the submission lock in it
+//!   (`crate::flights::threads`).
+
+use super::*;
+
+/// Since the last frame line: words made, into aliased memory; ranges
+/// declared, on aliased copies.
+static COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// When the last line was made.
+static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// A bottom-of-pipe write of `bytes` at `at` was made.
+pub(in crate::host) fn word(at: usize, bytes: usize) {
+    COUNTS[0].fetch_add(1, Relaxed);
+    if crate::shadow::find_aliased(at as u64, (at + bytes) as u64).is_some() {
+        COUNTS[1].fetch_add(1, Relaxed);
+    }
+}
+
+/// A finished submission declared that shaders write a range of `copy`.
+pub(in crate::host) fn declared(copy: &crate::shadow::Shadow) {
+    COUNTS[2].fetch_add(1, Relaxed);
+    if copy.is_aliased() {
+        COUNTS[3].fetch_add(1, Relaxed);
+    }
+}
+
+/// The submission lock, its wait counted for the thread.
+pub(super) fn lock_submitted(lock: &Mutex<u64>) -> std::sync::MutexGuard<'_, u64> {
+    let at = Instant::now();
+    let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    crate::flights::threads::add(crate::flights::threads::Spent::Lock, at.elapsed().as_micros() as u64);
+    held
+}
+
+/// The line (`frames` since the last one).
+pub(super) fn log(frames: f64) {
+    let [words, aliased_words, ranges, aliased_ranges] = COUNTS.each_ref().map(|n| n.swap(0, Relaxed) as f64 / frames);
+    let now = Instant::now();
+    let since = SINCE.lock().unwrap_or_else(|e| e.into_inner()).replace(now);
+    let frame = since.map_or(0.0, |s| (now - s).as_secs_f64() * 1000.0 / frames);
+    let mut threads = crate::flights::threads::take();
+    threads.sort_by_key(|t| std::cmp::Reverse(t.1[0]));
+    let threads: Vec<String> = threads
+        .iter()
+        .map(|(id, us)| {
+            let [inside, held, lock] = us.map(|u| u as f64 / 1000.0 / frames);
+            format!("{id}: {inside:.1}/{held:.1}/{lock:.1}")
+        })
+        .collect();
+    tracing::info!(
+        "overlap lines: {words:.1}/frame bottom-of-pipe writes made, {aliased_words:.1} of them into aliased memory; \
+         {ranges:.1}/frame shader-write ranges finished, {aliased_ranges:.1} of them on aliased copies; threads \
+         calling us by Windows thread id, ms/frame inside our queue calls (ExecuteCommandLists, Signal, Wait, \
+         PresentX) / waiting for the held-work lock / waiting for the submission lock: [{}]; {frame:.1} ms/frame by \
+         the clock (outside our calls, a thread spent that less its first figure)",
+        threads.join(", ")
+    );
+}

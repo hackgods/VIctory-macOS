@@ -341,8 +341,6 @@ struct Tracer<'a> {
     spill_at: std::collections::HashMap<usize, Result<u32, &'static str>>,
     /// Address sums already traced, indexed by SSA value.
     sums: std::cell::RefCell<Vec<Option<Sum>>>,
-    /// The access whose descriptor is being traced ([`Tracer::runs`]).
-    access: std::cell::Cell<Option<Site>>,
 }
 
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
@@ -460,7 +458,6 @@ impl<'a> Tracer<'a> {
             first_spilled: Default::default(),
             spill_at: Default::default(),
             sums: Default::default(),
-            access: Default::default(),
         };
         t.origin = t.propagate_copies(n)?;
         // Loads from the root signature's memory are found by their address,
@@ -1606,95 +1603,12 @@ impl<'a> Tracer<'a> {
         let Some(&Some(guard)) = lanes.guards.get(site.0).and_then(|g| g.get(site.1)) else {
             return Ok(());
         };
-        if self.access.get().is_some_and(|at| self.ran_under(at, site)) {
-            return Ok(());
-        }
         let mut skips = known.clone();
         skips.extend([(lanes.reach[site.0], true), (guard, false)]);
         if meet(lanes, &skips) {
             return Err("a per-lane descriptor written where some lanes may keep the old one");
         }
         Ok(())
-    }
-
-    /// Whether every lane that runs the access at `at` ran the copy at
-    /// `copy` (whose value the access reads, so the copy's block ran on the
-    /// way): the access's EXEC holds no lane the copy's EXEC did not
-    /// ([`Tracer::exec_within`]). A waterfall loop's EXEC starts as the
-    /// EXEC before it and each pass only takes lanes out, which the lane
-    /// conditions cannot tell where the loop's header forgets them.
-    fn ran_under(&self, at: Site, copy: Site) -> bool {
-        let (access, copy) = (self.inst(at), self.inst(copy));
-        let halves: &[u8] = if self.p.wave64 { &[0, 1] } else { &[0] };
-        halves.iter().all(
-            |&h| match (access.read(Reg::S(EXEC + h)), copy.read(Reg::S(EXEC + h))) {
-                (Some(e), Some(x)) => self.exec_within(e, x, h, &mut Vec::new()),
-                _ => false,
-            },
-        )
-    }
-
-    /// Whether lane mask half `v` (low dword 0, high 1: `half`) holds no lane
-    /// `x` does not: `x` itself, a phi of such, or a lane-mask operation that
-    /// keeps or takes out lanes of such (`and` of one, `andn2` or
-    /// `andn2_wrexec` of its first, `or` and `xor` of both, `v_cmpx` of the
-    /// EXEC it reads, the old EXEC an `_saveexec` saves). Going round a loop
-    /// back to a value being checked holds: lanes enter it only from the
-    /// rest.
-    fn exec_within(&self, v: Value, x: Value, half: u8, seen: &mut Vec<Value>) -> bool {
-        if v == x || seen.contains(&v) {
-            return true;
-        }
-        seen.push(v);
-        if let Some((b, i)) = self.phis[v.0 as usize] {
-            let args = self.p.blocks[b].phis[i].args.clone();
-            return args.iter().all(|&a| self.exec_within(a, x, half, seen));
-        }
-        let Some(inst) = self.def(v) else {
-            return false;
-        };
-        let exec_in = inst.read(Reg::S(EXEC + half));
-        let within = |l: &Self, w: Option<Value>, seen: &mut Vec<Value>| {
-            w.is_some_and(|w| l.exec_within(w, x, half, seen))
-        };
-        let name = inst.name();
-        if name.starts_with("v_cmpx_") {
-            return inst.write(Reg::S(EXEC + half)) == Some(v) && within(self, exec_in, seen);
-        }
-        let Fields::Sop { src, .. } = &inst.fields else {
-            return false;
-        };
-        let width = if self.p.wave64 { "_b64" } else { "_b32" };
-        let Some(op) = name.strip_prefix("s_").and_then(|n| n.strip_suffix(width)) else {
-            return false;
-        };
-        // A source operand's half, or an inline 0 (no lanes).
-        let operand = |k: usize| -> Option<Option<Value>> {
-            match *src.get(k)? {
-                Operand::Scalar { code, .. } if code != NULL => {
-                    Some(Some(inst.read(Reg::S(code + half))?))
-                }
-                Operand::Const(128) => Some(None),
-                _ => None,
-            }
-        };
-        let arg = |l: &Self, k: usize, seen: &mut Vec<Value>| match operand(k) {
-            Some(None) => true,
-            Some(w) => within(l, w, seen),
-            None => false,
-        };
-        let to_exec = inst.write(Reg::S(EXEC + half)) == Some(v);
-        match op {
-            "mov" => arg(self, 0, seen),
-            "and" => arg(self, 0, seen) || arg(self, 1, seen),
-            "andn2" => arg(self, 0, seen),
-            "or" | "xor" => arg(self, 0, seen) && arg(self, 1, seen),
-            "and_saveexec" if to_exec => arg(self, 0, seen) || within(self, exec_in, seen),
-            "andn2_saveexec" if to_exec => arg(self, 0, seen),
-            "andn2_wrexec" => arg(self, 0, seen),
-            _ if op.ends_with("_saveexec") && !to_exec => within(self, exec_in, seen),
-            _ => false,
-        }
     }
 
     /// The source of descriptor dwords each lane holds its own of (a

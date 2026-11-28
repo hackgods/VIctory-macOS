@@ -1647,6 +1647,7 @@ impl State {
         });
         #[cfg(feature = "diagnostics")]
         self.probe_small(list, true);
+        crate::census::direct(&p.name, [x, y, z], p.stages.first().and_then(|s| s.translated().threads));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.probe_hdr_compute(list);
@@ -2851,6 +2852,12 @@ impl State {
                 kind == DISPATCH,
             )
         });
+        if kind == DISPATCH
+            && crate::census::on()
+            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
+        {
+            crate::census::indirect(&p.name, max);
+        }
         // SAFETY: an open list with everything set; the buffers are host
         // copies the list keeps alive (refresh), the signature is cached.
         unsafe {

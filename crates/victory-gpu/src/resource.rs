@@ -1936,6 +1936,7 @@ pub(crate) fn evict_unused() {
     });
     let ram = ram_over();
     evict(frame, now_ms(), over.max(ram));
+    empty_sparse_heap(frame);
     // Host copies of title memory take the same memory and textures give
     // back only part of it: the idle ones go too.
     crate::shadow::release_idle(frame, ram);
@@ -1944,6 +1945,53 @@ pub(crate) fn evict_unused() {
         crate::texback::trim_idle();
     }
 }
+
+/// Presented frames between two [`empty_sparse_heap`] passes.
+#[cfg(windows)]
+const EMPTY_FRAMES: u64 = 30;
+
+/// Every [`EMPTY_FRAMES`] presented frames where the card's memory is the
+/// computer's own ([`unified`]), unless `VICTORY_EMPTY_HEAPS=0`: gives up
+/// the textures of one sparse heap of textures, so that it empties and is
+/// released (`crate::placement::choose_to_empty`). A heap goes back whole
+/// or not at all, and in world runs on a 32 GB Mac the heaps held 0.8 to
+/// 1.9 GB of free space. Only a heap whose textures may all be given up
+/// and were not used in the last [`SOON_FRAMES`] frames is emptied, as
+/// [`choose`] spares those past the budget. Returns how many textures were
+/// given up and their bytes.
+#[cfg(windows)]
+fn empty_sparse_heap(frame: u64) -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_HEAPS").is_none_or(|v| v != "0"));
+    if !on || !frame.is_multiple_of(EMPTY_FRAMES) || !unified() {
+        return (0, 0);
+    }
+    let candidates = candidates();
+    let quiet = |t: &HostTexture| frame.saturating_sub(t.last[0].load(Relaxed)) > SOON_FRAMES;
+    let mut may_go: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for (t, _) in &candidates {
+        if let Some(p) = t.placement.filter(|_| quiet(t)) {
+            *may_go.entry(p.heap()).or_default() += p.size();
+        }
+    }
+    let Some(heap) = crate::placement::choose_to_empty(|id| may_go.get(&id).copied().unwrap_or(0)) else {
+        return (0, 0);
+    };
+    let gone: Vec<Owned> =
+        candidates.into_iter().filter(|(t, _)| t.placement.is_some_and(|p| p.heap() == heap)).collect();
+    let (n, bytes) = give_up(&gone, frame);
+    HEAPS_EMPTIED[0].fetch_add(1, Relaxed);
+    HEAPS_EMPTIED[1].fetch_add(bytes, Relaxed);
+    tracing::debug!(heap, textures = n, mb = bytes as f64 / 1e6, "emptying a sparse heap of textures");
+    (n, bytes)
+}
+
+/// Heaps of textures [`empty_sparse_heap`] emptied, and the bytes of the
+/// textures it gave up for them, for the statistics line.
+#[cfg(windows)]
+pub(crate) static HEAPS_EMPTIED: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Where the card's memory is the computer's own (unified: Apple silicon
 /// under D3DMetal, integrated GPUs), host textures also go while less than
@@ -2123,9 +2171,10 @@ fn one_memory(uma: bool, local: f64, non_local: f64) -> bool {
 /// The card's budget in MB that [`evict_unused`] keeps host textures under:
 /// `VICTORY_GPU_BUDGET_MB` when set, else the device's (`device`). Under
 /// D3DMetal the device's is about four fifths of the Mac's memory, which the
-/// title's own memory shares, and memory freed through D3DMetal stays with
-/// the process for its next resources: on a Mac with 8 GB, unused textures
-/// filled memory into swap long before the pass would start (#135).
+/// title's own memory shares: on a Mac with 8 GB, unused textures filled
+/// memory into swap long before the pass would start (#135). Memory freed
+/// through D3DMetal leaves the process at the next submission, and the
+/// device's use follows it (`footprint_probe`).
 #[cfg(windows)]
 fn budget_mb(device: f64) -> f64 {
     static SET: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();

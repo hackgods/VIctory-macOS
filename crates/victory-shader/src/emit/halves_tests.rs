@@ -1889,6 +1889,210 @@ fn literal_wave64_vcc_hi_offset_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// How a full-LDS program reaches its halves exchange.
+#[derive(Clone, Copy, Debug)]
+enum Exchanges {
+    /// One ballot read as data.
+    One,
+    /// Two back to back.
+    Two,
+    /// One in a loop of 3 trips, each adding 1 to the dwords the exchange
+    /// borrows (the first 1,024) first.
+    Loop,
+}
+
+/// What the program adds to dwords 0..1023 before reading them back.
+const fn full_lds_bump(e: Exchanges) -> u32 {
+    match e {
+        Exchanges::Loop => 3,
+        _ => 0,
+    }
+}
+
+/// A 1,024-thread wave64 program that fills all 8,192 dwords of its LDS
+/// (thread t writes dword `t + 1024k` = `t + 1024k + 0xA500_0000` for k
+/// 0-7), passes a ballot between the halves (`e`), and reads all eight of
+/// another wave's dwords back (thread t reads those of `(t + 32) % 1024`).
+/// Per lane: the ballots' lane count, the OR of every difference from what
+/// was written (0 when the LDS came back byte for byte), and its own dword
+/// `t` as it is at the end.
+fn full_lds_program(e: Exchanges) -> Vec<u32> {
+    const BASE: u32 = 0xA500_0000;
+    let bump = full_lds_bump(e);
+    let ds_write = |offset: u32| [0xD834_0000 | offset, 0x0000_0401]; // ds_write_b32 v1, v4 offset:
+    let ds_read = |offset: u32| [0xD8D8_0000 | offset, 0x0E00_000A]; // ds_read_b32 v14, v10 offset:
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        0x4A04_00FF,
+        BASE, // v_add_nc_u32 v2, BASE, v0
+    ]);
+    for k in 0..8u32 {
+        w.extend([0x4A08_04FF, 1024 * k]); // v_add_nc_u32 v4, 1024k, v2
+        w.extend(ds_write(4096 * k));
+    }
+    w.extend([
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x360E_00BF, // v_and_b32 v7, 63, v0
+    ]);
+    // Lanes 0-39 of each console wave: 40 a ballot.
+    let ballot = [
+        0x7D88_0EA8, // v_cmp_gt_u32 vcc, 40, v7
+        0xBE8C_106A, // s_bcnt1_i32_b64 s12, vcc
+    ];
+    match e {
+        Exchanges::One => w.extend(ballot),
+        Exchanges::Two => {
+            w.extend(ballot);
+            w.extend([
+                0x7D88_0E94, // v_cmp_gt_u32 vcc, 20, v7
+                0xBE8D_106A, // s_bcnt1_i32_b64 s13, vcc
+                0x800C_0D0C, // s_add_u32 s12, s12, s13
+            ]);
+        }
+        Exchanges::Loop => {
+            w.extend([
+                0x7E12_0281, // v_mov_b32 v9, 1
+                0xBE94_0380, // s_mov_b32 s20, 0
+                0xBE8E_0380, // s_mov_b32 s14, 0
+            ]);
+            let top = w.len();
+            w.extend([0xD800_0000, 0x0000_0901]); // ds_add_u32 v1, v9
+            w.extend(ballot);
+            w.extend([
+                0x800E_0C0E, // s_add_u32 s14, s14, s12
+                0x8014_8114, // s_add_u32 s20, s20, 1
+                0xBF0A_8314, // s_cmp_lt_u32 s20, 3
+            ]);
+            let back = (top as i32 - (w.len() as i32 + 1)) as u16;
+            w.push(0xBF85_0000 | u32::from(back)); // s_cbranch_scc1 top
+            w.push(0xBE8C_030E); // s_mov_b32 s12, s14
+        }
+    }
+    w.extend([
+        S_WAITCNT_LGKM,
+        0xBF8A_0000, // s_barrier
+        0x4A1A_00A0, // v_add_nc_u32 v13, 32, v0
+        0x361A_1AFF,
+        0x0000_03FF, // v_and_b32 v13, 1023, v13
+        0x3414_1A82, // v_lshlrev_b32 v10, 2, v13
+        0x4A18_1AFF,
+        BASE,        // v_add_nc_u32 v12, BASE, v13
+        0x7E16_0280, // v_mov_b32 v11, 0
+    ]);
+    for k in 0..8u32 {
+        w.extend(ds_read(4096 * k));
+        w.extend([
+            S_WAITCNT_LGKM,
+            0x4A1E_18FF,
+            1024 * k + if k == 0 { bump } else { 0 }, // v_add_nc_u32 v15, what was written, v12
+            0x3A1C_1F0E,                              // v_xor_b32 v14, v14, v15
+            0x3816_1D0B,                              // v_or_b32 v11, v11, v14
+        ]);
+    }
+    w.extend([
+        0xD8D8_0000,
+        0x1100_0001, // ds_read_b32 v17, v1
+        S_WAITCNT_LGKM,
+        0x7E06_020C, // v_mov_b32 v3, s12
+    ]);
+    w.extend(store(3, 0));
+    w.extend(store(11, 4));
+    w.extend(store(17, 8));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// What each lane of [`full_lds_program`] stores.
+fn full_lds_want(e: Exchanges) -> Vec<u32> {
+    let count = match e {
+        Exchanges::One => 40,
+        Exchanges::Two => 60,
+        Exchanges::Loop => 120,
+    };
+    (0..1024u32)
+        .flat_map(|t| [count, 0, t + 0xA500_0000 + full_lds_bump(e)])
+        .collect()
+}
+
+/// The program's words are the instructions their comments name.
+#[test]
+fn the_full_lds_programs_are_what_their_comments_say() {
+    for e in [Exchanges::One, Exchanges::Two, Exchanges::Loop] {
+        let words = full_lds_program(e);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 256).unwrap();
+        let insts: Vec<_> = p.blocks.iter().flat_map(|b| b.insts.iter()).collect();
+        let count = |name: &str| insts.iter().filter(|i| i.name() == name).count();
+        assert_eq!(count("ds_write_b32"), 8, "{e:?}");
+        assert_eq!(count("ds_read_b32"), 9, "{e:?}");
+        assert_eq!(count("s_barrier"), 2, "{e:?}");
+        for name in [
+            "v_lshlrev_b32",
+            "v_add_nc_u32",
+            "v_and_b32",
+            "v_xor_b32",
+            "v_or_b32",
+            "v_cmp_gt_u32",
+            "s_bcnt1_i32_b64",
+            "buffer_store_dword",
+        ] {
+            assert!(count(name) > 0, "{e:?}: no {name}");
+        }
+        let offsets: Vec<i32> = insts
+            .iter()
+            .filter(|i| i.name() == "ds_write_b32")
+            .map(|i| match &i.fields {
+                gfx10::Fields::Ds {
+                    offset0, offset1, ..
+                } => i32::from(*offset1) << 8 | i32::from(*offset0),
+                _ => -1,
+            })
+            .collect();
+        assert_eq!(offsets, (0..8).map(|k| 4096 * k).collect::<Vec<_>>());
+        if let Exchanges::Loop = e {
+            assert_eq!(count("ds_add_u32"), 1);
+            assert_eq!(count("s_cbranch_scc1"), 1);
+            assert!(p.blocks.len() >= 3);
+        }
+    }
+}
+
+/// A program whose own LDS is the host's whole 32 KiB passes values between
+/// its halves through dwords it borrows from that LDS.
+#[test]
+fn halves_exchange_in_a_program_that_fills_the_lds() {
+    for e in [Exchanges::One, Exchanges::Two, Exchanges::Loop] {
+        let words = full_lds_program(e);
+        let full = lowered_with(&native(&words, true, 1024, 32768), true, true)
+            .unwrap_or_else(|why| panic!("{e:?}: {why}"));
+        assert_eq!(full.wave_size, Some(32));
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn halves_give_back_borrowed_lds_on_every_gpu() {
+    let mut failed = Vec::new();
+    for e in [Exchanges::One, Exchanges::Two, Exchanges::Loop] {
+        failed.extend(
+            differences_with(
+                &full_lds_program(e),
+                1024,
+                3,
+                &full_lds_want(e),
+                32768,
+                true,
+            )
+            .into_iter()
+            .map(|f| format!("{e:?}: {f}")),
+        );
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// VOP2 opcode for `v_add_f16`.
 const V_ADD_F16: u32 = 0x32;
 

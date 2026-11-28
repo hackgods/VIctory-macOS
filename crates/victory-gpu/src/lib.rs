@@ -59,6 +59,8 @@ pub mod frame;
 #[cfg(windows)]
 mod heap_worker;
 #[cfg(any(windows, test))]
+mod heap_fit;
+#[cfg(any(windows, test))]
 mod hdr_probe;
 mod hold;
 #[cfg(windows)]
@@ -108,6 +110,8 @@ mod texture;
 #[cfg(any(windows, test))]
 mod timing_cuts;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod twin;
 #[cfg(windows)]
 mod watch;
@@ -116,6 +120,9 @@ mod widened;
 // Whether the host opens heaps over process memory (ignored by default).
 #[cfg(all(windows, test))]
 mod inplace_probe;
+// Which `footprint` rows hold D3DMetal's memory (ignored by default).
+#[cfg(all(windows, test))]
+mod footprint_probe;
 
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use copystat::CountingAlloc;

@@ -617,6 +617,16 @@ impl Shared {
     }
 }
 
+/// The copies the page table of view heap `key` names: what programs using
+/// title memory with that heap bound may write, at addresses they compute
+/// (`crate::host::flight` arms them for a flight).
+#[cfg(windows)]
+pub(crate) fn copies(key: usize, mut each: impl FnMut(&Arc<Shadow>)) {
+    for copy in &layout(key).copies {
+        each(copy);
+    }
+}
+
 /// The page table of view heap `key`, as the last submission using it
 /// left it.
 fn layout(key: usize) -> Arc<Layout> {

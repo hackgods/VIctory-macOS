@@ -712,6 +712,18 @@ pub(crate) fn refresh_slot(
     }
 }
 
+/// Each copy the heap views for unordered access, with the range of it
+/// its views reach (address, bytes): what the heap's shaders may write with
+/// no list declaring it.
+pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>, usize, usize)) {
+    let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    for (shadow, address, len, uav, _) in &inner.hulls {
+        if *uav {
+            each(shadow, *address as usize, *len as usize);
+        }
+    }
+}
+
 /// Heap UAV ranges that may need to refresh a widened SRV after a later
 /// buffer barrier, added to `out` (the caller's buffer, kept from barrier to
 /// barrier: the world's heaps have tens of thousands). The list of them is

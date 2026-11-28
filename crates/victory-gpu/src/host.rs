@@ -7,6 +7,8 @@
 //! syncs of later submissions ([`overlap`]).
 
 mod flight;
+#[cfg(test)]
+pub(crate) use flight::{Gate, ModeGuard};
 pub(crate) use flight::{async_submit_enabled, flight1_enabled};
 
 use std::sync::atomic::{AtomicU32, Ordering};

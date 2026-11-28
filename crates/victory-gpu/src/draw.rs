@@ -3105,6 +3105,8 @@ const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
 mod tests {
+    mod flight;
+
     use super::*;
     use crate::backend::{HostGpu, HostMemory};
 

@@ -4227,6 +4227,47 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// A first-lane read of a value a multiply-accumulate made, in an
+/// `s_and_saveexec_b64` region whose EXEC is `mask_words`'s, its result
+/// used in the region only (as GTA VI's `ef154ebc9e03d1b1` reads a function
+/// of a constant-buffer value): `v4 = f32(s14)`, `s14` the first dword of
+/// the SRV buffer at table dword 8, then `v_mac_f32 v4, v7, v8` with
+/// `v7 = 2.0`, so `v4 += 2.0 * v8`. `v8` is 2.0 (the same in every lane of
+/// the region), or with `per_lane` the lane's thread id. The region's lanes
+/// store the read; the others 0.
+fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0xF420_0396,
+        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ]);
+    w.extend(mask_words);
+    w.extend([
+        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+        0xBF88_0006, // s_cbranch_execz (past the region)
+        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
+        0x7E0E_02F4, // v_mov_b32 v7, 2.0
+        if per_lane {
+            0x7E10_0D00 // v_cvt_f32_u32 v8, v0
+        } else {
+            0x7E10_02F4 // v_mov_b32 v8, 2.0
+        },
+        0x3E08_1107, // v_mac_f32 v4, v7, v8
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// A register-index waterfall as the console compiler writes one for a
 /// per-lane `v[3 + index]`: `v3..v10` hold `k * 1000 + thread id`, the index
 /// is `(thread id >> 2) & 7`, and the loop reads one index left
@@ -4272,123 +4313,11 @@ fn index_waterfall(with_mbcnt: bool, body: &[u32], after: &[u32]) -> Vec<u32> {
     w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
     w.extend(after);
     w.extend(store(31, 0));
-/// A first-lane read of a value a multiply-accumulate made, in an
-/// `s_and_saveexec_b64` region whose EXEC is `mask_words`'s, its result
-/// used in the region only (as GTA VI's `ef154ebc9e03d1b1` reads a function
-/// of a constant-buffer value): `v4 = f32(s14)`, `s14` the first dword of
-/// the SRV buffer at table dword 8, then `v_mac_f32 v4, v7, v8` with
-/// `v7 = 2.0`, so `v4 += 2.0 * v8`. `v8` is 2.0 (the same in every lane of
-/// the region), or with `per_lane` the lane's thread id. The region's lanes
-/// store the read; the others 0.
-fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
-    let mut w = PROLOGUE.to_vec();
-    w.extend([
-        0xF408_0B02,
-        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
-        S_WAITCNT_LGKM,
-        0xF420_0396,
-        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
-        S_WAITCNT_LGKM,
-        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-        0x7E04_0280, // v_mov_b32 v2, 0
-    ]);
-    w.extend(mask_words);
-    w.extend([
-        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
-        0xBF88_0006, // s_cbranch_execz (past the region)
-        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
-        0x7E0E_02F4, // v_mov_b32 v7, 2.0
-        if per_lane {
-            0x7E10_0D00 // v_cvt_f32_u32 v8, v0
-        } else {
-            0x7E10_02F4 // v_mov_b32 v8, 2.0
-        },
-        0x3E08_1107, // v_mac_f32 v4, v7, v8
-        0x7E18_0504, // v_readfirstlane_b32 s12, v4
-        0x7E04_020C, // v_mov_b32 v2, s12
-        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
-    ]);
-    w.extend(store(2, 0));
     w.push(S_ENDPGM);
     w
 }
 
 #[test]
-fn the_index_waterfall_programs_are_what_their_comments_say() {
-    let words = index_waterfall(true, &[], &[]);
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let all = gfx10::decode(&code)
-        .expect("decodes")
-        .iter()
-        .map(|i| i.text(true))
-        .collect::<Vec<_>>()
-        .join("\n");
-    for want in [
-        "v_add_nc_u32 v3, lit(0x00000000), v0",
-        "v_add_nc_u32 v10, lit(0x00001b58), v0",
-        "v_lshrrev_b32 v28, 2, v0",
-        "v_and_b32 v28, 7, v28",
-        "s_mov_b64 s[36:37], exec",
-        "v_readfirstlane_b32 s38, v28",
-        "v_cmp_eq_u32 vcc, s38, v28",
-        "s_and_saveexec_b64 s[6:7], vcc",
-        "s_mov_b32 m0, s38",
-        "v_movrels_b32 v31, v3",
-        "s_xor_b64 exec, exec, s[6:7]",
-        "s_cbranch_execnz",
-        "s_mov_b64 exec, s[36:37]",
-    ] {
-        assert!(all.contains(want), "{want:?} not in:\n{all}");
-    }
-}
-
-/// The first-lane read opening a register-index waterfall is made by each
-/// host half by itself: the program needs no halves for it, and translates
-/// in halves too although the read is in a loop (#522 sent GTA VI's
-/// `11eeb27c2d15980d` to halves for it, which refused it). Where the read's
-/// result is seen after the loop, or the loop body does scalar work, whose
-/// iterations the halves would see, the read still takes halves (refused
-/// where they cannot meet).
-#[test]
-fn a_register_index_waterfall_is_made_in_each_half() {
-    let across = "a first-lane read of a value that may differ between 32-lane halves";
-    let halves = |words: &[u32], threads: u32| match lowered(&native(words, true, threads, 0), true)
-    {
-        Ok(l) => l.wave_size == Some(32),
-        Err(e) => e.to_string().contains(across),
-    };
-    for threads in [64, 128] {
-        assert!(!halves(&index_waterfall(false, &[], &[]), threads));
-        assert!(halves(&index_waterfall(true, &[], &[]), threads));
-        // v_mov_b32 v31, s38 after the loop
-        assert!(halves(
-            &index_waterfall(false, &[], &[0x7E3E_0226]),
-            threads
-        ));
-        // s_add_u32 s50, s50, 1 in the body
-        assert!(halves(
-            &index_waterfall(false, &[0x8032_8132], &[]),
-            threads
-        ));
-    }
-}
-
-/// The register-index waterfall gives the console's lanes on every GPU, in
-/// halves and not: `((thread id >> 2) & 7) * 1000 + thread id` in every
-/// lane.
-#[cfg(windows)]
-#[test]
-fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
-    let mut failed = Vec::new();
-    for threads in [64, 128] {
-        let want: Vec<u32> = (0..threads).map(|t| ((t >> 2) & 7) * 1000 + t).collect();
-        for with_mbcnt in [false, true] {
-            let words = index_waterfall(with_mbcnt, &[], &[]);
-            failed.extend(
-                differences(&words, threads, 1, &want)
-                    .into_iter()
-                    .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
-            );
 fn the_mac_read_programs_are_what_their_comments_say() {
     for per_lane in [false, true] {
         let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
@@ -4478,6 +4407,88 @@ fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu()
                         .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
                 );
             }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+
+#[test]
+fn the_index_waterfall_programs_are_what_their_comments_say() {
+    let words = index_waterfall(true, &[], &[]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_add_nc_u32 v3, lit(0x00000000), v0",
+        "v_add_nc_u32 v10, lit(0x00001b58), v0",
+        "v_lshrrev_b32 v28, 2, v0",
+        "v_and_b32 v28, 7, v28",
+        "s_mov_b64 s[36:37], exec",
+        "v_readfirstlane_b32 s38, v28",
+        "v_cmp_eq_u32 vcc, s38, v28",
+        "s_and_saveexec_b64 s[6:7], vcc",
+        "s_mov_b32 m0, s38",
+        "v_movrels_b32 v31, v3",
+        "s_xor_b64 exec, exec, s[6:7]",
+        "s_cbranch_execnz",
+        "s_mov_b64 exec, s[36:37]",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// The first-lane read opening a register-index waterfall is made by each
+/// host half by itself: the program needs no halves for it, and translates
+/// in halves too although the read is in a loop (#522 sent GTA VI's
+/// `11eeb27c2d15980d` to halves for it, which refused it). Where the read's
+/// result is seen after the loop, or the loop body does scalar work, whose
+/// iterations the halves would see, the read still takes halves (refused
+/// where they cannot meet).
+#[test]
+fn a_register_index_waterfall_is_made_in_each_half() {
+    let across = "a first-lane read of a value that may differ between 32-lane halves";
+    let halves = |words: &[u32], threads: u32| match lowered(&native(words, true, threads, 0), true)
+    {
+        Ok(l) => l.wave_size == Some(32),
+        Err(e) => e.to_string().contains(across),
+    };
+    for threads in [64, 128] {
+        assert!(!halves(&index_waterfall(false, &[], &[]), threads));
+        assert!(halves(&index_waterfall(true, &[], &[]), threads));
+        // v_mov_b32 v31, s38 after the loop
+        assert!(halves(
+            &index_waterfall(false, &[], &[0x7E3E_0226]),
+            threads
+        ));
+        // s_add_u32 s50, s50, 1 in the body
+        assert!(halves(
+            &index_waterfall(false, &[0x8032_8132], &[]),
+            threads
+        ));
+    }
+}
+
+/// The register-index waterfall gives the console's lanes on every GPU, in
+/// halves and not: `((thread id >> 2) & 7) * 1000 + thread id` in every
+/// lane.
+#[cfg(windows)]
+#[test]
+fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads).map(|t| ((t >> 2) & 7) * 1000 + t).collect();
+        for with_mbcnt in [false, true] {
+            let words = index_waterfall(with_mbcnt, &[], &[]);
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
+            );
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));

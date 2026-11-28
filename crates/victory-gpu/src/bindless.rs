@@ -2269,6 +2269,50 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::shadow::unregister(at as usize, at);
     }
 
+    /// A range added below the copy's first start but inside an already
+    /// occupied 64 KiB page must still get a refresh span. Page buckets keep
+    /// their widest bounds while any range touches the page, but spans are
+    /// clamped to the copy's `(min, max)`, so after the low range leaves, the
+    /// bucket can reach below the first start without any span holding it.
+    #[test]
+    fn disjoint_range_below_first_start_inside_old_page_bounds_is_covered() {
+        const SIZE: usize = 1 << 20;
+        let memory = vec![0u8; SIZE];
+        let at = memory.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, SIZE as u64);
+        let Some(copy) = crate::shadow::find(at, SIZE as u64) else {
+            crate::shadow::unregister(at as usize, at);
+            return; // no host GPU here
+        };
+        // First 64 KiB-aligned address inside the buffer, so all ranges share a page.
+        let o = at.next_multiple_of(1 << CHUNK_SHIFT) - at;
+
+        for disjoint in [true, false] {
+            let viewed = Viewed::with_disjoint_spans(false, disjoint);
+            viewed.set_buffer_slot(1, Some((&copy, at + o, 4096, false)));
+            viewed.set_buffer_slot(2, Some((&copy, at + o + 32 * 1024, 4096, false)));
+            let mut seen = Vec::new();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            // The low range leaves: the first start moves up to the second range.
+            viewed.set_buffer_slot(1, None);
+            seen.clear();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            assert_eq!(seen, vec![(o + 32 * 1024, 4096)], "disjoint={disjoint}");
+            // A new range below the new first start, inside the old page bounds.
+            viewed.set_buffer_slot(3, Some((&copy, at + o + 16 * 1024, 4096, false)));
+            seen.clear();
+            refresh(&viewed, |_, a, l| seen.push((a as u64 - at, l as u64)));
+            let (from, to) = (o + 16 * 1024, o + 20 * 1024);
+            assert!(
+                seen.iter().any(|&(a, l)| a <= from && to <= a + l),
+                "disjoint={disjoint}: new range {from:#x}..{to:#x} not refreshed, got {seen:x?}"
+            );
+        }
+
+        drop(copy);
+        crate::shadow::unregister(at as usize, at);
+    }
+
     /// Evicting an unregistered shadow removes only its `k` associated slots in
     /// O(k) via `CopySpans::slots`, tracks slot reassignments without stale
     /// entries, and keeps live copies' slots and spans intact.

@@ -318,6 +318,10 @@ struct Stats {
     copies_made: u64,
     /// Copies made ahead of programs' root constants ([`prefetch`]).
     prefetched: u64,
+    /// Addresses root constants and their blocks name where nothing is
+    /// committed ([`prefetch`]), and the first: `(named at, address, state)`.
+    named_nowhere: u64,
+    first_nowhere: Vec<(u64, u64, &'static str)>,
 }
 
 static STATS: std::sync::Mutex<Option<Stats>> = std::sync::Mutex::new(None);
@@ -449,6 +453,18 @@ pub(crate) fn log_frame() {
             format!("{a:#x}")
         })
         .collect();
+    if s.named_nowhere > 0 {
+        let first: Vec<String> = s
+            .first_nowhere
+            .iter()
+            .map(|(from, at, state)| format!("{at:#x} {state} (named at {from:#x})"))
+            .collect();
+        tracing::info!(
+            "title memory programs' constants this frame name {} addresses of 4 GiB and up where nothing is committed (named at 0: in the root constants): {}",
+            s.named_nowhere,
+            first.join(", "),
+        );
+    }
     if !s.missed_by_region.is_empty() {
         // The regions shaders missed most in, with what the memory there is.
         let mut regions: Vec<(&u64, &[u64; 3])> = s.missed_by_region.iter().collect();
@@ -526,6 +542,32 @@ fn miss_kind(at: u64, since: u64) -> MissKind {
     }
 }
 
+/// Whether a read at a free address holds back what its list wrote
+/// (`VICTORY_MISS_FREE=0`: it does not; counted all the same). A diagnostic:
+/// on the console no program reads where nothing is mapped, so such a read
+/// comes of data that is already wrong, and if that data is wrong because
+/// earlier writes were held back, holding back keeps it wrong.
+fn free_withholds() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_MISS_FREE").as_deref() != Ok("0"))
+}
+
+/// Whether nothing is reserved in the whole 256 MiB region `l1` (a level-1
+/// index): a read there is a read at a free address, and the region needs
+/// no block to say so.
+fn region_free(l1: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_FREE, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let at = l1 << 28;
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    let asked = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    asked != 0
+        && misses_told_apart()
+        && info.State == MEM_FREE
+        && (info.BaseAddress as usize).saturating_add(info.RegionSize) >= at + (1 << 28)
+}
+
 /// Whether misses are told apart (`VICTORY_TITLE_MISSES=0`: every page read
 /// with no copy is a miss, and no copy is made for it, as before).
 fn misses_told_apart() -> bool {
@@ -591,12 +633,31 @@ fn addresses_in(words: &[(u8, u32, u32)]) -> impl Iterator<Item = u64> + '_ {
 
 /// The 40-bit addresses among the qwords of `block`, at every dword (the
 /// builder's programs load theirs at 0x4c and on).
-fn addresses_of(block: &[u8]) -> impl Iterator<Item = u64> + '_ {
+fn addresses_of(block: &[u8]) -> impl Iterator<Item = (usize, u64)> + '_ {
     block
         .windows(8)
         .step_by(4)
-        .map(|q| u64::from_le_bytes(q.try_into().expect("8 bytes")))
-        .filter(|&at| at >= crate::watch::PAGE as u64 && at < 1 << 40)
+        .enumerate()
+        .map(|(i, q)| (i * 4, u64::from_le_bytes(q.try_into().expect("8 bytes"))))
+        .filter(|&(_, at)| at >= crate::watch::PAGE as u64 && at < 1 << 40)
+}
+
+/// What Windows has at `at`: "committed", "reserved" or "free".
+fn state_of(at: u64) -> &'static str {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size; any address may be asked.
+    if unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) } == 0 {
+        return "free";
+    }
+    match info.State {
+        MEM_COMMIT => "committed",
+        MEM_RESERVE => "reserved",
+        _ => "free",
+    }
 }
 
 /// A program using title memory is handed root constants `words` (`(slot,
@@ -614,8 +675,17 @@ pub(crate) fn prefetch(words: &[(u8, u32, u32)]) {
     let mut seen = PREFETCHED.lock().unwrap_or_else(|e| e.into_inner());
     let seen = seen.get_or_insert_with(HashSet::new);
     let mut made = 0;
-    let mut copy = |at: u64, seen: &mut HashSet<u64>| -> bool {
-        if !seen.insert(at / page) || !writable(at) {
+    // Addresses of 4 GiB and up the constants name where nothing is
+    // committed: `(named at, address, state)`.
+    let mut nowhere: Vec<(u64, u64, &'static str)> = Vec::new();
+    let mut copy = |from: u64, at: u64, seen: &mut HashSet<u64>| -> bool {
+        if !seen.insert(at / page) {
+            return false;
+        }
+        if !writable(at) {
+            if at >= 1 << 32 {
+                nowhere.push((from, at, state_of(at)));
+            }
             return false;
         }
         let before = crate::shadow::generation();
@@ -624,19 +694,24 @@ pub(crate) fn prefetch(words: &[(u8, u32, u32)]) {
         found
     };
     for at in addresses_in(words) {
-        if !copy(at, seen) {
+        if !copy(0, at, seen) {
             continue;
         }
         let len = (PREFETCH_BLOCK as u64).min(page - at % page) as usize & !7;
         // SAFETY: the page is committed and readable (`writable`), and the
         // bytes end in it; the title may write them meanwhile (plain bytes).
         let block: Vec<u8> = (0..len).map(|i| unsafe { ((at as usize + i) as *const u8).read_volatile() }).collect();
-        for named in addresses_of(&block) {
-            copy(named, seen);
+        for (i, named) in addresses_of(&block) {
+            copy(at + i as u64, named, seen);
         }
     }
-    if made > 0 {
-        stats(|s| s.prefetched += made);
+    if made > 0 || !nowhere.is_empty() {
+        stats(|s| {
+            s.prefetched += made;
+            s.named_nowhere += nowhere.len() as u64;
+            let room = 16usize.saturating_sub(s.first_nowhere.len());
+            s.first_nowhere.extend(nowhere.into_iter().take(room));
+        });
     }
 }
 
@@ -891,12 +966,17 @@ fn has_missed(marks: &[u32], l: &Layout, kind: impl Fn(u64) -> MissKind) -> bool
             bits &= bits - 1;
             let (block, page) = (entry / BLOCK, entry % BLOCK);
             let Some(&l1) = l.blocks.get(block).filter(|_| block != 0) else {
+                if block == 0 && region_free(entry) && !free_withholds() {
+                    continue;
+                }
                 return true;
             };
-            if l.owner.get(entry).is_none_or(|o| o.is_none())
-                && kind((l1 << 28 | page << 16) as u64) != MissKind::Unmapped
-            {
-                return true;
+            if l.owner.get(entry).is_none_or(|o| o.is_none()) {
+                match kind((l1 << 28 | page << 16) as u64) {
+                    MissKind::Unmapped => {}
+                    MissKind::Free if !free_withholds() => {}
+                    _ => return true,
+                }
             }
         }
     }
@@ -955,6 +1035,8 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
             unsafe { std::slice::from_raw_parts_mut(pooled.data() as *mut u32, BITMAP_WORDS) };
         let (mut pages, mut regions, mut missed) = (0, 0, Vec::new());
         let (mut unmapped, mut copied) = (0, 0);
+        // Misses that hold back what the list wrote.
+        let mut holding = 0u64;
         let mut by_region: Vec<(u64, usize)> = Vec::new();
         let mut writes = Vec::new();
         for (w, mark) in marks.iter_mut().enumerate() {
@@ -969,8 +1051,17 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                 let (block, page) = (entry / BLOCK, entry % BLOCK);
                 // Block 0's bits are 256 MiB regions with no block.
                 let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
-                    regions += 1;
                     missed.push((entry as u64) << 28);
+                    if block == 0 && region_free(entry) {
+                        // Nothing in the whole region: a read at a free
+                        // address, whichever page it was.
+                        pages += 1;
+                        by_region.push(((entry as u64) << 28, 1));
+                        holding += u64::from(free_withholds());
+                        continue;
+                    }
+                    regions += 1;
+                    holding += 1;
                     by_region.push(((entry as u64) << 28, 2));
                     note_missed_region(entry);
                     continue;
@@ -983,6 +1074,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
                         MissKind::Unmapped => unmapped += 1,
                         k => {
                             pages += 1;
+                            holding += u64::from(k != MissKind::Free || free_withholds());
                             missed.push(at);
                             by_region.push((at & !((1 << 28) - 1), usize::from(k == MissKind::Free)));
                             if k == MissKind::Mapped && misses_told_apart() && copy_missed(at) {
@@ -997,7 +1089,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         // not the console's: it does not go into title memory, where it broke
         // the title's own data (garbage pointers in title threads, run c1),
         // nor while any list using title memory misses ([`withholding`]).
-        let withheld = if pages + regions > 0 || withholding() { writes.len() as u64 } else { 0 };
+        let withheld = if holding > 0 || withholding() { writes.len() as u64 } else { 0 };
         if withheld > 0 {
             for &(_, at) in &writes {
                 drop_withheld(at as usize, 1 << 16);
@@ -1322,11 +1414,11 @@ mod tests {
         let words = [(2u8, 0u32, 0x1234_0000u32), (2, 1, 0xabcd_ef05), (3, 0, 7), (3, 1, 0)];
         assert_eq!(addresses_in(&words).collect::<Vec<_>>(), [0x5_1234_0000]);
         let mut block = vec![0u8; 4];
-        for q in [0u64, 0x20, 0x7_0000_1000, 1 << 40, 0xff_ffff_fff8] {
+        for q in [0u64, 0x200, 0x7_0000_1000, 1 << 40, 0xff_ffff_fff8] {
             block.extend_from_slice(&q.to_le_bytes());
             block.extend_from_slice(&[0; 8]);
         }
-        assert_eq!(addresses_of(&block).collect::<Vec<_>>(), [0x7_0000_1000, 0xff_ffff_fff8]);
+        assert_eq!(addresses_of(&block).collect::<Vec<_>>(), [(36, 0x7_0000_1000), (68, 0xff_ffff_fff8)]);
         if crate::host::host().is_none() {
             return; // no host GPU here
         }

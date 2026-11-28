@@ -4227,45 +4227,6 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// A `while` loop as the console compiler lays one out: the entry jumps to
-/// the test, which branches back to the body while lanes stay; the body
-/// falls into the test. The body reads the first lane's thread id
-/// (`v_readfirstlane_b32 s6, v0`) into an accumulator `v2`, and counts its
-/// passes in `v1`. `narrow`: a lane stays while `v1 < (tid & 7)`, and the
-/// test drops the lanes done from EXEC (`s_and_b64 exec, exec, vcc;
-/// s_cbranch_execnz`). Else every lane stays while `v1 < 7`, a test the
-/// same in every lane, and EXEC stays (`s_and_b64 vcc, exec, vcc;
-/// s_cbranch_vccnz`, as GTA VI's loops test). Every lane stores `v2`.
-fn while_loop_first_lane(narrow: bool) -> Vec<u32> {
-    let mut w = PROLOGUE.to_vec();
-    w.extend([
-        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
-        0x7E02_0280, // v_mov_b32 v1, 0
-        0x7E04_0280, // v_mov_b32 v2, 0
-        if narrow {
-            0x360A_0087 // v_and_b32 v5, 7, v0
-        } else {
-            0x7E0A_0287 // v_mov_b32 v5, 7
-        },
-        0xBEA4_047E, // s_mov_b64 s[36:37], exec
-        0xBF82_0003, // s_branch (the test)
-        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
-        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
-        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
-        0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
-    ]);
-    if narrow {
-        w.extend([
-            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
-            0xBF89_FFFA, // s_cbranch_execnz (the body)
-        ]);
-    } else {
-        w.extend([
-            0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
-            0xBF87_FFFA, // s_cbranch_vccnz (the body)
-        ]);
-    }
-    w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
 /// A first-lane read of a value a multiply-accumulate made, in an
 /// `s_and_saveexec_b64` region whose EXEC is `mask_words`'s, its result
 /// used in the region only (as GTA VI's `ef154ebc9e03d1b1` reads a function
@@ -4307,6 +4268,145 @@ fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
     w
 }
 
+#[test]
+fn the_mac_read_programs_are_what_their_comments_say() {
+    for per_lane in [false, true] {
+        let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "s_buffer_load_dword s14, s[44:47]",
+            "s_and_saveexec_b64 s[0:1], vcc",
+            "s_cbranch_execz",
+            "v_cvt_f32_u32 v4, s14",
+            "v_mov_b32 v7, 2.0",
+            if per_lane {
+                "v_cvt_f32_u32 v8, v0"
+            } else {
+                "v_mov_b32 v8, 2.0"
+            },
+            "v_mac_f32 v4, v7, v8",
+            "v_readfirstlane_b32 s12, v4",
+            "v_mov_b32 v2, s12",
+            "s_mov_b64 exec, s[0:1]",
+        ] {
+            assert!(all.contains(want), "per_lane={per_lane}: {want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A multiply-accumulate adds to its old destination. Where that, like its
+/// operands, is the same in every lane of the read's EXEC, so is its
+/// result, and each half makes the read by itself: no halves for it, no
+/// exchange. Before, any multiply-accumulate in the value's chain sent the
+/// read to the halves. With a per-lane operand the read still takes them.
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_is_made_in_each_half() {
+    for threads in [64, 128] {
+        let of = |per_lane: bool| {
+            let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+            lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("per_lane={per_lane} {threads} threads: {e}"))
+        };
+        let alike = of(false);
+        assert_eq!(alike.barriers, 0, "{threads} threads: no exchange");
+        let per_lane = of(true);
+        assert_eq!(per_lane.wave_size, Some(32));
+        assert!(per_lane.barriers > 0, "{threads} threads: the halves pass the first lane");
+    }
+}
+
+/// Both give the console's lanes on every GPU: the region's lanes store
+/// `41.0 + 2.0 * 2.0`, or with a per-lane operand `41.0 + 2.0 *` the thread
+/// id of the console wave's first lane in the region.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu() {
+    type InRegion = fn(u32) -> bool;
+    let masks: [(&str, &[u32; 2], InRegion, &[u32]); 3] = [
+        ("lower_8_9", &MASK_LANES_8_9, |t| t >> 1 == 4, &[64]),
+        ("upper_40_41", &MASK_LANES_40_41, |t| t >> 1 == 20, &[64]),
+        ("both_12_44", &MASK_LANES_12_44, |t| t & 31 == 12, &[64, 128]),
+    ];
+    let mut failed = Vec::new();
+    for (label, mask, in_region, groups) in masks {
+        for &threads in groups {
+            for per_lane in [false, true] {
+                let words = mac_read_in_a_region(mask, per_lane);
+                let want: Vec<u32> = (0..threads)
+                    .map(|t| {
+                        if !in_region(t) {
+                            return 0;
+                        }
+                        let base = t & !63;
+                        let first = (base..base + 64).find(|&l| in_region(l)).expect("in it");
+                        let operand = if per_lane { first as f32 } else { 2.0 };
+                        (41.0 + 2.0 * operand).to_bits()
+                    })
+                    .collect();
+                let found = differences_with_buffer(
+                    true, &words, threads, 1, &want, 0, false, false, &[41, 0, 0, 0],
+                );
+                failed.extend(
+                    found
+                        .into_iter()
+                        .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A `while` loop as the console compiler lays one out: the entry jumps to
+/// the test, which branches back to the body while lanes stay; the body
+/// falls into the test. The body reads the first lane's thread id
+/// (`v_readfirstlane_b32 s6, v0`) into an accumulator `v2`, and counts its
+/// passes in `v1`. `narrow`: a lane stays while `v1 < (tid & 7)`, and the
+/// test drops the lanes done from EXEC (`s_and_b64 exec, exec, vcc;
+/// s_cbranch_execnz`). Else every lane stays while `v1 < 7`, a test the
+/// same in every lane, and EXEC stays (`s_and_b64 vcc, exec, vcc;
+/// s_cbranch_vccnz`, as GTA VI's loops test). Every lane stores `v2`.
+fn while_loop_first_lane(narrow: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x7E04_0280, // v_mov_b32 v2, 0
+        if narrow {
+            0x360A_0087 // v_and_b32 v5, 7, v0
+        } else {
+            0x7E0A_0287 // v_mov_b32 v5, 7
+        },
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+        0xBF82_0003, // s_branch (the test)
+        0x7E0C_0500, // v_readfirstlane_b32 s6, v0
+        0x4A04_0406, // v_add_nc_u32 v2, s6, v2
+        0x4A02_0281, // v_add_nc_u32 v1, 1, v1
+        0x7D82_0B01, // v_cmp_lt_u32 vcc, v1, v5
+    ]);
+    if narrow {
+        w.extend([
+            0x87FE_6A7E, // s_and_b64 exec, exec, vcc
+            0xBF89_FFFA, // s_cbranch_execnz (the body)
+        ]);
+    } else {
+        w.extend([
+            0x87EA_6A7E, // s_and_b64 vcc, exec, vcc
+            0xBF87_FFFA, // s_cbranch_vccnz (the body)
+        ]);
+    }
+    w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
 /// What every lane of [`while_loop_first_lane`] stores on the console: the
 /// first lane still in the loop in each pass is the console wave's thread
 /// `64 * wave + pass + 1` (narrow), or its first, `64 * wave`, in all 7
@@ -4325,10 +4425,6 @@ fn console_while_loop_first_lane(narrow: bool, t: u32) -> u32 {
 fn the_while_loop_programs_are_what_their_comments_say() {
     for narrow in [false, true] {
         let words = while_loop_first_lane(narrow);
-#[test]
-fn the_mac_read_programs_are_what_their_comments_say() {
-    for per_lane in [false, true] {
-        let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let all = gfx10::decode(&code)
             .expect("decodes")
@@ -4360,23 +4456,6 @@ fn the_mac_read_programs_are_what_their_comments_say() {
         .chain(tail)
         {
             assert!(all.contains(want), "{want:?} not in:\n{all}");
-        for want in [
-            "s_buffer_load_dword s14, s[44:47]",
-            "s_and_saveexec_b64 s[0:1], vcc",
-            "s_cbranch_execz",
-            "v_cvt_f32_u32 v4, s14",
-            "v_mov_b32 v7, 2.0",
-            if per_lane {
-                "v_cvt_f32_u32 v8, v0"
-            } else {
-                "v_mov_b32 v8, 2.0"
-            },
-            "v_mac_f32 v4, v7, v8",
-            "v_readfirstlane_b32 s12, v4",
-            "v_mov_b32 v2, s12",
-            "s_mov_b64 exec, s[0:1]",
-        ] {
-            assert!(all.contains(want), "per_lane={per_lane}: {want:?} not in:\n{all}");
         }
     }
 }
@@ -4804,62 +4883,6 @@ fn a_while_loop_in_rows_matches_the_console_and_leaves_on_every_gpu() {
                 }
                 eprintln!(
                     "{label}: {groups} groups: {best:?}; with every group at the limit of passes {limit:?}"
-/// A multiply-accumulate adds to its old destination. Where that, like its
-/// operands, is the same in every lane of the read's EXEC, so is its
-/// result, and each half makes the read by itself: no halves for it, no
-/// exchange. Before, any multiply-accumulate in the value's chain sent the
-/// read to the halves. With a per-lane operand the read still takes them.
-#[test]
-fn a_first_lane_read_of_a_multiply_accumulate_is_made_in_each_half() {
-    for threads in [64, 128] {
-        let of = |per_lane: bool| {
-            let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
-            lowered(&native(&words, true, threads, 0), true)
-                .unwrap_or_else(|e| panic!("per_lane={per_lane} {threads} threads: {e}"))
-        };
-        let alike = of(false);
-        assert_eq!(alike.barriers, 0, "{threads} threads: no exchange");
-        let per_lane = of(true);
-        assert_eq!(per_lane.wave_size, Some(32));
-        assert!(per_lane.barriers > 0, "{threads} threads: the halves pass the first lane");
-    }
-}
-
-/// Both give the console's lanes on every GPU: the region's lanes store
-/// `41.0 + 2.0 * 2.0`, or with a per-lane operand `41.0 + 2.0 *` the thread
-/// id of the console wave's first lane in the region.
-#[cfg(windows)]
-#[test]
-fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu() {
-    type InRegion = fn(u32) -> bool;
-    let masks: [(&str, &[u32; 2], InRegion, &[u32]); 3] = [
-        ("lower_8_9", &MASK_LANES_8_9, |t| t >> 1 == 4, &[64]),
-        ("upper_40_41", &MASK_LANES_40_41, |t| t >> 1 == 20, &[64]),
-        ("both_12_44", &MASK_LANES_12_44, |t| t & 31 == 12, &[64, 128]),
-    ];
-    let mut failed = Vec::new();
-    for (label, mask, in_region, groups) in masks {
-        for &threads in groups {
-            for per_lane in [false, true] {
-                let words = mac_read_in_a_region(mask, per_lane);
-                let want: Vec<u32> = (0..threads)
-                    .map(|t| {
-                        if !in_region(t) {
-                            return 0;
-                        }
-                        let base = t & !63;
-                        let first = (base..base + 64).find(|&l| in_region(l)).expect("in it");
-                        let operand = if per_lane { first as f32 } else { 2.0 };
-                        (41.0 + 2.0 * operand).to_bits()
-                    })
-                    .collect();
-                let found = differences_with_buffer(
-                    true, &words, threads, 1, &want, 0, false, false, &[41, 0, 0, 0],
-                );
-                failed.extend(
-                    found
-                        .into_iter()
-                        .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
                 );
             }
         }

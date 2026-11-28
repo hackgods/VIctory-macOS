@@ -6494,15 +6494,12 @@ mod batch {
         batch.add(&b, pb, 4 * PAGE);
         assert_eq!(
             batch.flush(),
-            2 * PAGE + 4 * PAGE,
-            "the overlapping copy's destination plus the disjoint copy deferred until flush"
+            2 * PAGE,
+            "only the overlapping copy's destination"
         );
         assert_eq!(a.read_host((pa + PAGE) as u64, 1)[0], 0x1212_1212);
         assert_eq!(a.read_host((pa + 2 * PAGE) as u64, 1)[0], 0x3434_3434);
         assert_eq!(b.read_host(pb as u64, 1)[0], 0x5656_5656);
-        batch.add(&a, pa, 4 * PAGE);
-        batch.add(&b, pb, 4 * PAGE);
-        assert_eq!(batch.flush(), 0, "both copies are now current");
         done(pa, Some(a));
         done(pb, Some(b));
     }

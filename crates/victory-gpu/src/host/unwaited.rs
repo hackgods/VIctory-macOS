@@ -1343,6 +1343,27 @@ mod tests {
         drop(flights);
     }
 
+    /// mac: what the host queue runs from now on waits for a fence of the
+    /// test's, which a thread of the test's signals `ms` from now: a
+    /// submission left meanwhile stays unfinished on the GPU that long.
+    /// Join it before looking at what ran.
+    fn hold_queue(host: &Host, ms: u64) -> std::thread::JoinHandle<()> {
+        // SAFETY: plain object creation; our queue waits for it.
+        let gate: ID3D12Fence = unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        // SAFETY: as above.
+        unsafe { host.queue().Wait(&gate, 1) }.unwrap();
+        struct Gate(ID3D12Fence);
+        // SAFETY: D3D12 fences are free-threaded.
+        unsafe impl Send for Gate {}
+        let gate = Gate(gate);
+        std::thread::spawn(move || {
+            let gate = gate;
+            std::thread::sleep(Duration::from_millis(ms));
+            // SAFETY: a CPU signal of the test's fence.
+            unsafe { gate.0.Signal(1) }.unwrap();
+        })
+    }
+
     /// mac: with flights, a host copy the title had not written when the
     /// next submission asked for it, beside the one left whose landing then
     /// writes its memory (as a texture read back into a buffer lands): the
@@ -1383,9 +1404,14 @@ mod tests {
         copy.refresh(&lists[1], p as u64, page as u64);
         lists.iter().for_each(|l| l.close());
         let flushes = flights::finished_for(flights::Why::Flush);
+        // The first is held on the host queue until well after the second
+        // was prepared: else its GPU work could be found done (and it
+        // finished) before the second asks.
+        let opener = hold_queue(host, 300);
         let mut back = host.execute_title(1, vec![lists[0].clone()]);
         let left = VALUE.load(Acquire) != 0;
         back.extend(host.execute_title(1, vec![lists[1].clone()]));
+        opener.join().unwrap();
         // The copy as the second went to the GPU with it.
         let read = copy.read_host(p as u64, 1)[0];
         settle(By::Signal);

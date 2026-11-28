@@ -822,7 +822,9 @@ impl Host {
                 continue;
             }
             // SAFETY: as above.
-            unsafe { WaitForSingleObject(self.event, 2) };
+            let woke = unsafe { WaitForSingleObject(self.event, 2) };
+            // mac: how the waits for a submission left end (`lines::waits`).
+            lines::woke(woke == windows::Win32::Foundation::WAIT_OBJECT_0, ran());
             if started.elapsed().as_secs() >= seconds {
                 seconds *= 2;
                 // SAFETY: as above.
@@ -835,7 +837,9 @@ impl Host {
                 );
             }
         }
-        started.elapsed()
+        let waited = started.elapsed();
+        lines::waited(waited);
+        waited
     }
 
     /// A round of the heap sync ahead by our thread, if nothing holds the

@@ -1658,6 +1658,7 @@ pub fn writing(at: usize, len: usize) -> Writing {
 pub fn title_memory_remapped(at: usize, len: usize) {
     crate::texback::remapped(at, len);
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    note_history(false, first, last);
     note_remap(first, last);
     let mut g = guards();
     remapped(&mut g, first, last);
@@ -1701,17 +1702,36 @@ fn note_remap(first: usize, last: usize) {
     remaps.1.push_back((n, first, last));
 }
 
-/// How many reported mapping changes ago the last one that touched page
-/// `page` was, among those kept, and how many are kept (diagnostics).
-pub(crate) fn last_remap(page: usize) -> (Option<u64>, usize) {
-    let remaps = REMAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let ago = remaps
-        .1
-        .iter()
-        .rev()
-        .find(|&&(_, first, last)| (first..last).contains(&page))
-        .map(|&(n, _, _)| remaps.0 - n);
-    (ago, remaps.1.len())
+/// With the per-program probe (`crate::memory::probing`): every mapping
+/// change the runtime reported, `(frame, unmapped or freed, first page,
+/// end page)`, at most [`HISTORY_MAX`] (diagnostics).
+static HISTORY: Mutex<Vec<(u32, bool, usize, usize)>> = Mutex::new(Vec::new());
+const HISTORY_MAX: usize = 8 << 20;
+
+fn note_history(gone: bool, first: usize, last: usize) {
+    if first < last && crate::memory::probing() {
+        let mut history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+        if history.len() < HISTORY_MAX {
+            history.push((crate::memory::frame() as u32, gone, first, last));
+        }
+    }
+}
+
+/// The last mapping and the last unmapping or free the runtime reported
+/// over pages `[page, end)`, each as `(frame, first page, end page, reports
+/// since)`, and how many reports are kept in all (diagnostics).
+pub(crate) type Reported = Option<(u32, usize, usize, usize)>;
+pub(crate) fn history_of(page: usize, end: usize) -> (Reported, Reported, usize) {
+    let history = HISTORY.lock().unwrap_or_else(|e| e.into_inner());
+    let last = |gone: bool| {
+        history
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, h)| h.1 == gone && h.2 < end && page < h.3)
+            .map(|(i, h)| (h.0, h.2, h.3, history.len() - 1 - i))
+    };
+    (last(false), last(true), history.len())
 }
 
 /// The number of the last reported mapping change ([`remapped_since`]).
@@ -1755,6 +1775,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) -> Writing {
     }
     let len = if len == 0 { allocation_len(at) } else { len };
     let (first, last) = (at / PAGE, at.saturating_add(len).div_ceil(PAGE));
+    note_history(true, first, last);
     note_remap(first, last);
     if !fault_tracking() {
         return Writing { first: 0, last: 0 };

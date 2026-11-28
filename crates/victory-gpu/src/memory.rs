@@ -658,17 +658,31 @@ static BUILDER_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static PROBED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
 
 /// What Windows and the runtime have at page `at`, for the probe's lines.
-fn describe(at: u64) -> String {
+fn describe((at, span): (u64, u64)) -> String {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size; any address may be asked.
     unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
-    let (ago, kept) = crate::watch::last_remap(at as usize / crate::watch::PAGE);
-    let remap = match ago {
-        Some(ago) => format!("mapping changed there {ago} changes ago"),
-        None => format!("no mapping change there among the last {kept} reported"),
+    // A missed region stands for any page of it: the last reports
+    // anywhere in the region are named.
+    let page = at as usize / crate::watch::PAGE;
+    let (mapped, gone, kept) = crate::watch::history_of(page, page + span as usize / crate::watch::PAGE);
+    let told = |what: &str, r: crate::watch::Reported| match r {
+        Some((frame, first, last, since)) => format!(
+            "{what} in frame {frame} ({:#x}+{:#x}, {since} reports ago)",
+            first * crate::watch::PAGE,
+            (last - first) * crate::watch::PAGE
+        ),
+        None => format!("never {what}"),
     };
+    let remap = format!(
+        "{}, {}, of {kept} reports; now frame {}, the builder's first {}",
+        told("mapped", mapped),
+        told("unmapped or freed", gone),
+        frame(),
+        BUILDER_FRAME.load(std::sync::atomic::Ordering::Relaxed),
+    );
     format!(
         "{at:#x} [{}, type {:#x}, protect {:#x}, allocation {:#x} protect {:#x}, run {:#x}+{:#x}; {remap}]",
         state_of(at),
@@ -718,7 +732,7 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
         // SAFETY: the bitmap is mapped and the list's run is over.
         let marks = unsafe { std::slice::from_raw_parts(bitmap.data() as *const u32, BITMAP_WORDS) };
         let (mut written, mut counts) = (0u64, [0u64; 4]);
-        let mut firsts: [Vec<u64>; 4] = Default::default();
+        let mut firsts: [Vec<(u64, u64)>; 4] = Default::default();
         for (w, &mark) in marks.iter().enumerate() {
             let mut bits = mark;
             while bits != 0 {
@@ -743,7 +757,8 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
                 };
                 counts[kind] += 1;
                 if firsts[kind].len() < 6 {
-                    firsts[kind].push(at);
+                    let whole = table.get(block).filter(|_| block != 0).is_none();
+                    firsts[kind].push((at, if whole { 1 << 28 } else { 1 << 16 }));
                 }
             }
         }
@@ -756,6 +771,7 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
             })
             .collect();
         let list_of = |kind: usize| firsts[kind].iter().map(|&at| describe(at)).collect::<Vec<_>>().join(", ");
+        let _ = &list_of;
         tracing::warn!(
             "DIAG probe {name}: wrote or read {written} pages with a copy; missed {} mapped ({}), {} reserved ({}), {} free ({}), {} in regions with no block ({}); root constants {}; blocks {}",
             counts[0],
@@ -771,6 +787,11 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
         );
     });
     Some(gpu)
+}
+
+/// The frame being counted ([`FRAMES`]).
+pub(crate) fn frame() -> u64 {
+    FRAMES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether the probe is asked for at all.

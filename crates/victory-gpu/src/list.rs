@@ -2465,6 +2465,9 @@ mod tests {
         let Some(host) = crate::host::host() else {
             return; // no host GPU here
         };
+        // Synchronous, and not while another test runs Flight-1: what it
+        // checks right after submitting assumes the submission has run.
+        let _mode = crate::host::ModeGuard::new(false, false);
         let null = std::ptr::null();
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
 

@@ -475,11 +475,12 @@ pub const ROOT_UAV_VIEW: u32 = 3;
 pub const ROOT_VIEW_OFFSET: u32 = 4;
 /// `RootType::Other` code of a user-data dword the host fills at a dispatch
 /// whose counts are threads, not groups (the console's `DispatchX` with its
-/// thread-dimensions flag): how many threads along x run, the lanes past
-/// that count leaving at once; 0, every lane of every group. Its
-/// [`UserData::dword`] is the group's width. Read only in translations
-/// with [`Options::thread_limits`], by compute programs of one dimension
-/// whose lanes never wait for each other (`Lower::leave_past_the_count`).
+/// thread-dimensions flag): how many threads along x run; 0, every lane of
+/// every group. Its [`UserData::dword`] is the group's width. Read only in
+/// translations with [`Options::thread_limits`], by compute programs of
+/// one dimension: the lanes past the count leave at once where no lane
+/// waits for another (`Lower::leave_past_the_count`), and elsewhere stay,
+/// outside EXEC from the entry on (`structure::structure_limited`).
 /// After DexNom/VIctory bc3cd4b0.
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
 
@@ -499,22 +500,42 @@ pub struct UserData {
     pub dword: u32,
 }
 
-/// Whether an `s_barrier` that a lane may miss at a capped loop's iteration
-/// limit makes the shader untranslatable (`VICTORY_CAP_BARRIERS=1`). Off by
-/// default: the refusal added with the loop-cap analysis left the tile-list,
-/// lighting and temporal anti-aliasing programs out and the world was drawn
-/// black on M3 Max and M5 Pro Macs (#497), where keeping their barrier, as
-/// before, drew it. Tests always run with the refusal on.
+/// Whether a group barrier that a lane may miss at a capped loop's
+/// iteration limit makes the shader untranslatable (`VICTORY_CAP_BARRIERS=1`):
+/// an `s_barrier`, and the barriers through which the two 32-lane halves of
+/// a console wave64 pass each other values (`lower::halves`), which the
+/// blocks after such a loop then do not get. Off by default: the console
+/// runs a loop to its end, and the limit is the host's guard against data it
+/// has not mirrored yet, so off, a translation is the console's wherever
+/// the limit is not reached. The refusal added with the loop-cap analysis
+/// left the tile-list, lighting and temporal anti-aliasing programs out and
+/// the world was drawn black on M3 Max and M5 Pro Macs (#497), where keeping
+/// their barrier, as before, drew it. Tests run with the refusal on unless
+/// they turn it off ([`with_cap_barriers`]).
 pub fn cap_barriers_refused() -> bool {
     #[cfg(test)]
     {
-        true
+        CAP_BARRIERS.get()
     }
     #[cfg(not(test))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ON.get_or_init(|| cap_barriers_from(std::env::var("VICTORY_CAP_BARRIERS").ok().as_deref()))
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAP_BARRIERS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Runs `f` with [`cap_barriers_refused`] answering `on` on this thread.
+#[cfg(test)]
+pub(crate) fn with_cap_barriers<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = CAP_BARRIERS.replace(on);
+    let r = f();
+    CAP_BARRIERS.set(was);
+    r
 }
 
 /// `VICTORY_CAP_BARRIERS`'s value as a switch: only `1` turns the refusal on.
@@ -579,9 +600,11 @@ pub struct Options {
     /// a read across the halves is refused. The translation differs, so
     /// the shader cache keys on it.
     pub halves_rendezvous: bool,
-    /// A compute program of one dimension whose lanes never wait for each
-    /// other reads [`USER_DISPATCH_THREADS_X`]: the lanes past a dispatch's
-    /// count of threads leave at once, as the console never starts them.
+    /// A compute program of one dimension reads
+    /// [`USER_DISPATCH_THREADS_X`]: the console never starts the lanes past
+    /// a dispatch's count of threads. They leave at once where no lane
+    /// waits for another; where lanes wait (a group barrier, 32-lane halves
+    /// passing values) they stay, outside EXEC from the entry on.
     /// The host asks for it only for programs a dispatch counted in threads
     /// ends in a part of a group of (`victory_gpu::pipeline::thread_limited`).
     pub thread_limits: bool,

@@ -159,7 +159,10 @@ pub(crate) fn split_wave_barriers_with_step(
 /// walk back from the latch stops at a block every lane runs together,
 /// though: every lane reconverges there before the cap exit, so a divergent
 /// branch earlier than that, whose arms already reconverged there, is no
-/// escape.
+/// escape. The escape half, and the blocks it takes out of step, are only
+/// worked out with the cap's barriers refused (`VICTORY_CAP_BARRIERS=1`,
+/// [`crate::emit::cap_barriers_refused`]); otherwise no lane is taken to
+/// leave at the cap, as before the loop-cap analysis.
 ///
 /// With `need_step` false the step half is left out unless the program has
 /// an `s_barrier` after a capped back edge, the only reader of the escape
@@ -197,12 +200,20 @@ pub(crate) fn step_and_cap_with(
     // The unconditional back edges, (latch, header): lowering counts the
     // loop's iterations and at the limit leaves the program from the latch
     // with an early return.
-    let capped: Vec<(usize, usize)> = (0..n)
-        .filter_map(|b| match exits[b] {
-            LaneExit::Jump(t) if back(b, t) => Some((b, t)),
-            _ => None,
-        })
-        .collect();
+    // Only with the cap's barriers refused (`VICTORY_CAP_BARRIERS=1`):
+    // otherwise translations take the cap as never reached, as the console
+    // runs every loop to its end, and keep the barriers after it, the
+    // halves' too ([`crate::emit::cap_barriers_refused`]).
+    let capped: Vec<(usize, usize)> = if crate::emit::cap_barriers_refused() {
+        (0..n)
+            .filter_map(|b| match exits[b] {
+                LaneExit::Jump(t) if back(b, t) => Some((b, t)),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if !need_step
         && (capped.is_empty()
             || !p

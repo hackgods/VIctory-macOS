@@ -17,7 +17,7 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
@@ -316,18 +316,25 @@ fn check_policy(cfg: &victory_core::Config) -> Result<()> {
     Ok(())
 }
 
-/// Paths given on the command line, or the configured game + test titles.
+/// Scan roots given on the command line, or the configured game and test titles.
 pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
-    if !paths.is_empty() {
-        return Ok(paths);
+    let paths = if paths.is_empty() {
+        let cfg = victory_core::Config::load()?;
+        let configured: Vec<_> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
+        anyhow::ensure!(
+            !configured.is_empty(),
+            "no paths given and none configured (see victory.example.toml)"
+        );
+        configured
+    } else {
+        paths
+    };
+    // Check all roots before a scanner can skip the error or report partial results.
+    for path in &paths {
+        path.metadata()
+            .with_context(|| format!("cannot access scan input {}", path.display()))?;
     }
-    let cfg = victory_core::Config::load()?;
-    let all: Vec<PathBuf> = cfg.game_dir.into_iter().chain(cfg.test_titles).collect();
-    anyhow::ensure!(
-        !all.is_empty(),
-        "no paths given and none configured (see victory.example.toml)"
-    );
-    Ok(all)
+    Ok(paths)
 }
 
 /// Writes a game-derived report (the `VICTORY_PREBUILD_KEYS` listing) to

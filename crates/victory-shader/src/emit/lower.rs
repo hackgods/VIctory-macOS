@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 
 mod atomics;
+mod back_edges;
 mod pages;
 mod barriers;
 mod bvh;
@@ -400,6 +401,8 @@ struct Lower<'a> {
     loop_act_phis: Vec<(V, usize, usize)>,
     /// [`Lower::relabelled_flat`], once made.
     relabelled: Option<V>,
+    /// [`Lower::dispatched`], once made.
+    dispatched: Option<V>,
     /// Lower non-provoking per-vertex pixel reads (P10/P20) to zero and
     /// hardware-interpolate float P0 at pixel center (`Options::per_vertex_center`).
     per_vertex_center: bool,
@@ -955,6 +958,7 @@ impl<'a> Lower<'a> {
             loop_outer_active: Map::default(),
             loop_act_phis: Vec::new(),
             relabelled: None,
+            dispatched: None,
             per_vertex_center,
             group_scalars,
             cap_escaped,
@@ -1587,7 +1591,10 @@ impl<'a> Lower<'a> {
     fn run(mut self, limits: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
         self.halves_only = self.places_read_as_halves();
-        if limits && self.can_leave_past_a_count() {
+        if self.x.st.limited {
+            // The word for the count, whatever the program reads of EXEC.
+            self.dispatched();
+        } else if limits && self.can_leave_past_a_count() {
             self.leave_past_the_count();
         }
         let order = crate::ir::reverse_postorder(&p.blocks);
@@ -3289,6 +3296,7 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(_) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            Atom::Dispatched => Ok(self.dispatched()),
         }
     }
 
@@ -7592,8 +7600,13 @@ impl<'a> Lower<'a> {
                 // for a value the same in both halves, or where the group is
                 // one host wave.
                 let is_vec = matches!(v.src.first(), Some(&Operand::Vector { .. }));
-                let is_alike = matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
-                    if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
+                // Alike in the lanes that made it: in a block predication
+                // runs in every lane the others hold an old value, and a
+                // half may have none of the first. There it is read as any
+                // other: from a lane of the predicate, between the halves.
+                let is_alike = self.pred_active(self.cur_ir).is_none()
+                    && matches!(v.src.first(), Some(&Operand::Vector { reg, .. })
+                        if inst.read(Reg::V(reg)).is_some_and(|x| self.alike.contains(&x)));
                 // Each half's own first active lane is the console's
                 // (`first_lane`): read it, with no exchange.
                 let alone = inst.writes.first().is_some_and(|w| self.first_alone.contains(&w.1));
@@ -11213,10 +11226,9 @@ impl<'a> Lower<'a> {
                     && back(self, taken)
                     && back(self, not_taken)
                 {
-                    return Err(unsupported(
-                        offset,
-                        "a wave64 branch with two loop back edges",
-                    ));
+                    let term = self.two_back_edges(b, cond, taken, not_taken);
+                    self.s.m.terminate(self.cur, term);
+                    return Ok(());
                 }
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
@@ -11472,7 +11484,7 @@ impl<'a> Lower<'a> {
                     }
                     None
                 }
-                Atom::Constant(_) => None,
+                Atom::Constant(_) | Atom::Dispatched => None,
             };
             if v.is_some_and(|v| tainted.contains(&v)) {
                 return true;

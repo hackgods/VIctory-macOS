@@ -899,6 +899,59 @@ mod tests {
         }
     }
 
+    /// Probe, run by hand under `xctrace record --attach`: named command
+    /// lists of copies for `VICTORY_LABEL_PROBE_S` seconds (5), to see in a
+    /// Metal System Trace whether D3DMetal labels their command buffers or
+    /// encoders with `SetName`'s text ("victory-label-probe N").
+    #[test]
+    #[ignore = "a probe for a trace recorded by hand"]
+    fn probe_list_names_reach_metal() {
+        use windows::core::{HSTRING, Interface};
+        let Some(host) = host() else { return };
+        let dev = &host.device;
+        let secs: u64 = std::env::var("VICTORY_LABEL_PROBE_S").ok().and_then(|s| s.parse().ok()).unwrap_or(5);
+        // SAFETY: plain creation and recording on our own queue; the
+        // buffers outlive every wait.
+        unsafe {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64 << 20,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut a: Option<ID3D12Resource> = None;
+            let mut b: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut a).unwrap();
+            dev.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut b).unwrap();
+            let (a, b) = (a.unwrap(), b.unwrap());
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let _ = queue.SetName(&HSTRING::from("victory-label-probe queue"));
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut n = 0u64;
+            while std::time::Instant::now() < end {
+                n += 1;
+                alloc.Reset().unwrap();
+                let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+                let _ = list.SetName(&HSTRING::from(format!("victory-label-probe {n}")));
+                list.CopyBufferRegion(&b, 0, &a, 0, 64 << 20);
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+                queue.Signal(&fence, n).unwrap();
+                while fence.GetCompletedValue() < n {
+                    std::thread::yield_now();
+                }
+            }
+            println!("label probe: {n} named lists");
+        }
+    }
+
     /// Run H's round trip: depth rendered, then an unordered use, then a
     /// depth use. Counted as a write, the unordered use makes the twin
     /// newer and the depth use copies it back; one that stores nothing

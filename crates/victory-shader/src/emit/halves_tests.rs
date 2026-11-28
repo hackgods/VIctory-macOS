@@ -11,15 +11,19 @@
 
 #[cfg(windows)]
 use super::host::{Dispatch, Host, Root, Stride, View};
+
 use super::lower;
+
 #[cfg(windows)]
 use super::validator;
+
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{gfx10, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
 const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
@@ -555,8 +559,11 @@ fn in_a_loop(body: &[u32], result: u32, count: Count) -> Vec<u32> {
 
 /// VOP2 opcodes of the operations [`reduction`] takes.
 const V_ADD_F32: u32 = 0x03;
+
 const V_MIN_U32: u32 = 0x13;
+
 const V_MAX_U32: u32 = 0x14;
+
 /// `v_mov_b32 v3, v0`.
 const V_MOV_V3_V0: u32 = 0x7E06_0300;
 
@@ -1616,7 +1623,9 @@ const fn permlanex16(fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
 
 /// The selectors: every nibble of `s8` is odd and every one of `s9` is even.
 const PERM_LOW: u32 = 0x1357_9BDF;
+
 const PERM_HIGH: u32 = 0x2468_ACE0;
+
 /// What `v1` holds before an instruction that may leave it alone.
 const PERM_OLD: u32 = 0xAAAA;
 
@@ -2127,7 +2136,6 @@ fn literal_wave64_programs_match_the_console_on_every_gpu() {
         assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 }
-
 
 /// A number kept in VCC_HI on its way into a scalar load's offset: the
 /// console wave's first thread id, plus one, times 16 bytes, read from the
@@ -3616,14 +3624,17 @@ const MASK_LANES_8_9: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0684, // v_cmp_eq_u32 vcc, 4, v3
 ];
+
 const MASK_LANES_40_41: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0694, // v_cmp_eq_u32 vcc, 20, v3
 ];
+
 const MASK_LANES_12_44: [u32; 2] = [
     0x3606_009F, // v_and_b32 v3, 31, v0
     0x7D84_068C, // v_cmp_eq_u32 vcc, 12, v3
 ];
+
 const MASK_EMPTY: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_06C0, // v_cmp_eq_u32 vcc, 64, v3
@@ -4018,7 +4029,6 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
         }
     }
 }
-
 
 /// A program whose only cross-half operations are first-lane reads goes to
 /// halves for them (#522). Where halves cannot pass the read between them,
@@ -5193,6 +5203,136 @@ fn lds_written_in_a_while_loop_matches_the_console_on_every_gpu() {
                 .into_iter()
                 .map(|m| format!("narrow_waves={narrow_waves}: {m}")),
         );
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// A register-index waterfall as the console compiler writes one for a
+/// per-lane `v[3 + index]`: `v3..v10` hold `k * 1000 + thread id`, the index
+/// is `(thread id >> 2) & 7`, and the loop reads one index left
+/// (`v_readfirstlane_b32 s38, v28`), runs the lanes holding it with
+/// `m0 = s38` and `v_movrels_b32 v31, v3`, drops them, and loops while any
+/// lane is left. Every lane stores `v31`: `index * 1000 + thread id`.
+/// `with_mbcnt` asks for console lanes as well (so the program runs in
+/// halves); `after` is put after the loop, `body` before the loop's
+/// `s_xor_b64`.
+fn index_waterfall(with_mbcnt: bool, body: &[u32], after: &[u32]) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.push(0x3420_0085); // v_lshlrev_b32 v16, 5, v0
+    if with_mbcnt {
+        w.extend([
+            0xD765_0001,
+            0x0001_00C1, // v_mbcnt_lo_u32_b32 v1, -1, 0
+        ]);
+    }
+    for k in 0..8u32 {
+        // v_add_nc_u32 v(3 + k), k * 1000, v0
+        w.extend([0x4A00_00FF | (3 + k) << 17, k * 1000]);
+    }
+    w.extend([
+        0x2C38_0082, // v_lshrrev_b32 v28, 2, v0
+        0x3638_3887, // v_and_b32 v28, 7, v28
+        0xBEA4_047E, // s_mov_b64 s[36:37], exec
+    ]);
+    let looped = [
+        &[
+            0x7E4C_051C, // v_readfirstlane_b32 s38, v28
+            0x7D84_3826, // v_cmp_eq_u32 vcc, s38, v28
+            0xBE86_246A, // s_and_saveexec_b64 s[6:7], vcc
+            0xBEFC_0326, // s_mov_b32 m0, s38
+            0x7E3E_8703, // v_movrels_b32 v31, v3
+        ][..],
+        body,
+        &[0x89FE_067E], // s_xor_b64 exec, exec, s[6:7]
+    ]
+    .concat();
+    let back = -(looped.len() as i32 + 1);
+    w.extend(&looped);
+    w.push(0xBF89_0000 | (back as u32 & 0xFFFF)); // s_cbranch_execnz (the read)
+    w.push(0xBEFE_0424); // s_mov_b64 exec, s[36:37]
+    w.extend(after);
+    w.extend(store(31, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_index_waterfall_programs_are_what_their_comments_say() {
+    let words = index_waterfall(true, &[], &[]);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(true))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_add_nc_u32 v3, lit(0x00000000), v0",
+        "v_add_nc_u32 v10, lit(0x00001b58), v0",
+        "v_lshrrev_b32 v28, 2, v0",
+        "v_and_b32 v28, 7, v28",
+        "s_mov_b64 s[36:37], exec",
+        "v_readfirstlane_b32 s38, v28",
+        "v_cmp_eq_u32 vcc, s38, v28",
+        "s_and_saveexec_b64 s[6:7], vcc",
+        "s_mov_b32 m0, s38",
+        "v_movrels_b32 v31, v3",
+        "s_xor_b64 exec, exec, s[6:7]",
+        "s_cbranch_execnz",
+        "s_mov_b64 exec, s[36:37]",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+}
+
+/// The first-lane read opening a register-index waterfall is made by each
+/// host half by itself: the program needs no halves for it, and translates
+/// in halves too although the read is in a loop (#522 sent GTA VI's
+/// `11eeb27c2d15980d` to halves for it, which refused it). Where the read's
+/// result is seen after the loop, or the loop body does scalar work, whose
+/// iterations the halves would see, the read still takes halves (refused
+/// where they cannot meet).
+#[test]
+fn a_register_index_waterfall_is_made_in_each_half() {
+    let across = "a first-lane read of a value that may differ between 32-lane halves";
+    let halves = |words: &[u32], threads: u32| match lowered(&native(words, true, threads, 0), true)
+    {
+        Ok(l) => l.wave_size == Some(32),
+        Err(e) => e.to_string().contains(across),
+    };
+    for threads in [64, 128] {
+        assert!(!halves(&index_waterfall(false, &[], &[]), threads));
+        assert!(halves(&index_waterfall(true, &[], &[]), threads));
+        // v_mov_b32 v31, s38 after the loop
+        assert!(halves(
+            &index_waterfall(false, &[], &[0x7E3E_0226]),
+            threads
+        ));
+        // s_add_u32 s50, s50, 1 in the body
+        assert!(halves(
+            &index_waterfall(false, &[0x8032_8132], &[]),
+            threads
+        ));
+    }
+}
+
+/// The register-index waterfall gives the console's lanes on every GPU, in
+/// halves and not: `((thread id >> 2) & 7) * 1000 + thread id` in every
+/// lane.
+#[cfg(windows)]
+#[test]
+fn a_register_index_waterfall_matches_the_console_on_every_gpu() {
+    let mut failed = Vec::new();
+    for threads in [64, 128] {
+        let want: Vec<u32> = (0..threads).map(|t| ((t >> 2) & 7) * 1000 + t).collect();
+        for with_mbcnt in [false, true] {
+            let words = index_waterfall(with_mbcnt, &[], &[]);
+            failed.extend(
+                differences(&words, threads, 1, &want)
+                    .into_iter()
+                    .map(|m| format!("{threads} threads (mbcnt={with_mbcnt}): {m}")),
+            );
+        }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }

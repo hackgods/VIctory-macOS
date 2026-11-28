@@ -302,11 +302,9 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         AllMemoryBarrierWithGroupSync();
         if (j < count && budgetWords[16u + lane] == PAST) {
-            if (((head >> 4) & 15u) <= 1u) {
-                dest.Store2(to, uint2(0u, 0u));
-            } else {
-                dest.Store3(to, uint3(0u, 0u, 0u));
-            }
+            // As the inline clamp: the record's first word, a draw's count or
+            // a dispatch's x.
+            dest.Store(to, 0u);
         }
         if (tile + 1u < tiles) {
             AllMemoryBarrierWithGroupSync();
@@ -2008,8 +2006,8 @@ void main(uint3 id : SV_DispatchThreadID) {
             (0, 10, 12, vec![100, 5, 3], None),
             (1, 10, 32, vec![70_000, 1, 1, 4, 5, 6, 7, 8], None),
             (0, 0, 32, vec![1 << 25, 10, 1, 2, 11, 12, 13, 14], None),
-            // A draw count of 2^23 + 5: cut to 2^24, as the inline clamp
-            // does (not emptied); no instances, so it costs nothing.
+            // A draw count of 2^23 + 5: kept, as the inline clamp does (not
+            // emptied); no instances, so it costs nothing.
             (0, 0, 32, vec![(1 << 23) + 5, 0, 1, 2, 21, 22, 23, 24], None),
             (2, 2, 12, vec![65_535, 17, 1], None),
             // Clamped inline (a count): the next execution opens a pass.
@@ -2193,21 +2191,22 @@ void main(uint3 id : SV_DispatchThreadID) {
             };
             assert_eq!(grouped[i][..used], inline[..used], "execution {i} kind {}", case.1);
             // v9's rules at the edges: a mesh dispatch of 70,000 groups cut
-            // to 65,535 (not emptied), a draw of 2^23 + 5 vertices cut to 2^24.
+            // to 65,535 (not emptied), a draw of 2^23 + 5 vertices kept (not
+            // emptied).
             if case.3[0] == 70_000 && case.1 == 10 {
                 assert_eq!(grouped[i][..3], [65_535, 1, 1]);
             }
             if case.3[0] == (1 << 23) + 5 {
-                assert_eq!(grouped[i][..2], [1 << 24, 0]);
+                assert_eq!(grouped[i][..2], [(1 << 23) + 5, 0]);
             }
             assert!(!inline[..used].contains(&STALE), "execution {i} read the producer's words");
         }
         let n = cases.len();
         assert_eq!(grouped[n - 4][0], 0, "the budget left no room for the first half");
         // A record that does not fit empties those after it here, as in the
-        // inline clamp (`indirect_rest`); on main, only itself.
-        let small: [u32; 2] = if indirect_rest() { [0, 0] } else { [3, 1] };
-        assert_eq!(grouped[n - 2][..2], small, "small ones after one that did not fit");
+        // inline clamp (`indirect_rest`): their first word, a draw's count.
+        assert!(indirect_rest());
+        assert_eq!(grouped[n - 2][0], 0, "small ones after one that did not fit");
         assert_eq!(host.log_messages(), None);
     }
 
@@ -2342,9 +2341,14 @@ void main(uint3 id : SV_DispatchThreadID) {
             }
         }
         let n = cases.len();
-        assert_eq!((hoisted[n - 4][0], hoisted[n - 3][0], hoisted[n - 2][0]), (1 << 22, 0, 0));
-        let small: [u32; 2] = if indirect_rest() { [0, 0] } else { [3, 1] };
-        assert_eq!(hoisted[n - 1][..2], small);
+        // Here a record that does not fit takes the rest of the budget
+        // (`indirect_rest`): from the first that comes up empty, all after
+        // it do. (Which one is first follows the costs of the records
+        // before: mesh groups cut to 65,535 cost, as inline.)
+        let firsts = [hoisted[n - 4][0], hoisted[n - 3][0], hoisted[n - 2][0], hoisted[n - 1][0]];
+        assert_eq!(firsts[3], 0, "the small one after them does not fit either: {firsts:?}");
+        let first_empty = firsts.iter().position(|&w| w == 0).unwrap();
+        assert!(firsts[first_empty..].iter().all(|&w| w == 0), "{firsts:?}");
         assert_eq!(host.log_messages(), None);
     }
 

@@ -30,7 +30,11 @@
 //!   its own (+0x7e9440) multiplies by a scale at +0x90 of it, set to 2/3 at
 //!   +0x28f1e78 (so 2560x1440 for 4K, 1280x720 for 1080p);
 //!   `VICTORY_RENDER_SCALE` replaces that constant (Series X; run res-4 at
-//!   1.0). FidelityFX's (+0x28ef680, Series S) multiplies by 1.0 on Series X,
+//!   1.0). Right after it (+0x28f1e87) the largest render size (+0x94, what
+//!   the render targets are made for) is max(2/3, scale); with the switch
+//!   that `vmaxss` becomes a `vmovss`, so it is the scale asked for (by
+//!   shortside, halfwave50 issue #1, cell frame 273 to 254 ms at 0.5 on
+//!   4K). FidelityFX's (+0x28ef680, Series S) multiplies by 1.0 on Series X,
 //!   2/3 on Series S. The fork also changes that one (`VICTORY_FFX_SCALE`),
 //!   but it is left out here: at 0.5 on Series S FidelityFX's jitter phase
 //!   count came back 0 and the title divided by it (+0x28f03e8).
@@ -107,9 +111,10 @@ pub fn parse_output(spec: &str) -> Option<(u32, u32)> {
 
 /// `VICTORY_RENDER_SCALE=<s>`, 0.5 to 1.0 (0.5: half the output's width and
 /// height): the title's own upscaler's scale (Series X; 2/3 without it).
-/// Tested at 1.0 (run res-4); below 2/3 the title's largest render size
-/// (+0x94, max(2/3, scale)) stays at 2/3. `None` if unset or out of range
-/// (said why).
+/// Tested at 1.0 (run res-4). The title's largest render size (+0x94,
+/// max(2/3, scale) without [`OWN_SCALE_MAX`]) is made the scale too, so
+/// below 2/3 the render targets shrink with it. `None` if unset or out of
+/// range (said why).
 pub fn asked_render_scale() -> Option<f32> {
     let spec = std::env::var("VICTORY_RENDER_SCALE").ok()?;
     let scale = parse_render_scale(&spec);
@@ -201,6 +206,25 @@ pub const OWN_SCALE: Site = Site {
     what: "the title's own upscaler's render scale",
     bytes: &[0xc7, 0x81, 0x90, 0x00, 0x00, 0x00, 0xab, 0xaa, 0x2a, 0x3f],
 };
+
+/// Right after [`OWN_SCALE`] in the same method: `vmaxss xmm0, xmm0,
+/// [rsi+90h]`, the largest render size (+0x94, what the render targets are
+/// made for) as max(2/3, the scale). By shortside (halfwave50 issue #1);
+/// these bytes are the instruction's encoding as they gave it, not checked
+/// against the title here (the load-time compare does that).
+pub const OWN_SCALE_MAX: Site = Site {
+    at: 0x28f1e87,
+    what: "the title's own upscaler's largest render size",
+    bytes: &[0xc5, 0xfa, 0x5f, 0x86, 0x90, 0x00, 0x00, 0x00], // vmaxss xmm0, xmm0, [rsi+90h]
+};
+
+/// What goes at [`OWN_SCALE_MAX`]: `vmovss xmm0, [rsi+90h]`, the scale
+/// alone (the same operands, the opcode 0x10 for 0x5f).
+pub fn own_scale_max_code() -> Vec<u8> {
+    let mut c = OWN_SCALE_MAX.bytes.to_vec();
+    c[2] = 0x10;
+    c
+}
 
 /// The upscaler picker, +0x7e93f0, to its first `ret`.
 pub const PICKER: Site = Site {
@@ -394,7 +418,14 @@ pub unsafe fn apply_asked(base: usize, size: usize) {
         ));
     }
     if let Some(s) = asked_render_scale() {
-        asked.push((vec![(&OWN_SCALE, own_scale_code(s))], format!("{s}")));
+        // The scale and the largest render size follow it together.
+        asked.push((
+            vec![
+                (&OWN_SCALE, own_scale_code(s)),
+                (&OWN_SCALE_MAX, own_scale_max_code()),
+            ],
+            format!("{s}"),
+        ));
     }
     if let Some(kind) = asked_upscaler() {
         asked.push((
@@ -518,6 +549,14 @@ mod tests {
         assert_eq!(own[..6], OWN_SCALE.bytes[..6]);
         assert_eq!(own[6..], 0.5f32.to_le_bytes());
         assert_eq!(OWN_SCALE.bytes[6..], (2.0f32 / 3.0).to_le_bytes());
+        // vmaxss to vmovss: only the opcode byte changes, the same length;
+        // the site starts after the scale's (no overlap).
+        let max = own_scale_max_code();
+        assert_eq!(max, [0xc5, 0xfa, 0x10, 0x86, 0x90, 0x00, 0x00, 0x00]);
+        assert_eq!(max.len(), OWN_SCALE_MAX.bytes.len());
+        assert_eq!(OWN_SCALE_MAX.bytes[2], 0x5f);
+        assert_eq!(max[3..], OWN_SCALE_MAX.bytes[3..]);
+        assert!(OWN_SCALE_MAX.at >= OWN_SCALE.at + OWN_SCALE.bytes.len());
         assert_eq!(picker_code(7), [0xb8, 7, 0, 0, 0, 0xc3]);
         assert_eq!(
             pool_check_code(),
@@ -653,6 +692,58 @@ mod tests {
             assert_eq!(
                 std::slice::from_raw_parts(place.add(0x300), check.len()),
                 check.as_slice()
+            );
+            // The render scale's two sites, as close as in the title (one
+            // page): both written.
+            let gap = OWN_SCALE_MAX.at - OWN_SCALE.at;
+            let scale_at = Site {
+                at: 0x400,
+                what: "test",
+                bytes: OWN_SCALE.bytes,
+            };
+            let max_at = Site {
+                at: 0x400 + gap,
+                what: "test",
+                bytes: OWN_SCALE_MAX.bytes,
+            };
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                0x40,
+                &mut old,
+            );
+            std::ptr::copy_nonoverlapping(
+                OWN_SCALE.bytes.as_ptr(),
+                place.add(scale_at.at),
+                OWN_SCALE.bytes.len(),
+            );
+            std::ptr::copy_nonoverlapping(
+                OWN_SCALE_MAX.bytes.as_ptr(),
+                place.add(max_at.at),
+                OWN_SCALE_MAX.bytes.len(),
+            );
+            windows_sys::Win32::System::Memory::VirtualProtect(
+                place.cast(),
+                0x1000,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            );
+            let max = own_scale_max_code();
+            assert_eq!(
+                write_together(
+                    place as usize,
+                    0x1000,
+                    &[(&scale_at, &scale), (&max_at, &max)]
+                ),
+                Patched::Done
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(place.add(scale_at.at), scale.len()),
+                scale.as_slice()
+            );
+            assert_eq!(
+                std::slice::from_raw_parts(place.add(max_at.at), max.len()),
+                max.as_slice()
             );
             VirtualFree(place.cast(), 0, MEM_RELEASE);
         }

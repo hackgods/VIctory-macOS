@@ -43,9 +43,15 @@ use crate::object::This;
 /// copy took them, guarded again), only earlier, so a page the title writes
 /// afterwards is copied again and the submission reads the same bytes as
 /// without the switch. What the flight may write is left alone until its
-/// copy-back: its declared ranges and those armed for it
-/// ([`arm_undeclared`]), as whole 64 KiB pages. Descriptors, uploads, title
-/// copies and snapshots are not moved.
+/// copy-back, as whole 64 KiB pages: its declared ranges, the copies its
+/// title-memory page tables name, and what the unordered views of its heaps
+/// reach (`crate::bindless::written_pages`: the views themselves, not the
+/// hull from a copy's first view to its last, which in the world covers
+/// nearly everything). Shaders write through the views the heaps hold, and
+/// the records the title writes into its heaps during the flight reach them
+/// at the next heap sync, after the landing; a view the title makes by call
+/// during the flight in a slot the flight reads races the GPU on the console
+/// too. Descriptors, uploads, title copies and snapshots are not moved.
 ///
 /// Work held behind the flight's bottom-of-pipe writes is run by the thread
 /// that asked for it too: it refreshes for the held lists, lands the flight
@@ -98,10 +104,12 @@ impl Drop for BesideGuard {
 /// first (nothing done), `[2]` bytes its refreshes copied, `[3]` bytes asked
 /// for and left as the flight may write them, `[4]` microseconds, `[5]`
 /// flights landed by the thread whose held work waited for them, `[6]`
-/// microseconds landings waited for the GPU (with or without the switch).
-static BESIDE: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// microseconds landings waited for the GPU (with or without the switch),
+/// `[7]` times a copy's pages under a heap's unordered views were made
+/// again (`crate::bindless::written_pages`).
+static BESIDE: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 /// [`BESIDE`] since the start (tests).
-static BESIDE_TOTAL: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+static BESIDE_TOTAL: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 fn beside(i: usize, n: u64) {
     BESIDE[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -110,7 +118,7 @@ fn beside(i: usize, n: u64) {
 
 /// [`BESIDE_TOTAL`] (tests).
 #[cfg(test)]
-pub(crate) fn beside_counts() -> [u64; 7] {
+pub(crate) fn beside_counts() -> [u64; 8] {
     BESIDE_TOTAL.each_ref().map(|a| a.load(Ordering::Relaxed))
 }
 
@@ -128,14 +136,15 @@ pub(super) fn log_beside(frames: f64, refreshed: u64) {
     tracing::info!(
         "prepared beside a flight per frame (VICTORY_PREP_BESIDE={}): {:.1} goes beside a flight still on the GPU, \
          {:.1} found it finished; refreshes copied {:.2} MB beside it and {:.2} MB after its landing, left {:.2} MB \
-         asked for in ranges it may write; {:.1} ms; {:.1} flights landed by the thread whose held work waited for them; \
-         landings still waited {:.1} ms for the GPU",
+         asked for in ranges it may write ({:.1} copies' written pages made again); {:.1} ms; {:.1} flights landed by \
+         the thread whose held work waited for them; landings still waited {:.1} ms for the GPU",
         u8::from(prep_beside_enabled()),
         per(b[0]),
         per(b[1]),
         per(b[2]) / 1e6,
         per(refreshed.saturating_sub(b[2])) / 1e6,
         per(b[3]) / 1e6,
+        per(b[7]),
         per(b[4]) / 1e3,
         per(b[5]),
         per(b[6]) / 1e3,
@@ -156,26 +165,6 @@ fn pages_joined(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
             Some(last) if from <= last.1 => last.1 = last.1.max(to),
             _ => out.push((from, to)),
         }
-    }
-    out
-}
-
-/// The parts of `[from, to)` outside the sorted, joined `writes`.
-fn outside(writes: &[(usize, usize)], from: usize, to: usize) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut at = from;
-    let first = writes.partition_point(|w| w.1 <= from);
-    for &(a, b) in &writes[first..] {
-        if a >= to {
-            break;
-        }
-        if a > at {
-            out.push((at, a));
-        }
-        at = at.max(b);
-    }
-    if at < to {
-        out.push((at, to));
     }
     out
 }
@@ -301,7 +290,6 @@ fn arm_undeclared(
     let mut seen = std::collections::HashSet::new();
     let mut arm = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
         copy.arm_undeclared(address, len);
-        ranges.push((address, address.saturating_add(len)));
         if seen.insert(Arc::as_ptr(copy) as usize) {
             armed.push(copy.clone());
         }
@@ -315,6 +303,7 @@ fn arm_undeclared(
                 crate::memory::copies(key, |copy| {
                     let (start, len) = copy.range();
                     arm(copy, start as usize, len as usize);
+                    ranges.push((start as usize, (start + len) as usize));
                 });
             }
         }
@@ -322,9 +311,11 @@ fn arm_undeclared(
     (armed, ranges)
 }
 
-/// Title memory a flight of `segments` may write, as sorted, joined whole
-/// pages: the ranges armed for it (`armed`, from [`arm_undeclared`]) and
-/// those its lists declare their shaders write.
+/// Title memory a flight of `segments` may write whatever its heaps view,
+/// as sorted, joined whole pages: the copies its title-memory page tables
+/// name (`armed`, from [`arm_undeclared`]) and the ranges its lists declare
+/// their shaders write. What its heaps' unordered views reach is asked of
+/// the heaps, copy by copy (`crate::bindless::written_pages`).
 fn flight_writes(segments: &[Arc<HostList>], mut armed: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     for list in segments {
         for step in &list.deferred().copies {
@@ -435,8 +426,9 @@ struct InFlight {
     /// Copies whose pages it armed for its shaders' undeclared writes
     /// ([`arm_undeclared`]), disarmed once it has landed.
     armed: Vec<Arc<crate::shadow::Shadow>>,
-    /// Title memory its shaders may write ([`flight_writes`]): what a
-    /// preparation beside it leaves alone ([`Host::prepare_beside`]).
+    /// Title memory its shaders may write whatever its heaps view
+    /// ([`flight_writes`]): with what the unordered views of `heaps` reach,
+    /// what a preparation beside it leaves alone ([`Host::prepare_beside`]).
     writes: Vec<(usize, usize)>,
     uploads: Option<crate::bindless::Uploads>,
     batch: Batch,
@@ -647,10 +639,10 @@ impl Host {
         if !prep_beside_enabled() {
             return;
         }
-        let (fence_value, writes) = {
+        let (fence_value, writes, heaps) = {
             let state = self.flight.lock().unwrap_or_else(|e| e.into_inner());
             match state.in_flight.as_ref() {
-                Some(f) if f.waited => (f.fence_value, f.writes.clone()),
+                Some(f) if f.waited => (f.fence_value, f.writes.clone(), f.heaps.clone()),
                 _ => return,
             }
         };
@@ -660,8 +652,11 @@ impl Host {
             return;
         }
         let started = std::time::Instant::now();
-        let mut batch = Batch::default();
-        let mut left = 0u64;
+        // What the lists ask for, by copy: every list of a world submission
+        // asks for every copy its heaps reach, so the flight's writes are
+        // taken out once per copy, not once per ask.
+        let mut asked: Vec<(Arc<crate::shadow::Shadow>, crate::ranges::Ranges)> = Vec::new();
+        let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
         let mut add = |copy: &Arc<crate::shadow::Shadow>, address: usize, len: usize| {
             // Memory that is not tracked is copied whole at every refresh:
             // done here it would be done again by the preparation.
@@ -678,12 +673,11 @@ impl Host {
             if from >= to {
                 return;
             }
-            let mut ahead = 0;
-            for (a, b) in outside(&writes, from, to) {
-                batch.add(copy, a, b - a);
-                ahead += b - a;
-            }
-            left += (to - from - ahead) as u64;
+            let i = *index.entry(Arc::as_ptr(copy) as usize).or_insert_with(|| {
+                asked.push((copy.clone(), Default::default()));
+                asked.len() - 1
+            });
+            asked[i].1.insert(from, to, 0);
         };
         for list in lists {
             for step in &list.deferred().copies {
@@ -703,6 +697,34 @@ impl Host {
                 }
             }
         }
+        let mut batch = Batch::default();
+        let (mut left, mut made) = (0u64, 0u64);
+        for (copy, mut ranges) in asked {
+            let bytes = |r: &crate::ranges::Ranges| r.iter().map(|(a, b)| b - a).sum::<usize>();
+            let before = bytes(&ranges);
+            let (Some((first, _)), Some((_, last))) = (ranges.iter().next(), ranges.iter().last()) else {
+                continue;
+            };
+            // Each sorted and joined: only those reaching the asked bytes.
+            let mut take_out = |writes: &[(usize, usize)]| {
+                let from = writes.partition_point(|w| w.1 <= first);
+                for &(a, b) in writes[from..].iter().take_while(|w| w.0 < last) {
+                    ranges.remove(a, b);
+                }
+            };
+            take_out(&writes);
+            let key = Arc::as_ptr(&copy) as usize;
+            for heap in &heaps {
+                let (pages, new) = crate::bindless::written_pages(heap, key);
+                made += u64::from(new);
+                take_out(&pages);
+            }
+            for (a, b) in ranges.iter() {
+                batch.add(&copy, a, b - a);
+            }
+            left += (before - bytes(&ranges)) as u64;
+        }
+        beside(7, made);
         let copied = batch.flush();
         beside(0, 1);
         beside(2, copied as u64);

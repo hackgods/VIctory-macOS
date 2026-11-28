@@ -199,6 +199,10 @@ struct Inner {
     /// this lock, which refreshes of table slots wait for).
     unordered: BTreeMap<(usize, u64, u64), Arc<Shadow>>,
     widened: Option<Arc<Vec<WidenedWrite>>>,
+    /// Per copy, the whole 64 KiB pages its unordered ranges reach, in
+    /// order and joined ([`written_pages`]): made when asked for, dropped
+    /// when an unordered range of the copy comes or goes.
+    written_pages: HashMap<usize, Arc<[(usize, usize)]>>,
 }
 
 /// A widened write a heap's unordered view makes: copy, title address,
@@ -259,6 +263,7 @@ impl Inner {
                             self.unordered.remove(&(key.0, key.1, key.2));
                         }
                         self.widened = None;
+                        self.written_pages.remove(&key.0);
                     }
                     let ends = self
                         .ends
@@ -722,6 +727,41 @@ pub(crate) fn written_ranges(viewed: &Viewed, mut each: impl FnMut(&Arc<Shadow>,
             each(shadow, *address as usize, *len as usize);
         }
     }
+}
+
+/// The title memory of `copy` (a host copy, by its address) that the heap's
+/// unordered views reach, as whole 64 KiB pages, in order and joined: what
+/// the heap's shaders can write of it, as the views bound their writes.
+/// Tighter than the copy's hull ([`written_ranges`]), which also holds what
+/// lies between its first and last view. The second value says whether the
+/// pages were made by this call (they are kept until a range of the copy
+/// comes or goes).
+pub(crate) fn written_pages(viewed: &Viewed, copy: usize) -> (Arc<[(usize, usize)]>, bool) {
+    let mut inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pages) = inner.written_pages.get(&copy) {
+        return (pages.clone(), false);
+    }
+    let page = crate::watch::PAGE as u64;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    // In the order of their starts, so a range joins the last run or
+    // starts a new one.
+    for &(_, from, to) in inner
+        .unordered
+        .range((copy, 0, 0)..=(copy, u64::MAX, u64::MAX))
+        .map(|(key, _)| key)
+    {
+        let (from, to) = (
+            (from / page * page) as usize,
+            (to.div_ceil(page).saturating_mul(page)) as usize,
+        );
+        match runs.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => runs.push((from, to)),
+        }
+    }
+    let pages: Arc<[(usize, usize)]> = runs.into();
+    inner.written_pages.insert(copy, pages.clone());
+    (pages, true)
 }
 
 /// Heap UAV ranges that may need to refresh a widened SRV after a later

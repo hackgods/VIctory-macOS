@@ -183,3 +183,117 @@ fn beside_a_flight_nothing_is_refreshed_without_the_switch() {
     assert_eq!(copy.read_host(p as u64, 1)[0], 0x5555_5555, "refreshed by the preparation");
     crate::shadow::unregister(buf as usize, p as u64);
 }
+
+/// A heap holds two unordered views of one buffer, on its first and its
+/// third page, and a flight's shader writes through the first. What the
+/// flight may write is what the views reach, not everything from the first
+/// view to the last: the page between them, written by the title during
+/// the flight, is refreshed beside it, and the two pages under the views
+/// are left until it has landed.
+#[test]
+fn beside_a_flight_the_pages_between_its_heaps_unordered_views_are_refreshed() {
+    let Some(host) = crate::host::host() else {
+        return;
+    };
+    const LIVE_MARKED_WRITE: &str = r#"
+RWByteAddressBuffer dst : register(u0);
+RWByteAddressBuffer writes : register(u1);
+cbuffer c : register(b0) { uint byte_offset; uint value; uint mark_word_bytes; uint mark_mask; }
+[numthreads(1, 1, 1)]
+void main() {
+    dst.Store(byte_offset, value);
+    writes.Store(mark_word_bytes, mark_mask);
+}
+"#;
+    let (root, pso) = compile_cs(
+        LIVE_MARKED_WRITE,
+        &[
+            Param::Table(&[uav(0, 1)]),
+            Param::Uav { register: 1 },
+            Param::Constants {
+                register: 0,
+                count: 4,
+            },
+        ],
+    );
+    let (_, title_heap, heap_host) = view_heap(8);
+    let p = crate::watch::tests::pool(3);
+    let set = |at: usize, value: u32| {
+        // SAFETY: a dword of our pages.
+        unsafe { (at as *mut u32).write_volatile(value) }
+    };
+    for (page, value) in [0x1111_1111u32, 0x2222_2222, 0x3333_3333].into_iter().enumerate() {
+        set(p + page * PAGE + 16, value);
+    }
+    let buf = buffer_at_address(p as u64, 3 * PAGE as u64);
+    let copy = crate::shadow::find(p as u64, 3 * PAGE as u64).expect("the pages' copy");
+    let Some((bit, _)) = copy.mark_entry(p as u64) else {
+        crate::shadow::unregister(buf as usize, p as u64);
+        return; // no write marks on this host
+    };
+    // Raw views of 256 bytes: of the first page, and of the third.
+    let third: [u32; 10] = [39, 1, (2 * PAGE / 4) as u32, 0, 64, 0, 0, 0, 1, 0];
+    let slot1 = title_heap.start + 32;
+    crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &RAW_256, title_heap.start);
+    crate::descriptor::create_uav(std::ptr::null(), buf, std::ptr::null(), &third, slot1);
+    let _ = heap_host.mirror(0, title_heap.start, true);
+    let _ = heap_host.mirror(1, slot1, true);
+    let _mode = ModeGuard::new(true, false);
+    let _beside = BesideGuard::new(true);
+    copy.update(p, 3 * PAGE);
+    let mut gate = Gate::hold(host);
+    let list = Arc::new(host.new_list().unwrap());
+    list.defer_heap(&heap_host.viewed);
+    let writes = crate::shadow::view_writes(false).expect("the write marks bitmap");
+    let constants = [0u32, 0xDEAD_BEEF, (bit >> 5) * 4, 1 << (bit & 31)];
+    // SAFETY: an open list, live objects and descriptors in our heap.
+    unsafe {
+        list.list
+            .SetDescriptorHeaps(&[Some(heap_host.heap.clone())]);
+        list.list.SetComputeRootSignature(&root);
+        list.list.SetComputeRootDescriptorTable(0, heap_host.gpu(0));
+        list.list.SetComputeRootUnorderedAccessView(1, writes);
+        list.list
+            .SetComputeRoot32BitConstants(2, 4, constants.as_ptr().cast(), 0);
+        list.list.SetPipelineState(&pso);
+        list.list.Dispatch(1, 1, 1);
+    }
+    list.close();
+    host.execute_flight1(vec![list], vec![]);
+    // The title writes all three pages while the flight is in the air.
+    for (page, value) in [0xAAAA_0000u32, 0xAAAA_0001, 0xAAAA_0002].into_iter().enumerate() {
+        set(p + page * PAGE + 16, value);
+    }
+    let next = Arc::new(host.new_list().unwrap());
+    next.defer_refresh(&copy, p, 3 * PAGE);
+    next.close();
+    host.prepare_beside(std::slice::from_ref(&next));
+    let held = gate.held();
+    let seen: Vec<u32> = (0..3)
+        .map(|page| copy.read_host((p + page * PAGE + 16) as u64, 1)[0])
+        .collect();
+    gate.open();
+    host.execute_flight1(vec![next], vec![]);
+    host.finish_flight_now();
+    if held {
+        assert_eq!(
+            seen,
+            [0x1111_1111, 0xAAAA_0001, 0x3333_3333],
+            "beside the flight: the pages under its heap's unordered views left, the page between refreshed"
+        );
+    }
+    let after: Vec<u32> = (0..3)
+        .map(|page| copy.read_host((p + page * PAGE + 16) as u64, 1)[0])
+        .collect();
+    assert_eq!(
+        after,
+        [0xAAAA_0000, 0xAAAA_0001, 0xAAAA_0002],
+        "after the landing the copy holds the title's writes on all three"
+    );
+    assert_eq!(
+        copy.read_host(p as u64, 1)[0],
+        0xDEAD_BEEF,
+        "and the shader's write on the first"
+    );
+    crate::shadow::unregister(buf as usize, p as u64);
+}

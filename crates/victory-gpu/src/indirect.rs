@@ -220,7 +220,6 @@ StructuredBuffer<uint> src5 : register(t6);
 StructuredBuffer<uint> src6 : register(t7);
 StructuredBuffer<uint> src7 : register(t8);
 static const uint BUDGET = 1u << 27;
-static const uint MOST_DRAW = 1u << 23;
 static const uint GROUPS = 1u << 20;
 static const uint PAST = 0xffffffffu;
 uint word(uint s, uint at) {
@@ -237,25 +236,15 @@ uint word(uint s, uint at) {
 // clamped to byte `to` of `dest`, as `WORDS_SOURCE` clamps one; its cost.
 uint clamped(uint s, uint kind, uint stride, uint from, uint to) {
     uint cost;
-    uint base_bytes;
     if (kind <= 1u) {
-        uint raw_count = word(s, from);
-        uint raw_instances = word(s, from + 1u);
-        uint count = raw_count;
-        uint instances = 0u;
-        if (raw_count >= MOST_DRAW) {
-            count = 0u;
-        } else {
-            instances = min(raw_instances, (1u << 26) / max(count, 1u));
-        }
+        uint count = min(word(s, from), 1u << 24);
+        uint instances = min(word(s, from + 1u), (1u << 26) / max(count, 1u));
         cost = count * instances;
         dest.Store2(to, uint2(count, instances));
         if (kind == 1u) {
             dest.Store3(to + 8u, uint3(word(s, from + 2u), word(s, from + 3u), word(s, from + 4u)));
-            base_bytes = 20u;
         } else {
             dest.Store2(to + 8u, uint2(word(s, from + 2u), word(s, from + 3u)));
-            base_bytes = 16u;
         }
     } else if (kind == 2u) {
         uint3 g = uint3(word(s, from), word(s, from + 1u), word(s, from + 2u));
@@ -265,19 +254,11 @@ uint clamped(uint s, uint kind, uint stride, uint from, uint to) {
         }
         cost = g.x * g.y * g.z * 64u;
         dest.Store3(to, g);
-        base_bytes = 12u;
     } else {
-        uint3 raw_g = uint3(word(s, from), word(s, from + 1u), word(s, from + 2u));
-        uint3 g = uint3(raw_g.x, min(raw_g.y, 1u), min(raw_g.z, 1u));
-        if (raw_g.x > 65535u) {
-            g = uint3(0u, 0u, 0u);
-        }
+        uint3 g = uint3(word(s, from), word(s, from + 1u), word(s, from + 2u));
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         dest.Store3(to, g);
-        base_bytes = 12u;
-    }
-    for (uint extra = base_bytes; extra < stride; extra += 4u) {
-        dest.Store(to + extra, word(s, from + extra / 4u));
     }
     return cost;
 }
@@ -2027,6 +2008,9 @@ void main(uint3 id : SV_DispatchThreadID) {
             (0, 10, 12, vec![100, 5, 3], None),
             (1, 10, 32, vec![70_000, 1, 1, 4, 5, 6, 7, 8], None),
             (0, 0, 32, vec![1 << 25, 10, 1, 2, 11, 12, 13, 14], None),
+            // A draw count of 2^23 + 5: cut to 2^24, as the inline clamp
+            // does (not emptied); no instances, so it costs nothing.
+            (0, 0, 32, vec![(1 << 23) + 5, 0, 1, 2, 21, 22, 23, 24], None),
             (2, 2, 12, vec![65_535, 17, 1], None),
             // Clamped inline (a count): the next execution opens a pass.
             (0, 0, 16, vec![5, 1, 3, 4], Some(1)),
@@ -2179,7 +2163,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         // to 8), after the inline one, and at the first execution of each
         // buffer the pass before does not bind.
         let passes: Vec<usize> = opened.iter().enumerate().filter(|&(_, &o)| o).map(|(i, _)| i).collect();
-        assert_eq!(passes, [0, 8, 9, 15, 16, 17, 18]);
+        assert_eq!(passes, [0, 9, 10, 16, 17, 18, 19]);
 
         // Inline: the producer and every clamp in one list C.
         stale();
@@ -2200,8 +2184,23 @@ void main(uint3 id : SV_DispatchThreadID) {
         host.execute(&[&c]);
         for (i, (case, copy)) in cases.iter().zip(&copies).enumerate() {
             let inline = read(copy, 0, case.2 as usize / 4);
-            assert_eq!(grouped[i], inline, "execution {i} kind {}", case.1);
-            assert!(!inline.contains(&STALE), "execution {i} read the producer's words");
+            // The words the argument signature reads: a record's others
+            // are not clamped (the title's inline clamp leaves them).
+            let used = match case.1 {
+                0 => 4,
+                1 => 5,
+                _ => 3,
+            };
+            assert_eq!(grouped[i][..used], inline[..used], "execution {i} kind {}", case.1);
+            // v9's rules at the edges: a mesh dispatch of 70,000 groups cut
+            // to 65,535 (not emptied), a draw of 2^23 + 5 vertices cut to 2^24.
+            if case.3[0] == 70_000 && case.1 == 10 {
+                assert_eq!(grouped[i][..3], [65_535, 1, 1]);
+            }
+            if case.3[0] == (1 << 23) + 5 {
+                assert_eq!(grouped[i][..2], [1 << 24, 0]);
+            }
+            assert!(!inline[..used].contains(&STALE), "execution {i} read the producer's words");
         }
         let n = cases.len();
         assert_eq!(grouped[n - 4][0], 0, "the budget left no room for the first half");
@@ -2329,7 +2328,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         c.close();
         host.execute(&[&c]);
         for (i, (case, copy)) in cases.iter().zip(&copies).enumerate() {
-            assert_eq!(hoisted[i], read(copy, 0, walked(case)), "clamp {i} kind {}", case.1);
+            // The words the argument signature reads: a record's others are
+            // not clamped (the title's inline clamp leaves them).
+            let used = match case.1 {
+                0 => 4,
+                1 => 5,
+                _ => 3,
+            };
+            let per = case.2 as usize / 4;
+            let inline = read(copy, 0, walked(case));
+            for (r, (h, l)) in hoisted[i].chunks(per).zip(inline.chunks(per)).enumerate() {
+                assert_eq!(h[..used], l[..used], "clamp {i} record {r} kind {}", case.1);
+            }
         }
         let n = cases.len();
         assert_eq!((hoisted[n - 4][0], hoisted[n - 3][0], hoisted[n - 2][0]), (1 << 22, 0, 0));

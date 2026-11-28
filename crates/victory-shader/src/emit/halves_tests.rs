@@ -11,15 +11,19 @@
 
 #[cfg(windows)]
 use super::host::{Dispatch, Host, Root, Stride, View};
+
 use super::lower;
+
 #[cfg(windows)]
 use super::validator;
+
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
 };
 use crate::{gfx10, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
+
 const S_WAITCNT_LGKM: u32 = 0xBF8C_C07F; // s_waitcnt lgkmcnt(0)
 
 /// `s[40:43]`: the raw UAV at table dword 16 (s0 is the table's address).
@@ -555,8 +559,11 @@ fn in_a_loop(body: &[u32], result: u32, count: Count) -> Vec<u32> {
 
 /// VOP2 opcodes of the operations [`reduction`] takes.
 const V_ADD_F32: u32 = 0x03;
+
 const V_MIN_U32: u32 = 0x13;
+
 const V_MAX_U32: u32 = 0x14;
+
 /// `v_mov_b32 v3, v0`.
 const V_MOV_V3_V0: u32 = 0x7E06_0300;
 
@@ -593,6 +600,36 @@ fn reduction(op: u32, ident: u32, input: u32) -> Vec<u32> {
         0x0001_0101, // v_readlane_b32 s15, v1, 0
         0xBEFE_040C, // s_mov_b64 exec, s[12:13]
         0x7E02_020F, // v_mov_b32 v1, s15
+    ]);
+    w.extend(store(1, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+/// A console wave32 waterfall loop over the low two bits of the thread id
+/// (`s_andn2_wrexec_b32` takes each value's lanes out of the pending mask
+/// and sets SCC to whether lanes remain), then the compiler's select on
+/// that SCC after the loop: `s_cselect_b32` of EXEC or 0, OR-ed with the
+/// lanes below 20. The loop leaves when no lanes remain, so SCC is 0 there
+/// and the mask is the compare's. Per thread, one dword at `l * 32`: 9
+/// below 20, else 7.
+fn mask_selected_after_a_waterfall() -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x360A_0083, // v_and_b32 v5, 3, v0
+        0xBE83_037E, // s_mov_b32 s3, exec_lo
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0x7E0E_0505, // v_readfirstlane_b32 s7, v5
+        0x7DA4_0A07, // v_cmpx_eq_u32 s7, v5
+        0xBE86_4706, // s_andn2_wrexec_b32 s6, s6
+        0xBF89_FFFC, // s_cbranch_execnz (back to the v_readfirstlane)
+        0xBEFE_0303, // s_mov_b32 exec_lo, s3
+        0x7D88_0094, // v_cmp_gt_u32 vcc_lo, 20, v0
+        0x8504_807E, // s_cselect_b32 s4, exec_lo, 0
+        0x8804_046A, // s_or_b32 s4, vcc_lo, s4
+        0xD501_0001,
+        0x0011_1287, // v_cndmask_b32 v1, 7, 9, s4
     ]);
     w.extend(store(1, 0));
     w.push(S_ENDPGM);
@@ -904,6 +941,50 @@ fn reductions_and_prefixes_across_halves_match_the_console_on_every_gpu() {
             .collect();
         failed.extend(differences(&half_sum, threads, 1, &want));
     }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`mask_selected_after_a_waterfall`]: the SCC the waterfall loop's exit
+/// shows is 0, so the select is the compare's mask and no lane mask is
+/// read as data.
+#[test]
+fn a_mask_selected_on_a_waterfall_exits_scc_translates() {
+    let words = mask_selected_after_a_waterfall();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let all = gfx10::decode(&code)
+        .expect("decodes")
+        .iter()
+        .map(|i| i.text(false))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for want in [
+        "v_and_b32 v5, 3, v0",
+        "s_mov_b32 s3, exec_lo",
+        "s_mov_b32 s6, exec_lo",
+        "v_readfirstlane_b32 s7, v5",
+        "v_cmpx_eq_u32 exec_lo, s7, v5",
+        "s_andn2_wrexec_b32 s6, s6",
+        "s_cbranch_execnz",
+        "s_mov_b32 exec_lo, s3",
+        "v_cmp_gt_u32 vcc_lo, 20, v0",
+        "s_cselect_b32 s4, exec_lo, 0",
+        "s_or_b32 s4, vcc_lo, s4",
+        "v_cndmask_b32 v1, 7, 9, s4",
+    ] {
+        assert!(all.contains(want), "{want:?} not in:\n{all}");
+    }
+    let n = native(&words, false, 32, 0);
+    lowered(&n, false).expect("wave32");
+}
+
+/// [`mask_selected_after_a_waterfall`] on every hardware adapter gives the
+/// console's values.
+#[test]
+#[cfg(windows)]
+fn a_mask_selected_on_a_waterfall_exits_scc_matches_the_console_on_every_gpu() {
+    let want: Vec<u32> = (0..32).map(|l| if l < 20 { 9 } else { 7 }).collect();
+    let words = mask_selected_after_a_waterfall();
+    let failed = differences_in(false, &words, 32, 1, &want, 0, false, false);
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
@@ -1542,7 +1623,9 @@ const fn permlanex16(fetch_inactive: bool, bound_ctrl: bool) -> [u32; 2] {
 
 /// The selectors: every nibble of `s8` is odd and every one of `s9` is even.
 const PERM_LOW: u32 = 0x1357_9BDF;
+
 const PERM_HIGH: u32 = 0x2468_ACE0;
+
 /// What `v1` holds before an instruction that may leave it alone.
 const PERM_OLD: u32 = 0xAAAA;
 
@@ -2054,6 +2137,72 @@ fn literal_wave64_programs_match_the_console_on_every_gpu() {
     }
 }
 
+/// A number kept in VCC_HI on its way into a scalar load's offset: the
+/// console wave's first thread id, plus one, times 16 bytes, read from the
+/// structured buffer, and a branch on the dword read. Every lane stores the
+/// dword when it is nonzero.
+fn literal_vcc_hi_offset() -> Vec<u32> {
+    literal_program(&[
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0x7E2A_0500, // v_readfirstlane_b32 s21, v0
+        0x8015_8115, // s_add_u32 s21, s21, 1
+        0x8F6B_8415, // s_lshl_b32 vcc_hi, s21, 4
+        0x8817_806B, // s_or_b32 s23, vcc_hi, 0
+        0xF420_0616,
+        0x2E00_0000, // s_buffer_load_dword s24, s[44:47], s23
+        S_WAITCNT_LGKM,
+        0xBF07_8018, // s_cmp_lg_u32 s24, 0
+        0xBF84_0001, // s_cbranch_scc0 1
+        0x7E06_0218, // v_mov_b32 v3, s24
+    ])
+}
+
+/// VCC_HI read as a number keeps the whole-wave translation's group
+/// control flow uniform.
+#[test]
+fn literal_wave64_reads_a_number_in_vcc_hi_as_data() {
+    let words = literal_vcc_hi_offset();
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let p = ir::build(&code, true, 256).unwrap();
+    let names: Vec<_> = p
+        .blocks
+        .iter()
+        .flat_map(|b| b.insts.iter().map(|i| i.name()))
+        .collect();
+    for want in [
+        "v_readfirstlane_b32",
+        "s_add_u32",
+        "s_lshl_b32",
+        "s_or_b32",
+        "s_buffer_load_dword",
+        "s_cmp_lg_u32",
+        "s_cbranch_scc0",
+    ] {
+        assert!(names.contains(&want), "{want} missing from {names:?}");
+    }
+    let n = native(&words, true, 64, 0);
+    let l = lower_halves(&n, true, true, true).expect("literal halves");
+    assert_eq!(l.wave_size, Some(32));
+}
+
+#[test]
+#[cfg(windows)]
+fn literal_wave64_vcc_hi_offset_matches_the_console_on_every_gpu() {
+    let failed = differences_with_buffer(
+        true,
+        &literal_vcc_hi_offset(),
+        64,
+        1,
+        &[7; 64],
+        0,
+        true,
+        true,
+        &[0, 0, 0, 0, 7, 0, 0, 0],
+    );
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
 
 /// VOP2 opcode for `v_add_f16`.
 const V_ADD_F16: u32 = 0x32;
@@ -3475,14 +3624,17 @@ const MASK_LANES_8_9: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0684, // v_cmp_eq_u32 vcc, 4, v3
 ];
+
 const MASK_LANES_40_41: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_0694, // v_cmp_eq_u32 vcc, 20, v3
 ];
+
 const MASK_LANES_12_44: [u32; 2] = [
     0x3606_009F, // v_and_b32 v3, 31, v0
     0x7D84_068C, // v_cmp_eq_u32 vcc, 12, v3
 ];
+
 const MASK_EMPTY: [u32; 2] = [
     0x2C06_0081, // v_lshrrev_b32 v3, 1, v0
     0x7D84_06C0, // v_cmp_eq_u32 vcc, 64, v3
@@ -3878,7 +4030,6 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
     }
 }
 
-
 /// A program whose only cross-half operations are first-lane reads goes to
 /// halves for them (#522). Where halves cannot pass the read between them,
 /// here in a loop counted to the console wave's first lane, it is refused,
@@ -4086,6 +4237,142 @@ fn a_first_lane_read_only_active_lanes_see_matches_the_console_on_every_gpu() {
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
+/// A first-lane read of a value a multiply-accumulate made, in an
+/// `s_and_saveexec_b64` region whose EXEC is `mask_words`'s, its result
+/// used in the region only (as GTA VI's `ef154ebc9e03d1b1` reads a function
+/// of a constant-buffer value): `v4 = f32(s14)`, `s14` the first dword of
+/// the SRV buffer at table dword 8, then `v_mac_f32 v4, v7, v8` with
+/// `v7 = 2.0`, so `v4 += 2.0 * v8`. `v8` is 2.0 (the same in every lane of
+/// the region), or with `per_lane` the lane's thread id. The region's lanes
+/// store the read; the others 0.
+fn mac_read_in_a_region(mask_words: &[u32], per_lane: bool) -> Vec<u32> {
+    let mut w = PROLOGUE.to_vec();
+    w.extend([
+        0xF408_0B02,
+        0xFA00_0020, // s_load_dwordx4 s[44:47], s[4:5], 0x20
+        S_WAITCNT_LGKM,
+        0xF420_0396,
+        0xFA00_0000, // s_buffer_load_dword s14, s[44:47], 0x0
+        S_WAITCNT_LGKM,
+        0x3420_0085, // v_lshlrev_b32 v16, 5, v0
+        0x7E04_0280, // v_mov_b32 v2, 0
+    ]);
+    w.extend(mask_words);
+    w.extend([
+        0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc
+        0xBF88_0006, // s_cbranch_execz (past the region)
+        0x7E08_0C0E, // v_cvt_f32_u32 v4, s14
+        0x7E0E_02F4, // v_mov_b32 v7, 2.0
+        if per_lane {
+            0x7E10_0D00 // v_cvt_f32_u32 v8, v0
+        } else {
+            0x7E10_02F4 // v_mov_b32 v8, 2.0
+        },
+        0x3E08_1107, // v_mac_f32 v4, v7, v8
+        0x7E18_0504, // v_readfirstlane_b32 s12, v4
+        0x7E04_020C, // v_mov_b32 v2, s12
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]);
+    w.extend(store(2, 0));
+    w.push(S_ENDPGM);
+    w
+}
+
+#[test]
+fn the_mac_read_programs_are_what_their_comments_say() {
+    for per_lane in [false, true] {
+        let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let all = gfx10::decode(&code)
+            .expect("decodes")
+            .iter()
+            .map(|i| i.text(true))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "s_buffer_load_dword s14, s[44:47]",
+            "s_and_saveexec_b64 s[0:1], vcc",
+            "s_cbranch_execz",
+            "v_cvt_f32_u32 v4, s14",
+            "v_mov_b32 v7, 2.0",
+            if per_lane {
+                "v_cvt_f32_u32 v8, v0"
+            } else {
+                "v_mov_b32 v8, 2.0"
+            },
+            "v_mac_f32 v4, v7, v8",
+            "v_readfirstlane_b32 s12, v4",
+            "v_mov_b32 v2, s12",
+            "s_mov_b64 exec, s[0:1]",
+        ] {
+            assert!(all.contains(want), "per_lane={per_lane}: {want:?} not in:\n{all}");
+        }
+    }
+}
+
+/// A multiply-accumulate adds to its old destination. Where that, like its
+/// operands, is the same in every lane of the read's EXEC, so is its
+/// result, and each half makes the read by itself: no halves for it, no
+/// exchange. Before, any multiply-accumulate in the value's chain sent the
+/// read to the halves. With a per-lane operand the read still takes them.
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_is_made_in_each_half() {
+    for threads in [64, 128] {
+        let of = |per_lane: bool| {
+            let words = mac_read_in_a_region(&MASK_LANES_12_44, per_lane);
+            lowered(&native(&words, true, threads, 0), true)
+                .unwrap_or_else(|e| panic!("per_lane={per_lane} {threads} threads: {e}"))
+        };
+        let alike = of(false);
+        assert_eq!(alike.barriers, 0, "{threads} threads: no exchange");
+        let per_lane = of(true);
+        assert_eq!(per_lane.wave_size, Some(32));
+        assert!(per_lane.barriers > 0, "{threads} threads: the halves pass the first lane");
+    }
+}
+
+/// Both give the console's lanes on every GPU: the region's lanes store
+/// `41.0 + 2.0 * 2.0`, or with a per-lane operand `41.0 + 2.0 *` the thread
+/// id of the console wave's first lane in the region.
+#[cfg(windows)]
+#[test]
+fn a_first_lane_read_of_a_multiply_accumulate_matches_the_console_on_every_gpu() {
+    type InRegion = fn(u32) -> bool;
+    let masks: [(&str, &[u32; 2], InRegion, &[u32]); 3] = [
+        ("lower_8_9", &MASK_LANES_8_9, |t| t >> 1 == 4, &[64]),
+        ("upper_40_41", &MASK_LANES_40_41, |t| t >> 1 == 20, &[64]),
+        ("both_12_44", &MASK_LANES_12_44, |t| t & 31 == 12, &[64, 128]),
+    ];
+    let mut failed = Vec::new();
+    for (label, mask, in_region, groups) in masks {
+        for &threads in groups {
+            for per_lane in [false, true] {
+                let words = mac_read_in_a_region(mask, per_lane);
+                let want: Vec<u32> = (0..threads)
+                    .map(|t| {
+                        if !in_region(t) {
+                            return 0;
+                        }
+                        let base = t & !63;
+                        let first = (base..base + 64).find(|&l| in_region(l)).expect("in it");
+                        let operand = if per_lane { first as f32 } else { 2.0 };
+                        (41.0 + 2.0 * operand).to_bits()
+                    })
+                    .collect();
+                let found = differences_with_buffer(
+                    true, &words, threads, 1, &want, 0, false, false, &[41, 0, 0, 0],
+                );
+                failed.extend(
+                    found
+                        .into_iter()
+                        .map(|m| format!("{label}(per_lane={per_lane}) {threads} threads: {m}")),
+                );
+            }
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
 /// Two first-lane reads of values the same in every lane that makes them,
 /// in an `s_and_saveexec_b64` region whose EXEC is `mask_words`'s:
 /// `v4 = 42` then `v4 = 1.0 + v4` (1.0, read into `s12`) and `v5 = 1.0 + v4`
@@ -4169,6 +4456,7 @@ const MASK_WAVE_LANES_8_9: [u32; 2] = [
     0x3606_00BE, // v_and_b32 v3, 62, v0
     0x7D84_0688, // v_cmp_eq_u32 vcc, 8, v3
 ];
+
 /// Lanes 40 and 41 of every console wave (its upper half).
 const MASK_WAVE_LANES_40_41: [u32; 2] = [
     0x3606_00BE, // v_and_b32 v3, 62, v0

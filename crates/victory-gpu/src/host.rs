@@ -5441,6 +5441,7 @@ impl Meter {
     fn frame(&mut self, hwnd: HWND) {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
+        pacing::presented();
         self.frames += 1;
         crate::memory::log_frame();
         #[cfg(windows)]
@@ -5477,6 +5478,7 @@ impl Meter {
             let zero_copy = crate::alias::frame_line(report_frames);
             // mac: the guard lock's waits and the protection calls, always.
             let guards = crate::watch::frame_line(report_frames);
+            pacing::log();
             // From ScarlettMac 4921b7e6: with `VICTORY_SYNC_EPOCH=1` only.
             let epoch = epoch_line(report_frames);
             // mac: write snapshots and their copy-back compares, always
@@ -7215,3 +7217,49 @@ float4 ps(float4 pos : SV_Position) : SV_Target {
 /// The pipelines of the lists the last submission ran, for a hang's log line
 /// (`Host::wait_for`): which work the GPU never finished.
 static WAITING_ON: Mutex<String> = Mutex::new(String::new());
+
+/// mac: frame pacing, what a median of frame-rate lines does not show: the
+/// time between one present and the next, each frame, and per report its
+/// percentiles (a frame line averages 5 s, so one long frame among short ones
+/// vanishes in it). One clock read a present.
+mod pacing {
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    /// The last present and the intervals since the last report, in µs.
+    static STATE: Mutex<(Option<Instant>, Vec<u32>)> = Mutex::new((None, Vec::new()));
+
+    pub(super) fn presented() {
+        let now = Instant::now();
+        let mut s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = s.0.replace(now) {
+            let us = now.duration_since(last).as_micros().min(u128::from(u32::MAX)) as u32;
+            if s.1.len() < 4096 {
+                s.1.push(us);
+            }
+        }
+    }
+
+    /// The percentile `p` (0..=100) of sorted `v`, in ms.
+    fn at(v: &[u32], p: usize) -> f64 {
+        f64::from(v[(v.len() - 1) * p / 100]) / 1000.0
+    }
+
+    pub(super) fn log() {
+        let mut v = std::mem::take(&mut STATE.lock().unwrap_or_else(|e| e.into_inner()).1);
+        if v.len() < 2 {
+            return;
+        }
+        v.sort_unstable();
+        let mean = v.iter().map(|&u| f64::from(u)).sum::<f64>() / v.len() as f64 / 1000.0;
+        tracing::info!(
+            "frame pacing over {} frames, ms between presents: p50 {:.1}, p95 {:.1}, p99 {:.1}, max {:.1}, mean {:.1}",
+            v.len(),
+            at(&v, 50),
+            at(&v, 95),
+            at(&v, 99),
+            at(&v, 100),
+            mean
+        );
+    }
+}

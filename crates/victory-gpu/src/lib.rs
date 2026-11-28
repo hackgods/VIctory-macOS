@@ -105,6 +105,9 @@ mod ranges;
 mod ray_skip;
 #[cfg(any(windows, test))]
 mod recent;
+// Its rules are plain std, so their tests run everywhere.
+#[cfg(any(windows, test))]
+mod release_copies;
 // The capture format is plain std: read, and tested, everywhere.
 pub mod replay;
 pub mod resource;

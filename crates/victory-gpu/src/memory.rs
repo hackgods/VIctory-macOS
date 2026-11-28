@@ -321,6 +321,11 @@ struct Stats {
     /// Addresses root constants and their blocks name where nothing is
     /// committed ([`prefetch`]), and the first: `(named at, address, state)`.
     named_nowhere: u64,
+    /// Lists that missed and were looked at for another run, the runs
+    /// more they got, and the lists still missing after ([`rerun_tries`]).
+    reran_lists: u64,
+    reruns: u64,
+    rerun_gave_up: u64,
     first_nowhere: Vec<(u64, u64, &'static str)>,
 }
 
@@ -453,6 +458,14 @@ pub(crate) fn log_frame() {
             format!("{a:#x}")
         })
         .collect();
+    if s.reran_lists > 0 {
+        tracing::info!(
+            "title memory lists run again this frame: {} lists missed, run {} times more in all, {} still missing after",
+            s.reran_lists,
+            s.reruns,
+            s.rerun_gave_up,
+        );
+    }
     if s.named_nowhere > 0 {
         let first: Vec<String> = s
             .first_nowhere
@@ -540,6 +553,46 @@ fn miss_kind(at: u64, since: u64) -> MissKind {
         MEM_FREE if !changed() => MissKind::Free,
         _ => MissKind::Mapped,
     }
+}
+
+/// How often a list that read title memory with no copy is run again once
+/// the copies are made (`VICTORY_MEMORY_RERUN=<tries>`, 0 by default: never;
+/// `Host::execute_sync`).
+///
+/// Holding back what such a list wrote keeps garbage out of title memory,
+/// but the title goes on as if the list had done its work (the
+/// acceleration-structure builder's builds are asked for once), and the
+/// lists after it in the submission read what it wrote in the copies. Run
+/// again with the copies it missed, from title memory's bytes, the list does
+/// the console's work, one level of addresses further each time.
+pub(crate) fn rerun_tries() -> u32 {
+    #[cfg(test)]
+    if let Some(tries) = RERUN_IN_TEST.with(std::cell::Cell::get) {
+        return tries;
+    }
+    static TRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *TRIES.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_RERUN")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's [`rerun_tries`].
+    static RERUN_IN_TEST: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// A list was run `again` times more for the copies it missed; `whole`:
+/// its last run missed none.
+pub(crate) fn note_rerun(again: u32, whole: bool) {
+    stats(|s| {
+        s.reran_lists += 1;
+        s.reruns += u64::from(again);
+        s.rerun_gave_up += u64::from(!whole);
+    });
 }
 
 /// Whether a read at a free address holds back what its list wrote
@@ -1026,6 +1079,48 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks =
             unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
         has_missed(marks, &l, kind)
+    });
+    let again_bitmap = Arc::clone(&pooled);
+    list.defer_again(key, move |clear| {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe {
+            std::slice::from_raw_parts_mut(again_bitmap.data() as *mut u32, BITMAP_WORDS)
+        };
+        if clear {
+            marks.fill(0);
+            return false;
+        }
+        let Layout { blocks, owner, .. } = &*layout(key);
+        let mut changed = false;
+        for (w, &mark) in marks.iter().enumerate() {
+            let mut bits = mark;
+            while bits != 0 {
+                let entry = w * 32 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let (block, page) = (entry / BLOCK, entry % BLOCK);
+                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                    if block == 0 && !region_free(entry) {
+                        let before = missed_regions_count();
+                        note_missed_region(entry);
+                        changed |= missed_regions_count() != before;
+                    }
+                    continue;
+                };
+                let at = (l1 << 28 | page << 16) as u64;
+                match owner.get(entry) {
+                    // What the list wrote leaves the copy: the next run
+                    // starts from title memory, as the first did.
+                    Some(&Some(_)) => crate::watch::retake(at as usize, 1 << 16),
+                    _ => {
+                        if kind(at) == MissKind::Mapped && misses_told_apart() {
+                            let before = crate::shadow::generation();
+                            changed |= copy_missed(at) && crate::shadow::generation() != before;
+                        }
+                    }
+                }
+            }
+        }
+        changed
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);
@@ -1812,6 +1907,111 @@ void main() {
         if FRAMES.load(std::sync::atomic::Ordering::Relaxed) == frame {
             assert_eq!(kept, 0x44, "a submission that missed nothing keeps its writes");
         }
+        crate::shadow::unregister(p, p as u64);
+        drop(copy);
+    }
+
+    const FOLLOW: &str = r#"
+#define RS "DescriptorTable(UAV(u0, numDescriptors=unbounded)), SRV(t0, space=2), UAV(u0, space=2), RootConstants(num32BitConstants=4, b0)"
+RWByteAddressBuffer views[] : register(u0);
+ByteAddressBuffer table : register(t0, space2);
+RWByteAddressBuffer dirty : register(u0, space2);
+cbuffer c : register(b0) { uint lo; uint hi; uint from_lo; uint from_hi; }
+uint access(uint a, uint h, bool write, uint value) {
+    bool inside = h < 256;
+    uint l1 = inside ? (h << 4 | a >> 28) : 0;
+    uint block = inside ? table.Load(l1 * 4) : 0;
+    uint entry = block << 12 | (a >> 16 & 0xFFF);
+    uint2 e = table.Load2((4096 + 2 * entry) * 4);
+    bool miss = e.x == table.Load(4096 * 4);
+    uint n = miss && block == 0 ? l1 : entry;
+    if (write || miss) {
+        dirty.InterlockedOr(n >> 5 << 2, 1u << (n & 31));
+    }
+    uint read = 0;
+    if (!miss) {
+        if (write) {
+            views[NonUniformResourceIndex(e.x + 1)].Store(a - e.y, value);
+        } else {
+            read = views[NonUniformResourceIndex(e.x)].Load(a - e.y);
+        }
+    }
+    return read;
+}
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    // The address to store at is read from memory, as the builder's are.
+    uint offset = access(from_lo, from_hi, false, 0);
+    access(lo + offset, hi, true, 0x70 + offset);
+}
+"#;
+
+    /// A list that read memory with no copy is run again once the copy is
+    /// made (`VICTORY_MEMORY_RERUN`): what its first run stored where zeros
+    /// sent it leaves the copies, and its last run's stores, made from the
+    /// title's bytes, go back in the same submission.
+    #[test]
+    fn a_list_that_missed_runs_again_with_the_copies_it_missed() {
+        let _guard = gpu_test_lock();
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let (Some(host), Some(views)) = (crate::host::host(), heap()) else {
+            return; // no host GPU here
+        };
+        let Some((root, pso)) = pipeline(FOLLOW) else {
+            return; // no compiler for the shader here
+        };
+        let alloc = |base: u64, flags: u32| {
+            (0..256u64)
+                .map(|k| base + (k << 28))
+                // SAFETY: a fresh allocation where nothing is mapped, or none.
+                .map(|hint| unsafe { VirtualAlloc(hint as *const _, PAGE, MEM_RESERVE | MEM_COMMIT | flags, PAGE_READWRITE) as usize })
+                .find(|&p| p != 0)
+                .expect("memory below 2^40")
+        };
+        // Where the list stores: a page with a copy. What names the offset
+        // there: memory nothing has a copy of, in a region with no block.
+        let p = alloc(0x52_0000_0000, crate::watch::tests::MEM_WRITE_WATCH);
+        let named = alloc(0x62_0000_0000, 0);
+        // SAFETY: our fresh pages.
+        unsafe {
+            (p as *mut u8).write_bytes(0x11, 64);
+            ((named + 8) as *mut u32).write_volatile(16);
+        }
+        crate::shadow::register(p, p as u64, PAGE as u64);
+        let copy = crate::shadow::find(p as u64, PAGE as u64).unwrap();
+        // No miss of another test's holds this one's writes back.
+        log_frame();
+        log_frame();
+        let list = host.new_list().unwrap();
+        let run = |tries: u32| {
+            RERUN_IN_TEST.with(|t| t.set(Some(tries)));
+            let map = bind(&list, OURS).expect("a page table");
+            let from = named as u64 + 8;
+            let constants = [p as u32, (p as u64 >> 32) as u32, from as u32, (from >> 32) as u32];
+            // SAFETY: an open list, live objects of ours.
+            unsafe {
+                list.list.SetDescriptorHeaps(&[Some(views.heap.clone())]);
+                list.list.SetComputeRootSignature(&root);
+                list.list.SetComputeRootDescriptorTable(0, views.gpu(0));
+                list.list.SetComputeRootShaderResourceView(1, map.table);
+                list.list.SetComputeRootUnorderedAccessView(2, map.dirty);
+                list.list.SetComputeRoot32BitConstants(3, 4, constants.as_ptr().cast(), 0);
+                list.list.SetPipelineState(&pso);
+                list.list.Dispatch(1, 1, 1);
+            }
+            list.close();
+            host.execute(&[&list]);
+            list.reset();
+            RERUN_IN_TEST.with(|t| t.set(None));
+        };
+        // SAFETY: our page.
+        let title = |offset: usize| unsafe { ((p + offset) as *const u32).read_volatile() };
+        run(4);
+        assert_eq!(title(16), 0x80, "the store made from the title's bytes went back");
+        assert_eq!(title(0), 0x1111_1111, "the store made from zeros did not");
+        assert_eq!(copy.read_host(p as u64, 4), [0x11; 4], "nor does the copy keep it");
         crate::shadow::unregister(p, p as u64);
         drop(copy);
     }

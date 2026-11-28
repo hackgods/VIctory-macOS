@@ -80,7 +80,6 @@ impl Drop for Quiet<'_> {
 /// `finish_post_gpu`.
 struct PreparedSubmission {
     lists: Vec<Option<ID3D12CommandList>>,
-    #[cfg(feature = "diagnostics")]
     firsts: Vec<usize>,
     native_boundaries: Vec<usize>,
     batch: Batch,
@@ -1868,7 +1867,16 @@ struct Deferred {
     /// shaders read title memory with no copy (`crate::memory`); then what
     /// they wrote through views does not go back either.
     missed: Vec<Box<dyn Fn() -> bool + Send>>,
+    /// For a list whose shaders read title memory with no copy, before it
+    /// is run again (`crate::memory::rerun_tries`), by view heap: called
+    /// with `false`, makes the copies it missed and drops what it wrote
+    /// from the copies, and says whether anything was made; with `true`,
+    /// forgets what the run marked.
+    again: Vec<(usize, Again)>,
 }
+
+/// A list's work before it is run again (`Deferred::again`).
+type Again = Box<dyn Fn(bool) -> bool + Send>;
 
 /// Features reported by the D3D12 device used for rendering. A failed
 /// feature query leaves its result unknown.
@@ -2146,11 +2154,80 @@ impl Host {
                 prep.native_boundaries.clear();
             }
         }
+        // Lists that use title memory at addresses their shaders compute run
+        // on their own first, and again with the copies they missed
+        // (`crate::memory::rerun_tries`): what follows them in the
+        // submission reads what they wrote.
+        let mut ran_to = 0usize;
+        let tries = crate::memory::rerun_tries();
+        if tries > 0 && groups.len() == 1 && runs.iter().any(|l| !l.deferred().again.is_empty()) {
+            prep.native_boundaries.clear();
+            let queue = self.queue();
+            let run = |submitted: &mut u64, lists: &[Option<ID3D12CommandList>]| {
+                *submitted += 1;
+                let mut group = lists.to_vec();
+                if let Some(mark) = mark {
+                    mark.arm(*submitted);
+                    group.push(mark.list());
+                }
+                // SAFETY: closed lists; the fence and event are ours.
+                unsafe {
+                    queue.ExecuteCommandLists(&group);
+                    let waited = queue
+                        .Signal(&self.fence, *submitted)
+                        .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    match waited {
+                        Ok(()) => self.wait_for(*submitted),
+                        Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    }
+                }
+            };
+            for (i, list) in runs.iter().enumerate() {
+                if list.deferred().again.is_empty() {
+                    continue;
+                }
+                let first = prep.firsts[i];
+                let end = prep.firsts.get(i + 1).copied().unwrap_or(prep.lists.len());
+                run(&mut submitted, &prep.lists[ran_to..end]);
+                ran_to = end;
+                let mut again = 0;
+                let whole = loop {
+                    let deferred = list.deferred();
+                    if !deferred.missed.iter().any(|check| check()) {
+                        break true;
+                    }
+                    let mut changed = false;
+                    for (_, work) in &deferred.again {
+                        changed |= work(false);
+                    }
+                    // The copies made and the pages taken again, brought
+                    // up from title memory; the page tables name them.
+                    let mut batch = Batch::take();
+                    for &(heap, _) in &deferred.again {
+                        crate::memory::prepare(heap, |s, a, l| batch.add(s, a, l));
+                    }
+                    batch.flush();
+                    if !changed || again == tries {
+                        break false;
+                    }
+                    for (_, work) in &deferred.again {
+                        work(true);
+                    }
+                    drop(deferred);
+                    run(&mut submitted, &prep.lists[first..end]);
+                    again += 1;
+                };
+                if again > 0 || !whole {
+                    crate::memory::note_rerun(again, whole);
+                }
+            }
+        }
         let split_marks = split_pool
             .as_deref()
             .and_then(Option::as_deref)
             .unwrap_or(&[]);
         for (i, group) in groups.iter().enumerate() {
+            let group = &group[ran_to.min(group.len())..];
             *submitted += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
@@ -2481,11 +2558,8 @@ impl Host {
             format!("{} lists, pipelines {pipelines:?}", runs.len())
         };
         drop(run_refs);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = firsts;
         PreparedSubmission {
             lists,
-            #[cfg(feature = "diagnostics")]
             firsts,
             native_boundaries,
             batch,
@@ -4100,6 +4174,12 @@ impl HostList {
     /// whether its shaders read title memory with no copy.
     pub(crate) fn defer_missed(&self, check: impl Fn() -> bool + Send + 'static) {
         self.deferred().missed.push(Box::new(check));
+    }
+
+    /// Before the list is run again for the title memory it missed (view
+    /// heap `heap`): see `Deferred::again`.
+    pub(crate) fn defer_again(&self, heap: usize, work: impl Fn(bool) -> bool + Send + 'static) {
+        self.deferred().again.push((heap, Box::new(work)));
     }
 
     /// Runs `work` once the list has run (each submission), before its

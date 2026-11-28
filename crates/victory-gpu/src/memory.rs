@@ -738,6 +738,18 @@ pub(crate) fn probe(list: &HostList, key: usize, name: &str, words: &[(u8, u32, 
         })
         .collect();
     let since = crate::watch::remap_epoch();
+    // The dispatch's misses count for its list, and for running it again.
+    let (missed_bitmap, again_bitmap) = (Arc::clone(&bitmap), Arc::clone(&bitmap));
+    list.defer_missed(move || {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts(missed_bitmap.data() as *const u32, BITMAP_WORDS) };
+        has_missed(marks, &layout(key), |at| miss_kind(at, since))
+    });
+    list.defer_again(key, move |clear| {
+        // SAFETY: the bitmap is mapped and the list's run is over.
+        let marks = unsafe { std::slice::from_raw_parts_mut(again_bitmap.data() as *mut u32, BITMAP_WORDS) };
+        before_again(marks, key, &|at| miss_kind(at, since), clear)
+    });
     list.defer_after(move || {
         let Layout { blocks: table, owner, .. } = &*layout(key);
         // SAFETY: the bitmap is mapped and the list's run is over.
@@ -1225,6 +1237,48 @@ fn has_missed(marks: &[u32], l: &Layout, kind: impl Fn(u64) -> MissKind) -> bool
     false
 }
 
+/// Before a list whose bitmap is `marks` (view heap `key`) is run again
+/// (`HostList::defer_again`): `clear` forgets what the run marked; else the
+/// copies it missed are made, what it wrote leaves the copies, and whether
+/// anything was made is returned.
+fn before_again(marks: &mut [u32], key: usize, kind: &dyn Fn(u64) -> MissKind, clear: bool) -> bool {
+    if clear {
+        marks.fill(0);
+        return false;
+    }
+    let Layout { blocks, owner, .. } = &*layout(key);
+    let mut changed = false;
+    for (w, &mark) in marks.iter().enumerate() {
+        let mut bits = mark;
+        while bits != 0 {
+            let entry = w * 32 + bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let (block, page) = (entry / BLOCK, entry % BLOCK);
+            let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
+                if block == 0 && !nowhere(entry, blocks) {
+                    let before = missed_regions_count();
+                    note_missed_region(entry);
+                    changed |= missed_regions_count() != before;
+                }
+                continue;
+            };
+            let at = (l1 << 28 | page << 16) as u64;
+            match owner.get(entry) {
+                // What the list wrote leaves the copy: the next run
+                // starts from title memory, as the first did.
+                Some(&Some(_)) => crate::watch::retake(at as usize, 1 << 16),
+                _ => {
+                    if kind(at) == MissKind::Mapped && misses_told_apart() {
+                        let before = crate::shadow::generation();
+                        changed |= copy_missed(at) && crate::shadow::generation() != before;
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// `list` uses title memory with view heap `key` bound: the heap's page
 /// table (made on first use) and a page bitmap of the list's, the table
 /// brought up to date at each submission of the list, its written pages
@@ -1275,41 +1329,7 @@ pub(crate) fn bind(list: &HostList, key: usize) -> Option<Map> {
         let marks = unsafe {
             std::slice::from_raw_parts_mut(again_bitmap.data() as *mut u32, BITMAP_WORDS)
         };
-        if clear {
-            marks.fill(0);
-            return false;
-        }
-        let Layout { blocks, owner, .. } = &*layout(key);
-        let mut changed = false;
-        for (w, &mark) in marks.iter().enumerate() {
-            let mut bits = mark;
-            while bits != 0 {
-                let entry = w * 32 + bits.trailing_zeros() as usize;
-                bits &= bits - 1;
-                let (block, page) = (entry / BLOCK, entry % BLOCK);
-                let Some(&l1) = blocks.get(block).filter(|_| block != 0) else {
-                    if block == 0 && !nowhere(entry, blocks) {
-                        let before = missed_regions_count();
-                        note_missed_region(entry);
-                        changed |= missed_regions_count() != before;
-                    }
-                    continue;
-                };
-                let at = (l1 << 28 | page << 16) as u64;
-                match owner.get(entry) {
-                    // What the list wrote leaves the copy: the next run
-                    // starts from title memory, as the first did.
-                    Some(&Some(_)) => crate::watch::retake(at as usize, 1 << 16),
-                    _ => {
-                        if kind(at) == MissKind::Mapped && misses_told_apart() {
-                            let before = crate::shadow::generation();
-                            changed |= copy_missed(at) && crate::shadow::generation() != before;
-                        }
-                    }
-                }
-            }
-        }
-        changed
+        before_again(marks, key, &kind, clear)
     });
     list.defer_after(move || {
         let Layout { copies, blocks, owner, .. } = &*layout(key);

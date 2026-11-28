@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Map, Set, Structured};
 mod atomics;
 mod barriers;
 mod bvh;
+mod descriptor_records;
 mod f64;
 mod first_lane;
 /// Format loads that move 16-bit halves without the d16 form, a child
@@ -40,7 +41,7 @@ mod thread_limits;
 #[cfg(test)]
 use barriers::split_wave_barriers;
 use barriers::{in_step, split_wave_barriers_with_step, step_and_cap};
-pub(crate) use mesh::KeptOutputs;
+pub(crate) use mesh::{KeptOutputs, idle_clip, plan_layout};
 use mesh::prune_signature;
 pub(crate) use meet::MeetSite;
 use super::bitcode::Rmw;
@@ -4934,7 +4935,10 @@ impl<'a> Lower<'a> {
                 .find_map(|&(s, _)| use_of(s))
         });
         let Some((at, first)) = use_at else {
-            return self.view_addresses(inst, site, code, count);
+            return match self.unused_buffer(site) {
+                Some(props) => self.buffer_records(inst, site, code, count, props),
+                None => self.view_addresses(inst, site, code, count),
+            };
         };
         let src = Source::Loaded { load: site, first };
         let used = self.used_kind(&src);
@@ -11108,18 +11112,10 @@ impl<'a> Lower<'a> {
                     if outputs.iter().any(|o| matches!(o.kind, 4 | 5)) {
                         return Err("render-target or viewport index exports");
                     }
-                    let mut dists: Vec<usize> = (0..outputs.len())
-                        .filter(|&i| matches!(outputs[i].kind, 6 | 7))
-                        .collect();
-                    dists.sort_by_key(|&i| (outputs[i].kind, outputs[i].index));
-                    let flat: Vec<(usize, u8)> = dists
-                        .iter()
-                        .flat_map(|&i| (0..outputs[i].cols).map(move |c| (i, c)))
-                        .collect();
                     // Channels past the distances the signature declares are
                     // ones the clipper does not enable (`PA_CL_VS_OUT_CNTL`).
                     let k = usize::from(n - 1) * 4 + usize::from(ch);
-                    flat.get(k).copied()
+                    mesh::distance_channel(&self.x.outputs, outputs, k)
                 }
                 Target::Position(_) => return Err("clip, cull or point-size exports"),
                 Target::Primitive => return Err("a primitive export"),

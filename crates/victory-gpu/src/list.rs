@@ -226,6 +226,35 @@ fn wait(this: This, wait: crate::hold::ValueWait) {
     let _ = (this, wait);
 }
 
+/// An indirect execution's clamp cannot run in the current host list's
+/// prelude, as a command before it may have written its arguments: the
+/// title list goes on in a new host list, as after a wait but with nothing
+/// to wait for, so the clamp, and those after it until the next write, run
+/// in that list's prelude (`crate::indirect::clamp_cuts_enabled`). The
+/// queue runs the host lists in order, so what the commands before wrote
+/// is there when the prelude reads it (its batch starts with an unordered
+/// access barrier).
+///
+/// Clamped inline instead, one compute dispatch between two draws, D3DMetal
+/// ends the render pass for each and starts another after it: a frame of
+/// thousands of indirect draws became thousands of render and compute
+/// encoders. Each host list has a budget of its own (`crate::indirect`).
+/// False if no new host list could be had: the clamp runs inline.
+#[cfg(windows)]
+fn cut_for_clamp(this: This) -> bool {
+    let Some(current) = host_list(this) else { return false };
+    let Some(next) = next_segment(this) else { return false };
+    crate::indirect::note_cut();
+    // SAFETY: the title passes one of our lists.
+    let list = unsafe { &*this.cast::<List>() };
+    let mut state = list.state.lock().unwrap_or_else(|e| e.into_inner());
+    state.flush_hdr_probe(current);
+    current.close();
+    state.cut(next);
+    next.mark_clamp_cut();
+    true
+}
+
 /// Moves a title list's recording on to its next host list (made, or one
 /// it held since an earlier recording, reset then): that host list.
 #[cfg(windows)]
@@ -1283,7 +1312,13 @@ extern "system" fn clear_dsv(
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
         const DEPTH_WRITE: u32 = 0x10;
-        ensure_state(list, record.resource, DEPTH_WRITE);
+        // Without rectangles a clear of every plane needs none of the older
+        // contents (`crate::twin`: a newer twin need not be copied in).
+        if rects.is_none() {
+            crate::twin::overwriting(flags, || ensure_state(list, record.resource, DEPTH_WRITE));
+        } else {
+            ensure_state(list, record.resource, DEPTH_WRITE);
+        }
         let dsv = host.dsv(&texture, record.depth_desc().as_ref());
         // SAFETY: an open list, a fresh view of a live texture.
         unsafe {
@@ -1851,9 +1886,19 @@ extern "system" fn execute_indirect(
         } else {
             *kind
         };
+        use crate::draw::Indirect;
+        let mut outcome = Indirect::NotRun;
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            outcome = s.execute_indirect(list, (kind, stride, max), address, counter, true);
         });
+        if outcome == Indirect::CutFirst {
+            // Clamped inline in the same host list if no new one can be had.
+            cut_for_clamp(this);
+            with_state(this, |list, s| {
+                outcome = s.execute_indirect(list, (kind, stride, max), address, counter, false);
+            });
+        }
+        ran = outcome == Indirect::Ran;
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
         crate::pipeline::note_why(format!(
@@ -2387,6 +2432,7 @@ mod tests {
             unsafe { p1.cast::<u32>().add(i as usize).write_volatile(0xA1B2_0000 + i) };
         }
         let s1 = crate::shadow::find(p1 as u64, 256).expect("upload 1 registered in shadow");
+        let r1 = s1.range();
         wait64(list, flag_addr, GREATER_EQUAL, 1, 0);
         {
             let h1 = host_list(list).expect("host list for batch 1");
@@ -2420,6 +2466,7 @@ mod tests {
             unsafe { p2.cast::<u32>().add(i as usize).write_volatile(0xC3D4_0000 + i) };
         }
         let s2 = crate::shadow::find(p2 as u64, 256).expect("upload 2 registered in shadow");
+        let r2 = s2.range();
         {
             let h2 = host_list(list).expect("host list for batch 2");
             s2.refresh(h2, p2 as u64, 256);
@@ -2453,9 +2500,12 @@ mod tests {
         // The finished batches, uploads included, are dropped on the
         // release thread, behind what other tests retired.
         crate::host::wait_for_releases();
+        // Freed, their addresses can go to a test running beside this one, so
+        // only the uploads' own copies must be gone.
+        let gone =
+            |p: *mut u8, r| crate::shadow::find(p as u64, 256).is_none_or(|s| s.range() != r);
         assert!(
-            crate::shadow::find(p1 as u64, 256).is_none()
-                && crate::shadow::find(p2 as u64, 256).is_none(),
+            gone(p1, r1) && gone(p2, r2),
             "both uploads must be unregistered and freed once held lists finish"
         );
 

@@ -2205,7 +2205,10 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         let n = cases.len();
         assert_eq!(grouped[n - 4][0], 0, "the budget left no room for the first half");
-        assert_eq!(grouped[n - 2][..2], [3, 1], "small ones fit");
+        // A record that does not fit empties those after it here, as in the
+        // inline clamp (`indirect_rest`); on main, only itself.
+        let small: [u32; 2] = if indirect_rest() { [0, 0] } else { [3, 1] };
+        assert_eq!(grouped[n - 2][..2], small, "small ones after one that did not fit");
         assert_eq!(host.log_messages(), None);
     }
 
@@ -2330,7 +2333,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         let n = cases.len();
         assert_eq!((hoisted[n - 4][0], hoisted[n - 3][0], hoisted[n - 2][0]), (1 << 22, 0, 0));
-        assert_eq!(hoisted[n - 1][..2], [3, 1]);
+        let small: [u32; 2] = if indirect_rest() { [0, 0] } else { [3, 1] };
+        assert_eq!(hoisted[n - 1][..2], small);
         assert_eq!(host.log_messages(), None);
     }
 

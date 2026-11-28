@@ -1412,7 +1412,15 @@ impl HostHeap {
             // one of its shaders may hold the old descriptor (or read the
             // slot at an index from wrong data): what it views is freed
             // only once that work has run.
-            if let Some((old, _)) = old {
+            if let Some((old, _)) = old
+                && !(crate::bindless::census_pages()
+                    && slot
+                        .as_ref()
+                        .map(|s| windows::core::Interface::as_raw(&s.0))
+                        == Some(windows::core::Interface::as_raw(&old)))
+            {
+                #[cfg(test)]
+                tests::RETIRES.with(|n| n.set(n.get() + 1));
                 crate::host::retire(old);
             }
         }
@@ -4027,6 +4035,53 @@ void main(uint3 id : SV_DispatchThreadID) {
         drop((src_shadow, dst_shadow));
         crate::object::release_ref(src);
         crate::object::release_ref(dst);
+    }
+
+    thread_local! {
+        /// Resources slots gave up on this thread ([`HostHeap::keep`]).
+        pub(super) static RETIRES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
+    /// With `VICTORY_CENSUS_PAGES=1` a slot made again on the resource it
+    /// holds retires nothing (it still holds it, and the GPU's old view of
+    /// it stays good); a view of another buffer and a null view retire the
+    /// old one as before. Off, every remake retires.
+    #[test]
+    fn a_slot_made_again_on_its_resource_retires_nothing() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let host = host().expect("a host");
+        let (a, _) = host.upload_buffer(1 << 16).expect("a buffer");
+        let (b, _) = host.upload_buffer(1 << 16).expect("a buffer");
+        let retires = || RETIRES.with(std::cell::Cell::get);
+        let slot = heap.count + 2;
+        for pages in [true, false] {
+            crate::bindless::TEST_CENSUS_PAGES.store(if pages { 2 } else { 1 }, Ordering::Relaxed);
+            heap.make_null(slot);
+            let before = retires();
+            heap.raw_view_at(slot, Some(&a), 0, 256, false);
+            assert_eq!(retires(), before, "an empty slot gives nothing up");
+            heap.raw_view_at(slot, Some(&a), 256, 256, false);
+            assert_eq!(
+                retires(),
+                before + u32::from(!pages),
+                "the same buffer again, pages {pages}"
+            );
+            heap.raw_view_at(slot, Some(&b), 0, 256, false);
+            assert_eq!(
+                retires(),
+                before + 1 + u32::from(!pages),
+                "another buffer: the first is retired"
+            );
+            heap.make_null(slot);
+            assert_eq!(
+                retires(),
+                before + 2 + u32::from(!pages),
+                "a null view: the second is retired"
+            );
+        }
+        crate::bindless::TEST_CENSUS_PAGES.store(0, Ordering::Relaxed);
     }
 
     /// Guards over several stripes take them in ascending order, whatever

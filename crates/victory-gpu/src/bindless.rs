@@ -49,9 +49,134 @@ type Range = (usize, u64, u64, bool);
 /// the change tracker (`crate::watch::clean_bit`).
 type Hull = (Arc<Shadow>, u64, u64, bool, Option<u32>);
 
+/// Whether the census keeps what each slot sees in pages indexed by slot
+/// and leaves its counts alone when a slot sees the same again
+/// (`VICTORY_CENSUS_PAGES=1`; off by default), and a slot made again on the
+/// resource it holds retires nothing (`descriptor::host`'s `keep`). Title
+/// threads mirroring slots enter the census under its one lock: in the
+/// world (rkinds2) 13,405 waits a frame, 307 ms summed. A hash map of a
+/// heap's ~600,000 slots costs a probe that misses the caches for each
+/// insert and remove, and a slot the title rewrites with a view of the same
+/// range or texture counted it out and in again (its hull made again when
+/// the count passed zero). Pages are one access a slot; the same entry
+/// again changes no count, which ends as it would. Based on Marvisak #3522
+/// by KainanP (census pages, single-lookup counting, keep not retiring a
+/// re-viewed resource); no code is taken from it.
+pub(crate) fn census_pages() -> bool {
+    #[cfg(test)]
+    match TEST_CENSUS_PAGES.load(Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CENSUS_PAGES"))
+}
+
+#[cfg(test)]
+pub(crate) static TEST_CENSUS_PAGES: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+/// What each slot sees: a map, or with [`census_pages`] pages of
+/// [`Slots::PAGE`] entries indexed by slot, made as slots in them are set.
+enum Slots {
+    Map(HashMap<u32, Seen>),
+    Pages(Vec<Option<Box<[Option<Seen>]>>>, usize),
+}
+
+impl Default for Slots {
+    fn default() -> Self {
+        if census_pages() {
+            Slots::Pages(Vec::new(), 0)
+        } else {
+            Slots::Map(HashMap::new())
+        }
+    }
+}
+
+impl Slots {
+    const PAGE: usize = 1024;
+
+    /// Slot `index` sees `seen` now: what it saw before.
+    fn insert(&mut self, index: u32, seen: Seen) -> Option<Seen> {
+        match self {
+            Slots::Map(map) => map.insert(index, seen),
+            Slots::Pages(pages, len) => {
+                let (page, at) = (index as usize / Self::PAGE, index as usize % Self::PAGE);
+                if pages.len() <= page {
+                    pages.resize_with(page + 1, || None);
+                }
+                let page =
+                    pages[page].get_or_insert_with(|| (0..Self::PAGE).map(|_| None).collect());
+                let old = page[at].replace(seen);
+                if old.is_none() {
+                    *len += 1;
+                }
+                old
+            }
+        }
+    }
+
+    /// Slot `index` sees nothing now: what it saw before.
+    fn remove(&mut self, index: &u32) -> Option<Seen> {
+        match self {
+            Slots::Map(map) => map.remove(index),
+            Slots::Pages(pages, len) => {
+                let (page, at) = (*index as usize / Self::PAGE, *index as usize % Self::PAGE);
+                let old = pages.get_mut(page)?.as_mut()?[at].take();
+                if old.is_some() {
+                    *len -= 1;
+                }
+                old
+            }
+        }
+    }
+
+    fn get(&self, index: &u32) -> Option<&Seen> {
+        match self {
+            Slots::Map(map) => map.get(index),
+            Slots::Pages(pages, _) => {
+                let (page, at) = (*index as usize / Self::PAGE, *index as usize % Self::PAGE);
+                pages.get(page)?.as_ref()?[at].as_ref()
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn values(&self) -> Box<dyn Iterator<Item = &Seen> + '_> {
+        match self {
+            Slots::Map(map) => Box::new(map.values()),
+            Slots::Pages(pages, _) => {
+                Box::new(pages.iter().flatten().flat_map(|p| p.iter().flatten()))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Slots::Map(map) => map.len(),
+            Slots::Pages(_, len) => *len,
+        }
+    }
+}
+
+/// Whether two entries count the same in the census: the same range of the
+/// same copy and kind, the same texture, or both left without a view.
+fn same(a: &Seen, b: &Seen) -> bool {
+    match (a, b) {
+        (Seen::Buffer(s, address, len, uav), Seen::Buffer(t, address2, len2, uav2)) => {
+            Arc::ptr_eq(s, t) && address == address2 && len == len2 && uav == uav2
+        }
+        (Seen::Texture(r), Seen::Texture(q)) => r == q,
+        (Seen::Left(_), Seen::Left(_)) => true,
+        _ => false,
+    }
+}
+
 #[derive(Default)]
 struct Inner {
-    slots: HashMap<u32, Seen>,
+    slots: Slots,
     ranges: BTreeMap<Range, (u32, Arc<Shadow>)>,
     /// Per title texture, the slots viewing it: an entry names its slots, so
     /// releasing the texture ([`Inner::forget`]) does not search the heap.
@@ -93,6 +218,26 @@ fn tally(counts: &mut BTreeMap<u64, u32>, at: u64, add: bool) {
 }
 
 impl Inner {
+    /// Slot `index` sees `seen` (or nothing) now. With [`census_pages`] an
+    /// entry the same as the slot's leaves the counts as they are (counted
+    /// out and in again, they end the same).
+    fn put(&mut self, index: u32, seen: Option<Seen>) {
+        if census_pages()
+            && let Some(seen) = &seen
+            && self.slots.get(&index).is_some_and(|old| same(old, seen))
+        {
+            self.slots.insert(index, seen.clone());
+            return;
+        }
+        if let Some(old) = self.slots.remove(&index) {
+            self.count(index, &old, false);
+        }
+        if let Some(seen) = seen {
+            self.count(index, &seen, true);
+            self.slots.insert(index, seen);
+        }
+    }
+
     fn count(&mut self, index: u32, seen: &Seen, add: bool) {
         let step = |n: &mut u32| if add { *n += 1 } else { *n = n.saturating_sub(1) };
         match seen {
@@ -172,13 +317,7 @@ impl Viewed {
     pub(crate) fn set(&self, index: u32, view: Option<&View>, made: bool) {
         let seen = view.and_then(|v| if made { seen(v) } else { Some(Seen::Left(left_kind(v))) });
         let mut inner = crate::spin::lock(&self.inner);
-        if let Some(old) = inner.slots.remove(&index) {
-            inner.count(index, &old, false);
-        }
-        if let Some(seen) = seen {
-            inner.count(index, &seen, true);
-            inner.slots.insert(index, seen);
-        }
+        inner.put(index, seen);
     }
 
     /// Batched [`Viewed::set`]: computes each unique view's entry outside the
@@ -212,13 +351,7 @@ impl Viewed {
         }
         let mut inner = crate::spin::lock(&self.inner);
         for (index, entry) in entries {
-            if let Some(old) = inner.slots.remove(&index) {
-                inner.count(index, &old, false);
-            }
-            if let Some(entry) = entry {
-                inner.count(index, &entry, true);
-                inner.slots.insert(index, entry);
-            }
+            inner.put(index, entry);
         }
     }
 
@@ -795,6 +928,130 @@ void main(uint3 id : SV_DispatchThreadID) {
     }
 
     const LINEAR: u32 = 0x100;
+
+    /// What the census holds, comparable: per range its count, per texture
+    /// its slots, per copy and kind its hull and its ends, the unordered
+    /// ranges.
+    #[allow(clippy::type_complexity)]
+    fn census_of(
+        inner: &Inner,
+    ) -> (
+        Vec<(Range, u32)>,
+        Vec<(usize, Vec<u32>)>,
+        Vec<((usize, bool), (u64, u64, bool))>,
+        Vec<((usize, bool), Vec<(u64, u32)>, Vec<(u64, u32)>)>,
+        Vec<(usize, u64, u64)>,
+    ) {
+        let ranges = inner.ranges.iter().map(|(k, v)| (*k, v.0)).collect();
+        let textures = inner
+            .textures
+            .iter()
+            .map(|(k, v)| (*k, v.iter().copied().collect()))
+            .collect();
+        let mut hulls: Vec<_> = inner
+            .hulls
+            .iter()
+            .map(|(k, h)| (*k, (h.1, h.2, h.3)))
+            .collect();
+        hulls.sort_unstable();
+        let mut ends: Vec<_> = inner
+            .ends
+            .iter()
+            .map(|(k, e)| {
+                (
+                    *k,
+                    e.1.iter().map(|(a, n)| (*a, *n)).collect(),
+                    e.2.iter().map(|(a, n)| (*a, *n)).collect(),
+                )
+            })
+            .collect();
+        ends.sort_unstable();
+        let unordered = inner.unordered.keys().copied().collect();
+        (ranges, textures, hulls, ends, unordered)
+    }
+
+    /// Eight threads set slots of one heap's census at once, overlapping,
+    /// with ranges of two copies (the same again, others, unordered ones),
+    /// textures, views left without a host view and nothing: afterwards the
+    /// census is the one the slots' last entries make, entered one by one,
+    /// with the map and one plain lock, and with `VICTORY_CENSUS_PAGES` and
+    /// spinning locks.
+    #[test]
+    fn a_census_set_from_eight_threads_counts_what_the_slots_see() {
+        let memory = vec![0u8; 0x2000];
+        let at = memory.as_ptr() as u64;
+        crate::shadow::register(at as usize, at, 0x1000);
+        crate::shadow::register(at as usize + 0x1000, at + 0x1000, 0x1000);
+        let (Some(a), Some(b)) = (
+            crate::shadow::find(at, 0x1000),
+            crate::shadow::find(at + 0x1000, 0x1000),
+        ) else {
+            crate::shadow::unregister(at as usize, at);
+            crate::shadow::unregister(at as usize + 0x1000, at + 0x1000);
+            return; // no host GPU here
+        };
+        let entry = |n: u64| -> Option<Seen> {
+            let copy = if n.is_multiple_of(2) { &a } else { &b };
+            let base = if n.is_multiple_of(2) { at } else { at + 0x1000 };
+            match n % 7 {
+                0 => None,
+                1 => Some(Seen::Texture(0x100 + (n % 3) as usize)),
+                2 => Some(Seen::Left((0, 0, 0))),
+                k => Some(Seen::Buffer(
+                    copy.clone(),
+                    base + (n % 5) * 0x100,
+                    0x80 * k,
+                    k == 6,
+                )),
+            }
+        };
+        for pages in [false, true] {
+            TEST_CENSUS_PAGES.store(if pages { 2 } else { 1 }, Relaxed);
+            crate::spin::TEST_ON.store(if pages { 2 } else { 1 }, Relaxed);
+            let viewed = Viewed::default();
+            assert_eq!(
+                matches!(viewed.inner.lock().unwrap().slots, Slots::Pages(..)),
+                pages
+            );
+            std::thread::scope(|s| {
+                for t in 0..8u64 {
+                    let (viewed, entry) = (&viewed, &entry);
+                    s.spawn(move || {
+                        let mut n = t.wrapping_mul(0x9E37_79B9);
+                        for round in 0..4_000u64 {
+                            n = n
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            // Slots 0..3000 across pages, threads overlapping.
+                            let slot = ((n >> 33) % 3_000) as u32;
+                            let seen = entry((n >> 20) % 61 + round % 2);
+                            let mut inner = crate::spin::lock(&viewed.inner);
+                            inner.put(slot, seen);
+                        }
+                    });
+                }
+            });
+            // The same census, made from the slots' last entries one by one.
+            let inner = viewed.inner.lock().unwrap();
+            let mut fresh = Inner::default();
+            for slot in 0..3_000u32 {
+                if let Some(seen) = inner.slots.get(&slot) {
+                    fresh.count(slot, seen, true);
+                    fresh.slots.insert(slot, seen.clone());
+                }
+            }
+            assert_eq!(fresh.slots.len(), inner.slots.len());
+            assert!(
+                census_of(&inner) == census_of(&fresh),
+                "pages {pages}: the census is what the slots see"
+            );
+        }
+        TEST_CENSUS_PAGES.store(0, Relaxed);
+        crate::spin::TEST_ON.store(0, Relaxed);
+        drop((a, b));
+        crate::shadow::unregister(at as usize, at);
+        crate::shadow::unregister(at as usize + 0x1000, at + 0x1000);
+    }
 
     /// A copy's hull is its live ranges' first start to last end, kept as
     /// slots come and go; a copy no slot views any more has none.

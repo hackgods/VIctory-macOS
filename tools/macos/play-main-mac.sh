@@ -26,6 +26,11 @@ d VICTORY_FLIGHTS 1
 d VICTORY_METAL_BC_CASTS 1
 # A title copy makes only the pending refreshes its window reaches (#452).
 d VICTORY_FLUSH_OVERLAPPING 1
+# VIctory-macOS #415, #416, #436, as this stack measured them (always on there):
+# unmapped texture pages split in tracked refreshes, only touched rows detiled
+# and uploaded, write snapshots that copy only what no earlier declaration took.
+d VICTORY_UNMAPPED_SPLIT 1;        d VICTORY_DIRTY_ROWS 1
+d VICTORY_SNAPSHOT_SPANS 1
 # A shader read of the null page is no title-memory miss (upstream #634): views
 # kept out of title memory 81.1 -> 0.0 MB a frame in the prison cell.
 d VICTORY_NULL_PAGE 1
